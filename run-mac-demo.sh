@@ -37,9 +37,19 @@ for tool in "$JAVAC" "$JAVA" "$JAR"; do
 done
 
 # ---------------------------------------------------------------------------
-# 2. Build libwebview.dylib if missing or source is newer
+# 2. Build libwebview.dylib if missing or source is newer.
+#    The directory name has to match NativeLibraryUtil.Architecture lowercased
+#    (osx_64 for Intel, osx_arm64 for Apple Silicon).  The JVM os.arch value
+#    determines which folder the runtime extractor looks in.
 # ---------------------------------------------------------------------------
-DYLIB="$REPO_DIR/src/osx_64/libwebview.dylib"
+case "$(uname -m)" in
+    arm64|aarch64) NATIVE_DIR=osx_arm64 ;;
+    x86_64)        NATIVE_DIR=osx_64 ;;
+    *)             NATIVE_DIR=osx_64 ;;
+esac
+echo "Native dir: $NATIVE_DIR"
+mkdir -p "$REPO_DIR/src/$NATIVE_DIR"
+DYLIB="$REPO_DIR/src/$NATIVE_DIR/libwebview.dylib"
 NEED_DYLIB=0
 if [ ! -f "$DYLIB" ]; then
     NEED_DYLIB=1
@@ -97,9 +107,9 @@ find src -name '*.java' > "$BUILD_DIR/wv-sources.txt"
 echo "Building WebView.jar ..."
 STAGE="$BUILD_DIR/stage-webview"
 rm -rf "$STAGE"
-mkdir -p "$STAGE/osx_64"
+mkdir -p "$STAGE/$NATIVE_DIR"
 cp -R "$WV_CLASSES"/. "$STAGE"/
-cp "$DYLIB" "$STAGE/osx_64/libwebview.dylib"
+cp "$DYLIB" "$STAGE/$NATIVE_DIR/libwebview.dylib"
 ( cd "$STAGE" && "$JAR" cf "$WV_JAR" . )
 echo "Built $WV_JAR"
 
