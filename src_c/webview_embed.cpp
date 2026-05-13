@@ -22,6 +22,7 @@
 
 #include <atomic>
 #include <condition_variable>
+#include <cstdio>
 #include <functional>
 #include <map>
 #include <memory>
@@ -84,19 +85,47 @@ struct JawtLock {
 #endif
             {
                 awt.version = JAWT_VERSION_1_4;
-                if (!JAWT_GetAWT(env, &awt)) return;
+                if (!JAWT_GetAWT(env, &awt)) {
+                    fprintf(stderr,
+                        "[webview-embed] JAWT_GetAWT failed for all "
+                        "version masks (tried 0x%x then 0x%x then 0x%x).\n",
+#if defined(JAWT_VERSION_9)
+                        (unsigned)(JAWT_VERSION_9
+#elif defined(JAWT_VERSION_1_7)
+                        (unsigned)(JAWT_VERSION_1_7
+#else
+                        (unsigned)(JAWT_VERSION_1_4
+#endif
+#if defined(JAWT_MACOSX_USE_CALAYER)
+                        | JAWT_MACOSX_USE_CALAYER
+#endif
+                        ),
+                        (unsigned)JAWT_VERSION_1_7,
+                        (unsigned)JAWT_VERSION_1_4);
+                    return;
+                }
             }
         }
         ds = awt.GetDrawingSurface(env, component);
-        if (ds == nullptr) return;
+        if (ds == nullptr) {
+            fprintf(stderr,
+                "[webview-embed] JAWT GetDrawingSurface returned NULL "
+                "(component is not displayable or not a heavyweight peer).\n");
+            return;
+        }
         lock = ds->Lock(ds);
         if (lock & JAWT_LOCK_ERROR) {
+            fprintf(stderr,
+                "[webview-embed] JAWT Lock returned JAWT_LOCK_ERROR (0x%x).\n",
+                (unsigned)lock);
             awt.FreeDrawingSurface(ds);
             ds = nullptr;
             return;
         }
         dsi = ds->GetDrawingSurfaceInfo(ds);
         if (dsi == nullptr) {
+            fprintf(stderr,
+                "[webview-embed] JAWT GetDrawingSurfaceInfo returned NULL.\n");
             ds->Unlock(ds);
             awt.FreeDrawingSurface(ds);
             ds = nullptr;

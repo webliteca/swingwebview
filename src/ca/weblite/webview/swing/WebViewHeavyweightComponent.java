@@ -11,7 +11,6 @@ import ca.weblite.webview.WebView;
 import java.awt.BorderLayout;
 import java.awt.Canvas;
 import java.awt.Dimension;
-import java.awt.EventQueue;
 import java.awt.event.ComponentAdapter;
 import java.awt.event.ComponentEvent;
 import java.util.ArrayList;
@@ -163,6 +162,8 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
 
     private final class EmbeddedCanvas extends Canvas {
 
+        private volatile boolean peerAttached = false;
+
         EmbeddedCanvas() {
             addComponentListener(new ComponentAdapter() {
                 @Override
@@ -173,34 +174,30 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         }
 
         @Override
-        public void addNotify() {
-            super.addNotify();
-            // The Canvas's native peer is now alive; create the embedded
-            // WebView underneath it.  Do this on the EDT so we have a
-            // stable view tree.
-            if (EventQueue.isDispatchThread()) {
-                createPeer();
-            } else {
-                EventQueue.invokeLater(new Runnable() {
-                    @Override public void run() { createPeer(); }
-                });
-            }
-        }
-
-        @Override
         public void removeNotify() {
+            peerAttached = false;
             dispose();
             super.removeNotify();
         }
 
         @Override
         public void paint(java.awt.Graphics g) {
-            // No-op: the native webview paints directly over this Canvas.
+            // The native peer creation has to happen *after* the underlying
+            // platform window/view has been instantiated, which on macOS is
+            // an async hop from EDT to the AppKit main thread inside Canvas.
+            // addNotify().  Hooking into the first paint gives us a moment
+            // when both the EDT view tree and the AppKit-side NSView are
+            // guaranteed to exist, so the JAWT lock can succeed.
+            if (!peerAttached) {
+                peerAttached = true;
+                createPeer();
+            }
+            // Otherwise no-op -- the native webview paints over this Canvas.
         }
 
         @Override
         public void update(java.awt.Graphics g) {
-            // No-op (don't clear the background; native is drawing here).
+            paint(g);
         }
     }
 }
