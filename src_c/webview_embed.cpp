@@ -25,6 +25,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
@@ -636,31 +637,40 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
             e->webview, sel("initWithFrame:configuration:"),
             CGRectMake(0, 0, 800, 600), e->config);
 
-        // Locate the AWT-owned NSView so we can addSubview: the WKWebView.
-        // JAWT_SurfaceLayers exposes a 'windowLayer' (private but stable in
-        // OpenJDK 8/11/17) whose delegate is, by convention, the NSView
-        // hosting it.  If that fails, walk up the superlayer chain looking
-        // for the first CALayer with an NSView delegate.
+        // Locate the AWT-owned per-Canvas NSView so we can addSubview: the
+        // WKWebView.  JAWT_SurfaceLayers exposes a 'windowLayer' (private
+        // but stable in OpenJDK 8/11/17) which is a sublayer of that view's
+        // layer; we walk up the layer chain looking for the first NSView
+        // delegate whose class name identifies it as AWT-owned.
+        //
+        // Filtering by class name matters -- naively taking the first
+        // NSView delegate we find walks past the AWTView and lands on
+        // NSThemeFrame (NSWindow's root frame view).  Adding a WKWebView
+        // there does render, but breaks window-level resize and hit
+        // testing and rapidly crashes AppKit.
         id ns_view_cls = objc_cls("NSView");
         SEL is_kind_of_class = sel("isKindOfClass:");
         id window_layer = e->surface_layers
             ? msg(e->surface_layers, sel("windowLayer"))
             : (id)nullptr;
         id host = nullptr;
-        if (window_layer) {
-            id d = msg(window_layer, sel("delegate"));
-            if (d && msg<BOOL>(d, is_kind_of_class, ns_view_cls)) {
-                host = d;
-            } else {
-                for (id l = msg(window_layer, sel("superlayer")); l;
-                     l = msg(l, sel("superlayer"))) {
-                    id ld = msg(l, sel("delegate"));
-                    if (ld && msg<BOOL>(ld, is_kind_of_class, ns_view_cls)) {
-                        host = ld;
-                        break;
-                    }
-                }
+        for (id l = window_layer; l; l = msg(l, sel("superlayer"))) {
+            id ld = msg(l, sel("delegate"));
+            if (!ld) continue;
+            if (!msg<BOOL>(ld, is_kind_of_class, ns_view_cls)) continue;
+            Class cls = object_getClass(ld);
+            const char *cls_name = cls ? class_getName(cls) : nullptr;
+            if (!cls_name) continue;
+            if (std::strstr(cls_name, "AWT") != nullptr) {
+                host = ld;
+                fprintf(stderr,
+                    "[webview-embed] Located AWT host view %s at %p\n",
+                    cls_name, ld);
+                break;
             }
+            fprintf(stderr,
+                "[webview-embed] Skipping NSView %s (not AWT-owned)\n",
+                cls_name);
         }
 
         if (host != nullptr) {
