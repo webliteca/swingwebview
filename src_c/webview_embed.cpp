@@ -86,7 +86,9 @@ static jawt_get_awt_fn resolve_jawt_get_awt() {
         "trying explicit dlopen of libjawt.\n");
 
     // Walk a few candidate paths.  Order: just the soname (uses dyld search
-    // path), then $JAVA_HOME variants for the two common JDK layouts.
+    // path), then $JAVA_HOME variants for the common JDK layouts (JDK 9+
+    // uses $JAVA_HOME/lib; JDK 8 puts libjawt in jre/lib/<arch> on Linux
+    // and jre/lib on macOS).
     const char *home = getenv("JAVA_HOME");
     std::vector<std::string> candidates;
     candidates.push_back("libjawt.dylib");
@@ -97,6 +99,10 @@ static jawt_get_awt_fn resolve_jawt_get_awt() {
         candidates.push_back(h + "/lib/libjawt.dylib");
         candidates.push_back(h + "/jre/lib/libjawt.so");
         candidates.push_back(h + "/lib/libjawt.so");
+        candidates.push_back(h + "/jre/lib/amd64/libjawt.so");
+        candidates.push_back(h + "/jre/lib/aarch64/libjawt.so");
+        candidates.push_back(h + "/jre/lib/arm/libjawt.so");
+        candidates.push_back(h + "/jre/lib/i386/libjawt.so");
     }
     void *handle = nullptr;
     for (const auto &path : candidates) {
