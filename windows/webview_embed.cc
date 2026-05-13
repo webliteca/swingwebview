@@ -35,10 +35,6 @@
 #include "ca_weblite_webview_WebViewNative.h"
 #include "WebView2.h"
 
-extern "C" {
-__declspec(dllimport) jboolean JNICALL JAWT_GetAWT(JNIEnv *env, JAWT *awt);
-}
-
 namespace embed_win {
 
 using DispatchFn = std::function<void()>;
