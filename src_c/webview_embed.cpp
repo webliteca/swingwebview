@@ -41,7 +41,9 @@
 
 #ifdef WEBVIEW_COCOA
 #include <CoreGraphics/CoreGraphics.h>
+#include <dispatch/dispatch.h>
 #include <objc/objc-runtime.h>
+#include <objc/runtime.h>
 #endif
 
 namespace embed {
@@ -421,10 +423,18 @@ struct Engine {
 };
 
 static void cocoa_run_on_main(std::function<void()> f) {
-    // dispatch_get_main_queue / dispatch_sync_f symbols pulled in via libSystem.
-    extern "C" void dispatch_sync_f(void *queue, void *ctx, void (*fn)(void *));
-    extern "C" void *dispatch_get_main_queue(void);
-    // Build a small trampoline.
+    // If we're already on the AppKit main thread, just run f inline; otherwise
+    // dispatch_sync to the main queue.  Synchronously dispatching onto your
+    // own queue deadlocks, which is easy to hit when a script-message handler
+    // (which runs on the main thread) ends up calling back into the embed API.
+    id main_thread = objc_msgSend(objc_cls("NSThread"), sel("mainThread"));
+    BOOL is_main = (BOOL)(intptr_t)objc_msgSend(
+        objc_cls("NSThread"), sel("isMainThread"));
+    (void)main_thread;
+    if (is_main) {
+        f();
+        return;
+    }
     struct Holder { std::function<void()> f; };
     Holder h{std::move(f)};
     dispatch_sync_f(dispatch_get_main_queue(), &h, +[](void *p) {
