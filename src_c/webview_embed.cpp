@@ -550,6 +550,13 @@ struct Engine {
     // Reference back into the JAWT-provided SurfaceLayers; we need it on
     // destroy to clear the layer.
     id surface_layers = nullptr;
+    // The AWT-owned NSView (if we managed to locate it) hosting the WKWebView
+    // as a real subview.  We addSubview the WKWebView here instead of just
+    // attaching its CALayer, because WKWebView uses a CARemoteLayer and only
+    // wires up its WebContent-process compositing once it is in an NSView
+    // hierarchy that ends in an NSWindow.  If this is nullptr we fall back
+    // to the layer-only attach via surface_layers.
+    id host_view = nullptr;
 };
 
 static void cocoa_run_on_main(std::function<void()> f) {
@@ -629,13 +636,52 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
             e->webview, sel("initWithFrame:configuration:"),
             CGRectMake(0, 0, 800, 600), e->config);
 
-        // wantsLayer + give the WKWebView a CALayer that JAWT can host.
-        msg<void, BOOL>(e->webview, sel("setWantsLayer:"), YES);
-        id layer = msg(e->webview, sel("layer"));
+        // Locate the AWT-owned NSView so we can addSubview: the WKWebView.
+        // JAWT_SurfaceLayers exposes a 'windowLayer' (private but stable in
+        // OpenJDK 8/11/17) whose delegate is, by convention, the NSView
+        // hosting it.  If that fails, walk up the superlayer chain looking
+        // for the first CALayer with an NSView delegate.
+        id ns_view_cls = objc_cls("NSView");
+        SEL is_kind_of_class = sel("isKindOfClass:");
+        id window_layer = e->surface_layers
+            ? msg(e->surface_layers, sel("windowLayer"))
+            : (id)nullptr;
+        id host = nullptr;
+        if (window_layer) {
+            id d = msg(window_layer, sel("delegate"));
+            if (d && msg<BOOL>(d, is_kind_of_class, ns_view_cls)) {
+                host = d;
+            } else {
+                for (id l = msg(window_layer, sel("superlayer")); l;
+                     l = msg(l, sel("superlayer"))) {
+                    id ld = msg(l, sel("delegate"));
+                    if (ld && msg<BOOL>(ld, is_kind_of_class, ns_view_cls)) {
+                        host = ld;
+                        break;
+                    }
+                }
+            }
+        }
 
-        // Place the layer into the JAWT-provided SurfaceLayers.
-        if (e->surface_layers) {
+        if (host != nullptr) {
+            // Real subview attach -- WKWebView's CARemoteLayer engages and
+            // renders properly.
+            msg<void>(host, sel("retain"));
+            e->host_view = host;
+            msg<void, id>(host, sel("addSubview:"), e->webview);
+            fprintf(stderr,
+                "[webview-embed] WKWebView added as subview of AWT NSView %p\n",
+                host);
+        } else if (e->surface_layers) {
+            // Layer-only fallback (won't render WKWebView content, but
+            // keeps the API surface intact for layer-friendly engines).
+            msg<void, BOOL>(e->webview, sel("setWantsLayer:"), YES);
+            id layer = msg(e->webview, sel("layer"));
             msg<void, id>(e->surface_layers, sel("setLayer:"), layer);
+            fprintf(stderr,
+                "[webview-embed] WARNING: could not locate AWT NSView; "
+                "falling back to layer-only attach. WKWebView content will "
+                "not render in this mode.\n");
         }
 
         // External-message bridge: register a script message handler.
@@ -689,6 +735,15 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
 static void cocoa_destroy_engine(Engine *e) {
     if (!e) return;
     cocoa_run_on_main([&] {
+        if (e->webview) {
+            // If we added the WKWebView as a subview, remove it before
+            // releasing so AppKit unwinds the view hierarchy cleanly.
+            msg<void>(e->webview, sel("removeFromSuperview"));
+        }
+        if (e->host_view) {
+            msg<void>(e->host_view, sel("release"));
+            e->host_view = nullptr;
+        }
         if (e->surface_layers) {
             msg<void, id>(e->surface_layers, sel("setLayer:"), (id)nullptr);
             msg<void>(e->surface_layers, sel("release"));
