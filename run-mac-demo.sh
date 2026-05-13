@@ -58,6 +58,13 @@ if [ "$NEED_DYLIB" = "1" ]; then
     # is broken on ARM64 for struct-by-value arguments anyway.  Fixing it is
     # a separate effort.  For the heavyweight Swing demo we only need the
     # embedded WebView entry points which live in webview_embed.cpp.
+    #
+    # libjawt lives in different places across JDK distributions
+    # (Corretto 8: $JAVA_HOME/jre/lib, JDK 9+: $JAVA_HOME/lib, Temurin: same,
+    # GraalVM: different again).  Rather than probe every layout, defer
+    # JAWT symbol resolution to runtime via -undefined dynamic_lookup: by
+    # the time this dylib is loaded the JVM has already loaded libjawt for
+    # Swing/AWT, so JAWT_GetAWT resolves naturally then.
     c++ \
         -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/darwin" \
         -dynamiclib \
@@ -66,7 +73,7 @@ if [ "$NEED_DYLIB" = "1" ]; then
         -DWEBVIEW_COCOA=1 \
         -std=c++11 \
         -framework WebKit -framework Cocoa -framework QuartzCore \
-        -L"$JAVA_HOME/lib" -ljawt
+        -Wl,-undefined,dynamic_lookup
     echo "Built $DYLIB"
 else
     echo "libwebview.dylib up to date."
