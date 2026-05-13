@@ -20,6 +20,8 @@
 #include <jawt.h>
 #include <jawt_md.h>
 
+#include <dlfcn.h>
+
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
@@ -53,6 +55,76 @@ namespace embed {
 // JAWT helpers
 // ---------------------------------------------------------------------------
 
+// Explicitly resolve JAWT_GetAWT through dlopen/dlsym instead of relying on
+// the static reference + -Wl,-undefined,dynamic_lookup chain.  In practice
+// the dynamic lookup on macOS can resolve the symbol to something other than
+// the real libjawt entry point (e.g. a stub installed by another framework),
+// which manifests as JAWT_GetAWT silently returning JNI_FALSE for every
+// version mask.  Going through dlsym anchors us to the JDK's libjawt.
+using jawt_get_awt_fn = jboolean (*)(JNIEnv *, JAWT *);
+
+static jawt_get_awt_fn resolve_jawt_get_awt() {
+    static jawt_get_awt_fn cached = nullptr;
+    static bool resolved = false;
+    if (resolved) return cached;
+    resolved = true;
+
+    // First try the process-default scope.  If libjawt is already loaded
+    // (e.g. via System.loadLibrary("jawt")) this finds the real entry point
+    // without us having to know the JDK install layout.
+    void *sym = dlsym(RTLD_DEFAULT, "JAWT_GetAWT");
+    if (sym != nullptr) {
+        fprintf(stderr,
+            "[webview-embed] Resolved JAWT_GetAWT via RTLD_DEFAULT at %p\n",
+            sym);
+        cached = reinterpret_cast<jawt_get_awt_fn>(sym);
+        return cached;
+    }
+    fprintf(stderr,
+        "[webview-embed] JAWT_GetAWT not visible in RTLD_DEFAULT; "
+        "trying explicit dlopen of libjawt.\n");
+
+    // Walk a few candidate paths.  Order: just the soname (uses dyld search
+    // path), then $JAVA_HOME variants for the two common JDK layouts.
+    const char *home = getenv("JAVA_HOME");
+    std::vector<std::string> candidates;
+    candidates.push_back("libjawt.dylib");
+    candidates.push_back("libjawt.so");
+    if (home != nullptr) {
+        std::string h(home);
+        candidates.push_back(h + "/jre/lib/libjawt.dylib");
+        candidates.push_back(h + "/lib/libjawt.dylib");
+        candidates.push_back(h + "/jre/lib/libjawt.so");
+        candidates.push_back(h + "/lib/libjawt.so");
+    }
+    void *handle = nullptr;
+    for (const auto &path : candidates) {
+        handle = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
+        if (handle != nullptr) {
+            fprintf(stderr,
+                "[webview-embed] dlopen'd libjawt from \"%s\"\n",
+                path.c_str());
+            break;
+        }
+    }
+    if (handle == nullptr) {
+        fprintf(stderr,
+            "[webview-embed] dlopen libjawt failed for all candidates "
+            "(last dlerror: %s).\n", dlerror());
+        return nullptr;
+    }
+    sym = dlsym(handle, "JAWT_GetAWT");
+    if (sym == nullptr) {
+        fprintf(stderr,
+            "[webview-embed] dlsym JAWT_GetAWT failed: %s\n", dlerror());
+        return nullptr;
+    }
+    fprintf(stderr,
+        "[webview-embed] Resolved JAWT_GetAWT via dlsym at %p\n", sym);
+    cached = reinterpret_cast<jawt_get_awt_fn>(sym);
+    return cached;
+}
+
 struct JawtLock {
     JAWT awt;
     JAWT_DrawingSurface *ds = nullptr;
@@ -61,51 +133,49 @@ struct JawtLock {
     bool ok = false;
 
     JawtLock(JNIEnv *env, jobject component) {
-        // Pick the newest JAWT version the JDK headers know about, then
-        // progressively fall back.  JAWT_VERSION_9 is missing in JDK 8.
-#if defined(JAWT_VERSION_9)
-        awt.version = JAWT_VERSION_9;
-#elif defined(JAWT_VERSION_1_7)
-        awt.version = JAWT_VERSION_1_7;
-#else
-        awt.version = JAWT_VERSION_1_4;
-#endif
+        jawt_get_awt_fn fn = resolve_jawt_get_awt();
+        if (fn == nullptr) {
+            fprintf(stderr,
+                "[webview-embed] No JAWT_GetAWT symbol available; "
+                "cannot attach embed peer.\n");
+            return;
+        }
+
+        // Try the newest JAWT version mask we know about first, then fall
+        // back through older masks.  On macOS the CALAYER flag has to be
+        // OR'd in for the platformInfo to expose JAWT_SurfaceLayers.
+        std::vector<jint> masks;
 #if defined(WEBVIEW_COCOA) && defined(JAWT_MACOSX_USE_CALAYER)
-        // On macOS, request the CALayer-based surface so we can attach a
-        // WKWebView layer through the JAWT_SurfaceLayers protocol.
-        awt.version |= JAWT_MACOSX_USE_CALAYER;
-#endif
-        if (!JAWT_GetAWT(env, &awt)) {
-#if defined(JAWT_VERSION_1_7)
-            awt.version = JAWT_VERSION_1_7;
-#if defined(WEBVIEW_COCOA) && defined(JAWT_MACOSX_USE_CALAYER)
-            awt.version |= JAWT_MACOSX_USE_CALAYER;
-#endif
-            if (!JAWT_GetAWT(env, &awt))
-#endif
-            {
-                awt.version = JAWT_VERSION_1_4;
-                if (!JAWT_GetAWT(env, &awt)) {
-                    fprintf(stderr,
-                        "[webview-embed] JAWT_GetAWT failed for all "
-                        "version masks (tried 0x%x then 0x%x then 0x%x).\n",
 #if defined(JAWT_VERSION_9)
-                        (unsigned)(JAWT_VERSION_9
-#elif defined(JAWT_VERSION_1_7)
-                        (unsigned)(JAWT_VERSION_1_7
-#else
-                        (unsigned)(JAWT_VERSION_1_4
+        masks.push_back(JAWT_VERSION_9 | JAWT_MACOSX_USE_CALAYER);
 #endif
-#if defined(JAWT_MACOSX_USE_CALAYER)
-                        | JAWT_MACOSX_USE_CALAYER
+        masks.push_back(JAWT_VERSION_1_7 | JAWT_MACOSX_USE_CALAYER);
+        masks.push_back(JAWT_VERSION_1_4 | JAWT_MACOSX_USE_CALAYER);
 #endif
-                        ),
-                        (unsigned)JAWT_VERSION_1_7,
-                        (unsigned)JAWT_VERSION_1_4);
-                    return;
-                }
+#if defined(JAWT_VERSION_9)
+        masks.push_back(JAWT_VERSION_9);
+#endif
+        masks.push_back(JAWT_VERSION_1_7);
+        masks.push_back(JAWT_VERSION_1_4);
+
+        bool got = false;
+        for (jint m : masks) {
+            awt.version = m;
+            if (fn(env, &awt)) {
+                fprintf(stderr,
+                    "[webview-embed] JAWT_GetAWT succeeded with mask 0x%x\n",
+                    (unsigned)m);
+                got = true;
+                break;
             }
         }
+        if (!got) {
+            fprintf(stderr,
+                "[webview-embed] JAWT_GetAWT rejected every version mask "
+                "we know about; the JDK does not appear to expose JAWT.\n");
+            return;
+        }
+
         ds = awt.GetDrawingSurface(env, component);
         if (ds == nullptr) {
             fprintf(stderr,
