@@ -60,12 +60,31 @@ struct JawtLock {
     bool ok = false;
 
     JawtLock(JNIEnv *env, jobject component) {
+        // Pick the newest JAWT version the JDK headers know about, then
+        // progressively fall back.  JAWT_VERSION_9 is missing in JDK 8.
+#if defined(JAWT_VERSION_9)
         awt.version = JAWT_VERSION_9;
+#elif defined(JAWT_VERSION_1_7)
+        awt.version = JAWT_VERSION_1_7;
+#else
+        awt.version = JAWT_VERSION_1_4;
+#endif
+#if defined(WEBVIEW_COCOA) && defined(JAWT_MACOSX_USE_CALAYER)
+        // On macOS, request the CALayer-based surface so we can attach a
+        // WKWebView layer through the JAWT_SurfaceLayers protocol.
+        awt.version |= JAWT_MACOSX_USE_CALAYER;
+#endif
         if (!JAWT_GetAWT(env, &awt)) {
-            // Fall back to older version for JVMs without JAWT_VERSION_9.
-            awt.version = JAWT_VERSION_1_4;
-            if (!JAWT_GetAWT(env, &awt)) {
-                return;
+#if defined(JAWT_VERSION_1_7)
+            awt.version = JAWT_VERSION_1_7;
+#if defined(WEBVIEW_COCOA) && defined(JAWT_MACOSX_USE_CALAYER)
+            awt.version |= JAWT_MACOSX_USE_CALAYER;
+#endif
+            if (!JAWT_GetAWT(env, &awt))
+#endif
+            {
+                awt.version = JAWT_VERSION_1_4;
+                if (!JAWT_GetAWT(env, &awt)) return;
             }
         }
         ds = awt.GetDrawingSurface(env, component);
@@ -405,8 +424,20 @@ static void gtk_bind(Engine *e, Binding *b) {
 
 static id objc_cls(const char *n) { return (id)objc_getClass(n); }
 static SEL sel(const char *n) { return sel_registerName(n); }
+
+// Modern macOS SDKs (Xcode 15+) declare objc_msgSend with no parameters even
+// when OBJC_OLD_DISPATCH_PROTOTYPES is defined, and on ARM64 the variadic
+// calling convention does not match the ABI used for struct-by-value
+// arguments anyway.  Every call therefore has to go through a typed
+// function-pointer cast.  msg<>() centralises that pattern.
+template <typename Ret = id, typename... Args>
+static inline Ret msg(id receiver, SEL selector, Args... args) {
+    using Fn = Ret (*)(id, SEL, Args...);
+    return reinterpret_cast<Fn>(objc_msgSend)(receiver, selector, args...);
+}
+
 static id ns_str(const char *s) {
-    return objc_msgSend(objc_cls("NSString"), sel("stringWithUTF8String:"), s);
+    return msg(objc_cls("NSString"), sel("stringWithUTF8String:"), s);
 }
 
 struct Engine {
@@ -427,10 +458,7 @@ static void cocoa_run_on_main(std::function<void()> f) {
     // dispatch_sync to the main queue.  Synchronously dispatching onto your
     // own queue deadlocks, which is easy to hit when a script-message handler
     // (which runs on the main thread) ends up calling back into the embed API.
-    id main_thread = objc_msgSend(objc_cls("NSThread"), sel("mainThread"));
-    BOOL is_main = (BOOL)(intptr_t)objc_msgSend(
-        objc_cls("NSThread"), sel("isMainThread"));
-    (void)main_thread;
+    BOOL is_main = msg<BOOL>(objc_cls("NSThread"), sel("isMainThread"));
     if (is_main) {
         f();
         return;
@@ -475,33 +503,40 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
     env->GetJavaVM(&e->jvm);
     e->debug = debug != 0;
 
-    // Resolve the JAWT surface layers object up front (must happen under JAWT lock).
-    JawtLock lock(env, parentComponent);
-    if (!lock.ok) {
-        delete e;
-        return nullptr;
+    // Resolve the JAWT surface layers object up front, then release the
+    // surface lock immediately -- holding it across a dispatch_sync to the
+    // AppKit main thread can deadlock with AppKit's redraw loop.
+    {
+        JawtLock lock(env, parentComponent);
+        if (!lock.ok) {
+            delete e;
+            return nullptr;
+        }
+        // On modern JDKs the platformInfo conforms to JAWT_SurfaceLayers and
+        // exposes a 'layer' property we can populate.  Retain the id so it
+        // survives any AWT-side recreation between attach and destroy.
+        e->surface_layers = (id)lock.dsi->platformInfo;
+        if (e->surface_layers) {
+            msg<void>(e->surface_layers, sel("retain"));
+        }
     }
-    // On modern JDKs the platformInfo conforms to JAWT_SurfaceLayers and has a
-    // 'layer' property we can populate.  We capture the id and release it
-    // when the engine is destroyed.
-    e->surface_layers = (id)lock.dsi->platformInfo;
 
     bool ok = false;
     cocoa_run_on_main([&] {
-        e->config = objc_msgSend(objc_cls("WKWebViewConfiguration"), sel("new"));
-        e->manager = objc_msgSend(e->config, sel("userContentController"));
-        e->webview = objc_msgSend(objc_cls("WKWebView"), sel("alloc"));
-        e->webview = objc_msgSend(
+        e->config = msg(objc_cls("WKWebViewConfiguration"), sel("new"));
+        e->manager = msg(e->config, sel("userContentController"));
+        e->webview = msg(objc_cls("WKWebView"), sel("alloc"));
+        e->webview = msg<id, CGRect, id>(
             e->webview, sel("initWithFrame:configuration:"),
             CGRectMake(0, 0, 800, 600), e->config);
 
         // wantsLayer + give the WKWebView a CALayer that JAWT can host.
-        objc_msgSend(e->webview, sel("setWantsLayer:"), (BOOL)1);
-        id layer = objc_msgSend(e->webview, sel("layer"));
+        msg<void, BOOL>(e->webview, sel("setWantsLayer:"), YES);
+        id layer = msg(e->webview, sel("layer"));
 
         // Place the layer into the JAWT-provided SurfaceLayers.
         if (e->surface_layers) {
-            objc_msgSend(e->surface_layers, sel("setLayer:"), layer);
+            msg<void, id>(e->surface_layers, sel("setLayer:"), layer);
         }
 
         // External-message bridge: register a script message handler.
@@ -513,35 +548,35 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
         class_addMethod(
             delegate_cls,
             sel("userContentController:didReceiveScriptMessage:"),
-            (IMP)(+[](id self, SEL, id, id msg) {
+            (IMP)(+[](id self, SEL, id, id m) {
                 Engine *eng = (Engine *)objc_getAssociatedObject(self, "eng");
-                id body = objc_msgSend(msg, sel("body"));
-                const char *s = (const char *)objc_msgSend(body, sel("UTF8String"));
+                id body = msg(m, sel("body"));
+                const char *s = msg<const char *>(body, sel("UTF8String"));
                 engine_on_message(eng, s);
             }),
             "v@:@@");
         objc_registerClassPair(delegate_cls);
-        id delegate = objc_msgSend((id)delegate_cls, sel("new"));
+        id delegate = msg((id)delegate_cls, sel("new"));
         objc_setAssociatedObject(delegate, "eng", (id)e, OBJC_ASSOCIATION_ASSIGN);
-        objc_msgSend(e->manager,
-                     sel("addScriptMessageHandler:name:"), delegate,
-                     ns_str("external"));
+        msg<void, id, id>(e->manager,
+                          sel("addScriptMessageHandler:name:"), delegate,
+                          ns_str("external"));
         // Install the external.invoke shim.
-        id script = objc_msgSend(objc_cls("WKUserScript"), sel("alloc"));
-        script = objc_msgSend(
+        id script = msg(objc_cls("WKUserScript"), sel("alloc"));
+        script = msg<id, id, long, BOOL>(
             script, sel("initWithSource:injectionTime:forMainFrameOnly:"),
             ns_str("window.external={invoke:function(s){"
                    "window.webkit.messageHandlers.external.postMessage(s);}};"),
             (long)0 /* WKUserScriptInjectionTimeAtDocumentStart */,
-            (BOOL)1);
-        objc_msgSend(e->manager, sel("addUserScript:"), script);
+            YES);
+        msg<void, id>(e->manager, sel("addUserScript:"), script);
 
         if (e->debug) {
-            id prefs = objc_msgSend(e->config, sel("preferences"));
-            objc_msgSend(prefs, sel("setValue:forKey:"),
-                         objc_msgSend(objc_cls("NSNumber"),
-                                      sel("numberWithBool:"), (BOOL)1),
-                         ns_str("developerExtrasEnabled"));
+            id prefs = msg(e->config, sel("preferences"));
+            id one = msg<id, BOOL>(objc_cls("NSNumber"),
+                                   sel("numberWithBool:"), YES);
+            msg<void, id, id>(prefs, sel("setValue:forKey:"),
+                              one, ns_str("developerExtrasEnabled"));
         }
         ok = true;
     });
@@ -556,14 +591,16 @@ static void cocoa_destroy_engine(Engine *e) {
     if (!e) return;
     cocoa_run_on_main([&] {
         if (e->surface_layers) {
-            objc_msgSend(e->surface_layers, sel("setLayer:"), (id) nullptr);
+            msg<void, id>(e->surface_layers, sel("setLayer:"), (id)nullptr);
+            msg<void>(e->surface_layers, sel("release"));
+            e->surface_layers = nullptr;
         }
         if (e->webview) {
-            objc_msgSend(e->webview, sel("release"));
+            msg<void>(e->webview, sel("release"));
             e->webview = nullptr;
         }
         if (e->config) {
-            objc_msgSend(e->config, sel("release"));
+            msg<void>(e->config, sel("release"));
             e->config = nullptr;
         }
     });
@@ -589,40 +626,39 @@ static void cocoa_destroy_engine(Engine *e) {
 static void cocoa_set_bounds(Engine *e, int x, int y, int w, int h) {
     cocoa_run_on_main([=] {
         if (!e->webview) return;
-        objc_msgSend(e->webview, sel("setFrame:"),
-                     CGRectMake(x, y, w, h));
+        msg<void, CGRect>(e->webview, sel("setFrame:"),
+                          CGRectMake(x, y, w, h));
     });
 }
 
 static void cocoa_navigate(Engine *e, std::string url) {
     cocoa_run_on_main([=] {
         if (!e->webview) return;
-        id nsurl = objc_msgSend(objc_cls("NSURL"), sel("URLWithString:"),
-                                ns_str(url.c_str()));
-        id req = objc_msgSend(objc_cls("NSURLRequest"),
-                              sel("requestWithURL:"), nsurl);
-        objc_msgSend(e->webview, sel("loadRequest:"), req);
+        id nsurl = msg<id, id>(objc_cls("NSURL"), sel("URLWithString:"),
+                               ns_str(url.c_str()));
+        id req = msg<id, id>(objc_cls("NSURLRequest"),
+                             sel("requestWithURL:"), nsurl);
+        msg<void, id>(e->webview, sel("loadRequest:"), req);
     });
 }
 
 static void cocoa_init_script(Engine *e, std::string js) {
     cocoa_run_on_main([=] {
         if (!e->manager) return;
-        id script = objc_msgSend(objc_cls("WKUserScript"), sel("alloc"));
-        script = objc_msgSend(
+        id script = msg(objc_cls("WKUserScript"), sel("alloc"));
+        script = msg<id, id, long, BOOL>(
             script, sel("initWithSource:injectionTime:forMainFrameOnly:"),
-            ns_str(js.c_str()),
-            (long)0, (BOOL)1);
-        objc_msgSend(e->manager, sel("addUserScript:"), script);
+            ns_str(js.c_str()), (long)0, YES);
+        msg<void, id>(e->manager, sel("addUserScript:"), script);
     });
 }
 
 static void cocoa_eval(Engine *e, std::string js) {
     cocoa_run_on_main([=] {
         if (!e->webview) return;
-        objc_msgSend(e->webview,
-                     sel("evaluateJavaScript:completionHandler:"),
-                     ns_str(js.c_str()), (id)nullptr);
+        msg<void, id, id>(e->webview,
+                          sel("evaluateJavaScript:completionHandler:"),
+                          ns_str(js.c_str()), (id)nullptr);
     });
 }
 

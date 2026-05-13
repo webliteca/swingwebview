@@ -51,12 +51,19 @@ fi
 
 if [ "$NEED_DYLIB" = "1" ]; then
     echo "Building libwebview.dylib (arch: $(uname -m)) ..."
+    # Note: src_c/webview.c (the upstream zserge WebView engine for the legacy
+    # `WebView` Java class) is intentionally NOT compiled here.  Its Cocoa
+    # branch in webview.h relies on the implicit variadic prototype of
+    # objc_msgSend which has been removed from the macOS SDK (Xcode 15+) and
+    # is broken on ARM64 for struct-by-value arguments anyway.  Fixing it is
+    # a separate effort.  For the heavyweight Swing demo we only need the
+    # embedded WebView entry points which live in webview_embed.cpp.
     c++ \
         -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/darwin" \
         -dynamiclib \
-        src_c/webview.c src_c/webview_embed.cpp \
+        src_c/webview_embed.cpp \
         -o "$DYLIB" \
-        -DWEBVIEW_COCOA=1 -DOBJC_OLD_DISPATCH_PROTOTYPES=1 \
+        -DWEBVIEW_COCOA=1 \
         -std=c++11 \
         -framework WebKit -framework Cocoa -framework QuartzCore \
         -L"$JAVA_HOME/lib" -ljawt
