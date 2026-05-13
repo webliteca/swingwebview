@@ -555,9 +555,15 @@ struct Engine {
     // CARemoteLayer-based rendering only engages once the view is part of
     // an NSView hierarchy that ends in an NSWindow.  On Corretto 8 macOS
     // arm64 (and OpenJDK builds with a similar layer-only design) there is
-    // no per-Canvas AWT NSView, so we use NSWindow.contentView and convert
-    // the JAWT windowLayer's frame on every setBounds.
+    // no per-Canvas AWT NSView; we attach to NSWindow.contentView and use
+    // the caller-supplied AWT canvas position to set the WKWebView's
+    // frame within it.
     id host_view = nullptr;
+    // True when host_view is a per-Canvas AWT NSView whose bounds already
+    // match the canvas (so WKWebView frame is just (0,0,w,h)).  False when
+    // host_view is NSWindow.contentView and we have to honor the caller's
+    // (x,y) and translate AWT top-left coords into Cocoa bottom-left.
+    bool host_is_awt = false;
 };
 
 static void cocoa_run_on_main(std::function<void()> f) {
@@ -626,8 +632,6 @@ static void engine_on_message(Engine *e, const char *msg) {
     }
     if (detach) e->jvm->DetachCurrentThread();
 }
-
-static void update_webview_frame(Engine *e);
 
 static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
                                    jlong /*display*/, jint debug) {
@@ -712,6 +716,7 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
         if (host != nullptr) {
             msg<void>(host, sel("retain"));
             e->host_view = host;
+            e->host_is_awt = host_is_awt;
             // contentView is often not layer-backed until something forces
             // it; make sure it is so AppKit composites WKWebView properly.
             msg<void, BOOL>(host, sel("setWantsLayer:"), YES);
@@ -719,7 +724,12 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
             fprintf(stderr,
                 "[webview-embed] WKWebView added as subview of %s at %p\n",
                 host_kind, host);
-            update_webview_frame(e);
+            // Hide the WKWebView until the first setBounds positions it
+            // correctly; otherwise the placeholder 800x600 frame from init
+            // shows up at the bottom of contentView (Cocoa origin) and
+            // briefly covers the URL bar.
+            msg<void, CGRect>(e->webview, sel("setFrame:"),
+                              CGRectMake(0, 0, 0, 0));
         } else if (e->surface_layers) {
             // Layer-only fallback (won't render WKWebView content, but
             // keeps the API surface intact for layer-friendly engines).
@@ -825,30 +835,32 @@ static void cocoa_destroy_engine(Engine *e) {
     delete e;
 }
 
-// Recompute the WKWebView's frame so it overlays the JAWT canvas exactly.
-// When we are attached to NSWindow.contentView we translate windowLayer's
-// frame from its own layer-tree coordinate space into the contentView's
-// layer coords with CALayer.convertRect:toLayer:, which transparently
-// handles flipped-Y and intermediate layer offsets.  When we managed to
-// find a real per-canvas AWT NSView the layer frame and the canvas bounds
-// already match.
-static void update_webview_frame(Engine *e) {
-    if (!e || !e->webview || !e->host_view || !e->surface_layers) return;
-    id window_layer = msg(e->surface_layers, sel("windowLayer"));
-    if (!window_layer) return;
-    CGRect r = msg<CGRect>(window_layer, sel("frame"));
-    id wl_super = msg(window_layer, sel("superlayer"));
-    id host_layer = msg(e->host_view, sel("layer"));
-    if (wl_super && host_layer && wl_super != host_layer) {
-        r = msg<CGRect, CGRect, id>(
-            wl_super, sel("convertRect:toLayer:"), r, host_layer);
-    }
-    msg<void, CGRect>(e->webview, sel("setFrame:"), r);
-}
-
-static void cocoa_set_bounds(Engine *e, int /*x*/, int /*y*/,
-                             int /*w*/, int /*h*/) {
-    cocoa_run_on_main_async([=] { update_webview_frame(e); });
+// Update the WKWebView's frame so it overlays exactly the AWT canvas
+// region.  When host_view is a per-Canvas AWT NSView its bounds already
+// match the canvas, so the WKWebView just fills it.  Otherwise host_view
+// is NSWindow.contentView and the caller's (x,y,w,h) -- the canvas
+// position in NSWindow content-pane coords with AWT's top-left origin --
+// is translated into Cocoa's bottom-left coords.
+static void cocoa_set_bounds(Engine *e, int x, int y, int w, int h) {
+    cocoa_run_on_main_async([=] {
+        if (!e || !e->webview || !e->host_view) return;
+        CGFloat fx = (CGFloat)x;
+        CGFloat fy = (CGFloat)y;
+        CGFloat fw = (CGFloat)w;
+        CGFloat fh = (CGFloat)h;
+        if (e->host_is_awt) {
+            msg<void, CGRect>(e->webview, sel("setFrame:"),
+                              CGRectMake(0, 0, fw, fh));
+            return;
+        }
+        CGRect b = msg<CGRect>(e->host_view, sel("bounds"));
+        BOOL flipped = msg<BOOL>(e->host_view, sel("isFlipped"));
+        CGFloat outY = flipped
+            ? fy
+            : (b.origin.y + b.size.height - fy - fh);
+        msg<void, CGRect>(e->webview, sel("setFrame:"),
+                          CGRectMake(b.origin.x + fx, outY, fw, fh));
+    });
 }
 
 static void cocoa_navigate(Engine *e, std::string url) {

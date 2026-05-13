@@ -11,8 +11,12 @@ import ca.weblite.webview.WebView;
 import java.awt.BorderLayout;
 import java.awt.Canvas;
 import java.awt.Dimension;
+import java.awt.Insets;
+import java.awt.Point;
+import java.awt.Window;
 import java.awt.event.ComponentAdapter;
 import java.awt.event.ComponentEvent;
+import javax.swing.SwingUtilities;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -157,7 +161,20 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         if (d.width <= 0 || d.height <= 0) {
             return;
         }
-        embedded.setBounds(0, 0, d.width, d.height);
+        // Send the canvas's position in the AWT Window's content-pane
+        // coordinates (top-left origin).  The native side translates into
+        // its host NSView's coordinate space; when the host is
+        // NSWindow.contentView this is what positions the WKWebView so it
+        // overlays only the canvas region, not the entire window.
+        int x = 0, y = 0;
+        Window window = SwingUtilities.getWindowAncestor(canvas);
+        if (window != null) {
+            Point inWindow = SwingUtilities.convertPoint(canvas, 0, 0, window);
+            Insets insets = window.getInsets();
+            x = inWindow.x - insets.left;
+            y = inWindow.y - insets.top;
+        }
+        embedded.setBounds(x, y, d.width, d.height);
     }
 
     private final class EmbeddedCanvas extends Canvas {
