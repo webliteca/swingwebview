@@ -160,5 +160,11 @@ native static void webview_embed_bind(long w, String name,
                                       WebViewNativeCallback fn, long arg);
 native static void webview_embed_dispatch(long w, Runnable callback);
 
+// Show or hide the embedded WebView in-place.  Used to track Swing
+// visibility changes -- e.g., JTabbedPane tab switches, parent setVisible.
+// visible != 0 makes the native view visible; 0 hides it (without
+// destroying the engine).
+native static void webview_embed_set_visible(long w, int visible);
+
 
 }

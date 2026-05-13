@@ -81,6 +81,17 @@ public class EmbeddedWebView {
     }
 
     /**
+     * Show or hide the embedded WebView without destroying the engine.
+     * Used to track Swing visibility changes (e.g. when the WebView is
+     * inside a JTabbedPane and a different tab is selected).
+     */
+    public EmbeddedWebView setVisible(boolean visible) {
+        checkAlive();
+        WebViewNative.webview_embed_set_visible(peer, visible ? 1 : 0);
+        return this;
+    }
+
+    /**
      * Navigate the WebView to the given URL.
      */
     public EmbeddedWebView navigate(String url) {

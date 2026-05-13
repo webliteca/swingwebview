@@ -511,6 +511,14 @@ static void gtk_eval(Engine *e, std::string js) {
     });
 }
 
+static void gtk_set_visible(Engine *e, bool visible) {
+    GtkPump::instance().run_async([=] {
+        if (!e->window) return;
+        if (visible) gtk_widget_show(e->window);
+        else gtk_widget_hide(e->window);
+    });
+}
+
 static void gtk_bind(Engine *e, Binding *b) {
     e->bindings[b->name] = b;
 }
@@ -894,6 +902,13 @@ static void cocoa_eval(Engine *e, std::string js) {
     });
 }
 
+static void cocoa_set_visible(Engine *e, bool visible) {
+    cocoa_run_on_main_async([=] {
+        if (!e->webview) return;
+        msg<void, BOOL>(e->webview, sel("setHidden:"), visible ? NO : YES);
+    });
+}
+
 static void cocoa_bind(Engine *e, Binding *b) { e->bindings[b->name] = b; }
 
 #endif // WEBVIEW_COCOA
@@ -959,6 +974,17 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
     embed::cocoa_set_bounds((Engine *)wv, x, y, w, h);
 #else
     (void)wv; (void)x; (void)y; (void)w; (void)h;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1visible
+  (JNIEnv *, jclass, jlong wv, jint visible) {
+#ifdef WEBVIEW_GTK
+    embed::gtk_set_visible((Engine *)wv, visible != 0);
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_set_visible((Engine *)wv, visible != 0);
+#else
+    (void)wv; (void)visible;
 #endif
 }
 

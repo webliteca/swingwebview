@@ -183,6 +183,14 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1bin
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1dispatch
   (JNIEnv *, jclass, jlong, jobject);
 
+/*
+ * Class:     ca_weblite_webview_WebViewNative
+ * Method:    webview_embed_set_visible
+ * Signature: (JI)V
+ */
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1visible
+  (JNIEnv *, jclass, jlong, jint);
+
 #ifdef __cplusplus
 }
 #endif

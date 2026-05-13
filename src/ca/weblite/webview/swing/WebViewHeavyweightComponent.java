@@ -16,6 +16,8 @@ import java.awt.Point;
 import java.awt.Window;
 import java.awt.event.ComponentAdapter;
 import java.awt.event.ComponentEvent;
+import java.awt.event.HierarchyEvent;
+import java.awt.event.HierarchyListener;
 import javax.swing.SwingUtilities;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -193,6 +195,26 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
                 }
             };
             addComponentListener(ca);
+
+            // Track visibility transitions so the native WebView hides when
+            // its tab in a JTabbedPane is deselected, when an ancestor is
+            // hidden, etc.  The native view is parented to NSWindow's
+            // contentView (not into Swing's layout) so without this it
+            // would happily paint over whatever Swing tab is active.
+            addHierarchyListener(new HierarchyListener() {
+                @Override
+                public void hierarchyChanged(HierarchyEvent e) {
+                    if ((e.getChangeFlags() & HierarchyEvent.SHOWING_CHANGED) == 0) {
+                        return;
+                    }
+                    if (embedded == null) return;
+                    boolean showing = isShowing();
+                    embedded.setVisible(showing);
+                    if (showing) {
+                        sizeNative();
+                    }
+                }
+            });
         }
 
         @Override
