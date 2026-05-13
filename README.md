@@ -128,9 +128,56 @@ NOTE: The `show()` method will start a blocking event loop.
 
 WARNING: Currently the WebView is picky about being started on the main application thread.  On Mac you may need to add the "-XstartOnFirstThread" flag in the JVM.
 
-## Using Java API from Swing, JavaFX, or other UI Toolkit
+## Embedding WebView Directly in Swing
 
-The WebView class cannot be used from Swing, JavaFX, or any other existing UI toolkit because it starts its own event loop.  If you want to make use of the WebView from within such an app, you'll need to use the WebViewCLIClient class, which provides an interface to create and manage a WebView which runs inside its own subprocess.
+In addition to the out-of-process `WebViewCLIClient` approach, the library
+includes an in-process Swing embedding API in the
+`ca.weblite.webview.swing` package.  A `WebViewHeavyweightComponent` extends
+`JComponent` and embeds the native WebView as a child of the underlying
+heavyweight AWT peer, so it renders directly inside the Swing hierarchy
+without spawning a child process.
+
+```java
+import ca.weblite.webview.swing.WebViewHeavyweightComponent;
+
+WebViewHeavyweightComponent wv = new WebViewHeavyweightComponent();
+wv.setUrl("https://example.com");
+wv.setPreferredSize(new Dimension(900, 600));
+frame.add(wv, BorderLayout.CENTER);
+```
+
+See the [Heavyweight Swing Demo](demos/WebViewHeavyweightDemo/README.md) for
+a complete example.  A second mode, `WebViewLightweightComponent`, that
+renders into an off-screen pixel buffer and composites into Swing cleanly
+across the Z-order, is scaffolded but not yet implemented; use the
+heavyweight component for now.
+
+Platform notes for the heavyweight embedding:
+
+* **Linux (GTK / WebKitGTK / X11)** -- the WebView's GTK window is
+  reparented under the JAWT-managed X11 window via `XReparentWindow`.  A
+  dedicated GTK pump thread drives the WebKitGTK main loop independently of
+  AWT's X11 event loop.  Requires `libwebkit2gtk-4.0-dev` or
+  `libwebkit2gtk-4.1-dev`.
+* **macOS (Cocoa / WKWebView)** -- the WKWebView's `CALayer` is installed
+  via the JAWT `JAWT_SurfaceLayers` protocol.  Initial cut focuses on
+  rendering; input forwarding for clicks/typing may need additional work
+  depending on the JDK in use.
+* **Windows (WebView2)** -- a child `HWND` is created under the AWT canvas
+  HWND and an `IWebView2WebView` controller is hosted inside it.  Each
+  embedded WebView runs on its own worker thread that pumps a private
+  message queue.
+
+The embedded WebView does **not** call `webview_run()` and never takes
+ownership of the host application's event loop.
+
+## Using Java API from Swing, JavaFX, or other UI Toolkit (subprocess mode)
+
+The original `WebView` class cannot be used directly from Swing, JavaFX, or
+any other existing UI toolkit because it starts its own event loop.  If you
+want to use that class from such an app, you can use the `WebViewCLIClient`
+class, which provides an interface to create and manage a WebView running
+in its own subprocess.
 
 See the [Swing Demo](demos/WebViewSwingDemo/README.md) for a full example of this.
 
@@ -175,8 +222,9 @@ webview.close();
 
 #### Demos
 
-1. [Swing Demo](demos/WebViewSwingDemo/README.md) - A simple demo showing how to create and control a WebView from a Swing App.
-2. [Minimal Demo](demos/WebViewMinimalDemo/README.md) - A simple demo that only launches a WebView on the main thread.
+1. [Swing Demo](demos/WebViewSwingDemo/README.md) - A simple demo showing how to create and control a WebView from a Swing App (subprocess mode).
+2. [Heavyweight Swing Demo](demos/WebViewHeavyweightDemo/README.md) - A demo showing how to embed the WebView directly into a Swing hierarchy as a heavyweight component.
+3. [Minimal Demo](demos/WebViewMinimalDemo/README.md) - A simple demo that only launches a WebView on the main thread.
 
 ## Supported Platforms
 

@@ -89,5 +89,63 @@ native static void webview_bind(long w, String name,
                               WebViewNativeCallback fn, long arg);
 
 
-    
+// --------------------------------------------------------------------------
+// Swing / embedding API.
+//
+// These entry points allow a WebView to be created as a child of an existing
+// native window owned by another toolkit (typically Swing/AWT, via JAWT), so
+// the WebView can be embedded inside a heavyweight Component instead of
+// creating its own top-level window.  The host application is responsible
+// for driving its own UI event loop -- webview_run() is NOT called for
+// embedded WebViews.
+// --------------------------------------------------------------------------
+
+// Returns the native window handle of a Swing/AWT heavyweight Component, or 0.
+// Intended for diagnostics and advanced integrations; the embedded WebView
+// creation path resolves the handle internally and does not require this.
+// The handle is interpreted as:
+//   - Linux:   an X11 Window (XID) cast to a jlong.
+//   - macOS:   a pointer to a JAWT SurfaceLayers id cast to a jlong (only
+//              valid while the JAWT drawing surface is locked, which is not
+//              the case after this method returns -- use with care).
+//   - Windows: an HWND cast to a jlong.
+// The component must be displayable (addNotify() called) before invoking this.
+native static long jawt_get_window_handle(java.awt.Component c);
+
+// Creates a WebView attached to the given AWT Component.  The component must
+// be heavyweight and already displayable.  Returns an opaque pointer that
+// must be passed to the remaining webview_embed_* methods, or 0 on failure.
+native static long webview_embed_create(java.awt.Component parent, int debug);
+
+// Positions and resizes the embedded WebView within its parent.  Coordinates
+// are in the parent's local coordinate space, in pixels.
+native static void webview_embed_set_bounds(long w, int x, int y, int width, int height);
+
+// Pumps one iteration of the platform UI loop for the embedded WebView.
+// If waitForEvent is non-zero, the call blocks until at least one event has
+// been processed.  Otherwise it returns immediately after processing any
+// events that are already available.  This is only required on platforms
+// whose UI loop is not already being driven by the host (notably Linux/GTK,
+// where the GTK main loop is independent of AWT's X11 event loop).
+// On macOS and Windows this is a no-op when the host's event loop is already
+// running.
+native static int webview_embed_pump(long w, int waitForEvent);
+
+// Releases the resources associated with an embedded WebView and detaches it
+// from its native parent.  Equivalent to webview_destroy for embedded
+// instances but ensures any pump thread is stopped first.
+native static void webview_embed_destroy(long w);
+
+// The remaining embed entry points mirror their non-embedded counterparts but
+// operate on the opaque pointer returned by webview_embed_create.  They are
+// kept distinct so the embed engine implementation can evolve independently
+// from the legacy top-level WebView engine.
+native static void webview_embed_navigate(long w, String url);
+native static void webview_embed_init(long w, String js);
+native static void webview_embed_eval(long w, String js);
+native static void webview_embed_bind(long w, String name,
+                                      WebViewNativeCallback fn, long arg);
+native static void webview_embed_dispatch(long w, Runnable callback);
+
+
 }
