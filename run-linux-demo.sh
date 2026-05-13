@@ -175,8 +175,11 @@ echo "Launching demo ..."
 export GDK_BACKEND=x11
 # Disable WebKitGTK's DMA-BUF renderer and sandbox.  Both have been seen
 # to silently fail in virtualized environments (Parallels ARM in
-# particular) and produce a permanently empty WebView.
+# particular) and produce a permanently empty WebView.  Newer WebKitGTK
+# renamed the sandbox-disable env var; keep the older one set for
+# compatibility with older WebKit builds where it was named differently.
 export WEBKIT_DISABLE_DMABUF_RENDERER=1
+export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
 export WEBKIT_FORCE_SANDBOX=0
 exec "$JAVA" \
     -cp "$DEMO_CLASSES:$WV_JAR" \

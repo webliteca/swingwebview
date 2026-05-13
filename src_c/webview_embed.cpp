@@ -476,12 +476,20 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
                 WEBKIT_WEB_VIEW(e->web), &white);
         }
 
-        // Log load lifecycle events so we can tell whether the WebProcess
-        // is actually fetching+rendering the URL.  G_CALLBACK is a
-        // single-argument macro; cast to GCallback by hand so the
-        // preprocessor doesn't split the lambda parameter list on commas.
+        // Log load lifecycle events and force a redraw when content
+        // first becomes available.  In some virtualized X11 setups
+        // (Parallels ARM most reliably) WebKit's own damage notification
+        // doesn't propagate to the GdkWindow's expose pipeline, so the
+        // newly-rendered content stays invisible until something else
+        // triggers a paint (e.g. hide+show from a JTabbedPane switch).
+        // Queueing a draw on COMMITTED and FINISHED restores the
+        // expected behaviour.
+        //
+        // G_CALLBACK is a single-argument macro; cast to GCallback by
+        // hand so the preprocessor doesn't split the lambda parameter
+        // list on commas.
         auto on_load_changed =
-            +[](WebKitWebView *wv, WebKitLoadEvent ev, gpointer) {
+            +[](WebKitWebView *wv, WebKitLoadEvent ev, gpointer user) {
                 static const char *names[] = {
                     "started", "redirected", "committed", "finished"
                 };
@@ -491,6 +499,13 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
                 fprintf(stderr,
                     "[webview-embed] load-%s: %s\n",
                     n, uri ? uri : "(null)");
+                if (ev == WEBKIT_LOAD_COMMITTED || ev == WEBKIT_LOAD_FINISHED) {
+                    gtk_widget_queue_draw(GTK_WIDGET(wv));
+                    Engine *eng = static_cast<Engine *>(user);
+                    if (eng && eng->window) {
+                        gtk_widget_queue_draw(eng->window);
+                    }
+                }
             };
         auto on_load_failed =
             +[](WebKitWebView *, WebKitLoadEvent, const char *uri,
@@ -502,7 +517,7 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
                 return FALSE;
             };
         g_signal_connect(WEBKIT_WEB_VIEW(e->web), "load-changed",
-                         (GCallback)on_load_changed, nullptr);
+                         (GCallback)on_load_changed, e);
         g_signal_connect(WEBKIT_WEB_VIEW(e->web), "load-failed",
                          (GCallback)on_load_failed, nullptr);
 
@@ -585,13 +600,18 @@ static void gtk_set_bounds(Engine *e, int /*x*/, int /*y*/,
     // (0,0) of it and just match the size.
     GtkPump::instance().run_async([=] {
         if (!e->window) return;
-        gtk_window_resize(GTK_WINDOW(e->window), width > 0 ? width : 1,
-                          height > 0 ? height : 1);
+        int w = width > 0 ? width : 1;
+        int h = height > 0 ? height : 1;
+        gtk_window_resize(GTK_WINDOW(e->window), w, h);
         GdkWindow *gdkw = gtk_widget_get_window(e->window);
         if (gdkw) {
-            gdk_window_move_resize(gdkw, 0, 0, width > 0 ? width : 1,
-                                   height > 0 ? height : 1);
+            gdk_window_move_resize(gdkw, 0, 0, w, h);
         }
+        // Force a repaint after resize -- in some virtualized X11 setups
+        // the resize does not on its own generate an Expose, leaving the
+        // newly-revealed regions blank.
+        gtk_widget_queue_draw(e->window);
+        if (e->web) gtk_widget_queue_draw(e->web);
     });
 }
 
