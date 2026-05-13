@@ -551,12 +551,12 @@ struct Engine {
     // Reference back into the JAWT-provided SurfaceLayers; we need it on
     // destroy to clear the layer.
     id surface_layers = nullptr;
-    // The AWT-owned NSView (if we managed to locate it) hosting the WKWebView
-    // as a real subview.  We addSubview the WKWebView here instead of just
-    // attaching its CALayer, because WKWebView uses a CARemoteLayer and only
-    // wires up its WebContent-process compositing once it is in an NSView
-    // hierarchy that ends in an NSWindow.  If this is nullptr we fall back
-    // to the layer-only attach via surface_layers.
+    // The NSView hosting the WKWebView as a real subview.  WKWebView's
+    // CARemoteLayer-based rendering only engages once the view is part of
+    // an NSView hierarchy that ends in an NSWindow.  On Corretto 8 macOS
+    // arm64 (and OpenJDK builds with a similar layer-only design) there is
+    // no per-Canvas AWT NSView, so we use NSWindow.contentView and convert
+    // the JAWT windowLayer's frame on every setBounds.
     id host_view = nullptr;
 };
 
@@ -604,6 +604,8 @@ static void engine_on_message(Engine *e, const char *msg) {
     if (detach) e->jvm->DetachCurrentThread();
 }
 
+static void update_webview_frame(Engine *e);
+
 static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
                                    jlong /*display*/, jint debug) {
     auto *e = new Engine();
@@ -637,51 +639,64 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
             e->webview, sel("initWithFrame:configuration:"),
             CGRectMake(0, 0, 800, 600), e->config);
 
-        // Locate the AWT-owned per-Canvas NSView so we can addSubview: the
-        // WKWebView.  JAWT_SurfaceLayers exposes a 'windowLayer' (private
-        // but stable in OpenJDK 8/11/17) which is a sublayer of that view's
-        // layer; we walk up the layer chain looking for the first NSView
-        // delegate whose class name identifies it as AWT-owned.
-        //
-        // Filtering by class name matters -- naively taking the first
-        // NSView delegate we find walks past the AWTView and lands on
-        // NSThemeFrame (NSWindow's root frame view).  Adding a WKWebView
-        // there does render, but breaks window-level resize and hit
-        // testing and rapidly crashes AppKit.
+        // Find a hostable NSView.  Walk up the windowLayer's superlayer
+        // chain and use whatever NSView class we encounter to reach the
+        // owning NSWindow.contentView -- the layer-only AWT design used by
+        // Corretto 8 macOS arm64 has no per-Canvas AWT NSView, so we
+        // attach the WKWebView to contentView and convert windowLayer's
+        // frame on every setBounds to keep it overlaid on the canvas.  If
+        // we happen to find an AWT-named view (other JDK layouts) we use
+        // it directly; coordinates there are already canvas-relative.
         id ns_view_cls = objc_cls("NSView");
         SEL is_kind_of_class = sel("isKindOfClass:");
         id window_layer = e->surface_layers
             ? msg(e->surface_layers, sel("windowLayer"))
             : (id)nullptr;
         id host = nullptr;
+        const char *host_kind = "(none)";
+        bool host_is_awt = false;
         for (id l = window_layer; l; l = msg(l, sel("superlayer"))) {
             id ld = msg(l, sel("delegate"));
             if (!ld) continue;
             if (!msg<BOOL>(ld, is_kind_of_class, ns_view_cls)) continue;
             Class cls = object_getClass(ld);
-            const char *cls_name = cls ? class_getName(cls) : nullptr;
-            if (!cls_name) continue;
+            const char *cls_name = cls ? class_getName(cls) : "<unknown>";
             if (std::strstr(cls_name, "AWT") != nullptr) {
                 host = ld;
-                fprintf(stderr,
-                    "[webview-embed] Located AWT host view %s at %p\n",
-                    cls_name, ld);
+                host_kind = cls_name;
+                host_is_awt = true;
                 break;
             }
+            // Not an AWT view -- treat this as a stepping stone to
+            // NSWindow.contentView.  We don't break here because a later
+            // (further-up) layer might have an AWT NSView delegate.
+            if (host == nullptr) {
+                id window = msg(ld, sel("window"));
+                if (window) {
+                    id cv = msg(window, sel("contentView"));
+                    if (cv) {
+                        host = cv;
+                        host_kind = "NSWindow.contentView";
+                    }
+                }
+            }
             fprintf(stderr,
-                "[webview-embed] Skipping NSView %s (not AWT-owned)\n",
-                cls_name);
+                "[webview-embed] Found NSView %s; %s\n", cls_name,
+                host_is_awt ? "using directly" :
+                (host ? "deferring to NSWindow.contentView" : "no window"));
         }
 
         if (host != nullptr) {
-            // Real subview attach -- WKWebView's CARemoteLayer engages and
-            // renders properly.
             msg<void>(host, sel("retain"));
             e->host_view = host;
+            // contentView is often not layer-backed until something forces
+            // it; make sure it is so AppKit composites WKWebView properly.
+            msg<void, BOOL>(host, sel("setWantsLayer:"), YES);
             msg<void, id>(host, sel("addSubview:"), e->webview);
             fprintf(stderr,
-                "[webview-embed] WKWebView added as subview of AWT NSView %p\n",
-                host);
+                "[webview-embed] WKWebView added as subview of %s at %p\n",
+                host_kind, host);
+            update_webview_frame(e);
         } else if (e->surface_layers) {
             // Layer-only fallback (won't render WKWebView content, but
             // keeps the API surface intact for layer-friendly engines).
@@ -689,7 +704,7 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
             id layer = msg(e->webview, sel("layer"));
             msg<void, id>(e->surface_layers, sel("setLayer:"), layer);
             fprintf(stderr,
-                "[webview-embed] WARNING: could not locate AWT NSView; "
+                "[webview-embed] WARNING: could not locate any host NSView; "
                 "falling back to layer-only attach. WKWebView content will "
                 "not render in this mode.\n");
         }
@@ -787,12 +802,30 @@ static void cocoa_destroy_engine(Engine *e) {
     delete e;
 }
 
-static void cocoa_set_bounds(Engine *e, int x, int y, int w, int h) {
-    cocoa_run_on_main([=] {
-        if (!e->webview) return;
-        msg<void, CGRect>(e->webview, sel("setFrame:"),
-                          CGRectMake(x, y, w, h));
-    });
+// Recompute the WKWebView's frame so it overlays the JAWT canvas exactly.
+// When we are attached to NSWindow.contentView we translate windowLayer's
+// frame from its own layer-tree coordinate space into the contentView's
+// layer coords with CALayer.convertRect:toLayer:, which transparently
+// handles flipped-Y and intermediate layer offsets.  When we managed to
+// find a real per-canvas AWT NSView the layer frame and the canvas bounds
+// already match.
+static void update_webview_frame(Engine *e) {
+    if (!e || !e->webview || !e->host_view || !e->surface_layers) return;
+    id window_layer = msg(e->surface_layers, sel("windowLayer"));
+    if (!window_layer) return;
+    CGRect r = msg<CGRect>(window_layer, sel("frame"));
+    id wl_super = msg(window_layer, sel("superlayer"));
+    id host_layer = msg(e->host_view, sel("layer"));
+    if (wl_super && host_layer && wl_super != host_layer) {
+        r = msg<CGRect, CGRect, id>(
+            wl_super, sel("convertRect:toLayer:"), r, host_layer);
+    }
+    msg<void, CGRect>(e->webview, sel("setFrame:"), r);
+}
+
+static void cocoa_set_bounds(Engine *e, int /*x*/, int /*y*/,
+                             int /*w*/, int /*h*/) {
+    cocoa_run_on_main([=] { update_webview_frame(e); });
 }
 
 static void cocoa_navigate(Engine *e, std::string url) {

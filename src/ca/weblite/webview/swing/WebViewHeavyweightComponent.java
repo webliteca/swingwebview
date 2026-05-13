@@ -165,12 +165,17 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         private volatile boolean peerAttached = false;
 
         EmbeddedCanvas() {
-            addComponentListener(new ComponentAdapter() {
+            ComponentAdapter ca = new ComponentAdapter() {
                 @Override
                 public void componentResized(ComponentEvent e) {
                     sizeNative();
                 }
-            });
+                @Override
+                public void componentMoved(ComponentEvent e) {
+                    sizeNative();
+                }
+            };
+            addComponentListener(ca);
         }
 
         @Override
