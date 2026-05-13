@@ -168,6 +168,16 @@ echo "Compiling demo ..."
     "$DEMO_DIR/src/ca/weblite/webview/demos/WebViewHeavyweightDemo.java"
 
 echo "Launching demo ..."
+# Force the X11 GDK backend; embedding via XReparentWindow needs a real X11
+# GdkDisplay on both sides.  The same flag is set programmatically in the
+# native code as a safety net, but exporting it here covers any GTK call
+# that happens before our pump thread initializes.
+export GDK_BACKEND=x11
+# Disable WebKitGTK's DMA-BUF renderer and sandbox.  Both have been seen
+# to silently fail in virtualized environments (Parallels ARM in
+# particular) and produce a permanently empty WebView.
+export WEBKIT_DISABLE_DMABUF_RENDERER=1
+export WEBKIT_FORCE_SANDBOX=0
 exec "$JAVA" \
     -cp "$DEMO_CLASSES:$WV_JAR" \
     ca.weblite.webview.demos.WebViewHeavyweightDemo

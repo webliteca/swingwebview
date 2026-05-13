@@ -395,7 +395,12 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
     GtkPump::instance().run_sync([&] {
         e->window = gtk_window_new(GTK_WINDOW_POPUP);
         gtk_window_set_decorated(GTK_WINDOW(e->window), FALSE);
-        gtk_widget_set_app_paintable(e->window, TRUE);
+        // Don't set app_paintable -- with that flag set, GTK skips
+        // painting a default background, which leaves the X11 default
+        // (often black) showing through whenever the WebKit view fails
+        // to fully cover the GdkWindow.  Letting GTK paint the theme
+        // background means a render bug shows up as white, not black,
+        // and reduces visual artifacts during live resize.
         gtk_widget_realize(e->window);
 
         GdkWindow *gdkw = gtk_widget_get_window(e->window);
@@ -439,12 +444,10 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
 
         // Reparent under the AWT canvas.  We use the GDK display since AWT
         // and GTK may have different Display* handles for the same X server.
-        // Explicit XMapWindow + XSync ensures the X server has actually
-        // mapped the child before we attach the WebKit view -- without it,
-        // WebKitGTK has been observed to start rendering before the
-        // window is on-screen and produce blank or torn output.
+        // Don't XMapWindow here -- gtk_widget_show_all below will call
+        // gdk_window_show which maps via the X server through GDK, keeping
+        // GDK's mapped-state tracking in sync with reality.
         XReparentWindow(gdkd, child, e->parent_xid, 0, 0);
-        XMapWindow(gdkd, child);
         XSync(gdkd, False);
 
         e->web = webkit_web_view_new();
@@ -463,6 +466,45 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
             webkit_settings_set_hardware_acceleration_policy(
                 s, WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER);
         }
+
+        // Force an opaque white background so a failure to render leaves
+        // the WebView white (visibly empty) rather than black (which can
+        // look identical to "X11 window with no content yet").
+        {
+            GdkRGBA white = {1.0, 1.0, 1.0, 1.0};
+            webkit_web_view_set_background_color(
+                WEBKIT_WEB_VIEW(e->web), &white);
+        }
+
+        // Log load lifecycle events so we can tell whether the WebProcess
+        // is actually fetching+rendering the URL.  G_CALLBACK is a
+        // single-argument macro; cast to GCallback by hand so the
+        // preprocessor doesn't split the lambda parameter list on commas.
+        auto on_load_changed =
+            +[](WebKitWebView *wv, WebKitLoadEvent ev, gpointer) {
+                static const char *names[] = {
+                    "started", "redirected", "committed", "finished"
+                };
+                int idx = (int)ev;
+                const char *n = (idx >= 0 && idx < 4) ? names[idx] : "?";
+                const char *uri = webkit_web_view_get_uri(wv);
+                fprintf(stderr,
+                    "[webview-embed] load-%s: %s\n",
+                    n, uri ? uri : "(null)");
+            };
+        auto on_load_failed =
+            +[](WebKitWebView *, WebKitLoadEvent, const char *uri,
+                GError *err, gpointer) -> gboolean {
+                fprintf(stderr,
+                    "[webview-embed] load-failed: uri=%s err=%s\n",
+                    uri ? uri : "(null)",
+                    (err && err->message) ? err->message : "(no message)");
+                return FALSE;
+            };
+        g_signal_connect(WEBKIT_WEB_VIEW(e->web), "load-changed",
+                         (GCallback)on_load_changed, nullptr);
+        g_signal_connect(WEBKIT_WEB_VIEW(e->web), "load-failed",
+                         (GCallback)on_load_failed, nullptr);
 
         // Wire up the "external" message handler.
         g_signal_connect(
@@ -556,6 +598,8 @@ static void gtk_set_bounds(Engine *e, int /*x*/, int /*y*/,
 static void gtk_navigate(Engine *e, std::string url) {
     GtkPump::instance().run_async([=] {
         if (!e->web) return;
+        fprintf(stderr,
+            "[webview-embed] webkit_web_view_load_uri: %s\n", url.c_str());
         webkit_web_view_load_uri(WEBKIT_WEB_VIEW(e->web), url.c_str());
     });
 }
