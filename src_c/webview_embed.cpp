@@ -399,6 +399,22 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
         Window child = GDK_WINDOW_XID(gdkw);
         Display *gdkd = GDK_WINDOW_XDISPLAY(gdkw);
 
+        // Size the GTK window to match the AWT canvas's current X11
+        // bounds so the very first frame doesn't show up as the GTK
+        // default ~200x200 in the corner.  Java's first setBounds call
+        // will refresh it once paint() fires on the canvas.
+        {
+            Window root_w;
+            int gx = 0, gy = 0;
+            unsigned int gw = 1, gh = 1, gb = 0, gd = 0;
+            if (XGetGeometry(gdkd, e->parent_xid, &root_w,
+                             &gx, &gy, &gw, &gh, &gb, &gd) &&
+                gw > 0 && gh > 0) {
+                gtk_window_resize(GTK_WINDOW(e->window), (int)gw, (int)gh);
+                gdk_window_move_resize(gdkw, 0, 0, (int)gw, (int)gh);
+            }
+        }
+
         // Reparent under the AWT canvas.  We use the GDK display since AWT
         // and GTK may have different Display* handles for the same X server.
         XReparentWindow(gdkd, child, e->parent_xid, 0, 0);
@@ -477,14 +493,21 @@ static void gtk_destroy_engine(Engine *e) {
     delete e;
 }
 
-static void gtk_set_bounds(Engine *e, int x, int y, int width, int height) {
+static void gtk_set_bounds(Engine *e, int /*x*/, int /*y*/,
+                           int width, int height) {
+    // The Java side passes (x,y) as the canvas's position in the AWT
+    // Window's content-pane coordinates because the Mac path needs that
+    // (its host is NSWindow.contentView, not the canvas).  On Linux the
+    // host is the canvas's own X11 window, which is already correctly
+    // positioned/sized by AWT, so we always place the GTK child at
+    // (0,0) of it and just match the size.
     GtkPump::instance().run_async([=] {
         if (!e->window) return;
         gtk_window_resize(GTK_WINDOW(e->window), width > 0 ? width : 1,
                           height > 0 ? height : 1);
         GdkWindow *gdkw = gtk_widget_get_window(e->window);
         if (gdkw) {
-            gdk_window_move_resize(gdkw, x, y, width > 0 ? width : 1,
+            gdk_window_move_resize(gdkw, 0, 0, width > 0 ? width : 1,
                                    height > 0 ? height : 1);
         }
     });
