@@ -308,6 +308,11 @@ private:
         thread = std::thread([&] {
             // X11 must be told we're going to use it from multiple threads.
             XInitThreads();
+            // Embedding via XReparentWindow requires a real X11 GdkDisplay
+            // on both sides.  Force the X11 backend in case GTK would
+            // otherwise pick Wayland or some other backend (e.g. in a
+            // Parallels / virtual desktop session that exposes both).
+            gdk_set_allowed_backends("x11");
             int argc = 0;
             char **argv = nullptr;
             gtk_init(&argc, &argv);
@@ -394,10 +399,27 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
         gtk_widget_realize(e->window);
 
         GdkWindow *gdkw = gtk_widget_get_window(e->window);
-        if (!gdkw) { return; }
+        if (!gdkw) {
+            fprintf(stderr,
+                "[webview-embed] gtk_widget_get_window returned NULL "
+                "after realize; aborting attach.\n");
+            return;
+        }
+        if (!GDK_IS_X11_WINDOW(gdkw)) {
+            fprintf(stderr,
+                "[webview-embed] GdkWindow is not an X11 window (display "
+                "backend is %s).  Heavyweight embedding requires X11.\n",
+                gdk_display_get_name(gdk_window_get_display(gdkw)));
+            return;
+        }
 
         Window child = GDK_WINDOW_XID(gdkw);
         Display *gdkd = GDK_WINDOW_XDISPLAY(gdkw);
+        fprintf(stderr,
+            "[webview-embed] Reparenting GTK X11 window 0x%lx under AWT "
+            "Canvas X11 window 0x%lx (display %s).\n",
+            (unsigned long)child, (unsigned long)e->parent_xid,
+            gdk_display_get_name(gdk_window_get_display(gdkw)));
 
         // Size the GTK window to match the AWT canvas's current X11
         // bounds so the very first frame doesn't show up as the GTK
@@ -417,12 +439,30 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
 
         // Reparent under the AWT canvas.  We use the GDK display since AWT
         // and GTK may have different Display* handles for the same X server.
+        // Explicit XMapWindow + XSync ensures the X server has actually
+        // mapped the child before we attach the WebKit view -- without it,
+        // WebKitGTK has been observed to start rendering before the
+        // window is on-screen and produce blank or torn output.
         XReparentWindow(gdkd, child, e->parent_xid, 0, 0);
+        XMapWindow(gdkd, child);
         XSync(gdkd, False);
 
         e->web = webkit_web_view_new();
         e->manager =
             webkit_web_view_get_user_content_manager(WEBKIT_WEB_VIEW(e->web));
+
+        // Force software compositing.  WebKitGTK's hardware-accelerated
+        // path uses DMA-BUF / GL surfaces that frequently fail when the
+        // hosting GdkWindow has been XReparented into a foreign X11 tree
+        // (or when the system's GL stack is virtualized, e.g. in a
+        // Parallels ARM VM).  Software rendering follows reparenting
+        // reliably.
+        {
+            WebKitSettings *s =
+                webkit_web_view_get_settings(WEBKIT_WEB_VIEW(e->web));
+            webkit_settings_set_hardware_acceleration_policy(
+                s, WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER);
+        }
 
         // Wire up the "external" message handler.
         g_signal_connect(
