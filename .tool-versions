@@ -1,0 +1,23 @@
+# Tool versions pinned via asdf or mise.
+#
+# To install all listed tools:
+#   asdf install        # if using asdf
+#   mise install        # if using mise
+#
+# The project's javac.source / javac.target are 1.8 and the Ant build looks
+# for `platforms.JDK_1.8.home`, so we pin Java 8 here.  If you prefer to
+# develop on a newer LTS you can build with Java 17/21 and pass
+# `--release 8` (or `-source 1.8 -target 1.8`) -- the source code itself
+# stays 1.8-compatible.
+#
+# Native build dependencies are NOT managed via asdf/mise and need to be
+# installed with your OS package manager / toolchain:
+#
+#   Linux:    libgtk-3-dev, libwebkit2gtk-4.1-dev (or -4.0-dev on older
+#             distros), libx11-dev, g++, pkg-config
+#   macOS:    Xcode Command Line Tools (`xcode-select --install`)
+#   Windows:  Visual Studio 2019+ with the "Desktop C++" workload; the
+#             WebView2 SDK is bundled under windows/script/.
+#
+java temurin-8.0.422+5
+ant 1.10.14
