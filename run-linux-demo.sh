@@ -5,9 +5,15 @@
 # Usage:    ./run-linux-demo.sh
 # Override: JAVA_HOME=/path/to/jdk ./run-linux-demo.sh
 #
-# Requires: g++, pkg-config, libgtk-3-dev, and either libwebkit2gtk-4.1-dev
-# (Ubuntu 24.04+) or libwebkit2gtk-4.0-dev (older distros).
+# Required packages:
+#   - g++, pkg-config
+#   - libgtk-3-dev
+#   - libwebkit2gtk-4.1-dev (Ubuntu 24.04+) or libwebkit2gtk-4.0-dev (older)
+#   - libx11-dev
+#   - libxt-dev   <-- pulled in because JDK 8's jawt_md.h includes
+#                     <X11/Intrinsic.h>.  JDK 9+ does not need this.
 set -e
+set -o pipefail
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$REPO_DIR"
@@ -58,6 +64,27 @@ if ! pkg-config --exists gtk+-3.0; then
     exit 1
 fi
 echo "Using WebKit package: $WEBKIT_PKG"
+
+# JDK 8's jawt_md.h on Linux #include's <X11/Intrinsic.h>, which is in
+# libxt-dev (Debian/Ubuntu) -- separate from libx11-dev.  Probe with the
+# preprocessor so we surface a clear message before cl/g++ buries the
+# error several screens of WebKit deprecation noise deep.
+if ! printf '#include <X11/Intrinsic.h>\nint main(){return 0;}\n' | \
+        g++ -E -x c++ - >/dev/null 2>&1; then
+    echo "" >&2
+    echo "ERROR: <X11/Intrinsic.h> not found." >&2
+    echo "" >&2
+    echo "JDK 8 on Linux pulls X11 Intrinsics in via jawt_md.h.  Install:" >&2
+    echo "  Debian/Ubuntu:  sudo apt install libxt-dev" >&2
+    echo "  Fedora:         sudo dnf install libXt-devel" >&2
+    echo "  Arch:           sudo pacman -S libxt" >&2
+    echo "" >&2
+    echo "JDK 9 and newer do not have this dependency.  If you are using" >&2
+    echo "JDK 9+ and still hit this, your headers are in an unusual spot." >&2
+    echo "" >&2
+    exit 1
+fi
+echo "Found X11 Intrinsics."
 
 # ---------------------------------------------------------------------------
 # 3. Build libwebview.so for the current arch.
