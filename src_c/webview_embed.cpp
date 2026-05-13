@@ -565,6 +565,14 @@ static void cocoa_run_on_main(std::function<void()> f) {
     // dispatch_sync to the main queue.  Synchronously dispatching onto your
     // own queue deadlocks, which is easy to hit when a script-message handler
     // (which runs on the main thread) ends up calling back into the embed API.
+    //
+    // This MUST NOT be called from the EDT during a live AppKit operation
+    // (window resize / drag etc.) -- main's run loop is in
+    // NSEventTrackingRunLoopMode during those and the main dispatch queue is
+    // not reliably drained from sync waiters on other threads, causing the
+    // EDT to block forever.  Use cocoa_run_on_main_async for fire-and-forget
+    // calls (setBounds, navigate, eval, ...).  Reserve the sync version for
+    // attach/detach where we genuinely need to wait for the result.
     BOOL is_main = msg<BOOL>(objc_cls("NSThread"), sel("isMainThread"));
     if (is_main) {
         f();
@@ -574,6 +582,21 @@ static void cocoa_run_on_main(std::function<void()> f) {
     Holder h{std::move(f)};
     dispatch_sync_f(dispatch_get_main_queue(), &h, +[](void *p) {
         static_cast<Holder *>(p)->f();
+    });
+}
+
+static void cocoa_run_on_main_async(std::function<void()> f) {
+    BOOL is_main = msg<BOOL>(objc_cls("NSThread"), sel("isMainThread"));
+    if (is_main) {
+        f();
+        return;
+    }
+    struct Holder { std::function<void()> f; };
+    Holder *h = new Holder{std::move(f)};
+    dispatch_async_f(dispatch_get_main_queue(), h, +[](void *p) {
+        Holder *g = static_cast<Holder *>(p);
+        g->f();
+        delete g;
     });
 }
 
@@ -825,11 +848,11 @@ static void update_webview_frame(Engine *e) {
 
 static void cocoa_set_bounds(Engine *e, int /*x*/, int /*y*/,
                              int /*w*/, int /*h*/) {
-    cocoa_run_on_main([=] { update_webview_frame(e); });
+    cocoa_run_on_main_async([=] { update_webview_frame(e); });
 }
 
 static void cocoa_navigate(Engine *e, std::string url) {
-    cocoa_run_on_main([=] {
+    cocoa_run_on_main_async([=] {
         if (!e->webview) return;
         id nsurl = msg<id, id>(objc_cls("NSURL"), sel("URLWithString:"),
                                ns_str(url.c_str()));
@@ -840,7 +863,7 @@ static void cocoa_navigate(Engine *e, std::string url) {
 }
 
 static void cocoa_init_script(Engine *e, std::string js) {
-    cocoa_run_on_main([=] {
+    cocoa_run_on_main_async([=] {
         if (!e->manager) return;
         id script = msg(objc_cls("WKUserScript"), sel("alloc"));
         script = msg<id, id, long, BOOL>(
@@ -851,7 +874,7 @@ static void cocoa_init_script(Engine *e, std::string js) {
 }
 
 static void cocoa_eval(Engine *e, std::string js) {
-    cocoa_run_on_main([=] {
+    cocoa_run_on_main_async([=] {
         if (!e->webview) return;
         msg<void, id, id>(e->webview,
                           sel("evaluateJavaScript:completionHandler:"),
@@ -1038,7 +1061,7 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1dis
 #ifdef WEBVIEW_GTK
     embed::GtkPump::instance().run_async(fn);
 #else
-    embed::cocoa_run_on_main(fn);
+    embed::cocoa_run_on_main_async(fn);
 #endif
 #else
     (void)env; (void)wv; (void)callback;
