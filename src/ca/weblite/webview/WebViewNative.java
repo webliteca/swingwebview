@@ -21,6 +21,19 @@ public class WebViewNative {
             if (System.getProperty("os.name").toLowerCase().contains("win")) {
                 NativeLoader.loadLibrary("WebView2Loader");
             }
+            // Make sure libjawt is in the process before our dylib is bound.
+            // The embed engine references JAWT_GetAWT and AWT does not pull
+            // libjawt in transitively on macOS, so without this the first
+            // JAWT call would dereference an unresolved symbol and SIGSEGV
+            // at PC=0 (the dyld lazy-binding stub never resolved it).
+            try {
+                System.loadLibrary("jawt");
+            } catch (UnsatisfiedLinkError ignored) {
+                // Some JDK distributions don't ship libjawt as a standalone
+                // loadable library, or AWT has already pulled it in.  In
+                // either case we can proceed; the symbol will resolve when
+                // the webview library is loaded next.
+            }
             NativeLoader.loadLibrary("webview");
         } catch (IOException ex) {
             Logger.getLogger(WebViewNative.class.getName()).log(Level.SEVERE, null, ex);
