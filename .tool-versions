@@ -10,6 +10,10 @@
 # `--release 8` (or `-source 1.8 -target 1.8`) -- the source code itself
 # stays 1.8-compatible.
 #
+# We use Amazon Corretto 8 (an OpenJDK 8 build) because mise/asdf do not
+# ship Eclipse Temurin for Java 8 -- Temurin's mise registry starts at 11.
+# Corretto 8 is binary-compatible with Temurin 8 for our purposes.
+#
 # Native build dependencies are NOT managed via asdf/mise and need to be
 # installed with your OS package manager / toolchain:
 #
@@ -19,5 +23,5 @@
 #   Windows:  Visual Studio 2019+ with the "Desktop C++" workload; the
 #             WebView2 SDK is bundled under windows/script/.
 #
-java temurin-8.0.422+5
+java corretto-8.492.09.2
 ant 1.10.14
