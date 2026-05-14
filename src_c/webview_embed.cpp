@@ -26,6 +26,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <functional>
 #include <map>
@@ -314,6 +315,19 @@ private:
             // otherwise pick Wayland or some other backend (e.g. in a
             // Parallels / virtual desktop session that exposes both).
             gdk_set_allowed_backends("x11");
+            // Use the simple input-method module rather than the system
+            // default (ibus / fcitx / etc.).  On the offscreen embed
+            // path the system IMs were observed to commit special-key
+            // control characters as text -- e.g. typing Backspace
+            // inserted 0x08 into the field instead of triggering the
+            // DeleteBackward command, and Delete inserted 0x7F (which
+            // renders as a block glyph in most fonts).  The simple
+            // IM is a pass-through that handles dead keys and Compose
+            // sequences only and lets special keys reach WebKit as
+            // commands.  Setting GTK_IM_MODULE before gtk_init.  The
+            // setenv overwrite=0 form respects an explicit user
+            // override from the environment.
+            setenv("GTK_IM_MODULE", "gtk-im-context-simple", 0);
             int argc = 0;
             char **argv = nullptr;
             gtk_init(&argc, &argv);
