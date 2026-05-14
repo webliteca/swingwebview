@@ -263,6 +263,14 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1mouse_1scroll
   (JNIEnv *, jclass, jlong, jint, jint, jdouble, jdouble, jint);
 
+/*
+ * Class:     ca_weblite_webview_WebViewNative
+ * Method:    webview_offscreen_key_event
+ * Signature: (JIIII)V
+ */
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1key_1event
+  (JNIEnv *, jclass, jlong, jint, jint, jint, jint);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1078,6 +1078,48 @@ static void gtk_off_mouse_scroll(OffEngine *e, int x, int y,
     });
 }
 
+// Key event injection.  Java KeyListeners on
+// WebViewLightweightComponent translate AWT KeyEvents to a GDK
+// keyval (via the GdkInput helper) and forward via these calls.
+// We also focus the WebKitWebView once on first key press so GTK's
+// internal focus chain agrees that this widget should receive the
+// dispatched key event.
+static void gtk_off_key_event(OffEngine *e, bool press,
+                              int keyval, int modifiers,
+                              bool is_modifier_key) {
+    GtkPump::instance().run_async([=] {
+        if (!e || !e->web) return;
+        GdkWindow *gw = gtk_widget_get_window(e->web);
+        if (!gw) return;
+        GdkDisplay *display = gtk_widget_get_display(e->web);
+        GdkSeat *seat = gdk_display_get_default_seat(display);
+        GdkDevice *keyboard = seat ? gdk_seat_get_keyboard(seat) : nullptr;
+
+        // Make sure GTK considers the WebKitWebView focused before we
+        // dispatch a key event -- gtk_main_do_event routes by
+        // focus_widget on the toplevel.
+        if (!gtk_widget_has_focus(e->web)) {
+            gtk_widget_grab_focus(e->web);
+        }
+
+        GdkEvent *ev =
+            gdk_event_new(press ? GDK_KEY_PRESS : GDK_KEY_RELEASE);
+        ev->key.window = (GdkWindow *)g_object_ref(gw);
+        ev->key.send_event = TRUE;
+        ev->key.time = GDK_CURRENT_TIME;
+        ev->key.state = (GdkModifierType)modifiers;
+        ev->key.keyval = (guint)keyval;
+        ev->key.length = 0;
+        ev->key.string = nullptr;
+        ev->key.hardware_keycode = 0;
+        ev->key.group = 0;
+        ev->key.is_modifier = is_modifier_key ? 1 : 0;
+        if (keyboard) gdk_event_set_device(ev, keyboard);
+        gtk_main_do_event(ev);
+        gdk_event_free(ev);
+    });
+}
+
 // Copies the current contents of the offscreen window into the caller-
 // supplied Java int[].  Pixels are CAIRO_FORMAT_ARGB32 -- 0xAARRGGBB per
 // pixel on both little- and big-endian builds (matches Java
@@ -1824,5 +1866,18 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
                                 (int)modifiers);
 #else
     (void)peer; (void)x; (void)y; (void)dx; (void)dy; (void)modifiers;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1key_1event
+  (JNIEnv *, jclass, jlong peer, jint press, jint keyval, jint modifiers,
+   jint is_modifier_key) {
+#ifdef WEBVIEW_GTK
+    embed::gtk_off_key_event((embed::OffEngine *)peer, press != 0,
+                             (int)keyval, (int)modifiers,
+                             is_modifier_key != 0);
+#else
+    (void)peer; (void)press; (void)keyval; (void)modifiers;
+    (void)is_modifier_key;
 #endif
 }

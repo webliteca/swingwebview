@@ -94,6 +94,16 @@ public class OffscreenWebView {
                                                     modifiers);
     }
 
+    /** Inject a key event (press={@code true} for press, {@code false}
+     *  for release).  See {@link GdkInput} for keyval translation. */
+    public void keyEvent(boolean press, int keyval, int modifiers,
+                         boolean isModifierKey) {
+        checkAlive();
+        WebViewNative.webview_offscreen_key_event(
+            peer, press ? 1 : 0, keyval, modifiers,
+            isModifierKey ? 1 : 0);
+    }
+
     /** Release native resources. */
     public void dispose() {
         if (peer != 0L) {

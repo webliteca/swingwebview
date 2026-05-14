@@ -6,6 +6,7 @@
 package ca.weblite.webview;
 
 import java.awt.event.InputEvent;
+import java.awt.event.KeyEvent;
 import java.awt.event.MouseEvent;
 
 /**
@@ -49,6 +50,96 @@ public final class GdkInput {
             case MouseEvent.BUTTON2: return 2;
             case MouseEvent.BUTTON3: return 3;
             default: return awtButton;
+        }
+    }
+
+    // ----- Keyboard ------------------------------------------------------
+    //
+    // Translation between AWT VK codes / chars and GDK keysyms.  Values
+    // taken from gdk/gdkkeysyms.h.  Latin-1 printable characters use the
+    // char value directly (GDK_KEY_a == 'a' == 0x61 etc.); only non-
+    // character keys need an explicit table entry.
+
+    /**
+     * Map an AWT KeyEvent to a GDK keysym.  Returns 0 when the event has
+     * neither a known special-key mapping nor a usable character.
+     */
+    public static int translateKeyCode(int vkCode, char keyChar) {
+        int special = vkToGdkKeysym(vkCode);
+        if (special != 0) return special;
+        if (keyChar != KeyEvent.CHAR_UNDEFINED && keyChar != 0xFFFF
+            && keyChar > 0) {
+            // Latin-1 / Unicode-BMP printable -- the char value matches
+            // the corresponding GDK_KEY_xxx for ASCII; for higher
+            // codepoints WebKit's input pipeline can usually still
+            // recover the character via gdk_keyval_to_unicode.
+            return keyChar;
+        }
+        return 0;
+    }
+
+    /** True when the AWT VK code represents a modifier key. */
+    public static boolean isModifierKey(int vkCode) {
+        switch (vkCode) {
+            case KeyEvent.VK_SHIFT:
+            case KeyEvent.VK_CONTROL:
+            case KeyEvent.VK_ALT:
+            case KeyEvent.VK_ALT_GRAPH:
+            case KeyEvent.VK_META:
+            case KeyEvent.VK_CAPS_LOCK:
+            case KeyEvent.VK_NUM_LOCK:
+            case KeyEvent.VK_SCROLL_LOCK:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    private static int vkToGdkKeysym(int vk) {
+        switch (vk) {
+            case KeyEvent.VK_BACK_SPACE:  return 0xff08;
+            case KeyEvent.VK_TAB:         return 0xff09;
+            case KeyEvent.VK_ENTER:       return 0xff0d;
+            case KeyEvent.VK_ESCAPE:      return 0xff1b;
+            case KeyEvent.VK_DELETE:      return 0xffff;
+            case KeyEvent.VK_INSERT:      return 0xff63;
+
+            case KeyEvent.VK_HOME:        return 0xff50;
+            case KeyEvent.VK_LEFT:        return 0xff51;
+            case KeyEvent.VK_UP:          return 0xff52;
+            case KeyEvent.VK_RIGHT:       return 0xff53;
+            case KeyEvent.VK_DOWN:        return 0xff54;
+            case KeyEvent.VK_PAGE_UP:     return 0xff55;
+            case KeyEvent.VK_PAGE_DOWN:   return 0xff56;
+            case KeyEvent.VK_END:         return 0xff57;
+
+            case KeyEvent.VK_F1:          return 0xffbe;
+            case KeyEvent.VK_F2:          return 0xffbf;
+            case KeyEvent.VK_F3:          return 0xffc0;
+            case KeyEvent.VK_F4:          return 0xffc1;
+            case KeyEvent.VK_F5:          return 0xffc2;
+            case KeyEvent.VK_F6:          return 0xffc3;
+            case KeyEvent.VK_F7:          return 0xffc4;
+            case KeyEvent.VK_F8:          return 0xffc5;
+            case KeyEvent.VK_F9:          return 0xffc6;
+            case KeyEvent.VK_F10:         return 0xffc7;
+            case KeyEvent.VK_F11:         return 0xffc8;
+            case KeyEvent.VK_F12:         return 0xffc9;
+
+            case KeyEvent.VK_SHIFT:       return 0xffe1; // Shift_L
+            case KeyEvent.VK_CONTROL:     return 0xffe3; // Control_L
+            case KeyEvent.VK_CAPS_LOCK:   return 0xffe5; // Caps_Lock
+            case KeyEvent.VK_ALT:         return 0xffe9; // Alt_L
+            case KeyEvent.VK_ALT_GRAPH:   return 0xfe03; // ISO_Level3_Shift
+            case KeyEvent.VK_META:        return 0xffeb; // Super_L
+            case KeyEvent.VK_NUM_LOCK:    return 0xff7f;
+            case KeyEvent.VK_SCROLL_LOCK: return 0xff14;
+
+            // Common punctuation / special chars -- in most cases
+            // KeyEvent.getKeyChar already gives the character we want,
+            // so no entry is needed here.
+
+            default: return 0;
         }
     }
 }

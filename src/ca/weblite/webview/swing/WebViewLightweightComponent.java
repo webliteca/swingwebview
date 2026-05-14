@@ -14,6 +14,8 @@ import java.awt.Dimension;
 import java.awt.Graphics;
 import java.awt.event.ComponentAdapter;
 import java.awt.event.ComponentEvent;
+import java.awt.event.KeyAdapter;
+import java.awt.event.KeyEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.event.MouseMotionAdapter;
@@ -64,6 +66,7 @@ public class WebViewLightweightComponent extends WebViewComponent {
             }
         });
         installMouseListeners();
+        installKeyListener();
     }
 
     private void installMouseListeners() {
@@ -112,6 +115,26 @@ public class WebViewLightweightComponent extends WebViewComponent {
                 else                  dy = rot * step;
                 engine.mouseScroll(e.getX(), e.getY(), dx, dy,
                     GdkInput.translateModifiers(e.getModifiersEx()));
+            }
+        });
+    }
+
+    private void installKeyListener() {
+        // Don't traverse focus on Tab/Shift-Tab -- let WebKit see them
+        // so the user can tab through form fields inside the page.
+        setFocusTraversalKeysEnabled(false);
+        addKeyListener(new KeyAdapter() {
+            @Override public void keyPressed(KeyEvent e)  { forward(true,  e); }
+            @Override public void keyReleased(KeyEvent e) { forward(false, e); }
+
+            private void forward(boolean press, KeyEvent e) {
+                if (engine == null) return;
+                int keyval = GdkInput.translateKeyCode(
+                    e.getKeyCode(), e.getKeyChar());
+                if (keyval == 0) return;
+                engine.keyEvent(press, keyval,
+                    GdkInput.translateModifiers(e.getModifiersEx()),
+                    GdkInput.isModifierKey(e.getKeyCode()));
             }
         });
     }

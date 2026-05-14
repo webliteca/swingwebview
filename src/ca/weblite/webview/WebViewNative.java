@@ -229,5 +229,17 @@ native static void webview_offscreen_mouse_scroll(long peer, int x, int y,
                                                   double dx, double dy,
                                                   int modifiers);
 
+// Inject a key press / release into the offscreen WebView.
+// press: 1 for press, 0 for release.
+// keyval: a GDK keysym (printable ASCII characters use the char value
+//   directly; special keys use the GDK_KEY_xxx constants from
+//   gdk/gdkkeysyms.h, see ca.weblite.webview.GdkInput).
+// modifiers: bitmask of GDK modifier constants.
+// is_modifier_key: 1 if the keyval is itself a modifier (Shift, Ctrl,
+//   Alt, etc.) so WebKit can track modifier-up/down state.
+native static void webview_offscreen_key_event(long peer, int press,
+                                               int keyval, int modifiers,
+                                               int is_modifier_key);
+
 
 }
