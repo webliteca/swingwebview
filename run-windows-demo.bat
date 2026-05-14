@@ -86,6 +86,18 @@ if not defined SDK_OK (
     echo ERROR: Windows SDK headers not found on the cl.exe INCLUDE path.
     echo        vsdevcmd activated successfully but no SDK provides windows.h.
     echo.
+    echo --- Diagnostics ----------------------------------------------------
+    echo INCLUDE = %INCLUDE%
+    echo.
+    echo WindowsSdkDir       = %WindowsSdkDir%
+    echo WindowsSdkVersion   = %WindowsSdkVersion%
+    echo UCRTVersion         = %UCRTVersion%
+    echo.
+    echo Headers physically present on disk:
+    where /R "C:\Program Files (x86)\Windows Kits" windows.h 2>nul
+    where /R "C:\Program Files (x86)\Windows Kits" crtdbg.h 2>nul
+    echo --------------------------------------------------------------------
+    echo.
     echo Fix: open the Visual Studio Installer, click Modify on your VS 2022
     echo install, and on the "Individual components" tab tick a "Windows 11
     echo SDK" (e.g. 10.0.22621.0) or "Windows 10 SDK" entry, then re-run this
