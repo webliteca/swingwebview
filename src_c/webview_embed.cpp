@@ -921,6 +921,25 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
         gtk_window_set_default_size(GTK_WINDOW(e->window),
                                     e->width, e->height);
         gtk_widget_show_all(e->window);
+
+        // Tell WebKit it has focus so input fields can show carets
+        // and the page is treated as "active" for compositing.  GTK
+        // normally only emits focus-in-event when the toplevel
+        // GtkWindow gains WM focus -- which never happens for our
+        // offscreen toplevel -- so without this synthetic event
+        // WebKit thinks the page is permanently inactive and skips
+        // caret painting.
+        gtk_widget_grab_focus(e->web);
+        GdkWindow *gw = gtk_widget_get_window(e->web);
+        if (gw) {
+            GdkEvent *fe = gdk_event_new(GDK_FOCUS_CHANGE);
+            fe->focus_change.window = (GdkWindow *)g_object_ref(gw);
+            fe->focus_change.send_event = TRUE;
+            fe->focus_change.in = TRUE;
+            gtk_main_do_event(fe);
+            gdk_event_free(fe);
+        }
+
         ok = (e->web != nullptr && e->window != nullptr);
     });
     if (!ok) {
