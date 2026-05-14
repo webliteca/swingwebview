@@ -33,15 +33,18 @@ import javax.swing.Timer;
  * doesn't put a native window into the Swing hierarchy, so it composites
  * cleanly with arbitrary Swing widgets (popups, Z-order, JLayer, etc.).
  *
- * <p><strong>Phase 1 status:</strong> this implementation currently does
- * <em>rendering only</em>.  Input forwarding (mouse / keyboard / IME)
- * isn't wired yet -- the WebView will display pages but you can't
- * interact with them.  For interaction use
- * {@link WebViewHeavyweightComponent} until Phase 2 lands.
+ * <p><strong>Input.</strong> AWT mouse and keyboard events are
+ * translated to GDK events and injected into WebKit, so clicks, drags,
+ * scroll, typing, and the common edit keys (Backspace, Delete, arrows,
+ * Home/End, modifiers) all work.  IME / CJK composition is currently
+ * not available -- the WebKit input-method context is disabled because
+ * all input arrives already-decoded from AWT.
  *
- * <p><strong>Platform support:</strong> currently Linux only.  On macOS
- * and Windows the underlying native entry points are stubs that return 0,
- * so this component will fail to attach and report it in the logs.
+ * <p><strong>Platform support.</strong> Linux only at the moment.  On
+ * macOS and Windows the underlying native entry points are stubs that
+ * return 0 from create, so this component will silently fail to attach
+ * and show its empty Swing background.  Use
+ * {@link WebViewHeavyweightComponent} on those platforms.
  */
 public class WebViewLightweightComponent extends WebViewComponent {
 

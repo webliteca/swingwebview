@@ -109,21 +109,26 @@ public class WebViewHeavyweightDemo {
         browserTab.add(wv, BorderLayout.CENTER);
         tabs.addTab("Heavyweight", browserTab);
 
-        // Lightweight (offscreen) WebView for comparison.  Currently
-        // rendering-only (no input forwarding) and Linux-only; on macOS /
-        // Windows the native entry points are stubs and the component will
-        // show its empty Swing background.
+        // Lightweight (offscreen) WebView.  Currently Linux-only;
+        // on macOS / Windows the native entry points are stubs and
+        // the component will show its empty Swing background.  On
+        // Linux this is the recommended mode: rendering, mouse, and
+        // keyboard all work; the heavyweight tab has reliable
+        // rendering but unreliable visible text-input feedback.
         WebViewLightweightComponent lwv = new WebViewLightweightComponent();
         lwv.setUrl("https://example.com");
         lwv.setPreferredSize(new Dimension(900, 600));
         JPanel lightweightTab = new JPanel(new BorderLayout());
         JTextArea lwExplainer = new JTextArea(
-            "Lightweight (offscreen) WebView -- Linux only, rendering only.\n" +
-            "Use the URL bar above to navigate.  Mouse/keyboard input " +
-            "forwarding isn't wired yet so you can't click links or type " +
-            "into fields in this tab.  This mode bypasses the AWT/X11/GTK " +
-            "focus and frame-clock problems that limit the Heavyweight " +
-            "tab on this VM.");
+            "Lightweight (offscreen) WebView.  Renders the page into a " +
+            "BufferedImage and forwards mouse/keyboard from AWT into the " +
+            "engine -- so Swing components composite cleanly above it " +
+            "(JComboBox dropdowns, JLayer overlays, etc.) and Z-order " +
+            "works without tricks.  On Linux this is the recommended " +
+            "mode.  Known limitations: no IME / CJK composition; " +
+            "right-click context menus and in-page <select> dropdowns " +
+            "don't render (they're suppressed because they'd otherwise " +
+            "paint to our invisible offscreen surface).");
         lwExplainer.setEditable(false);
         lwExplainer.setLineWrap(true);
         lwExplainer.setWrapStyleWord(true);
@@ -131,6 +136,14 @@ public class WebViewHeavyweightDemo {
         lightweightTab.add(lwExplainer, BorderLayout.NORTH);
         lightweightTab.add(lwv, BorderLayout.CENTER);
         tabs.addTab("Lightweight", lightweightTab);
+
+        // On Linux the lightweight tab is the recommended path, so
+        // open the demo on it.  Other platforms get the heavyweight
+        // tab by default since heavyweight works fully there.
+        if (System.getProperty("os.name", "").toLowerCase()
+                .contains("linux")) {
+            tabs.setSelectedIndex(1); // Lightweight
+        }
 
         // Have the Go button and bookmark dropdown drive both webviews
         // so the user can compare them side-by-side as they navigate.
