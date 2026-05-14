@@ -22,6 +22,7 @@
 
 #include <dlfcn.h>
 
+#include <algorithm>
 #include <atomic>
 #include <condition_variable>
 #include <cstdio>
@@ -859,6 +860,169 @@ static void gtk_bind(Engine *e, Binding *b) {
     e->bindings[b->name] = b;
 }
 
+// ===========================================================================
+// Linux / GTK lightweight (offscreen) engine
+//
+// Renders the WebKitWebView into a GtkOffscreenWindow which never touches
+// the user's screen.  Java polls the latest pixels via JNI and blits them
+// into a JComponent itself.  The whole heavyweight AWT/X11/GTK focus and
+// frame-clock circus is bypassed -- we own the paint cycle, Java owns the
+// AWT event flow.
+// ===========================================================================
+
+struct OffEngine {
+    GtkWidget *window = nullptr;    // GtkOffscreenWindow
+    GtkWidget *web = nullptr;       // WebKitWebView
+    WebKitUserContentManager *manager = nullptr;
+    int width = 1;
+    int height = 1;
+    bool debug = false;
+    std::map<std::string, Binding *> bindings;
+    JavaVM *jvm = nullptr;
+};
+
+static OffEngine *gtk_off_create_engine(JNIEnv *env,
+                                        int width, int height, jint debug) {
+    if (width < 1) width = 1;
+    if (height < 1) height = 1;
+    auto *e = new OffEngine();
+    env->GetJavaVM(&e->jvm);
+    e->width = width;
+    e->height = height;
+    e->debug = debug != 0;
+
+    bool ok = false;
+    GtkPump::instance().run_sync([&] {
+        e->window = gtk_offscreen_window_new();
+        e->web = webkit_web_view_new();
+        e->manager =
+            webkit_web_view_get_user_content_manager(WEBKIT_WEB_VIEW(e->web));
+
+        // Software compositing -- same rationale as the heavyweight engine:
+        // hardware-accelerated paths assume on-screen surfaces, and we are
+        // offscreen by design.
+        WebKitSettings *s =
+            webkit_web_view_get_settings(WEBKIT_WEB_VIEW(e->web));
+        webkit_settings_set_hardware_acceleration_policy(
+            s, WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER);
+        if (e->debug) {
+            webkit_settings_set_enable_developer_extras(s, TRUE);
+            webkit_settings_set_enable_write_console_messages_to_stdout(s, TRUE);
+        }
+
+        // Opaque white background so transparent / empty regions don't
+        // surface premultiplied artefacts when blitted into Swing.
+        GdkRGBA white = {1.0, 1.0, 1.0, 1.0};
+        webkit_web_view_set_background_color(
+            WEBKIT_WEB_VIEW(e->web), &white);
+
+        gtk_widget_set_size_request(e->web, e->width, e->height);
+        gtk_container_add(GTK_CONTAINER(e->window), e->web);
+        gtk_window_set_default_size(GTK_WINDOW(e->window),
+                                    e->width, e->height);
+        gtk_widget_show_all(e->window);
+        ok = (e->web != nullptr && e->window != nullptr);
+    });
+    if (!ok) {
+        delete e;
+        return nullptr;
+    }
+    fprintf(stderr,
+        "[webview-embed] offscreen engine ready (%dx%d)\n",
+        e->width, e->height);
+    return e;
+}
+
+static void gtk_off_destroy_engine(OffEngine *e) {
+    if (!e) return;
+    GtkPump::instance().run_sync([&] {
+        if (e->window) {
+            gtk_widget_destroy(e->window);
+            e->window = nullptr;
+            e->web = nullptr;
+        }
+    });
+    for (auto &kv : e->bindings) {
+        Binding *b = kv.second;
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) {
+            env->DeleteGlobalRef(b->fn);
+            env->DeleteGlobalRef(b->cls);
+        }
+        if (detach) e->jvm->DetachCurrentThread();
+        delete b;
+    }
+    e->bindings.clear();
+    delete e;
+}
+
+static void gtk_off_resize(OffEngine *e, int w, int h) {
+    if (w < 1) w = 1;
+    if (h < 1) h = 1;
+    GtkPump::instance().run_async([=] {
+        if (!e->web || !e->window) return;
+        e->width = w;
+        e->height = h;
+        gtk_widget_set_size_request(e->web, w, h);
+        gtk_window_resize(GTK_WINDOW(e->window), w, h);
+    });
+}
+
+static void gtk_off_navigate(OffEngine *e, std::string url) {
+    GtkPump::instance().run_async([=] {
+        if (!e->web) return;
+        fprintf(stderr,
+            "[webview-embed] offscreen load_uri: %s\n", url.c_str());
+        webkit_web_view_load_uri(WEBKIT_WEB_VIEW(e->web), url.c_str());
+    });
+}
+
+// Copies the current contents of the offscreen window into the caller-
+// supplied Java int[].  Pixels are CAIRO_FORMAT_ARGB32 -- 0xAARRGGBB per
+// pixel on both little- and big-endian builds (matches Java
+// BufferedImage TYPE_INT_ARGB).  The Java array must be at least w*h ints.
+static void gtk_off_snapshot_into(OffEngine *e, JNIEnv *env,
+                                  jintArray dest, jint w, jint h) {
+    if (!e || w < 1 || h < 1) return;
+    cairo_surface_t *cs = nullptr;
+    GtkPump::instance().run_sync([&] {
+        if (!e->window) return;
+        cs = gtk_offscreen_window_get_surface(
+            GTK_OFFSCREEN_WINDOW(e->window));
+    });
+    if (!cs) return;
+
+    int sw = cairo_image_surface_get_width(cs);
+    int sh = cairo_image_surface_get_height(cs);
+    int stride = cairo_image_surface_get_stride(cs);
+    unsigned char *data = cairo_image_surface_get_data(cs);
+
+    if (sw > 0 && sh > 0 && data) {
+        jint *jpixels = env->GetIntArrayElements(dest, nullptr);
+        if (jpixels) {
+            int copy_w = std::min(sw, (int)w);
+            int copy_h = std::min(sh, (int)h);
+            // Clear the dest if the source is smaller than the buffer so
+            // we don't leave stale stripes around the edges.
+            if (copy_w < w || copy_h < h) {
+                std::memset(jpixels, 0, (size_t)w * (size_t)h * sizeof(jint));
+            }
+            for (int y = 0; y < copy_h; y++) {
+                std::memcpy(jpixels + (size_t)y * (size_t)w,
+                            data + (size_t)y * (size_t)stride,
+                            (size_t)copy_w * 4);
+            }
+            env->ReleaseIntArrayElements(dest, jpixels, 0);
+        }
+    }
+    cairo_surface_destroy(cs);
+}
+
 #endif // WEBVIEW_GTK
 
 #ifdef WEBVIEW_COCOA
@@ -1460,5 +1624,59 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1dis
 #endif
 #else
     (void)env; (void)wv; (void)callback;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Offscreen / lightweight JNI exports (Linux-only for now).
+// macOS and Windows return 0 / no-op from these entry points; their
+// lightweight implementations are scaffolded but not yet wired.
+// ---------------------------------------------------------------------------
+
+JNIEXPORT jlong JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1create
+  (JNIEnv *env, jclass, jint w, jint h, jint debug) {
+#ifdef WEBVIEW_GTK
+    return (jlong)embed::gtk_off_create_engine(env, (int)w, (int)h, debug);
+#else
+    (void)env; (void)w; (void)h; (void)debug;
+    return 0;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1destroy
+  (JNIEnv *, jclass, jlong peer) {
+#ifdef WEBVIEW_GTK
+    embed::gtk_off_destroy_engine((embed::OffEngine *)peer);
+#else
+    (void)peer;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1resize
+  (JNIEnv *, jclass, jlong peer, jint w, jint h) {
+#ifdef WEBVIEW_GTK
+    embed::gtk_off_resize((embed::OffEngine *)peer, (int)w, (int)h);
+#else
+    (void)peer; (void)w; (void)h;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1navigate
+  (JNIEnv *env, jclass, jlong peer, jstring url) {
+#ifdef WEBVIEW_GTK
+    const char *u = env->GetStringUTFChars(url, nullptr);
+    embed::gtk_off_navigate((embed::OffEngine *)peer, u ? u : "");
+    env->ReleaseStringUTFChars(url, u);
+#else
+    (void)env; (void)peer; (void)url;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1snapshot
+  (JNIEnv *env, jclass, jlong peer, jintArray pixels, jint w, jint h) {
+#ifdef WEBVIEW_GTK
+    embed::gtk_off_snapshot_into((embed::OffEngine *)peer, env, pixels, w, h);
+#else
+    (void)env; (void)peer; (void)pixels; (void)w; (void)h;
 #endif
 }

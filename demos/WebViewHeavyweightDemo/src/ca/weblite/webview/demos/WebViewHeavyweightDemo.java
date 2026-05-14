@@ -9,6 +9,7 @@
 package ca.weblite.webview.demos;
 
 import ca.weblite.webview.swing.WebViewHeavyweightComponent;
+import ca.weblite.webview.swing.WebViewLightweightComponent;
 
 import java.awt.BorderLayout;
 import java.awt.Dimension;
@@ -106,7 +107,41 @@ public class WebViewHeavyweightDemo {
 
         JPanel browserTab = new JPanel(new BorderLayout());
         browserTab.add(wv, BorderLayout.CENTER);
-        tabs.addTab("Browser", browserTab);
+        tabs.addTab("Heavyweight", browserTab);
+
+        // Lightweight (offscreen) WebView for comparison.  Currently
+        // rendering-only (no input forwarding) and Linux-only; on macOS /
+        // Windows the native entry points are stubs and the component will
+        // show its empty Swing background.
+        WebViewLightweightComponent lwv = new WebViewLightweightComponent();
+        lwv.setUrl("https://example.com");
+        lwv.setPreferredSize(new Dimension(900, 600));
+        JPanel lightweightTab = new JPanel(new BorderLayout());
+        JTextArea lwExplainer = new JTextArea(
+            "Lightweight (offscreen) WebView -- Linux only, rendering only.\n" +
+            "Use the URL bar above to navigate.  Mouse/keyboard input " +
+            "forwarding isn't wired yet so you can't click links or type " +
+            "into fields in this tab.  This mode bypasses the AWT/X11/GTK " +
+            "focus and frame-clock problems that limit the Heavyweight " +
+            "tab on this VM.");
+        lwExplainer.setEditable(false);
+        lwExplainer.setLineWrap(true);
+        lwExplainer.setWrapStyleWord(true);
+        lwExplainer.setMargin(new java.awt.Insets(8, 12, 8, 12));
+        lightweightTab.add(lwExplainer, BorderLayout.NORTH);
+        lightweightTab.add(lwv, BorderLayout.CENTER);
+        tabs.addTab("Lightweight", lightweightTab);
+
+        // Have the Go button and bookmark dropdown drive both webviews
+        // so the user can compare them side-by-side as they navigate.
+        go.addActionListener(e -> lwv.setUrl(urlField.getText().trim()));
+        urlField.addActionListener(e -> lwv.setUrl(urlField.getText().trim()));
+        bookmark.addActionListener(e -> {
+            int i = bookmark.getSelectedIndex();
+            if (i <= 0) return;
+            String u = (String) bookmark.getSelectedItem();
+            lwv.setUrl(u);
+        });
 
         JPanel swingTab = new JPanel(new BorderLayout(8, 8));
         JTextArea explainer = new JTextArea(

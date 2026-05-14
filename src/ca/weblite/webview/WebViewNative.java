@@ -177,4 +177,34 @@ native static void webview_embed_set_visible(long w, int visible);
 native static void webview_embed_request_focus(long w);
 
 
+// ---------------------------------------------------------------------------
+// Lightweight / offscreen API (currently Linux-only).
+//
+// The native engine renders the WebView into a GtkOffscreenWindow that
+// never touches the screen; Java pulls pixels via snapshot() and paints
+// them itself.  Bypasses all the AWT/GTK/X11 focus and frame-clock
+// negotiation that the heavyweight embed path has to fight on Linux.
+// ---------------------------------------------------------------------------
+
+// Create the offscreen engine with the given initial pixel dimensions.
+// Returns an opaque pointer (jlong) or 0 on unsupported platform / failure.
+native static long webview_offscreen_create(int w, int h, int debug);
+
+// Tear down the offscreen engine.
+native static void webview_offscreen_destroy(long peer);
+
+// Resize the offscreen WebView's viewport.  Pixel size; the WebView will
+// re-layout to fit.
+native static void webview_offscreen_resize(long peer, int w, int h);
+
+// Navigate the offscreen WebView to the given URL.
+native static void webview_offscreen_navigate(long peer, String url);
+
+// Copy the current pixel contents of the offscreen WebView into the given
+// Java int[] (assumed to hold at least w*h pixels in ARGB / 0xAARRGGBB
+// format, matching BufferedImage.TYPE_INT_ARGB).
+native static void webview_offscreen_snapshot(long peer, int[] pixels,
+                                              int w, int h);
+
+
 }
