@@ -206,5 +206,28 @@ native static void webview_offscreen_navigate(long peer, String url);
 native static void webview_offscreen_snapshot(long peer, int[] pixels,
                                               int w, int h);
 
+// Inject a mouse button press / release into the offscreen WebView.
+// press: 1 for press, 0 for release.
+// (x, y): pixel coords relative to the WebView.
+// button: 1 = primary, 2 = middle, 3 = secondary.
+// modifiers: bitmask of GDK modifier constants (GDK_SHIFT_MASK=1,
+//   GDK_CONTROL_MASK=4, GDK_MOD1_MASK=8 (alt), GDK_META_MASK=0x10000000).
+// click_count: 1 single, 2 double, 3+ triple.
+native static void webview_offscreen_mouse_button(long peer, int press,
+                                                  int x, int y, int button,
+                                                  int modifiers,
+                                                  int click_count);
+
+// Inject a mouse-move event.  Same coord / modifier semantics as
+// mouse_button.
+native static void webview_offscreen_mouse_motion(long peer, int x, int y,
+                                                  int modifiers);
+
+// Inject a smooth-scroll event.  dx/dy are scroll deltas in pixel-ish
+// units (GDK_SCROLL_SMOOTH semantics).
+native static void webview_offscreen_mouse_scroll(long peer, int x, int y,
+                                                  double dx, double dy,
+                                                  int modifiers);
+
 
 }

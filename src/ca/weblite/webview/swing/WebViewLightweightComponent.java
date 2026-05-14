@@ -5,6 +5,7 @@
  */
 package ca.weblite.webview.swing;
 
+import ca.weblite.webview.GdkInput;
 import ca.weblite.webview.OffscreenWebView;
 import ca.weblite.webview.WebView;
 
@@ -13,6 +14,11 @@ import java.awt.Dimension;
 import java.awt.Graphics;
 import java.awt.event.ComponentAdapter;
 import java.awt.event.ComponentEvent;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
+import java.awt.event.MouseMotionAdapter;
+import java.awt.event.MouseWheelEvent;
+import java.awt.event.MouseWheelListener;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
 import javax.swing.Timer;
@@ -50,10 +56,62 @@ public class WebViewLightweightComponent extends WebViewComponent {
     public WebViewLightweightComponent() {
         setOpaque(true);
         setBackground(Color.WHITE);
+        setFocusable(true);
         addComponentListener(new ComponentAdapter() {
             @Override
             public void componentResized(ComponentEvent e) {
                 resizeNative();
+            }
+        });
+        installMouseListeners();
+    }
+
+    private void installMouseListeners() {
+        MouseAdapter ma = new MouseAdapter() {
+            @Override public void mousePressed(MouseEvent e) {
+                if (engine == null) return;
+                requestFocusInWindow();
+                engine.mouseButton(true, e.getX(), e.getY(),
+                    GdkInput.translateButton(e.getButton()),
+                    GdkInput.translateModifiers(e.getModifiersEx()),
+                    e.getClickCount());
+            }
+            @Override public void mouseReleased(MouseEvent e) {
+                if (engine == null) return;
+                engine.mouseButton(false, e.getX(), e.getY(),
+                    GdkInput.translateButton(e.getButton()),
+                    GdkInput.translateModifiers(e.getModifiersEx()),
+                    e.getClickCount());
+            }
+        };
+        addMouseListener(ma);
+        addMouseMotionListener(new MouseMotionAdapter() {
+            @Override public void mouseMoved(MouseEvent e) {
+                if (engine == null) return;
+                engine.mouseMotion(e.getX(), e.getY(),
+                    GdkInput.translateModifiers(e.getModifiersEx()));
+            }
+            @Override public void mouseDragged(MouseEvent e) {
+                if (engine == null) return;
+                engine.mouseMotion(e.getX(), e.getY(),
+                    GdkInput.translateModifiers(e.getModifiersEx()));
+            }
+        });
+        addMouseWheelListener(new MouseWheelListener() {
+            @Override public void mouseWheelMoved(MouseWheelEvent e) {
+                if (engine == null) return;
+                // Java's wheel rotation is integer units (+ down / - up).
+                // GTK's smooth scroll wants pixel-ish deltas; multiply by
+                // a small step so a single notch scrolls a sensible
+                // amount.  Hold Shift to scroll horizontally to match
+                // GTK/web convention.
+                double step = 40.0;
+                double rot = e.getPreciseWheelRotation();
+                double dx = 0, dy = 0;
+                if (e.isShiftDown()) dx = rot * step;
+                else                  dy = rot * step;
+                engine.mouseScroll(e.getX(), e.getY(), dx, dy,
+                    GdkInput.translateModifiers(e.getModifiersEx()));
             }
         });
     }

@@ -982,6 +982,102 @@ static void gtk_off_navigate(OffEngine *e, std::string url) {
     });
 }
 
+// Mouse event injection.  Java listeners on WebViewLightweightComponent
+// translate AWT MouseEvents into these calls; we synthesize a GdkEvent
+// and dispatch through gtk_main_do_event, which routes through GTK's
+// normal event pipeline so WebKit sees them just like a real click.
+static void gtk_off_mouse_button(OffEngine *e, bool press,
+                                 int x, int y, int button, int modifiers,
+                                 int click_count) {
+    GtkPump::instance().run_async([=] {
+        if (!e || !e->web) return;
+        GdkWindow *gw = gtk_widget_get_window(e->web);
+        if (!gw) return;
+        GdkDisplay *display = gtk_widget_get_display(e->web);
+        GdkSeat *seat = gdk_display_get_default_seat(display);
+        GdkDevice *pointer = seat ? gdk_seat_get_pointer(seat) : nullptr;
+
+        GdkEventType type;
+        if (press) {
+            type = (click_count >= 3) ? GDK_3BUTTON_PRESS
+                 : (click_count == 2) ? GDK_2BUTTON_PRESS
+                 :                       GDK_BUTTON_PRESS;
+        } else {
+            type = GDK_BUTTON_RELEASE;
+        }
+
+        GdkEvent *ev = gdk_event_new(type);
+        ev->button.window = (GdkWindow *)g_object_ref(gw);
+        ev->button.send_event = TRUE;
+        ev->button.time = GDK_CURRENT_TIME;
+        ev->button.x = x;
+        ev->button.y = y;
+        ev->button.x_root = x;
+        ev->button.y_root = y;
+        ev->button.state = (GdkModifierType)modifiers;
+        ev->button.button = button;
+        ev->button.device = pointer;
+        if (pointer) gdk_event_set_device(ev, pointer);
+        gtk_main_do_event(ev);
+        gdk_event_free(ev);
+    });
+}
+
+static void gtk_off_mouse_motion(OffEngine *e, int x, int y, int modifiers) {
+    GtkPump::instance().run_async([=] {
+        if (!e || !e->web) return;
+        GdkWindow *gw = gtk_widget_get_window(e->web);
+        if (!gw) return;
+        GdkDisplay *display = gtk_widget_get_display(e->web);
+        GdkSeat *seat = gdk_display_get_default_seat(display);
+        GdkDevice *pointer = seat ? gdk_seat_get_pointer(seat) : nullptr;
+
+        GdkEvent *ev = gdk_event_new(GDK_MOTION_NOTIFY);
+        ev->motion.window = (GdkWindow *)g_object_ref(gw);
+        ev->motion.send_event = TRUE;
+        ev->motion.time = GDK_CURRENT_TIME;
+        ev->motion.x = x;
+        ev->motion.y = y;
+        ev->motion.x_root = x;
+        ev->motion.y_root = y;
+        ev->motion.state = (GdkModifierType)modifiers;
+        ev->motion.is_hint = FALSE;
+        ev->motion.device = pointer;
+        if (pointer) gdk_event_set_device(ev, pointer);
+        gtk_main_do_event(ev);
+        gdk_event_free(ev);
+    });
+}
+
+static void gtk_off_mouse_scroll(OffEngine *e, int x, int y,
+                                 double dx, double dy, int modifiers) {
+    GtkPump::instance().run_async([=] {
+        if (!e || !e->web) return;
+        GdkWindow *gw = gtk_widget_get_window(e->web);
+        if (!gw) return;
+        GdkDisplay *display = gtk_widget_get_display(e->web);
+        GdkSeat *seat = gdk_display_get_default_seat(display);
+        GdkDevice *pointer = seat ? gdk_seat_get_pointer(seat) : nullptr;
+
+        GdkEvent *ev = gdk_event_new(GDK_SCROLL);
+        ev->scroll.window = (GdkWindow *)g_object_ref(gw);
+        ev->scroll.send_event = TRUE;
+        ev->scroll.time = GDK_CURRENT_TIME;
+        ev->scroll.x = x;
+        ev->scroll.y = y;
+        ev->scroll.x_root = x;
+        ev->scroll.y_root = y;
+        ev->scroll.state = (GdkModifierType)modifiers;
+        ev->scroll.direction = GDK_SCROLL_SMOOTH;
+        ev->scroll.delta_x = dx;
+        ev->scroll.delta_y = dy;
+        ev->scroll.device = pointer;
+        if (pointer) gdk_event_set_device(ev, pointer);
+        gtk_main_do_event(ev);
+        gdk_event_free(ev);
+    });
+}
+
 // Copies the current contents of the offscreen window into the caller-
 // supplied Java int[].  Pixels are CAIRO_FORMAT_ARGB32 -- 0xAARRGGBB per
 // pixel on both little- and big-endian builds (matches Java
@@ -1693,5 +1789,40 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
     embed::gtk_off_snapshot_into((embed::OffEngine *)peer, env, pixels, w, h);
 #else
     (void)env; (void)peer; (void)pixels; (void)w; (void)h;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1mouse_1button
+  (JNIEnv *, jclass, jlong peer, jint press, jint x, jint y, jint button,
+   jint modifiers, jint click_count) {
+#ifdef WEBVIEW_GTK
+    embed::gtk_off_mouse_button((embed::OffEngine *)peer, press != 0,
+                                (int)x, (int)y, (int)button,
+                                (int)modifiers, (int)click_count);
+#else
+    (void)peer; (void)press; (void)x; (void)y; (void)button;
+    (void)modifiers; (void)click_count;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1mouse_1motion
+  (JNIEnv *, jclass, jlong peer, jint x, jint y, jint modifiers) {
+#ifdef WEBVIEW_GTK
+    embed::gtk_off_mouse_motion((embed::OffEngine *)peer,
+                                (int)x, (int)y, (int)modifiers);
+#else
+    (void)peer; (void)x; (void)y; (void)modifiers;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1mouse_1scroll
+  (JNIEnv *, jclass, jlong peer, jint x, jint y, jdouble dx, jdouble dy,
+   jint modifiers) {
+#ifdef WEBVIEW_GTK
+    embed::gtk_off_mouse_scroll((embed::OffEngine *)peer,
+                                (int)x, (int)y, (double)dx, (double)dy,
+                                (int)modifiers);
+#else
+    (void)peer; (void)x; (void)y; (void)dx; (void)dy; (void)modifiers;
 #endif
 }

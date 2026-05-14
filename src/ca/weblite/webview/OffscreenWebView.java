@@ -70,6 +70,30 @@ public class OffscreenWebView {
         WebViewNative.webview_offscreen_snapshot(peer, pixels, width, height);
     }
 
+    /**
+     * Inject a mouse button press / release into the offscreen WebView.
+     * GDK modifier bits live in {@link GdkInput#GDK_SHIFT_MASK} etc.
+     */
+    public void mouseButton(boolean press, int x, int y, int button,
+                            int modifiers, int clickCount) {
+        checkAlive();
+        WebViewNative.webview_offscreen_mouse_button(
+            peer, press ? 1 : 0, x, y, button, modifiers, clickCount);
+    }
+
+    /** Inject a mouse-move event. */
+    public void mouseMotion(int x, int y, int modifiers) {
+        checkAlive();
+        WebViewNative.webview_offscreen_mouse_motion(peer, x, y, modifiers);
+    }
+
+    /** Inject a smooth-scroll event. */
+    public void mouseScroll(int x, int y, double dx, double dy, int modifiers) {
+        checkAlive();
+        WebViewNative.webview_offscreen_mouse_scroll(peer, x, y, dx, dy,
+                                                    modifiers);
+    }
+
     /** Release native resources. */
     public void dispose() {
         if (peer != 0L) {

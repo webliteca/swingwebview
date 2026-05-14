@@ -239,6 +239,30 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1snapshot
   (JNIEnv *, jclass, jlong, jintArray, jint, jint);
 
+/*
+ * Class:     ca_weblite_webview_WebViewNative
+ * Method:    webview_offscreen_mouse_button
+ * Signature: (JIIIIII)V
+ */
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1mouse_1button
+  (JNIEnv *, jclass, jlong, jint, jint, jint, jint, jint, jint);
+
+/*
+ * Class:     ca_weblite_webview_WebViewNative
+ * Method:    webview_offscreen_mouse_motion
+ * Signature: (JIII)V
+ */
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1mouse_1motion
+  (JNIEnv *, jclass, jlong, jint, jint, jint);
+
+/*
+ * Class:     ca_weblite_webview_WebViewNative
+ * Method:    webview_offscreen_mouse_scroll
+ * Signature: (JIIDDI)V
+ */
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1mouse_1scroll
+  (JNIEnv *, jclass, jlong, jint, jint, jdouble, jdouble, jint);
+
 #ifdef __cplusplus
 }
 #endif
