@@ -576,13 +576,12 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
             // right-click also grabs focus.
             gtk_gesture_single_set_button(
                 GTK_GESTURE_SINGLE(click), 0);
-            // CAPTURE phase: we observe the event before WebKit's
-            // own handling so the X11 focus grab is in place by the
-            // time WebKit reacts to the click (e.g. focuses a text
-            // field).  We never consume the event -- the gesture
-            // observes alongside the normal signal pipeline.
-            gtk_event_controller_set_propagation_phase(
-                GTK_EVENT_CONTROLLER(click), GTK_PHASE_CAPTURE);
+            // Note: leaving the propagation phase at the default
+            // BUBBLE.  An earlier revision set CAPTURE so the focus
+            // grab would happen before WebKit reacts to the click,
+            // but CAPTURE somehow broke WebKit's rendering pipeline
+            // entirely.  BUBBLE observes alongside WebKit's normal
+            // handling and is rendering-safe.
             auto on_pressed =
                 +[](GtkGestureMultiPress *, gint, gdouble x, gdouble y,
                     gpointer data) {
