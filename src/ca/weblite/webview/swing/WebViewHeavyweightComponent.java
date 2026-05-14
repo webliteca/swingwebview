@@ -188,7 +188,6 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         private volatile boolean peerAttached = false;
 
         EmbeddedCanvas() {
-            setFocusable(true);
             ComponentAdapter ca = new ComponentAdapter() {
                 @Override
                 public void componentResized(ComponentEvent e) {
@@ -221,32 +220,15 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
                 }
             });
 
-            // Forward focus to the embedded WebView.  The heavyweight
-            // child window doesn't share Swing's focus state, and on
-            // Linux specifically the X server keeps keyboard focus on
-            // the AWT top-level frame until we explicitly XSetInputFocus
-            // the popup -- which means text fields inside the WebView
-            // never receive keystrokes otherwise.  We listen for both
-            // mouse-press (the typical "click into the WebView" gesture)
-            // and AWT focus-gained (Tab traversal, programmatic
-            // requestFocus on the canvas).
-            addMouseListener(new MouseAdapter() {
-                @Override
-                public void mousePressed(MouseEvent e) {
-                    if (embedded != null) {
-                        embedded.requestFocus();
-                    }
-                    requestFocusInWindow();
-                }
-            });
-            addFocusListener(new FocusAdapter() {
-                @Override
-                public void focusGained(FocusEvent e) {
-                    if (embedded != null) {
-                        embedded.requestFocus();
-                    }
-                }
-            });
+            // Note: there used to be AWT mouse/focus listeners here that
+            // forwarded clicks/focus-gained to embedded.requestFocus().
+            // They are removed because on Linux they appeared to cause AWT
+            // to alter the canvas's X11 event-mask setup in a way that
+            // broke rendering of the embedded popup.  Click-to-focus is
+            // now handled entirely native-side (a button-press-event hook
+            // on the WebKitWebView calls XSetInputFocus on the popup).
+            // For programmatic focus from Java code, call
+            // EmbeddedWebView.requestFocus() directly.
         }
 
         @Override
