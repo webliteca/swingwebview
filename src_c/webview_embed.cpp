@@ -1131,6 +1131,13 @@ static void gtk_off_mouse_scroll(OffEngine *e, int x, int y,
 // We also focus the WebKitWebView once on first key press so GTK's
 // internal focus chain agrees that this widget should receive the
 // dispatched key event.
+//
+// hardware_keycode is derived from the keyval via the active keymap.
+// WebKit's editor command lookup uses the keycode (combined with the
+// group / level) to identify the physical key; with hardware_keycode
+// left at 0 it falls into a "treat as character input" path and ends
+// up inserting the Unicode of the keysym (0x08 for BackSpace, 0x7F
+// for Delete) instead of executing DeleteBackward / DeleteForward.
 static void gtk_off_key_event(OffEngine *e, bool press,
                               int keyval, int modifiers,
                               bool is_modifier_key) {
@@ -1142,9 +1149,21 @@ static void gtk_off_key_event(OffEngine *e, bool press,
         GdkSeat *seat = gdk_display_get_default_seat(display);
         GdkDevice *keyboard = seat ? gdk_seat_get_keyboard(seat) : nullptr;
 
-        // Make sure GTK considers the WebKitWebView focused before we
-        // dispatch a key event -- gtk_main_do_event routes by
-        // focus_widget on the toplevel.
+        guint hwcode = 0;
+        guint8 group = 0;
+        GdkKeymap *km = gdk_keymap_get_for_display(display);
+        if (km) {
+            GdkKeymapKey *keys = nullptr;
+            gint n_keys = 0;
+            if (gdk_keymap_get_entries_for_keyval(km, (guint)keyval,
+                                                  &keys, &n_keys)
+                && n_keys > 0 && keys != nullptr) {
+                hwcode = keys[0].keycode;
+                group = (guint8)keys[0].group;
+            }
+            if (keys) g_free(keys);
+        }
+
         if (!gtk_widget_has_focus(e->web)) {
             gtk_widget_grab_focus(e->web);
         }
@@ -1158,8 +1177,8 @@ static void gtk_off_key_event(OffEngine *e, bool press,
         ev->key.keyval = (guint)keyval;
         ev->key.length = 0;
         ev->key.string = nullptr;
-        ev->key.hardware_keycode = 0;
-        ev->key.group = 0;
+        ev->key.hardware_keycode = (guint16)hwcode;
+        ev->key.group = group;
         ev->key.is_modifier = is_modifier_key ? 1 : 0;
         if (keyboard) gdk_event_set_device(ev, keyboard);
         gtk_main_do_event(ev);
