@@ -338,15 +338,19 @@ struct Engine {
     GtkWidget *web = nullptr;        // WebKitWebView*
     WebKitUserContentManager *manager = nullptr;
 
-    // GdkFrameClock + "update" signal hookup that keeps the GTK paint
-    // pipeline ticking at vsync after we XReparent the popup under a
-    // non-GTK X11 parent.  Without this, WebKit's internal damage
-    // notification doesn't reliably translate into expose events on
-    // the reparented GdkWindow (page loads, animations, video, JS DOM
-    // updates all appear "stuck" until something else triggers a
-    // repaint), at least on some virtualized X stacks.
-    GdkFrameClock *frame_clock = nullptr;
-    gulong frame_update_handler = 0;
+    // The X11 GdkFrameClock paces itself against _NET_WM_FRAME_DRAWN
+    // ClientMessages from the window manager.  Our reparented popup
+    // has no WM relationship (the WM only manages the AWT top-level
+    // frame), so the clock waits forever for vsync pulses that never
+    // come.  gdk_frame_clock_begin_updating is supposed to drive it
+    // anyway but doesn't in practice on this code path -- experiment
+    // confirms only a handful of phase events across the entire
+    // session.  Instead, drive paints from a plain g_timeout at
+    // ~60Hz.  On a healthy GTK stack this is a redundant tick that
+    // WebKit's internal damage tracking optimizes away; on the
+    // virtualized X stacks where the clock stalls, it provides the
+    // working paint cycle that's otherwise missing.
+    guint redraw_timer_id = 0;
 
     bool debug = false;
 
@@ -552,57 +556,36 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
         gtk_container_add(GTK_CONTAINER(e->window), e->web);
         gtk_widget_show_all(e->window);
 
-        // Anchor a GdkFrameClock "update" -> queue_draw + process_updates
-        // loop so the GTK paint pipeline keeps ticking at vsync.  The
-        // gdk_frame_clock_begin_updating side keeps the clock running;
-        // the update-signal handler walks the rest of the paint leg
-        // (queue_draw to mark the widget dirty, then a synchronous
-        // gdk_window_process_updates so any pending expose is actually
-        // delivered now rather than deferred to a later mainloop turn
-        // that may never come on a reparented popup).  WebKit's draw
-        // handler is internally damage-aware so when no pixels have
-        // changed the queue_draw is effectively a no-op.
-        {
-            GdkWindow *gdkw_pop = gtk_widget_get_window(e->window);
-            if (gdkw_pop) {
-                e->frame_clock = gdk_window_get_frame_clock(gdkw_pop);
-                if (e->frame_clock) {
-                    auto on_update =
-                        +[](GdkFrameClock *, gpointer data) {
-                            Engine *eng = static_cast<Engine *>(data);
-                            if (!eng) return;
-                            if (eng->web && gtk_widget_get_visible(eng->web)) {
-                                gtk_widget_queue_draw(eng->web);
-                            }
-                            if (eng->window) {
-                                GdkWindow *pgw =
-                                    gtk_widget_get_window(eng->window);
-                                if (pgw) {
-                                    G_GNUC_BEGIN_IGNORE_DEPRECATIONS
-                                    gdk_window_process_updates(pgw, TRUE);
-                                    G_GNUC_END_IGNORE_DEPRECATIONS
-                                }
-                            }
-                        };
-                    e->frame_update_handler = g_signal_connect(
-                        e->frame_clock, "update",
-                        (GCallback)on_update, e);
-                    gdk_frame_clock_begin_updating(e->frame_clock);
-                    fprintf(stderr,
-                        "[webview-embed] GdkFrameClock anchored "
-                        "(frame_clock=%p, handler=%lu).\n",
-                        (void *)e->frame_clock,
-                        (unsigned long)e->frame_update_handler);
+        // Drive the GTK paint pipeline from a plain g_timeout at ~60Hz.
+        // See the redraw_timer_id field comment on Engine for the
+        // rationale; in short, the X11 GdkFrameClock won't pace itself
+        // on a reparented popup that has no WM relationship, so we
+        // run the queue_draw + process_updates pair ourselves on a
+        // timer.  WebKit's internal damage tracking decides whether
+        // anything actually needs repainting; calls with no damage
+        // are effectively no-ops.
+        auto redraw_tick =
+            +[](gpointer data) -> gboolean {
+                Engine *eng = static_cast<Engine *>(data);
+                if (!eng || !eng->web) return G_SOURCE_REMOVE;
+                if (gtk_widget_get_visible(eng->web)) {
+                    gtk_widget_queue_draw(eng->web);
+                    if (eng->window) {
+                        GdkWindow *pgw =
+                            gtk_widget_get_window(eng->window);
+                        if (pgw) {
+                            G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+                            gdk_window_process_updates(pgw, TRUE);
+                            G_GNUC_END_IGNORE_DEPRECATIONS
+                        }
+                    }
                 }
-            }
-            if (!e->frame_clock) {
-                fprintf(stderr,
-                    "[webview-embed] WARNING: no GdkFrameClock available "
-                    "for the embed popup; animations and JS-driven page "
-                    "updates may not repaint until a host event forces "
-                    "an expose.\n");
-            }
-        }
+                return G_SOURCE_CONTINUE;
+            };
+        e->redraw_timer_id = g_timeout_add(16, redraw_tick, e);
+        fprintf(stderr,
+            "[webview-embed] repaint timer started (id=%u, period=16ms).\n",
+            (unsigned)e->redraw_timer_id);
 
         // Verbose pipeline instrumentation -- enabled with
         // DEBUG_WEBVIEW_EMBED=1 because the per-frame signals are too
@@ -630,7 +613,10 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
             g_signal_connect(e->window, "draw",
                              (GCallback)on_draw, (gpointer)"popup");
 
-            if (e->frame_clock) {
+            GdkWindow *gdkw_pop = gtk_widget_get_window(e->window);
+            GdkFrameClock *clk = gdkw_pop
+                ? gdk_window_get_frame_clock(gdkw_pop) : nullptr;
+            if (clk) {
                 auto on_phase =
                     +[](GdkFrameClock *, gpointer name) {
                         static guint counters[8] = {0};
@@ -642,15 +628,15 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
                                 "[webview-embed] frame-clock %s #%u\n", n, c);
                         }
                     };
-                g_signal_connect(e->frame_clock, "before-paint",
+                g_signal_connect(clk, "before-paint",
                                  (GCallback)on_phase, (gpointer)"before-paint");
-                g_signal_connect(e->frame_clock, "update",
+                g_signal_connect(clk, "update",
                                  (GCallback)on_phase, (gpointer)"update");
-                g_signal_connect(e->frame_clock, "layout",
+                g_signal_connect(clk, "layout",
                                  (GCallback)on_phase, (gpointer)"layout");
-                g_signal_connect(e->frame_clock, "paint",
+                g_signal_connect(clk, "paint",
                                  (GCallback)on_phase, (gpointer)"paint");
-                g_signal_connect(e->frame_clock, "after-paint",
+                g_signal_connect(clk, "after-paint",
                                  (GCallback)on_phase, (gpointer)"after-paint");
             }
 
@@ -683,14 +669,9 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
 static void gtk_destroy_engine(Engine *e) {
     if (!e) return;
     GtkPump::instance().run_sync([&] {
-        if (e->frame_clock) {
-            if (e->frame_update_handler) {
-                g_signal_handler_disconnect(e->frame_clock,
-                                            e->frame_update_handler);
-                e->frame_update_handler = 0;
-            }
-            gdk_frame_clock_end_updating(e->frame_clock);
-            e->frame_clock = nullptr;
+        if (e->redraw_timer_id) {
+            g_source_remove(e->redraw_timer_id);
+            e->redraw_timer_id = 0;
         }
         if (e->window) {
             gtk_widget_destroy(e->window);
