@@ -66,9 +66,33 @@ echo Visual Studio: %vc_dir%
 REM ---------------------------------------------------------------------------
 REM 3. Activate the MSVC x64 environment
 REM ---------------------------------------------------------------------------
-call "%vc_dir%\Common7\Tools\vsdevcmd.bat" -arch=x64 -host_arch=x64 >nul
+call "%vc_dir%\Common7\Tools\vsdevcmd.bat" -arch=x64 -host_arch=x64
 if errorlevel 1 (
     echo ERROR: vsdevcmd.bat failed.
+    exit /b 1
+)
+
+REM Sanity-check that vsdevcmd actually wired up a Windows SDK -- if the
+REM "Desktop development with C++" workload was installed without the
+REM Windows 10/11 SDK component, INCLUDE won't contain windows.h and cl.exe
+REM will fail with a confusing C1083 wall.  Catch it here with an
+REM actionable message instead.
+set "SDK_OK="
+for %%I in ("%INCLUDE:;=";"%") do (
+    if exist "%%~I\windows.h" set "SDK_OK=1"
+)
+if not defined SDK_OK (
+    echo.
+    echo ERROR: Windows SDK headers not found on the cl.exe INCLUDE path.
+    echo        vsdevcmd activated successfully but no SDK provides windows.h.
+    echo.
+    echo Fix: open the Visual Studio Installer, click Modify on your VS 2022
+    echo install, and on the "Individual components" tab tick a "Windows 11
+    echo SDK" (e.g. 10.0.22621.0) or "Windows 10 SDK" entry, then re-run this
+    echo script.  Alternatively, on the "Workloads" tab make sure "Desktop
+    echo development with C++" is selected AND its right-pane "Windows 11
+    echo SDK" optional component is checked.
+    echo.
     exit /b 1
 )
 
