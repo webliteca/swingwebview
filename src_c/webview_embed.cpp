@@ -930,6 +930,20 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
         webkit_web_view_set_background_color(
             WEBKIT_WEB_VIEW(e->web), &white);
 
+        // Disable WebKit's input method context entirely.  In our
+        // offscreen embed all input arrives synthesized from Java
+        // AWT, so there is nothing for an IM to compose; leaving an
+        // IM in place was observed to swallow special keys -- ibus
+        // / fcitx / even gtk-im-context-simple committed the
+        // control character of Backspace (0x08) and Delete (0x7F)
+        // as text input, leaving the field with no visible change
+        // (BS) or a block glyph (DEL) instead of triggering the
+        // DeleteBackward / DeleteForward editor commands.
+        // Disabling IM forces every key event through WebKit's
+        // editor-command lookup, which maps Backspace etc. correctly.
+        webkit_web_view_set_input_method_context(
+            WEBKIT_WEB_VIEW(e->web), NULL);
+
         gtk_widget_set_size_request(e->web, e->width, e->height);
         gtk_container_add(GTK_CONTAINER(e->window), e->web);
         gtk_window_set_default_size(GTK_WINDOW(e->window),
