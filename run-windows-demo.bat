@@ -85,23 +85,23 @@ for %%I in ("%INCLUDE:;=";"%") do (
 REM Recovery path: the SDK IS installed at the default Kits location but the
 REM VS installation manifest got out of sync, so vsdevcmd didn't wire it up.
 REM Glue it on manually by picking the highest versioned subdir that has a
-REM real um\windows.h on disk.
-if not defined SDK_OK (
-    set "KITS_ROOT=C:\Program Files (x86)\Windows Kits\10"
-    set "SDK_VER="
-    if exist "!KITS_ROOT!\Include" (
-        for /f "delims=" %%V in ('dir /b /ad /on "!KITS_ROOT!\Include" 2^>nul') do (
-            if exist "!KITS_ROOT!\Include\%%V\um\windows.h" set "SDK_VER=%%V"
-        )
-    )
-    if defined SDK_VER (
-        echo NOTE: vsdevcmd did not register a Windows SDK, but one is present
-        echo       on disk.  Manually adding Windows SDK !SDK_VER! at !KITS_ROOT!.
-        set "INCLUDE=!INCLUDE!;!KITS_ROOT!\Include\!SDK_VER!\ucrt;!KITS_ROOT!\Include\!SDK_VER!\um;!KITS_ROOT!\Include\!SDK_VER!\shared;!KITS_ROOT!\Include\!SDK_VER!\winrt"
-        set "LIB=!LIB!;!KITS_ROOT!\Lib\!SDK_VER!\ucrt\x64;!KITS_ROOT!\Lib\!SDK_VER!\um\x64"
-        set "SDK_OK=1"
-    )
+REM real um\windows.h on disk.  Done via goto labels rather than a nested
+REM if-block because the literal "(x86)" in the Kits path confuses CMD's
+REM block parser when references to it appear inside an "if (...)" body.
+if defined SDK_OK goto :sdk_check_done
+set "KITS_ROOT=C:\Program Files (x86)\Windows Kits\10"
+set "SDK_VER="
+if not exist "%KITS_ROOT%\Include" goto :sdk_check_done
+for /f "delims=" %%V in ('dir /b /ad /on "%KITS_ROOT%\Include" 2^>nul') do (
+    if exist "%KITS_ROOT%\Include\%%V\um\windows.h" set "SDK_VER=%%V"
 )
+if "%SDK_VER%"=="" goto :sdk_check_done
+echo NOTE: vsdevcmd did not register a Windows SDK, but one is present
+echo       on disk.  Manually adding Windows SDK %SDK_VER% at %KITS_ROOT%.
+set "INCLUDE=%INCLUDE%;%KITS_ROOT%\Include\%SDK_VER%\ucrt;%KITS_ROOT%\Include\%SDK_VER%\um;%KITS_ROOT%\Include\%SDK_VER%\shared;%KITS_ROOT%\Include\%SDK_VER%\winrt"
+set "LIB=%LIB%;%KITS_ROOT%\Lib\%SDK_VER%\ucrt\x64;%KITS_ROOT%\Lib\%SDK_VER%\um\x64"
+set "SDK_OK=1"
+:sdk_check_done
 
 if not defined SDK_OK (
     echo.
