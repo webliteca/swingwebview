@@ -556,6 +556,27 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
         gtk_container_add(GTK_CONTAINER(e->window), e->web);
         gtk_widget_show_all(e->window);
 
+        // Click-to-focus: when the user presses a mouse button anywhere
+        // on the WebView, hand X11 input focus to our popup so the X
+        // server starts routing key events to the GTK widget tree (and
+        // from there to the WebKitWebView).  Without this, mouse and
+        // pointer events work but typing does not, because the AWT
+        // top-level frame still holds X11 input focus.
+        auto on_button_press =
+            +[](GtkWidget *, GdkEvent *, gpointer data) -> gboolean {
+                Engine *eng = static_cast<Engine *>(data);
+                if (!eng || !eng->window) return FALSE;
+                GdkWindow *gw = gtk_widget_get_window(eng->window);
+                if (!gw || !GDK_IS_X11_WINDOW(gw)) return FALSE;
+                XSetInputFocus(GDK_WINDOW_XDISPLAY(gw),
+                               GDK_WINDOW_XID(gw),
+                               RevertToParent, CurrentTime);
+                XSync(GDK_WINDOW_XDISPLAY(gw), False);
+                return FALSE;  // let WebKit also handle the click
+            };
+        g_signal_connect(e->web, "button-press-event",
+                         (GCallback)on_button_press, e);
+
         // Drive the GTK paint pipeline from a plain g_timeout at ~60Hz.
         // See the redraw_timer_id field comment on Engine for the
         // rationale; in short, the X11 GdkFrameClock won't pace itself
@@ -757,6 +778,25 @@ static void gtk_set_visible(Engine *e, bool visible) {
         if (!e->window) return;
         if (visible) gtk_widget_show(e->window);
         else gtk_widget_hide(e->window);
+    });
+}
+
+// Move X11 input focus to the embedded popup's X11 window.  X11 routes
+// key events based on input focus, not pointer position; on the AWT
+// embed path the WM has only ever assigned input focus to the AWT
+// top-level frame, so without this call keystrokes typed while the
+// pointer is over the WebView region go to the AWT frame (and get
+// swallowed there) instead of the WebKit widget.
+static void gtk_request_focus(Engine *e) {
+    GtkPump::instance().run_async([=] {
+        if (!e || !e->window || !e->web) return;
+        GdkWindow *gdkw = gtk_widget_get_window(e->window);
+        if (!gdkw || !GDK_IS_X11_WINDOW(gdkw)) return;
+        Window xwin = GDK_WINDOW_XID(gdkw);
+        Display *dpy = GDK_WINDOW_XDISPLAY(gdkw);
+        XSetInputFocus(dpy, xwin, RevertToParent, CurrentTime);
+        XSync(dpy, False);
+        gtk_widget_grab_focus(e->web);
     });
 }
 
@@ -1150,6 +1190,16 @@ static void cocoa_set_visible(Engine *e, bool visible) {
     });
 }
 
+static void cocoa_request_focus(Engine *e) {
+    cocoa_run_on_main_async([=] {
+        if (!e->webview) return;
+        id win = msg(e->webview, sel("window"));
+        if (win) {
+            msg<BOOL, id>(win, sel("makeFirstResponder:"), e->webview);
+        }
+    });
+}
+
 static void cocoa_bind(Engine *e, Binding *b) { e->bindings[b->name] = b; }
 
 #endif // WEBVIEW_COCOA
@@ -1226,6 +1276,17 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
     embed::cocoa_set_visible((Engine *)wv, visible != 0);
 #else
     (void)wv; (void)visible;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1request_1focus
+  (JNIEnv *, jclass, jlong wv) {
+#ifdef WEBVIEW_GTK
+    embed::gtk_request_focus((Engine *)wv);
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_request_focus((Engine *)wv);
+#else
+    (void)wv;
 #endif
 }
 

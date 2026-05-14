@@ -92,6 +92,21 @@ public class EmbeddedWebView {
     }
 
     /**
+     * Hand text-input / keyboard focus to the embedded WebView.  When
+     * the WebView is hosted inside a Swing heavyweight component the
+     * AWT side keeps system keyboard focus until told otherwise, so
+     * typing in fields (form inputs, address bars, contenteditable
+     * regions) won't reach the embedded engine unless this is called.
+     * The Swing wrapper auto-calls this on mouse press and on AWT
+     * focus-gained events.
+     */
+    public EmbeddedWebView requestFocus() {
+        checkAlive();
+        WebViewNative.webview_embed_request_focus(peer);
+        return this;
+    }
+
+    /**
      * Navigate the WebView to the given URL.
      */
     public EmbeddedWebView navigate(String url) {

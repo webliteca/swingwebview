@@ -16,8 +16,12 @@ import java.awt.Point;
 import java.awt.Window;
 import java.awt.event.ComponentAdapter;
 import java.awt.event.ComponentEvent;
+import java.awt.event.FocusAdapter;
+import java.awt.event.FocusEvent;
 import java.awt.event.HierarchyEvent;
 import java.awt.event.HierarchyListener;
+import java.awt.event.MouseAdapter;
+import java.awt.event.MouseEvent;
 import javax.swing.SwingUtilities;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -184,6 +188,7 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         private volatile boolean peerAttached = false;
 
         EmbeddedCanvas() {
+            setFocusable(true);
             ComponentAdapter ca = new ComponentAdapter() {
                 @Override
                 public void componentResized(ComponentEvent e) {
@@ -212,6 +217,33 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
                     embedded.setVisible(showing);
                     if (showing) {
                         sizeNative();
+                    }
+                }
+            });
+
+            // Forward focus to the embedded WebView.  The heavyweight
+            // child window doesn't share Swing's focus state, and on
+            // Linux specifically the X server keeps keyboard focus on
+            // the AWT top-level frame until we explicitly XSetInputFocus
+            // the popup -- which means text fields inside the WebView
+            // never receive keystrokes otherwise.  We listen for both
+            // mouse-press (the typical "click into the WebView" gesture)
+            // and AWT focus-gained (Tab traversal, programmatic
+            // requestFocus on the canvas).
+            addMouseListener(new MouseAdapter() {
+                @Override
+                public void mousePressed(MouseEvent e) {
+                    if (embedded != null) {
+                        embedded.requestFocus();
+                    }
+                    requestFocusInWindow();
+                }
+            });
+            addFocusListener(new FocusAdapter() {
+                @Override
+                public void focusGained(FocusEvent e) {
+                    if (embedded != null) {
+                        embedded.requestFocus();
                     }
                 }
             });

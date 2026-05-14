@@ -166,5 +166,15 @@ native static void webview_embed_dispatch(long w, Runnable callback);
 // destroying the engine).
 native static void webview_embed_set_visible(long w, int visible);
 
+// Hand keyboard / text-input focus to the embedded WebView.  On Linux
+// this calls XSetInputFocus on the embedded popup's X11 window so the
+// X server delivers key events to our GTK widget tree rather than to
+// the AWT top-level frame; on macOS it calls makeFirstResponder on the
+// WKWebView; on Windows it brings the WebView2 child HWND into focus.
+// Without this, keyboard input typed while the pointer is over the
+// WebView region goes nowhere because the AWT frame still holds
+// system focus.
+native static void webview_embed_request_focus(long w);
+
 
 }
