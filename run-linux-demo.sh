@@ -181,6 +181,17 @@ export GDK_BACKEND=x11
 export WEBKIT_DISABLE_DMABUF_RENDERER=1
 export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
 export WEBKIT_FORCE_SANDBOX=0
+
+# Uncomment to enable verbose paint-pipeline diagnostics inside our
+# embed code (per-frame draw / frame-clock-phase logging and widget
+# state dump after attach):
+#   export DEBUG_WEBVIEW_EMBED=1
+#
+# Uncomment the next two to also enable GTK/GDK's own verbose update +
+# event tracing.  Loud but invaluable when investigating "draw never
+# fires" symptoms:
+#   export GDK_DEBUG=frames,events
+#   export GTK_DEBUG=updates
 exec "$JAVA" \
     -cp "$DEMO_CLASSES:$WV_JAR" \
     ca.weblite.webview.demos.WebViewHeavyweightDemo

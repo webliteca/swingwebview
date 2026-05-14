@@ -552,15 +552,16 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
         gtk_container_add(GTK_CONTAINER(e->window), e->web);
         gtk_widget_show_all(e->window);
 
-        // Anchor a GdkFrameClock "update" -> queue_draw loop so the
-        // GTK paint pipeline keeps ticking at vsync.  This is the GTK
-        // idiomatic equivalent of a 60Hz repaint timer; on a healthy
-        // GTK stack begin_updating + queue_draw is paced with the
-        // compositor (cheap, vsync-aligned) and on the virtualized X
-        // stacks where WebKit's internal damage signal doesn't reach
-        // the GdkWindow, it provides a working paint cycle.  WebKit's
-        // draw handler is internally damage-aware, so when nothing
-        // has changed the queue_draw is effectively a no-op.
+        // Anchor a GdkFrameClock "update" -> queue_draw + process_updates
+        // loop so the GTK paint pipeline keeps ticking at vsync.  The
+        // gdk_frame_clock_begin_updating side keeps the clock running;
+        // the update-signal handler walks the rest of the paint leg
+        // (queue_draw to mark the widget dirty, then a synchronous
+        // gdk_window_process_updates so any pending expose is actually
+        // delivered now rather than deferred to a later mainloop turn
+        // that may never come on a reparented popup).  WebKit's draw
+        // handler is internally damage-aware so when no pixels have
+        // changed the queue_draw is effectively a no-op.
         {
             GdkWindow *gdkw_pop = gtk_widget_get_window(e->window);
             if (gdkw_pop) {
@@ -572,6 +573,15 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
                             if (!eng) return;
                             if (eng->web && gtk_widget_get_visible(eng->web)) {
                                 gtk_widget_queue_draw(eng->web);
+                            }
+                            if (eng->window) {
+                                GdkWindow *pgw =
+                                    gtk_widget_get_window(eng->window);
+                                if (pgw) {
+                                    G_GNUC_BEGIN_IGNORE_DEPRECATIONS
+                                    gdk_window_process_updates(pgw, TRUE);
+                                    G_GNUC_END_IGNORE_DEPRECATIONS
+                                }
                             }
                         };
                     e->frame_update_handler = g_signal_connect(
@@ -592,6 +602,73 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
                     "updates may not repaint until a host event forces "
                     "an expose.\n");
             }
+        }
+
+        // Verbose pipeline instrumentation -- enabled with
+        // DEBUG_WEBVIEW_EMBED=1 because the per-frame signals are too
+        // chatty for normal use.  When set, this tells us:
+        //   - whether ::draw fires on the WebKitWebView at all
+        //     (no => paint pipeline is dead before WebKit ever runs)
+        //   - whether each GdkFrameClock phase fires
+        //     (no => begin_updating isn't taking effect on this window)
+        //   - widget state right after show_all
+        //     (mapped/realized/drawable/viewable + allocation)
+        if (getenv("DEBUG_WEBVIEW_EMBED")) {
+            auto on_draw =
+                +[](GtkWidget *w, cairo_t *, gpointer name) -> gboolean {
+                    static guint counter = 0;
+                    guint c = ++counter;
+                    if (c < 8 || (c % 60) == 0) {
+                        fprintf(stderr,
+                            "[webview-embed] draw#%u on %s (%p)\n",
+                            c, (const char *)name, (void *)w);
+                    }
+                    return FALSE;
+                };
+            g_signal_connect(e->web, "draw",
+                             (GCallback)on_draw, (gpointer)"WebKitWebView");
+            g_signal_connect(e->window, "draw",
+                             (GCallback)on_draw, (gpointer)"popup");
+
+            if (e->frame_clock) {
+                auto on_phase =
+                    +[](GdkFrameClock *, gpointer name) {
+                        static guint counters[8] = {0};
+                        const char *n = (const char *)name;
+                        guint h = (guint)((uintptr_t)name & 7);
+                        guint c = ++counters[h];
+                        if (c < 4 || (c % 240) == 0) {
+                            fprintf(stderr,
+                                "[webview-embed] frame-clock %s #%u\n", n, c);
+                        }
+                    };
+                g_signal_connect(e->frame_clock, "before-paint",
+                                 (GCallback)on_phase, (gpointer)"before-paint");
+                g_signal_connect(e->frame_clock, "update",
+                                 (GCallback)on_phase, (gpointer)"update");
+                g_signal_connect(e->frame_clock, "layout",
+                                 (GCallback)on_phase, (gpointer)"layout");
+                g_signal_connect(e->frame_clock, "paint",
+                                 (GCallback)on_phase, (gpointer)"paint");
+                g_signal_connect(e->frame_clock, "after-paint",
+                                 (GCallback)on_phase, (gpointer)"after-paint");
+            }
+
+            GtkAllocation alloc = {0, 0, 0, 0};
+            if (e->web) gtk_widget_get_allocation(e->web, &alloc);
+            GdkWindow *pgw = gtk_widget_get_window(e->window);
+            fprintf(stderr,
+                "[webview-embed] state after show_all: popup mapped=%d "
+                "realized=%d drawable=%d viewable=%d, webview mapped=%d "
+                "realized=%d drawable=%d allocation=%dx%d at (%d,%d)\n",
+                gtk_widget_get_mapped(e->window),
+                gtk_widget_get_realized(e->window),
+                gtk_widget_is_drawable(e->window),
+                pgw ? gdk_window_is_viewable(pgw) : -1,
+                e->web ? gtk_widget_get_mapped(e->web) : -1,
+                e->web ? gtk_widget_get_realized(e->web) : -1,
+                e->web ? gtk_widget_is_drawable(e->web) : -1,
+                alloc.width, alloc.height, alloc.x, alloc.y);
         }
 
         ok = true;
