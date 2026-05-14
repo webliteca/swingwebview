@@ -587,26 +587,39 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
                     gpointer data) {
                     Engine *eng = static_cast<Engine *>(data);
                     if (!eng || !eng->web) return;
-                    // X11 focus: target the WebKitWebView's own
-                    // GdkWindow (child of the popup) so the X server
-                    // routes keystrokes directly to the widget that
-                    // wants them, not to the popup's outer window.
                     GdkWindow *wgw = gtk_widget_get_window(eng->web);
-                    if (wgw && GDK_IS_X11_WINDOW(wgw)) {
-                        XSetInputFocus(GDK_WINDOW_XDISPLAY(wgw),
-                                       GDK_WINDOW_XID(wgw),
-                                       RevertToParent, CurrentTime);
-                        XSync(GDK_WINDOW_XDISPLAY(wgw), False);
+                    Display *dpy = wgw && GDK_IS_X11_WINDOW(wgw)
+                        ? GDK_WINDOW_XDISPLAY(wgw) : nullptr;
+                    Window wxid = wgw && GDK_IS_X11_WINDOW(wgw)
+                        ? GDK_WINDOW_XID(wgw) : 0UL;
+                    if (dpy && wxid) {
+                        XSetInputFocus(dpy, wxid, RevertToParent,
+                                       CurrentTime);
+                        XSync(dpy, False);
                     }
-                    // GTK focus chain: tell GTK that the WebKitWebView
-                    // is the focus widget within the popup, so any
-                    // keys that arrive get dispatched to it.
                     gtk_widget_grab_focus(eng->web);
+
+                    // Diagnostic: ask X11 who actually owns input
+                    // focus now.  If this prints something other
+                    // than our web_xid, our XSetInputFocus was
+                    // either rejected or immediately stomped on by
+                    // someone else (likely AWT XSetInputFocus'ing
+                    // its own top-level frame in response to its
+                    // own focus management).
+                    Window cur = 0;
+                    int rev = 0;
+                    if (dpy) {
+                        XGetInputFocus(dpy, &cur, &rev);
+                    }
                     fprintf(stderr,
                         "[webview-embed] click @ (%.0f,%.0f) -> "
-                        "focus grabbed (web_xid=0x%lx)\n",
+                        "asked focus=0x%lx, X11 reports focus=0x%lx "
+                        "(revert=%d) gtk_has_focus=%d\n",
                         x, y,
-                        wgw ? (unsigned long)GDK_WINDOW_XID(wgw) : 0UL);
+                        (unsigned long)wxid,
+                        (unsigned long)cur,
+                        rev,
+                        gtk_widget_has_focus(eng->web));
                 };
             g_signal_connect(click, "pressed",
                              (GCallback)on_pressed, e);
