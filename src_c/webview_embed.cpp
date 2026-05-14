@@ -407,7 +407,18 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
 
     bool ok = false;
     GtkPump::instance().run_sync([&] {
-        e->window = gtk_window_new(GTK_WINDOW_POPUP);
+        // GTK_WINDOW_TOPLEVEL rather than POPUP.  POPUP is heavily
+        // special-cased in GTK: many WMs ignore it for activation,
+        // it gets override-redirect semantics, and its focus
+        // bookkeeping is partial.  TOPLEVEL goes through GTK's
+        // full focus/activation machinery, which the focus
+        // research brief identified as a likely contributor to
+        // the visible-text-input-feedback regression on this
+        // reparented-popup-with-no-WM-relationship setup.
+        // set_decorated(FALSE) suppresses the titlebar so the
+        // TOPLEVEL window doesn't paint chrome inside the AWT
+        // canvas region.
+        e->window = gtk_window_new(GTK_WINDOW_TOPLEVEL);
         gtk_window_set_decorated(GTK_WINDOW(e->window), FALSE);
         // Don't set app_paintable -- with that flag set, GTK skips
         // painting a default background, which leaves the X11 default
