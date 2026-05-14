@@ -132,7 +132,30 @@ WARNING: Currently the WebView is picky about being started on the main applicat
 
 In addition to the out-of-process `WebViewCLIClient` approach, the library
 includes an in-process Swing embedding API in the
-`ca.weblite.webview.swing` package.  Two modes are provided:
+`ca.weblite.webview.swing` package.  The recommended entry point is the
+abstract `WebViewComponent` and its static factory, which picks the best
+implementation for the current platform automatically:
+
+```java
+import ca.weblite.webview.swing.WebViewComponent;
+
+WebViewComponent wv = WebViewComponent.create();
+wv.setUrl("https://example.com");
+wv.setPreferredSize(new Dimension(900, 600));
+frame.add(wv, BorderLayout.CENTER);
+```
+
+`WebViewComponent.create()` returns a heavyweight implementation on
+macOS / Windows and a lightweight one on Linux (where the heavyweight
+path's visible text-input feedback is unreliable).  To force a specific
+mode, set the `ca.weblite.webview.mode` system property to
+`heavyweight` or `lightweight` (case-insensitive), or call
+`WebViewComponent.create(Mode.HEAVYWEIGHT)` / `Mode.LIGHTWEIGHT`
+explicitly.
+
+Internally there are two concrete subclasses, both extending
+`WebViewComponent`, which you can also instantiate directly if you
+need to:
 
 * **`WebViewHeavyweightComponent`** — embeds the native WebView as a child
   of the underlying heavyweight AWT peer.  Renders directly to screen
@@ -147,23 +170,6 @@ includes an in-process Swing embedding API in the
   needs Swing-side input forwarding (which is wired for mouse and
   keyboard).
 
-```java
-import ca.weblite.webview.swing.WebViewHeavyweightComponent;
-import ca.weblite.webview.swing.WebViewLightweightComponent;
-
-// Heavyweight (recommended on macOS / Windows; partial on Linux):
-WebViewHeavyweightComponent wv = new WebViewHeavyweightComponent();
-wv.setUrl("https://example.com");
-wv.setPreferredSize(new Dimension(900, 600));
-frame.add(wv, BorderLayout.CENTER);
-
-// Lightweight (recommended on Linux):
-WebViewLightweightComponent lwv = new WebViewLightweightComponent();
-lwv.setUrl("https://example.com");
-lwv.setPreferredSize(new Dimension(900, 600));
-frame.add(lwv, BorderLayout.CENTER);
-```
-
 See the [Heavyweight Swing Demo](demos/WebViewHeavyweightDemo/README.md)
 for a working example exercising both modes side-by-side, plus
 interaction with surrounding Swing widgets (JComboBox dropdowns, tab
@@ -177,9 +183,10 @@ switching).
 | **Linux** (WebKitGTK / X11) | ⚠️ Rendering, mouse, scroll, resize, tab switching work.  Visible text-input feedback (caret blink, characters appearing as typed) is **unreliable** because of how GTK frame-clock and focus interact with `XReparentWindow` under a foreign (non-GTK) parent. | ✅ **Full** — rendering + mouse (click, drag, scroll, hover) + keyboard (typing, Backspace, Delete, arrows, function keys, common modifiers) |
 | **Windows** (WebView2) | ⚠️ Implemented but **not yet runtime-tested** — your mileage may vary; please file issues. | ⚠️ Stub |
 
-Practical recommendation: use **heavyweight** on macOS and Windows, and
-**lightweight** on Linux.  A future cross-platform lightweight pass
-would make lightweight a sane default everywhere.
+The `WebViewComponent.create()` factory already encodes these
+defaults, so most callers don't need to think about it.  A future
+cross-platform lightweight pass would make lightweight a sane default
+everywhere.
 
 ### Heavyweight platform notes
 

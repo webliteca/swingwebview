@@ -12,6 +12,12 @@ import javax.swing.JComponent;
 /**
  * Base class for Swing components that host a native WebView.
  *
+ * <p>Most callers don't need to think about heavyweight vs lightweight --
+ * use the {@link #create()} factory and the right mode for the current
+ * platform is picked for you (heavyweight on macOS / Windows, lightweight
+ * on Linux).  Override with the {@code ca.weblite.webview.mode} system
+ * property if you need a specific mode.
+ *
  * <p>Two concrete implementations are provided:
  * <ul>
  *   <li>{@link WebViewHeavyweightComponent} -- the native WebView is embedded
@@ -34,6 +40,79 @@ import javax.swing.JComponent;
  * underlying native WebView.
  */
 public abstract class WebViewComponent extends JComponent {
+
+    /** Implementation mode for {@link #create(Mode)}. */
+    public enum Mode {
+        /** Native WebView embedded as a heavyweight AWT peer.  Highest
+         *  fidelity on macOS and Windows.  On Linux, mouse and rendering
+         *  work, but visible text-input feedback is unreliable. */
+        HEAVYWEIGHT,
+        /** Native WebView rendered offscreen and blitted into a regular
+         *  Swing component.  Composites cleanly with other Swing widgets.
+         *  Currently fully implemented on Linux only; on macOS and
+         *  Windows this falls back silently to an empty component. */
+        LIGHTWEIGHT
+    }
+
+    /** System property to force a specific mode regardless of platform. */
+    public static final String MODE_PROPERTY = "ca.weblite.webview.mode";
+
+    /**
+     * Create a WebView component using the best mode for the current
+     * platform.  The default is:
+     * <ul>
+     *   <li>macOS, Windows: {@link Mode#HEAVYWEIGHT}</li>
+     *   <li>Linux:          {@link Mode#LIGHTWEIGHT}</li>
+     * </ul>
+     * Override by setting the {@code ca.weblite.webview.mode} system
+     * property to {@code "heavyweight"} or {@code "lightweight"} (case
+     * insensitive).
+     */
+    public static WebViewComponent create() {
+        return create(resolveDefaultMode());
+    }
+
+    /** Create a WebView component using the requested implementation mode. */
+    public static WebViewComponent create(Mode mode) {
+        switch (mode) {
+            case HEAVYWEIGHT: return new WebViewHeavyweightComponent();
+            case LIGHTWEIGHT: return new WebViewLightweightComponent();
+            default:
+                throw new IllegalArgumentException(
+                    "Unknown WebViewComponent.Mode: " + mode);
+        }
+    }
+
+    /**
+     * @return the mode that {@link #create()} will use right now.  Honors
+     *         the {@code ca.weblite.webview.mode} system property if set.
+     */
+    public static Mode resolveDefaultMode() {
+        String override = System.getProperty(MODE_PROPERTY, "")
+            .trim().toLowerCase();
+        if (!override.isEmpty()) {
+            if (override.equals("heavyweight") || override.equals("heavy")) {
+                return Mode.HEAVYWEIGHT;
+            }
+            if (override.equals("lightweight") || override.equals("light")) {
+                return Mode.LIGHTWEIGHT;
+            }
+            System.err.println(
+                "[webview] Unrecognized " + MODE_PROPERTY + " value: \"" +
+                override + "\" (expected 'heavyweight' or 'lightweight'). " +
+                "Falling back to platform default.");
+        }
+        String os = System.getProperty("os.name", "").toLowerCase();
+        // Linux defaults to lightweight: the heavyweight path's visible
+        // text-input feedback is unreliable on WebKitGTK reparented under
+        // a foreign-toolkit X11 parent (see README for details).
+        if (os.contains("linux") || os.contains("nix") || os.contains("nux")) {
+            return Mode.LIGHTWEIGHT;
+        }
+        // macOS, Windows, everything else: heavyweight has full fidelity
+        // and works end-to-end.
+        return Mode.HEAVYWEIGHT;
+    }
 
     /** @return true if this component embeds the WebView as a heavyweight peer. */
     public boolean isHeavyweight() {
