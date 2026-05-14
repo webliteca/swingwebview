@@ -986,41 +986,56 @@ static void gtk_off_navigate(OffEngine *e, std::string url) {
 // supplied Java int[].  Pixels are CAIRO_FORMAT_ARGB32 -- 0xAARRGGBB per
 // pixel on both little- and big-endian builds (matches Java
 // BufferedImage TYPE_INT_ARGB).  The Java array must be at least w*h ints.
+//
+// Implementation note: we allocate our own image surface and ask the
+// offscreen GtkWindow to draw into it via gtk_widget_draw.  We do NOT
+// use gtk_offscreen_window_get_surface -- it's (transfer-none) so we
+// must not destroy what it returns, and its internal surface is only
+// populated after a frame-clock-driven draw, which on this code path
+// isn't reliably ticking.  Drawing on demand into a surface we own
+// sidesteps both lifetime and timing concerns.
 static void gtk_off_snapshot_into(OffEngine *e, JNIEnv *env,
                                   jintArray dest, jint w, jint h) {
     if (!e || w < 1 || h < 1) return;
-    cairo_surface_t *cs = nullptr;
+    jsize len = env->GetArrayLength(dest);
+    if (len < (jsize)((size_t)w * (size_t)h)) return;
+
+    // Default-fill the temp buffer with opaque white so any region not
+    // actually drawn by WebKit shows up as expected background colour
+    // rather than uninitialised memory.
+    std::vector<uint32_t> tmp((size_t)w * (size_t)h, 0xFFFFFFFFu);
+
     GtkPump::instance().run_sync([&] {
-        if (!e->window) return;
-        cs = gtk_offscreen_window_get_surface(
-            GTK_OFFSCREEN_WINDOW(e->window));
-    });
-    if (!cs) return;
-
-    int sw = cairo_image_surface_get_width(cs);
-    int sh = cairo_image_surface_get_height(cs);
-    int stride = cairo_image_surface_get_stride(cs);
-    unsigned char *data = cairo_image_surface_get_data(cs);
-
-    if (sw > 0 && sh > 0 && data) {
-        jint *jpixels = env->GetIntArrayElements(dest, nullptr);
-        if (jpixels) {
-            int copy_w = std::min(sw, (int)w);
-            int copy_h = std::min(sh, (int)h);
-            // Clear the dest if the source is smaller than the buffer so
-            // we don't leave stale stripes around the edges.
-            if (copy_w < w || copy_h < h) {
-                std::memset(jpixels, 0, (size_t)w * (size_t)h * sizeof(jint));
-            }
-            for (int y = 0; y < copy_h; y++) {
-                std::memcpy(jpixels + (size_t)y * (size_t)w,
-                            data + (size_t)y * (size_t)stride,
-                            (size_t)copy_w * 4);
-            }
-            env->ReleaseIntArrayElements(dest, jpixels, 0);
+        if (!e->window || !e->web) return;
+        cairo_surface_t *dst = cairo_image_surface_create(
+            CAIRO_FORMAT_ARGB32, w, h);
+        if (!dst || cairo_surface_status(dst) != CAIRO_STATUS_SUCCESS) {
+            if (dst) cairo_surface_destroy(dst);
+            return;
         }
-    }
-    cairo_surface_destroy(cs);
+        cairo_t *cr = cairo_create(dst);
+        if (cr && cairo_status(cr) == CAIRO_STATUS_SUCCESS) {
+            gtk_widget_draw(e->window, cr);
+        }
+        if (cr) cairo_destroy(cr);
+
+        cairo_surface_flush(dst);
+        unsigned char *data = cairo_image_surface_get_data(dst);
+        int stride = cairo_image_surface_get_stride(dst);
+        if (data) {
+            for (int y = 0; y < h; y++) {
+                std::memcpy(tmp.data() + (size_t)y * (size_t)w,
+                            data + (size_t)y * (size_t)stride,
+                            (size_t)w * 4);
+            }
+        }
+        cairo_surface_destroy(dst);
+    });
+
+    // Now safely on the calling thread: copy temp buffer into the Java
+    // int[].  SetIntArrayRegion is thread-safe per the JNI spec.
+    env->SetIntArrayRegion(dest, 0, (jsize)((size_t)w * (size_t)h),
+                           reinterpret_cast<const jint *>(tmp.data()));
 }
 
 #endif // WEBVIEW_GTK
