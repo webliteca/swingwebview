@@ -572,21 +572,42 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
         {
             GtkGesture *click =
                 gtk_gesture_multi_press_new(e->web);
-            // Default propagation phase is BUBBLE: we observe the
-            // event after WebKit has had a chance to handle it,
-            // which is what we want -- we never consume, we only
-            // grab X11 focus as a side effect of the click.
+            // Listen for any mouse button, not just primary, so a
+            // right-click also grabs focus.
+            gtk_gesture_single_set_button(
+                GTK_GESTURE_SINGLE(click), 0);
+            // CAPTURE phase: we observe the event before WebKit's
+            // own handling so the X11 focus grab is in place by the
+            // time WebKit reacts to the click (e.g. focuses a text
+            // field).  We never consume the event -- the gesture
+            // observes alongside the normal signal pipeline.
+            gtk_event_controller_set_propagation_phase(
+                GTK_EVENT_CONTROLLER(click), GTK_PHASE_CAPTURE);
             auto on_pressed =
-                +[](GtkGestureMultiPress *, gint, gdouble, gdouble,
+                +[](GtkGestureMultiPress *, gint, gdouble x, gdouble y,
                     gpointer data) {
                     Engine *eng = static_cast<Engine *>(data);
-                    if (!eng || !eng->window) return;
-                    GdkWindow *gw = gtk_widget_get_window(eng->window);
-                    if (!gw || !GDK_IS_X11_WINDOW(gw)) return;
-                    XSetInputFocus(GDK_WINDOW_XDISPLAY(gw),
-                                   GDK_WINDOW_XID(gw),
-                                   RevertToParent, CurrentTime);
-                    XSync(GDK_WINDOW_XDISPLAY(gw), False);
+                    if (!eng || !eng->web) return;
+                    // X11 focus: target the WebKitWebView's own
+                    // GdkWindow (child of the popup) so the X server
+                    // routes keystrokes directly to the widget that
+                    // wants them, not to the popup's outer window.
+                    GdkWindow *wgw = gtk_widget_get_window(eng->web);
+                    if (wgw && GDK_IS_X11_WINDOW(wgw)) {
+                        XSetInputFocus(GDK_WINDOW_XDISPLAY(wgw),
+                                       GDK_WINDOW_XID(wgw),
+                                       RevertToParent, CurrentTime);
+                        XSync(GDK_WINDOW_XDISPLAY(wgw), False);
+                    }
+                    // GTK focus chain: tell GTK that the WebKitWebView
+                    // is the focus widget within the popup, so any
+                    // keys that arrive get dispatched to it.
+                    gtk_widget_grab_focus(eng->web);
+                    fprintf(stderr,
+                        "[webview-embed] click @ (%.0f,%.0f) -> "
+                        "focus grabbed (web_xid=0x%lx)\n",
+                        x, y,
+                        wgw ? (unsigned long)GDK_WINDOW_XID(wgw) : 0UL);
                 };
             g_signal_connect(click, "pressed",
                              (GCallback)on_pressed, e);
@@ -798,21 +819,28 @@ static void gtk_set_visible(Engine *e, bool visible) {
     });
 }
 
-// Move X11 input focus to the embedded popup's X11 window.  X11 routes
+// Move X11 input focus to the embedded WebView's X11 window.  X11 routes
 // key events based on input focus, not pointer position; on the AWT
 // embed path the WM has only ever assigned input focus to the AWT
 // top-level frame, so without this call keystrokes typed while the
 // pointer is over the WebView region go to the AWT frame (and get
 // swallowed there) instead of the WebKit widget.
+//
+// We target the WebKitWebView's own GdkWindow rather than the popup's
+// outer window.  WebKitWebView is a windowed GtkContainer (creates its
+// own X11 child window inside the popup), so giving X11 focus to that
+// inner window lets the X server route keystrokes straight to the
+// widget that wants them.
 static void gtk_request_focus(Engine *e) {
     GtkPump::instance().run_async([=] {
-        if (!e || !e->window || !e->web) return;
-        GdkWindow *gdkw = gtk_widget_get_window(e->window);
-        if (!gdkw || !GDK_IS_X11_WINDOW(gdkw)) return;
-        Window xwin = GDK_WINDOW_XID(gdkw);
-        Display *dpy = GDK_WINDOW_XDISPLAY(gdkw);
-        XSetInputFocus(dpy, xwin, RevertToParent, CurrentTime);
-        XSync(dpy, False);
+        if (!e || !e->web) return;
+        GdkWindow *wgw = gtk_widget_get_window(e->web);
+        if (wgw && GDK_IS_X11_WINDOW(wgw)) {
+            XSetInputFocus(GDK_WINDOW_XDISPLAY(wgw),
+                           GDK_WINDOW_XID(wgw),
+                           RevertToParent, CurrentTime);
+            XSync(GDK_WINDOW_XDISPLAY(wgw), False);
+        }
         gtk_widget_grab_focus(e->web);
     });
 }
