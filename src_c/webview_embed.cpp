@@ -556,26 +556,18 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
         gtk_container_add(GTK_CONTAINER(e->window), e->web);
         gtk_widget_show_all(e->window);
 
-        // Click-to-focus: when the user presses a mouse button anywhere
-        // on the WebView, hand X11 input focus to our popup so the X
-        // server starts routing key events to the GTK widget tree (and
-        // from there to the WebKitWebView).  Without this, mouse and
-        // pointer events work but typing does not, because the AWT
-        // top-level frame still holds X11 input focus.
-        auto on_button_press =
-            +[](GtkWidget *, GdkEvent *, gpointer data) -> gboolean {
-                Engine *eng = static_cast<Engine *>(data);
-                if (!eng || !eng->window) return FALSE;
-                GdkWindow *gw = gtk_widget_get_window(eng->window);
-                if (!gw || !GDK_IS_X11_WINDOW(gw)) return FALSE;
-                XSetInputFocus(GDK_WINDOW_XDISPLAY(gw),
-                               GDK_WINDOW_XID(gw),
-                               RevertToParent, CurrentTime);
-                XSync(GDK_WINDOW_XDISPLAY(gw), False);
-                return FALSE;  // let WebKit also handle the click
-            };
-        g_signal_connect(e->web, "button-press-event",
-                         (GCallback)on_button_press, e);
+        // Note: an earlier revision installed a "button-press-event"
+        // signal handler on e->web here that called XSetInputFocus to
+        // hand X11 keyboard focus to the popup on click.  That was the
+        // intended click-to-focus path on Linux, but the act of
+        // connecting to button-press-event on a WebKitWebView in
+        // webkit2gtk-4.1 broke the WebView's rendering pipeline
+        // entirely -- even tab-switch hide+show wouldn't bring it
+        // back.  Removed pending a different focus-handoff hook
+        // (e.g. installing the handler on the popup GtkWindow, or
+        // tracking pointer position on the AWT side and calling
+        // gtk_request_focus from Java).  Programmatic focus from
+        // Java code via EmbeddedWebView.requestFocus() still works.
 
         // Drive the GTK paint pipeline from a plain g_timeout at ~60Hz.
         // See the redraw_timer_id field comment on Engine for the
