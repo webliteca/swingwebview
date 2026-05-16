@@ -103,32 +103,32 @@ set "LIB=%LIB%;%KITS_ROOT%\Lib\%SDK_VER%\ucrt\x64;%KITS_ROOT%\Lib\%SDK_VER%\um\x
 set "SDK_OK=1"
 :sdk_check_done
 
-if not defined SDK_OK (
-    echo.
-    echo ERROR: Windows SDK headers not found on the cl.exe INCLUDE path.
-    echo        vsdevcmd activated successfully but no SDK provides windows.h.
-    echo.
-    echo --- Diagnostics ----------------------------------------------------
-    echo INCLUDE = %INCLUDE%
-    echo.
-    echo WindowsSdkDir       = %WindowsSdkDir%
-    echo WindowsSdkVersion   = %WindowsSdkVersion%
-    echo UCRTVersion         = %UCRTVersion%
-    echo.
-    echo Headers physically present on disk:
-    where /R "C:\Program Files (x86)\Windows Kits" windows.h 2>nul
-    where /R "C:\Program Files (x86)\Windows Kits" crtdbg.h 2>nul
-    echo --------------------------------------------------------------------
-    echo.
-    echo Fix: open the Visual Studio Installer, click Modify on your VS 2022
-    echo install, and on the "Individual components" tab tick a "Windows 11
-    echo SDK" (e.g. 10.0.22621.0) or "Windows 10 SDK" entry, then re-run this
-    echo script.  Alternatively, on the "Workloads" tab make sure "Desktop
-    echo development with C++" is selected AND its right-pane "Windows 11
-    echo SDK" optional component is checked.
-    echo.
-    exit /b 1
-)
+if defined SDK_OK goto :build_dll
+echo.
+echo ERROR: Windows SDK headers not found on the cl.exe INCLUDE path.
+echo        vsdevcmd activated successfully but no SDK provides windows.h.
+echo.
+echo --- Diagnostics ----------------------------------------------------
+echo INCLUDE = %INCLUDE%
+echo.
+echo WindowsSdkDir       = %WindowsSdkDir%
+echo WindowsSdkVersion   = %WindowsSdkVersion%
+echo UCRTVersion         = %UCRTVersion%
+echo.
+echo Headers physically present on disk:
+where /R "C:\Program Files (x86)\Windows Kits" windows.h 2>nul
+where /R "C:\Program Files (x86)\Windows Kits" crtdbg.h 2>nul
+echo --------------------------------------------------------------------
+echo.
+echo Fix: open the Visual Studio Installer, click Modify on your VS 2022
+echo install, and on the "Individual components" tab tick a "Windows 11
+echo SDK" (e.g. 10.0.22621.0) or "Windows 10 SDK" entry, then re-run this
+echo script.  Alternatively, on the "Workloads" tab make sure "Desktop
+echo development with C++" is selected AND its right-pane "Windows 11
+echo SDK" optional component is checked.
+echo.
+exit /b 1
+:build_dll
 
 REM ---------------------------------------------------------------------------
 REM 4. Build webview.dll (x64).  The directory name has to match
