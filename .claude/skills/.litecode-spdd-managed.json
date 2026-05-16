@@ -1,0 +1,11 @@
+{
+  "spdd-analysis": "5456bf20734a02d9616bd832e21c5d7c528983ee81291be06389f84d44db31d9",
+  "spdd-api-test": "f7a64e35148cd33d635847bdaa17ac93cd36c269e1ec7f19d96122552b099c20",
+  "spdd-bootstrap": "7f4fadc6c25e1e90f139221d86ec35f43db4fbf1ec5c4df58ac1487d290bed92",
+  "spdd-generate": "280759f498f2fd6b84fd3cdc0a8237522a6086b513651c718754c00ed8d510cf",
+  "spdd-prompt-update": "0394cd07a3828a2ca6f1f203d628693cfe8cef8d87e1ea6fecfb28d532b7f58f",
+  "spdd-reasons-canvas": "7738bdffc6fc183355f3012eef2ff6314f4e585f658d09a99d1bcc62b963d4d9",
+  "spdd-review": "e24fb2fc05ce9878dac97663cb49cef2b03840f2425d6c4a05ac7a8d3bfc792c",
+  "spdd-story": "9055a6d497289588cd25aa5cdb993fe9924606be2b9ada1ba7eb621808bf62d0",
+  "spdd-sync": "dcd2949b09c7e4cb0e4e1854eec6f798b090d3b446ef231005023339e19ae93d"
+}
