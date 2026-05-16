@@ -1,0 +1,243 @@
+name: Build cross-platform jar
+
+on:
+  push:
+    branches: ['**']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Six native build jobs.  Each compiles webview's native lib for one
+  # OS/arch combo on a matching GitHub-hosted runner and uploads the lib
+  # as an artifact named native-<native_dir>.  No demo runs (no display).
+  # ---------------------------------------------------------------------------
+  native:
+    name: native (${{ matrix.native_dir }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13          # Intel
+            native_dir: osx_64
+            lib_name: libwebview.dylib
+          - os: macos-14          # Apple Silicon
+            native_dir: osx_arm64
+            lib_name: libwebview.dylib
+          - os: ubuntu-24.04
+            native_dir: linux_64
+            lib_name: libwebview.so
+          - os: ubuntu-24.04-arm
+            native_dir: linux_arm64
+            lib_name: libwebview.so
+          - os: windows-latest
+            native_dir: windows_64
+            lib_name: webview.dll
+            wv2_arch: x64
+            vsdev_arch: x64
+          - os: windows-11-arm
+            native_dir: windows_arm64
+            lib_name: webview.dll
+            wv2_arch: arm64
+            vsdev_arch: arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Liberica (BellSoft) ships JDK 8 for all six OS/arch combos we
+      # target -- including Windows ARM64, which Corretto 8 doesn't have.
+      # Keeping the build on JDK 8 matches the project's .tool-versions
+      # and avoids any --release 8 dance in the assembly job.
+      - name: Set up JDK 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: liberica
+          java-version: '8'
+
+      # ---------------- macOS -------------------------------------------------
+      - name: Build macOS native
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "src/${{ matrix.native_dir }}"
+          c++ \
+              -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/darwin" \
+              -dynamiclib \
+              src_c/webview_embed.cpp \
+              -o "src/${{ matrix.native_dir }}/${{ matrix.lib_name }}" \
+              -DWEBVIEW_COCOA=1 \
+              -std=c++11 \
+              -framework WebKit -framework Cocoa -framework QuartzCore \
+              -Wl,-undefined,dynamic_lookup
+          file "src/${{ matrix.native_dir }}/${{ matrix.lib_name }}"
+
+      # ---------------- Linux -------------------------------------------------
+      - name: Install Linux deps
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+              g++ pkg-config \
+              libgtk-3-dev libwebkit2gtk-4.1-dev libx11-dev libxt-dev
+
+      - name: Build Linux native
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "src/${{ matrix.native_dir }}"
+          if pkg-config --exists webkit2gtk-4.1; then
+            WEBKIT_PKG=webkit2gtk-4.1
+          else
+            WEBKIT_PKG=webkit2gtk-4.0
+          fi
+          g++ -fPIC -std=c++11 -Wall \
+              -DWEBVIEW_GTK=1 \
+              -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/linux" \
+              -I./src_c \
+              $(pkg-config --cflags gtk+-3.0 "$WEBKIT_PKG") \
+              src_c/webview.c src_c/webview_embed.cpp \
+              $(pkg-config --libs gtk+-3.0 "$WEBKIT_PKG") \
+              -lX11 -ldl \
+              -shared -o "src/${{ matrix.native_dir }}/${{ matrix.lib_name }}"
+          file "src/${{ matrix.native_dir }}/${{ matrix.lib_name }}"
+
+      # ---------------- Windows -----------------------------------------------
+      - name: Set up MSVC environment
+        if: runner.os == 'Windows'
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.vsdev_arch }}
+
+      - name: Download WebView2 SDK
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $version = '1.0.2592.51'
+          $dir = "windows\script\Microsoft.Web.WebView2.$version"
+          $nupkg = "$dir\Microsoft.Web.WebView2.$version.nupkg"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          if (!(Test-Path "$dir\build\native\include\WebView2.h")) {
+            $url = "https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/$version"
+            $ProgressPreference = 'SilentlyContinue'
+            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            Invoke-WebRequest -Uri $url -OutFile $nupkg -UseBasicParsing
+            Add-Type -AssemblyName System.IO.Compression.FileSystem
+            [System.IO.Compression.ZipFile]::ExtractToDirectory($nupkg, $dir)
+          }
+          Get-Item "$dir\build\native\include\WebView2.h"
+
+      - name: Build Windows native
+        if: runner.os == 'Windows'
+        shell: cmd
+        run: |
+          @echo on
+          setlocal enableextensions
+          set "REPO_DIR=%CD%"
+          set "BUILD_DIR=%REPO_DIR%\build"
+          set "DLL_OUT=%REPO_DIR%\src\${{ matrix.native_dir }}"
+          set "WEBVIEW2_DIR=%REPO_DIR%\windows\script\Microsoft.Web.WebView2.1.0.2592.51"
+          if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
+          if not exist "%DLL_OUT%" mkdir "%DLL_OUT%"
+
+          cl /nologo ^
+              /D "WEBVIEW_API=__declspec(dllexport)" ^
+              /I "%JAVA_HOME%\include" ^
+              /I "%JAVA_HOME%\include\win32" ^
+              /I "%REPO_DIR%\windows" ^
+              /I "%WEBVIEW2_DIR%\build\native\include" ^
+              /std:c++17 /EHsc ^
+              /Fo"%BUILD_DIR%\\" ^
+              "%REPO_DIR%\windows\webview.cc" ^
+              "%REPO_DIR%\windows\webview_embed.cc" ^
+              /link /DLL ^
+              "%WEBVIEW2_DIR%\build\native\${{ matrix.wv2_arch }}\WebView2LoaderStatic.lib" ^
+              "%JAVA_HOME%\lib\jawt.lib" ^
+              advapi32.lib ole32.lib oleaut32.lib shlwapi.lib shell32.lib user32.lib version.lib winhttp.lib ^
+              /OUT:"%BUILD_DIR%\webview.dll" || exit /b 1
+          copy /Y "%BUILD_DIR%\webview.dll" "%DLL_OUT%\${{ matrix.lib_name }}"
+          dir "%DLL_OUT%"
+
+      # ---------------- Artifact ----------------------------------------------
+      - name: Upload native artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-${{ matrix.native_dir }}
+          path: src/${{ matrix.native_dir }}/${{ matrix.lib_name }}
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Assembly job: compile Java once, pull in every native artifact, package
+  # them into a single WebView.jar with NativeLibraryUtil-compatible layout.
+  # ---------------------------------------------------------------------------
+  jar:
+    name: WebView.jar (all platforms)
+    needs: native
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 8
+        uses: actions/setup-java@v4
+        with:
+          distribution: liberica
+          java-version: '8'
+
+      - name: Download all native artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: native-artifacts
+          pattern: native-*
+
+      - name: Lay natives into src/<arch>/
+        shell: bash
+        run: |
+          set -euo pipefail
+          for d in native-artifacts/native-*; do
+            arch="$(basename "$d" | sed 's/^native-//')"
+            mkdir -p "src/$arch"
+            cp -v "$d"/* "src/$arch/"
+          done
+          echo "--- final native layout ---"
+          find src -maxdepth 2 -type f \( -name '*.dylib' -o -name '*.so' -o -name '*.dll' \) | sort
+
+      - name: Compile WebView Java sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build/classes-webview dist
+          find src -name '*.java' > build/wv-sources.txt
+          javac -d build/classes-webview -classpath 'lib/*' @build/wv-sources.txt
+
+      - name: Stage and package WebView.jar
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGE=build/stage-webview
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          cp -R build/classes-webview/. "$STAGE"/
+          # Copy each <native_dir> from src/ into the jar root so
+          # NativeLibraryUtil.getPlatformLibraryPath finds it.
+          for d in src/osx_64 src/osx_arm64 src/linux_64 src/linux_arm64 \
+                   src/windows_64 src/windows_arm64; do
+              if [ -d "$d" ]; then
+                  cp -R "$d" "$STAGE"/
+              fi
+          done
+          ( cd "$STAGE" && jar cf ../../dist/WebView.jar . )
+          echo "--- jar contents ---"
+          jar tf dist/WebView.jar | sort | head -80
+          ls -la dist/
+
+      - name: Upload WebView.jar
+        uses: actions/upload-artifact@v4
+        with:
+          name: WebView-jar
+          path: dist/WebView.jar
+          if-no-files-found: error
