@@ -181,7 +181,7 @@ switching).
 |---|---|---|
 | **macOS** (Cocoa / WKWebView) | ✅ Full (rendering, input, resize, tab visibility) | ⚠️ Stub — falls back to default Swing background |
 | **Linux** (WebKitGTK / X11) | ⚠️ Rendering, mouse, scroll, resize, tab switching work.  Visible text-input feedback (caret blink, characters appearing as typed) is **unreliable** because of how GTK frame-clock and focus interact with `XReparentWindow` under a foreign (non-GTK) parent. | ✅ **Full** — rendering + mouse (click, drag, scroll, hover) + keyboard (typing, Backspace, Delete, arrows, function keys, common modifiers) |
-| **Windows** (WebView2) | ⚠️ Implemented but **not yet runtime-tested** — your mileage may vary; please file issues. | ⚠️ Stub |
+| **Windows** (WebView2) | ✅ Full (rendering, input, resize, tab visibility) on Windows 11.  Requires the system-wide Microsoft Edge WebView2 Runtime (ships with current Windows 11 / Edge; install Evergreen from https://developer.microsoft.com/microsoft-edge/webview2/ on older Windows). | ⚠️ Stub |
 
 The `WebViewComponent.create()` factory already encodes these
 defaults, so most callers don't need to think about it.  A future
@@ -204,9 +204,13 @@ everywhere.
   compositing engages and input dispatch goes through AppKit's normal
   responder chain.  All input works end-to-end.
 * **Windows (WebView2)** — a child `HWND` is created under the AWT
-  canvas HWND and an `IWebView2WebView` controller is hosted inside
-  it.  Each embedded WebView runs on its own worker thread that pumps
-  a private message queue.
+  canvas HWND and an `ICoreWebView2Controller` + `ICoreWebView2` are
+  hosted inside it (modern stable WebView2 SDK).  Each embedded
+  WebView runs on its own worker thread that pumps a private message
+  queue.  `WebView2LoaderStatic.lib` is linked statically so we ship
+  just `webview.dll`, no separate `WebView2Loader.dll`.  The system
+  WebView2 Runtime (part of Edge / Windows 11) provides the actual
+  Chromium binaries.
 
 ### Lightweight notes
 
