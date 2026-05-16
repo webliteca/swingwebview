@@ -15,6 +15,9 @@
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+// WIN32_LEAN_AND_MEAN excludes objbase.h, which defines `interface` (=struct)
+// used pervasively by WebView2.h's COM declarations.  Pull it in explicitly.
+#include <objbase.h>
 
 #include <atomic>
 #include <cstdio>
