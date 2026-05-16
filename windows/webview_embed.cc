@@ -505,3 +505,40 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1dis
         if (detach) jvm->DetachCurrentThread();
     });
 }
+
+// ---------------------------------------------------------------------------
+// Offscreen / lightweight JNI exports.  Lightweight is Linux-only today;
+// Windows stubs return 0 / no-op so the Java side falls back to the empty
+// Swing background (see WebViewLightweightComponent.addNotify).
+// ---------------------------------------------------------------------------
+
+extern "C" {
+
+JNIEXPORT jlong JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1create
+  (JNIEnv *, jclass, jint, jint, jint) { return 0; }
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1destroy
+  (JNIEnv *, jclass, jlong) {}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1resize
+  (JNIEnv *, jclass, jlong, jint, jint) {}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1navigate
+  (JNIEnv *, jclass, jlong, jstring) {}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1snapshot
+  (JNIEnv *, jclass, jlong, jintArray, jint, jint) {}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1mouse_1button
+  (JNIEnv *, jclass, jlong, jint, jint, jint, jint, jint, jint) {}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1mouse_1motion
+  (JNIEnv *, jclass, jlong, jint, jint, jint) {}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1mouse_1scroll
+  (JNIEnv *, jclass, jlong, jint, jint, jdouble, jdouble, jint) {}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1key_1event
+  (JNIEnv *, jclass, jlong, jint, jint, jint, jint) {}
+
+} // extern "C"
