@@ -699,4 +699,52 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1key_1event
   (JNIEnv *, jclass, jlong, jint, jint, jint, jint) {}
 
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1init
+  (JNIEnv *, jclass, jlong, jstring) {}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1eval
+  (JNIEnv *, jclass, jlong, jstring) {}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1bind
+  (JNIEnv *, jclass, jlong, jstring, jobject, jlong) {}
+
+JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1open_1devtools
+  (JNIEnv *, jclass, jlong) { return 0; }
+
+JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1open_1devtools
+  (JNIEnv *, jclass, jlong wv) {
+    auto *e = (Engine *)wv;
+    if (!e) return 0;
+    // Marshal to the WebView2 worker thread (the thread the controller
+    // was created on) and call OpenDevToolsWindow.  Synchronously wait
+    // for the worker to report success/failure so the JNI return value
+    // accurately reflects whether the window opened.  The wait is
+    // bounded by normal WebView2 method dispatch.
+    std::atomic<bool> done{false};
+    std::atomic<int> result{0};
+    embed_win::dispatch_to_thread(e, [e, &done, &result] {
+        if (!e->webview) { result.store(0); done.store(true); return; }
+        ICoreWebView2Settings *settings = nullptr;
+        BOOL enabled = FALSE;
+        if (SUCCEEDED(e->webview->get_Settings(&settings)) && settings) {
+            settings->get_AreDevToolsEnabled(&enabled);
+            settings->Release();
+        }
+        if (!enabled) { result.store(0); done.store(true); return; }
+        HRESULT hr = e->webview->OpenDevToolsWindow();
+        if (FAILED(hr)) {
+            WV_LOG("OpenDevToolsWindow failed: HRESULT=0x%08lx",
+                   (unsigned long)hr);
+            result.store(0);
+        } else {
+            result.store(1);
+        }
+        done.store(true);
+    });
+    while (!done.load()) {
+        Sleep(1);
+    }
+    return (jint)result.load();
+}
+
 } // extern "C"

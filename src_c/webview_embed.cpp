@@ -895,10 +895,10 @@ struct OffEngine {
     JavaVM *jvm = nullptr;
 };
 
-// Mirrors engine_on_message for the offscreen engine: parse the {name,
-// seq, args} envelope produced by the bind shim, look the binding up by
-// name, and forward the raw JSON payload to the Java callback's
-// WebViewNativeCallback.invoke(String, long).
+// Parallel of engine_on_message for OffEngine: parse the {name, seq, args}
+// envelope produced by window.external.invoke / the bind shim, look the
+// binding up by name, and forward the raw JSON payload to the Java
+// callback's WebViewNativeCallback.invoke(String, long).
 static void off_engine_on_message(OffEngine *e, const char *msg) {
     if (msg == nullptr) return;
     std::string s(msg);
@@ -954,6 +954,33 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
             webkit_settings_set_enable_developer_extras(s, TRUE);
             webkit_settings_set_enable_write_console_messages_to_stdout(s, TRUE);
         }
+
+        // Wire up the "external" script-message channel exactly as the
+        // embed path does (see gtk_create_engine lines 553-573).  This
+        // is what makes window.external.invoke -- and therefore the
+        // bind-shim's webview_offscreen_bind plumbing and the
+        // ConsoleDispatcher console capture -- work on the lightweight
+        // component.
+        g_signal_connect(
+            e->manager, "script-message-received::external",
+            G_CALLBACK(+[](WebKitUserContentManager *,
+                           WebKitJavascriptResult *r, gpointer arg) {
+                auto *eng = static_cast<OffEngine *>(arg);
+                JSCValue *v = webkit_javascript_result_get_js_value(r);
+                char *str = jsc_value_to_string(v);
+                off_engine_on_message(eng, str);
+                g_free(str);
+            }),
+            e);
+        webkit_user_content_manager_register_script_message_handler(
+            e->manager, "external");
+        webkit_user_content_manager_add_script(
+            e->manager,
+            webkit_user_script_new(
+                "window.external={invoke:function(s){"
+                "window.webkit.messageHandlers.external.postMessage(s);}};",
+                WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+                WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL));
 
         // Opaque white background so transparent / empty regions don't
         // surface premultiplied artefacts when blitted into Swing.
@@ -1108,6 +1135,47 @@ static void gtk_off_navigate(OffEngine *e, std::string url) {
             "[webview-embed] offscreen load_uri: %s\n", url.c_str());
         webkit_web_view_load_uri(WEBKIT_WEB_VIEW(e->web), url.c_str());
     });
+}
+
+// Open the WebKitGTK Web Inspector for the offscreen WebView in a separate
+// OS-level GtkWindow.  The inspector belongs to the WebView's own
+// process and is unaffected by the host Swing window's visibility.
+// Returns 1 on success, 0 if developer-extras is disabled or the
+// inspector is unavailable.
+static int gtk_off_open_devtools(OffEngine *e) {
+    if (!e || !e->web) return 0;
+    int result = 0;
+    GtkPump::instance().run_sync([&] {
+        if (!e->web) return;
+        WebKitSettings *s =
+            webkit_web_view_get_settings(WEBKIT_WEB_VIEW(e->web));
+        if (!s || !webkit_settings_get_enable_developer_extras(s)) return;
+        WebKitWebInspector *insp =
+            webkit_web_view_get_inspector(WEBKIT_WEB_VIEW(e->web));
+        if (!insp) return;
+        webkit_web_inspector_show(insp);
+        result = 1;
+    });
+    return result;
+}
+
+// Same idea for the heavyweight embed-path engine.  Lives here next to
+// the offscreen variant so both implementations are visible side by side.
+static int gtk_open_devtools(Engine *e) {
+    if (!e || !e->web) return 0;
+    int result = 0;
+    GtkPump::instance().run_sync([&] {
+        if (!e->web) return;
+        WebKitSettings *s =
+            webkit_web_view_get_settings(WEBKIT_WEB_VIEW(e->web));
+        if (!s || !webkit_settings_get_enable_developer_extras(s)) return;
+        WebKitWebInspector *insp =
+            webkit_web_view_get_inspector(WEBKIT_WEB_VIEW(e->web));
+        if (!insp) return;
+        webkit_web_inspector_show(insp);
+        result = 1;
+    });
+    return result;
 }
 
 // Mouse event injection.  Java listeners on WebViewLightweightComponent
@@ -1588,6 +1656,18 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
                                    sel("numberWithBool:"), YES);
             msg<void, id, id>(prefs, sel("setValue:forKey:"),
                               one, ns_str("developerExtrasEnabled"));
+            // macOS 13.3+ exposes -[WKWebView setInspectable:] as a
+            // public BOOL property; enabling it exposes the Web
+            // Inspector via the Safari Develop menu (remote inspection)
+            // and is required for right-click -> Inspect Element to
+            // function on those OS versions.  On macOS 12.x and earlier
+            // the selector does not exist and is silently skipped --
+            // the legacy developerExtrasEnabled flag alone is
+            // sufficient for in-process inspection there.
+            if (msg<BOOL>(e->webview, sel("respondsToSelector:"),
+                          sel("setInspectable:"))) {
+                msg<void, BOOL>(e->webview, sel("setInspectable:"), YES);
+            }
         }
         ok = true;
     });
@@ -1720,6 +1800,18 @@ static void cocoa_request_focus(Engine *e) {
 }
 
 static void cocoa_bind(Engine *e, Binding *b) { e->bindings[b->name] = b; }
+
+// macOS has no public API to programmatically open the Web Inspector; the
+// only public entry points are right-click -> Inspect Element (gated by
+// developerExtrasEnabled, already set in debug mode) and Safari ->
+// Develop menu (gated by setInspectable:YES, also set in debug mode).
+// Returning 0 signals to the Java side that no programmatic open
+// happened, so the boolean openDevTools() return surfaces the macOS
+// limitation honestly.
+static int cocoa_open_devtools(Engine *e) {
+    (void)e;
+    return 0;
+}
 
 #endif // WEBVIEW_COCOA
 
@@ -2029,6 +2121,22 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// DevTools open + offscreen JS bridge / dispatch JNI exports.
+// ---------------------------------------------------------------------------
+
+JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1open_1devtools
+  (JNIEnv *, jclass, jlong wv) {
+#ifdef WEBVIEW_GTK
+    return (jint)embed::gtk_open_devtools((Engine *)wv);
+#elif defined(WEBVIEW_COCOA)
+    return (jint)embed::cocoa_open_devtools((Engine *)wv);
+#else
+    (void)wv;
+    return 0;
+#endif
+}
+
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1init
   (JNIEnv *env, jclass, jlong wv, jstring js) {
     const char *s = env->GetStringUTFChars(js, nullptr);
@@ -2114,5 +2222,15 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
     embed::GtkPump::instance().run_async(fn);
 #else
     (void)env; (void)wv; (void)callback;
+#endif
+}
+
+JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1open_1devtools
+  (JNIEnv *, jclass, jlong wv) {
+#ifdef WEBVIEW_GTK
+    return (jint)embed::gtk_off_open_devtools((embed::OffEngine *)wv);
+#else
+    (void)wv;
+    return 0;
 #endif
 }

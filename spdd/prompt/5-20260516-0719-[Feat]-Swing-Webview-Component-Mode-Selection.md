@@ -14,7 +14,25 @@ generated_at: 2026-05-16T07:19:13-07:00
 - Public abstract API: `setUrl`/`getUrl`, `setDebug`,
   `addOnBeforeLoad`, `eval`, `addJavascriptCallback`,
   `dispatch`, `dispose`, `isHeavyweight`
-  (`WebViewComponent.java:122`–`WebViewComponent.java:157`).
+  (`WebViewComponent.java:122`–`WebViewComponent.java:170`).
+- Public non-abstract API (defaulted on the base class so any
+  future subclass inherits without rework):
+  - `openDevTools(): boolean` — opens the platform's native
+    DevTools / Web Inspector in a separate OS window; returns
+    `true` when an inspector window was actually opened, `false`
+    when unsupported, disabled, or not yet displayed. Default
+    implementation on `WebViewComponent` returns `false`; the
+    two first-party subclasses override.
+  - `addConsoleListener(ConsoleListener)` /
+    `removeConsoleListener(ConsoleListener)` /
+    `setConsoleOutput(PrintStream)` /
+    `getConsoleOutput(): PrintStream` — structured JavaScript
+    `console.*` capture. Default implementations on
+    `WebViewComponent` delegate to a per-component
+    `ConsoleDispatcher` (see Entities) so every subclass
+    inherits the API for free; subclasses only need to install
+    the JS shim and route the internal `__webview_console__`
+    binding into `ConsoleDispatcher.dispatch(rawPayload)`.
 - `WebViewComponent.create()` chooses the right implementation for
   the platform automatically: heavyweight on macOS / Windows,
   lightweight on Linux (`WebViewComponent.java:71`,
@@ -50,6 +68,56 @@ generated_at: 2026-05-16T07:19:13-07:00
 - **MODE_PROPERTY** (`WebViewComponent.java:58`) — public
   string constant `"ca.weblite.webview.mode"` used as the system
   property name.
+- **ConsoleMessage** (new, public, immutable; package
+  `ca.weblite.webview`). Read-only fields/accessors:
+  - `level: ConsoleMessage.Level` — one of
+    `LOG, INFO, WARN, ERROR, DEBUG`.
+  - `text: String` — the space-joined JS-side stringified
+    arguments of the `console.*` call. May be empty for
+    zero-arg calls.
+  - `sourceUrl: String` — URL of the JS source that issued the
+    call, or `null` when not detectable (anonymous inline
+    script, `eval`, missing stack frame).
+  - `lineNumber: int` — line within `sourceUrl`, or `-1` when
+    not detectable.
+  - `toString(): String` — canonical formatted line; see Norms
+    for the exact format.
+- **ConsoleMessage.Level** (new, public nested enum) — closed
+  set `LOG, INFO, WARN, ERROR, DEBUG`. One value per intercepted
+  `console.*` method; `trace`/`assert`/`table`/`group` are
+  explicitly out of scope.
+- **ConsoleListener** (new, public functional interface;
+  package `ca.weblite.webview`). Single method
+  `onMessage(ConsoleMessage)`.
+- **ConsoleDispatcher** (new, **public but documented as
+  internal**; package `ca.weblite.webview`). Public because
+  the consumer classes live in `ca.weblite.webview.swing` and
+  Java has no cross-package-but-non-public access modifier;
+  matches the existing "public class, de-facto internal"
+  pattern used by `EmbeddedWebView`, `OffscreenWebView`, and
+  `WebViewNativeCallback`. Class-level Javadoc must flag it as
+  internal and direct users to the public
+  `WebViewComponent.addConsoleListener` / `setConsoleOutput`
+  surface. Per-component fan-out hub owned by every
+  `WebViewComponent` instance. Invariants:
+  - Holds a `List<ConsoleListener>` and at most one
+    `PrintStream` output sink (`null` when unset).
+  - Snapshots the listener list before each fan-out so a
+    listener mutating the list during `onMessage` only takes
+    effect for the NEXT message (matches the "removal takes
+    effect for the next message" non-functional requirement).
+  - Marshals every fan-out onto the EDT via
+    `SwingUtilities.invokeLater`, or runs inline when already
+    on the EDT.
+  - Wraps each individual listener invocation in try/catch;
+    a thrown exception is routed through
+    `Thread.getDefaultUncaughtExceptionHandler` (or printed to
+    STDERR if none) and the remaining listeners still receive
+    the message.
+  - Exposes `dispatch(String rawPayload)` for the subclass
+    bridge to call from any thread; the dispatcher parses the
+    canonical payload format (see Norms) into a
+    `ConsoleMessage` and runs the fan-out as above.
 
 ## A · Approach
 - **Platform default has rationale baked in.** Linux is forced to
@@ -70,6 +138,46 @@ generated_at: 2026-05-16T07:19:13-07:00
   BEFORE the component is displayable; each concrete subclass is
   responsible for buffering and replaying on attach. The factory
   itself stays free of any such state.
+- **DevTools is platform-owned; we don't dock it.** Every
+  supported engine ships its own inspector window — Safari Web
+  Inspector on macOS, WebKitGTK Web Inspector on Linux,
+  Chromium DevTools on Windows. `openDevTools()` returns a
+  boolean rather than a handle because the inspector is the
+  platform's window and we don't attempt to skin, reparent, or
+  dock it inside the Swing UI. macOS specifically has no public
+  API to programmatically pop the inspector — the contract is
+  to enable the developer-extras / `isInspectable` flags so
+  right-click → Inspect Element and the Safari Develop menu
+  both work, and to return `false` from `openDevTools()` to
+  reflect that no programmatic open happened.
+- **Console capture rides the existing message bridge.** Every
+  engine already runs a `webkit_user_script` /
+  `WKUserScript` / `AddScriptToExecuteOnDocumentCreated` shim
+  that installs `window.external.invoke` and a paired
+  script-message handler. The console-capture pipeline is the
+  same pattern with a reserved internal binding name
+  (`__webview_console__`) and a small JS shim that wraps the
+  five `console.*` methods to (a) still call the original
+  implementation it captured by closure (so the platform's
+  native DevTools Console panel and stdout sinks keep
+  receiving output untouched), (b) post a canonical
+  pipe-separated payload (see Norms) through the binding, and
+  (c) suppress shim re-entry so a listener calling
+  `console.log` doesn't loop.  In addition the shim
+  subscribes to `window`'s `error` and `unhandledrejection`
+  events and emits them as `ERROR`-level `ConsoleMessage`s
+  so uncaught script errors and rejected promises surface
+  through the same listener pipeline (they bypass the
+  console.* wrappers because the engine's internal error
+  reporter doesn't go through `window.console.error()`).
+- **EDT marshaling for listeners.** Native callbacks land on
+  whichever native UI thread the engine runs on (AppKit main
+  on macOS, GTK pump thread on Linux heavyweight and offscreen,
+  the dedicated WebView2 worker on Windows). `ConsoleDispatcher`
+  is the one place that hops to the EDT, so every listener
+  receives `onMessage` on the EDT regardless of which
+  subclass produced the message — matches Swing convention
+  and lets listeners touch Swing state directly.
 
 ## S · Structure
 - `src/ca/weblite/webview/swing/WebViewComponent.java` — abstract
@@ -80,6 +188,16 @@ generated_at: 2026-05-16T07:19:13-07:00
 - `src/ca/weblite/webview/swing/WebViewLightweightComponent.java`
   — lightweight subclass; implementation details in
   [[swing-lightweight-webview-embedding]].
+- `src/ca/weblite/webview/ConsoleMessage.java` (new) — public
+  immutable value type + nested `Level` enum.
+- `src/ca/weblite/webview/ConsoleListener.java` (new) — public
+  functional interface.
+- `src/ca/weblite/webview/ConsoleDispatcher.java` (new, public
+  but Javadoc-marked internal) — listener registry, EDT
+  marshaling, payload parsing. Owns the canonical JS shim
+  source string as a compile-time constant
+  `ConsoleDispatcher.SHIM_JS` so each subclass installs the
+  same shim by referencing one location.
 - `README.md ("Choosing a mode" section)` — user-facing platform/mode matrix and override
   documentation.
 
@@ -184,6 +302,64 @@ File: `src/ca/weblite/webview/swing/WebViewComponent.java`
      (e.g. `EmbeddedWebView.attach(canvas, debug)` at
      `EmbeddedWebView.java:57`).
 
+### 5. Declare DevTools + Console API Surface
+File: `src/ca/weblite/webview/swing/WebViewComponent.java`
+
+1. Responsibility: declare the developer-visibility API and
+   provide a default ConsoleDispatcher-backed implementation
+   for the console-listener methods so subclasses inherit the
+   API automatically.
+2. Methods (all non-abstract on `WebViewComponent`):
+   - `openDevTools(): boolean`
+     - Default logic: return `false`. Subclasses override:
+       heavyweight delegates to
+       `EmbeddedWebView.openDevTools()`; lightweight delegates
+       to `OffscreenWebView.openDevTools()`. Both subclass
+       implementations return `false` when the native peer
+       does not yet exist (i.e. component not displayed) or
+       when the native call returned 0.
+   - `addConsoleListener(ConsoleListener listener): void`
+     - Logic: delegate to the component's
+       `ConsoleDispatcher.addListener(listener)`. Null
+       listeners must be rejected with
+       `NullPointerException`.
+   - `removeConsoleListener(ConsoleListener listener): void`
+     - Logic: delegate to
+       `ConsoleDispatcher.removeListener(listener)`. Removing
+       an unregistered listener is silently ignored.
+   - `setConsoleOutput(PrintStream stream): void`
+     - Logic: delegate to
+       `ConsoleDispatcher.setOutputStream(stream)`. Passing
+       `null` clears the redirect. The stream's charset is
+       respected as-is — the dispatcher writes through
+       `PrintStream.print(String) + println()`, never wraps
+       it in an `OutputStreamWriter`.
+   - `getConsoleOutput(): PrintStream`
+     - Logic: delegate to
+       `ConsoleDispatcher.getOutputStream()`. Returns `null`
+       when never set or after a `setConsoleOutput(null)`
+       call.
+   - `addJavascriptCallback(String name, ...)` — overrides
+     must reject reserved names: any name starting with the
+     prefix `__webview_` throws
+     `IllegalArgumentException("name is reserved for internal
+     use: ...")`. This guards the internal
+     `__webview_console__` channel and any future internal
+     channels under the same prefix.
+3. Constraints / Invariants:
+   - The four console-listener methods MUST NOT change the
+     observable order of message delivery for a given
+     subscriber: messages arrive in source order, listener
+     fan-out is in registration order, and the same message
+     reaches every then-registered listener exactly once.
+   - `openDevTools` is idempotent: repeated calls while the
+     peer is alive are safe and return whatever the native
+     call returned each time. Each subclass must marshal
+     the underlying native call asynchronously where required
+     (Windows: WebView2 worker thread; macOS: AppKit main)
+     so calling from the EDT never blocks beyond a normal
+     native UI dispatch.
+
 ## N · Norms
 - The system property name `ca.weblite.webview.mode` is part of
   the public surface — do not rename it. Document any new
@@ -192,6 +368,49 @@ File: `src/ca/weblite/webview/swing/WebViewComponent.java`
   `README.md ("Platform support" section)` and must be kept in sync with what
   `resolveDefaultMode` actually returns and what each subclass
   actually supports.
+- The `__webview_` prefix on JS binding names is reserved for
+  this library's internal channels — currently
+  `__webview_console__`. Callers attempting to bind a name in
+  this namespace MUST be rejected with
+  `IllegalArgumentException`. New internal channels MUST use
+  the same prefix.
+- The canonical `ConsoleMessage.toString()` and
+  `PrintStream` line format is
+  `[<LEVEL>] <source>:<line> <text>` terminated by `\n`. When
+  `sourceUrl == null` use the literal substitution `<unknown>`
+  for the source portion; when `lineNumber == -1` omit the
+  `:<line>` suffix entirely (so a message with both unknown
+  collapses to `[LOG] <unknown> hello`). This format is part
+  of the public contract — callers grep these lines from log
+  pipelines. Any change is a breaking change.
+- The JS → native payload format for the
+  `__webview_console__` channel is pipe-separated with a
+  length-prefixed text body, exactly as:
+  `<level>|<sourceUrl>|<lineNumber>|<textLength>|<text>`.
+  Field semantics:
+  - `<level>` is one of the five strings `LOG`, `INFO`,
+    `WARN`, `ERROR`, `DEBUG` (uppercase, matching the enum
+    names).
+  - `<sourceUrl>` is the raw URL string with no escaping, or
+    the empty string when not detectable. Pipes inside a URL
+    are not possible per RFC 3986 — no escaping required.
+  - `<lineNumber>` is a decimal integer or the literal
+    string `-1`.
+  - `<textLength>` is the byte length of the UTF-8 encoding
+    of `<text>`.
+  - `<text>` follows verbatim for exactly `<textLength>`
+    bytes; may contain pipes, newlines, or anything else.
+  This format is deliberately not JSON to avoid a JSON parser
+  on the Java side and to be robust against pipes / newlines /
+  control characters inside log messages.
+- `ConsoleDispatcher.SHIM_JS` is the single source of truth
+  for the injected JS shim. If you change the payload format
+  above, update the shim source AND the parser in
+  `ConsoleDispatcher` in the same commit.
+- Listener callbacks MUST be invoked on the EDT. The
+  dispatcher is the only place that enforces this; subclass
+  bridges call `ConsoleDispatcher.dispatch` from native
+  threads without thread-checking.
 
 ## S · Safeguards
 - Unrecognised system property values are warned about but never
@@ -206,3 +425,29 @@ File: `src/ca/weblite/webview/swing/WebViewComponent.java`
   unknown future subclass is treated as lightweight by callers
   that branch on this — safer assumption since it implies
   "behaves like a normal Swing component."
+- The `__webview_` reserved-name reject in
+  `addJavascriptCallback` MUST fire before any state is
+  mutated — no partial registration on rejection. The exception
+  message MUST name the offending prefix so callers can
+  recognise the cause without reading source.
+- A listener throwing from `onMessage` MUST NOT prevent
+  subsequent listeners from receiving the same message.
+  `ConsoleDispatcher` wraps every `onMessage` call in try/catch
+  and routes the exception through
+  `Thread.getDefaultUncaughtExceptionHandler()`. If no handler
+  is installed, the exception's stack trace is printed to
+  STDERR. This matches Swing convention for event-listener
+  exceptions.
+- `setConsoleOutput(null)` MUST be idempotent — calling it
+  when no stream is set is a no-op, not an error. Same for
+  `removeConsoleListener` on an unregistered listener.
+- `PrintStream` write failures inside the redirect listener
+  MUST NOT propagate. `PrintStream` itself swallows
+  `IOException` from its underlying writer, but the dispatcher
+  also wraps the call in try/catch as a belt-and-braces guard
+  against subclasses of `PrintStream` that re-throw.
+- The default `openDevTools()` on `WebViewComponent` returns
+  `false` rather than throwing `UnsupportedOperationException`
+  so a future subclass that doesn't override the method still
+  behaves consistently with the macOS "enabled but not
+  programmatically openable" semantics.

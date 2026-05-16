@@ -5,6 +5,7 @@
  */
 package ca.weblite.webview.swing;
 
+import ca.weblite.webview.ConsoleDispatcher;
 import ca.weblite.webview.GdkInput;
 import ca.weblite.webview.OffscreenWebView;
 import ca.weblite.webview.WebView;
@@ -180,13 +181,25 @@ public class WebViewLightweightComponent extends WebViewComponent {
             // will fall back to the default Swing background.
             return;
         }
-        allocateBuffer(w, h);
+        // Install the console bridge BEFORE replaying user config so the
+        // shim observes every user init script.  Goes directly through
+        // `engine` rather than this component's addJavascriptCallback,
+        // which would reject the reserved-prefix name.
+        engine.addOnBeforeLoad(ConsoleDispatcher.SHIM_JS);
+        engine.addJavascriptCallback("__webview_console__",
+            new WebView.JavascriptCallback() {
+                @Override
+                public void run(String arg) {
+                    consoleDispatcher.dispatch(arg);
+                }
+            });
         for (String js : pendingInit) {
             engine.addOnBeforeLoad(js);
         }
-        for (Map.Entry<String, WebView.JavascriptCallback> b : pendingBindings.entrySet()) {
-            engine.addJavascriptCallback(b.getKey(), b.getValue());
+        for (Map.Entry<String, WebView.JavascriptCallback> ent : pendingBindings.entrySet()) {
+            engine.addJavascriptCallback(ent.getKey(), ent.getValue());
         }
+        allocateBuffer(w, h);
         engine.navigate(pendingUrl);
         repaintTimer = new Timer(REPAINT_INTERVAL_MS, e -> repaint());
         repaintTimer.setRepeats(true);
@@ -281,6 +294,12 @@ public class WebViewLightweightComponent extends WebViewComponent {
     @Override
     public WebViewComponent addJavascriptCallback(String name,
                                                   WebView.JavascriptCallback cb) {
+        if (name != null && name.startsWith(RESERVED_BINDING_PREFIX)) {
+            throw new IllegalArgumentException(
+                "name is reserved for internal use: names starting with \""
+                + RESERVED_BINDING_PREFIX + "\" are not allowed (got \""
+                + name + "\")");
+        }
         pendingBindings.put(name, cb);
         if (engine != null) {
             engine.addJavascriptCallback(name, cb);
@@ -294,6 +313,12 @@ public class WebViewLightweightComponent extends WebViewComponent {
             engine.dispatch(r);
         }
         return this;
+    }
+
+    @Override
+    public boolean openDevTools() {
+        if (engine == null) return false;
+        return engine.openDevTools();
     }
 
     @Override

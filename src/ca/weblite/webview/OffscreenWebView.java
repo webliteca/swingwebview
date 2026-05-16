@@ -182,6 +182,17 @@ public class OffscreenWebView {
         return this;
     }
 
+    /**
+     * Open the WebKitGTK Web Inspector for the offscreen WebView in a
+     * separate OS window.  Returns {@code true} if opened, {@code false}
+     * if developer-extras was not enabled at create time or the engine
+     * has no inspector.
+     */
+    public boolean openDevTools() {
+        checkAlive();
+        return WebViewNative.webview_offscreen_open_devtools(peer) == 1;
+    }
+
     /** Release native resources. */
     public void dispose() {
         if (peer != 0L) {

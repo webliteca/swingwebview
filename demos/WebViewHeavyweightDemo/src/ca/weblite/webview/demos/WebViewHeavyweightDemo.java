@@ -1,17 +1,20 @@
 /*
  * MIT License
  *
- * Demonstrates embedding a native WebView as a heavyweight Swing component,
- * and exercises the trickier mixing scenarios with surrounding Swing
- * widgets: a JComboBox whose drop-down extends over the WebView area, and
- * a JTabbedPane where the WebView is one of several tabs.
+ * Demonstrates embedding a native WebView in a Swing application via the
+ * {@link WebViewComponent#create()} factory, alongside surrounding Swing
+ * widgets that exercise the trickier mixing scenarios: a JComboBox whose
+ * drop-down extends over the WebView area, a JTabbedPane where the
+ * WebView is one of several tabs, and a JS Bridge panel that round-trips
+ * values between the page and Java via the structured callback / eval /
+ * dispatch / console-capture APIs.
  */
 package ca.weblite.webview.demos;
 
+import ca.weblite.webview.ConsoleListener;
+import ca.weblite.webview.ConsoleMessage;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.swing.WebViewComponent;
-import ca.weblite.webview.swing.WebViewHeavyweightComponent;
-import ca.weblite.webview.swing.WebViewLightweightComponent;
 
 import java.awt.BorderLayout;
 import java.awt.Dimension;
@@ -20,8 +23,6 @@ import java.awt.FlowLayout;
 import java.awt.Font;
 import java.time.LocalTime;
 import java.time.format.DateTimeFormatter;
-import java.util.LinkedHashMap;
-import java.util.Map;
 import javax.swing.BorderFactory;
 import javax.swing.BoxLayout;
 import javax.swing.DefaultListModel;
@@ -45,7 +46,7 @@ public class WebViewHeavyweightDemo {
 
     // Self-contained page that exercises every JS-bridge feature: it calls
     // window.swingLog / window.swingPing on button click so the user can
-    // observe round-trips from both webviews after registering the bindings.
+    // observe round-trips after registering the bindings.
     private static final String TEST_PAGE_LABEL = "(JS bridge test page)";
     private static final String TEST_PAGE_URL =
         "data:text/html;charset=utf-8," +
@@ -58,6 +59,14 @@ public class WebViewHeavyweightDemo {
         "<button onclick=\"if(window.swingLog)window.swingLog('hello from button',new Date().toLocaleTimeString());else alert('swingLog not bound yet')\">Call swingLog</button> " +
         "<button onclick=\"if(window.swingPing)window.swingPing(JSON.stringify({rand:Math.random()}));else alert('swingPing not bound yet')\">Call swingPing</button>" +
         "</p>" +
+        "<p>Console output (visible in the Log tab):</p>" +
+        "<p>" +
+        "<button onclick=\"console.log('log()', new Date().toLocaleTimeString())\">console.log</button> " +
+        "<button onclick=\"console.info('info()')\">console.info</button> " +
+        "<button onclick=\"console.warn('warn() — careful')\">console.warn</button> " +
+        "<button onclick=\"console.error('error() — oops')\">console.error</button> " +
+        "<button onclick=\"console.debug('debug() trace')\">console.debug</button>" +
+        "</p>" +
         "<p>Or type in <code>document.title</code> below and use the JS " +
         "Bridge eval box to read it back via <code>window.swingLog</code>:</p>" +
         "<p>Title: <input id='t' value='hello'/> " +
@@ -67,32 +76,55 @@ public class WebViewHeavyweightDemo {
 
     public static void main(String[] args) {
         // Heavyweight popups so JComboBox dropdowns, tooltips, and menus
-        // render as real NSWindows that sit above the WKWebView heavyweight
-        // peer.  Without this their lightweight Swing form would be painted
-        // behind the WebView and effectively invisible.
+        // render as real OS-level popups that sit above any heavyweight
+        // WebView peer.  Has no observable downside in lightweight mode
+        // (Linux default), where Swing popups composite over the offscreen
+        // pixels just fine either way.
         JPopupMenu.setDefaultLightWeightPopupEnabled(false);
         ToolTipManager.sharedInstance().setLightWeightPopupEnabled(false);
         EventQueue.invokeLater(WebViewHeavyweightDemo::run);
     }
 
     private static void run() {
-        JFrame frame = new JFrame("WebView Heavyweight Demo");
+        JFrame frame = new JFrame("WebView Demo");
         frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
 
-        // ----- WebView and URL bar -----
-        WebViewHeavyweightComponent wv = new WebViewHeavyweightComponent();
+        // ----- WebView via factory -----
+        // create() picks the right implementation for the host platform
+        // (heavyweight on macOS/Windows, lightweight on Linux).  Override
+        // with -Dca.weblite.webview.mode=heavyweight|lightweight.
+        WebViewComponent wv = WebViewComponent.create();
+        // debug=true enables the platform's native DevTools and (on Linux
+        // debug builds) routes console.* to stdout.  Console capture
+        // itself works either way.
+        wv.setDebug(true);
         wv.setUrl("https://example.com");
         wv.setPreferredSize(new Dimension(900, 600));
 
+        System.err.println("[demo] WebView mode: "
+            + WebViewComponent.resolveDefaultMode()
+            + " (heavyweight=" + wv.isHeavyweight() + ")");
+
+        // ----- Console capture -> Log tab -----
+        JTextArea logArea = new JTextArea(20, 80);
+        logArea.setEditable(false);
+        logArea.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+        ConsoleListener consoleListener = new ConsoleListener() {
+            @Override
+            public void onMessage(ConsoleMessage msg) {
+                logArea.append(msg.toString() + "\n");
+                logArea.setCaretPosition(logArea.getDocument().getLength());
+            }
+        };
+        wv.addConsoleListener(consoleListener);
+
+        // ----- URL bar / toolbar -----
         JTextField urlField = new JTextField("https://example.com", 50);
         urlField.setToolTipText("Press Enter or click Go to navigate.");
         JButton go = new JButton("Go");
         go.addActionListener(e -> wv.setUrl(resolveUrl(urlField.getText())));
         urlField.addActionListener(e -> wv.setUrl(resolveUrl(urlField.getText())));
 
-        // JComboBox in the toolbar -- drop-down should open over the
-        // WebView area when "Browser" tab is selected.  This is the
-        // canonical "does heavyweight popup work?" test.
         JComboBox<String> bookmark = new JComboBox<>(new String[] {
             "Bookmarks ...",
             TEST_PAGE_LABEL,
@@ -119,9 +151,10 @@ public class WebViewHeavyweightDemo {
         JCheckBox lightweightToggle = new JCheckBox("Lightweight popups");
         lightweightToggle.setToolTipText(
             "Toggle to flip popup style.  When checked, dropdowns try to " +
-            "use lightweight Swing rendering -- which on this WebView " +
-            "renders BEHIND the heavyweight peer.  Restart required for " +
-            "the change to apply to already-created components.");
+            "use lightweight Swing rendering -- which on a heavyweight " +
+            "WebView renders BEHIND the native peer.  Useful for verifying " +
+            "the heavyweight popup interop story; has no observable effect " +
+            "in lightweight mode.");
         lightweightToggle.addActionListener(e -> {
             JPopupMenu.setDefaultLightWeightPopupEnabled(
                 lightweightToggle.isSelected());
@@ -143,64 +176,52 @@ public class WebViewHeavyweightDemo {
         // ----- Tabs -----
         JTabbedPane tabs = new JTabbedPane();
 
-        JPanel browserTab = new JPanel(new BorderLayout());
-        browserTab.add(wv, BorderLayout.CENTER);
-        tabs.addTab("Heavyweight", browserTab);
+        JPanel webviewTab = new JPanel(new BorderLayout());
+        webviewTab.add(wv, BorderLayout.CENTER);
+        tabs.addTab("WebView", webviewTab);
 
-        // Lightweight (offscreen) WebView.  Currently Linux-only;
-        // on macOS / Windows the native entry points are stubs and
-        // the component will show its empty Swing background.  On
-        // Linux this is the recommended mode: rendering, mouse, and
-        // keyboard all work; the heavyweight tab has reliable
-        // rendering but unreliable visible text-input feedback.
-        WebViewLightweightComponent lwv = new WebViewLightweightComponent();
-        lwv.setUrl("https://example.com");
-        lwv.setPreferredSize(new Dimension(900, 600));
-        JPanel lightweightTab = new JPanel(new BorderLayout());
-        JTextArea lwExplainer = new JTextArea(
-            "Lightweight (offscreen) WebView.  Renders the page into a " +
-            "BufferedImage and forwards mouse/keyboard from AWT into the " +
-            "engine -- so Swing components composite cleanly above it " +
-            "(JComboBox dropdowns, JLayer overlays, etc.) and Z-order " +
-            "works without tricks.  On Linux this is the recommended " +
-            "mode.  Known limitations: no IME / CJK composition; " +
-            "right-click context menus and in-page <select> dropdowns " +
-            "don't render (they're suppressed because they'd otherwise " +
-            "paint to our invisible offscreen surface).");
-        lwExplainer.setEditable(false);
-        lwExplainer.setLineWrap(true);
-        lwExplainer.setWrapStyleWord(true);
-        lwExplainer.setMargin(new java.awt.Insets(8, 12, 8, 12));
-        lightweightTab.add(lwExplainer, BorderLayout.NORTH);
-        lightweightTab.add(lwv, BorderLayout.CENTER);
-        tabs.addTab("Lightweight", lightweightTab);
-
-        // On Linux the lightweight tab is the recommended path, so
-        // open the demo on it.  Other platforms get the heavyweight
-        // tab by default since heavyweight works fully there.
-        if (System.getProperty("os.name", "").toLowerCase()
-                .contains("linux")) {
-            tabs.setSelectedIndex(1); // Lightweight
-        }
-
-        // Have the Go button and bookmark dropdown drive both webviews
-        // so the user can compare them side-by-side as they navigate.
-        go.addActionListener(e -> lwv.setUrl(resolveUrl(urlField.getText())));
-        urlField.addActionListener(e -> lwv.setUrl(resolveUrl(urlField.getText())));
-        bookmark.addActionListener(e -> {
-            int i = bookmark.getSelectedIndex();
-            if (i <= 0) return;
-            String selected = (String) bookmark.getSelectedItem();
-            lwv.setUrl(resolveUrl(selected));
+        // Log tab -- captures every console.* call from the page on the EDT.
+        JPanel logTab = new JPanel(new BorderLayout(4, 4));
+        JTextArea logExplainer = new JTextArea(
+            "Captured console.log / info / warn / error / debug calls from " +
+            "the embedded page.  Lines are formatted as " +
+            "[LEVEL] source:line text.  Listeners fire on the EDT and the " +
+            "shim is installed at document-start, so this includes calls " +
+            "that run before the first navigation completes.");
+        logExplainer.setEditable(false);
+        logExplainer.setLineWrap(true);
+        logExplainer.setWrapStyleWord(true);
+        logExplainer.setMargin(new java.awt.Insets(8, 12, 8, 12));
+        JButton clearLogBtn = new JButton("Clear");
+        clearLogBtn.addActionListener(e -> logArea.setText(""));
+        JCheckBox mirrorStdout = new JCheckBox("Mirror to System.out", false);
+        mirrorStdout.setToolTipText(
+            "When checked, captured messages are also written to the " +
+            "process's stdout (in addition to this Log tab).");
+        mirrorStdout.addActionListener(e -> {
+            wv.setConsoleOutput(mirrorStdout.isSelected() ? System.out : null);
         });
+        JPanel logCtrlRow = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 2));
+        logCtrlRow.add(mirrorStdout);
+        logCtrlRow.add(clearLogBtn);
+        logTab.add(logExplainer, BorderLayout.NORTH);
+        logTab.add(new JScrollPane(logArea), BorderLayout.CENTER);
+        logTab.add(logCtrlRow, BorderLayout.SOUTH);
+        tabs.addTab("Log", logTab);
 
+        // Pure-Swing tab -- exercises the tab-visibility tracking on the
+        // heavyweight engine (HierarchyListener hides the native peer when
+        // this tab is selected and restores it on the way back).  No-op on
+        // lightweight where the engine is offscreen anyway.
         JPanel swingTab = new JPanel(new BorderLayout(8, 8));
         JTextArea explainer = new JTextArea(
             "This tab is pure Swing.\n\n" +
-            "Switch back to the 'Browser' tab to verify the embedded\n" +
-            "WebView re-appears (a HierarchyListener on the heavyweight\n" +
-            "Canvas calls setHidden:YES on the WKWebView when this tab\n" +
-            "becomes active, and reverses it on the way back).");
+            "Switch back to the 'WebView' tab to verify the embedded\n" +
+            "WebView re-appears.  On heavyweight (macOS / Windows) a\n" +
+            "HierarchyListener on the Canvas hides the native peer when\n" +
+            "this tab becomes active and restores it on the way back.\n" +
+            "Lightweight (Linux) has nothing to hide -- the offscreen\n" +
+            "engine just stops being painted.");
         explainer.setEditable(false);
         explainer.setMargin(new java.awt.Insets(12, 12, 12, 12));
         swingTab.add(explainer, BorderLayout.NORTH);
@@ -211,11 +232,8 @@ public class WebViewHeavyweightDemo {
         swingTab.add(new JScrollPane(new JList<>(items)), BorderLayout.CENTER);
         tabs.addTab("Swing only", swingTab);
 
-        // ----- JS Bridge panel (drives both WebViews) -----
-        Map<String, WebViewComponent> bridgeTargets = new LinkedHashMap<>();
-        bridgeTargets.put("[hw]", wv);
-        bridgeTargets.put("[lw]", lwv);
-        JPanel jsBridge = buildJsBridgePanel(bridgeTargets);
+        // ----- JS Bridge panel -----
+        JPanel jsBridge = buildJsBridgePanel(wv);
 
         // ----- Frame -----
         JSplitPane split = new JSplitPane(
@@ -243,12 +261,10 @@ public class WebViewHeavyweightDemo {
      * Builds a panel that exercises every JS-interaction method on the
      * abstract {@link WebViewComponent}: {@code eval},
      * {@code addOnBeforeLoad}, {@code addJavascriptCallback}, and
-     * {@code dispatch}.  The same controls drive every webview in
-     * {@code targets} so the heavyweight and lightweight implementations
-     * can be compared side-by-side by switching tabs.
+     * {@code dispatch}.  The controls drive the single webview supplied
+     * by the factory.
      */
-    private static JPanel buildJsBridgePanel(
-            Map<String, WebViewComponent> targets) {
+    private static JPanel buildJsBridgePanel(WebViewComponent wv) {
         JPanel panel = new JPanel(new BorderLayout(6, 6));
         panel.setBorder(BorderFactory.createTitledBorder("JS Bridge"));
 
@@ -266,15 +282,13 @@ public class WebViewHeavyweightDemo {
         JPanel evalRow = new JPanel(new BorderLayout(4, 0));
         JTextField evalField = new JTextField("document.title");
         evalField.setToolTipText(
-            "Run JS in the current document of both webviews.  Result is " +
-            "fire-and-forget -- use a binding (swingLog) to round-trip a value.");
+            "Run JS in the current document.  Result is fire-and-forget " +
+            "-- use a binding (swingLog) to round-trip a value.");
         JButton evalBtn = new JButton("Eval");
         Runnable runEval = () -> {
             String js = evalField.getText();
-            for (Map.Entry<String, WebViewComponent> en : targets.entrySet()) {
-                append.accept(en.getKey() + " eval: " + js);
-                en.getValue().eval(js);
-            }
+            append.accept("eval: " + js);
+            wv.eval(js);
         };
         evalBtn.addActionListener(e -> runEval.run());
         evalField.addActionListener(e -> runEval.run());
@@ -293,11 +307,8 @@ public class WebViewHeavyweightDemo {
         JButton initBtn = new JButton("Add onBeforeLoad");
         initBtn.addActionListener(e -> {
             String js = initField.getText();
-            for (Map.Entry<String, WebViewComponent> en : targets.entrySet()) {
-                en.getValue().addOnBeforeLoad(js);
-            }
-            append.accept("addOnBeforeLoad registered on " +
-                targets.size() + " webview(s); takes effect on next navigation");
+            wv.addOnBeforeLoad(js);
+            append.accept("addOnBeforeLoad registered; takes effect on next navigation");
         });
         initRow.add(new JLabel("Init:"), BorderLayout.WEST);
         initRow.add(initField, BorderLayout.CENTER);
@@ -307,53 +318,52 @@ public class WebViewHeavyweightDemo {
         JPanel bindRow = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
         JButton bindLog = new JButton("Register window.swingLog");
         bindLog.setToolTipText(
-            "Expose a Java callback as window.swingLog(...) inside both " +
-            "pages.  Args arrive as a JSON array string.");
+            "Expose a Java callback as window.swingLog(...) inside the " +
+            "page.  Args arrive as a JSON-array string.");
         bindLog.addActionListener(e -> {
-            for (Map.Entry<String, WebViewComponent> en : targets.entrySet()) {
-                final String lbl = en.getKey();
-                en.getValue().addJavascriptCallback("swingLog",
-                    new WebView.JavascriptCallback() {
-                        @Override public void run(String arg) {
-                            append.accept(lbl + " swingLog <- " + arg);
-                        }
-                    });
-            }
-            append.accept("(registered window.swingLog on " +
-                targets.size() + " webview(s))");
+            wv.addJavascriptCallback("swingLog",
+                new WebView.JavascriptCallback() {
+                    @Override public void run(String arg) {
+                        append.accept("swingLog <- " + arg);
+                    }
+                });
+            append.accept("(registered window.swingLog)");
         });
         JButton bindPing = new JButton("Register window.swingPing");
         bindPing.addActionListener(e -> {
-            for (Map.Entry<String, WebViewComponent> en : targets.entrySet()) {
-                final String lbl = en.getKey();
-                en.getValue().addJavascriptCallback("swingPing",
-                    new WebView.JavascriptCallback() {
-                        @Override public void run(String arg) {
-                            append.accept(lbl + " swingPing <- " + arg);
-                        }
-                    });
-            }
-            append.accept("(registered window.swingPing on " +
-                targets.size() + " webview(s))");
+            wv.addJavascriptCallback("swingPing",
+                new WebView.JavascriptCallback() {
+                    @Override public void run(String arg) {
+                        append.accept("swingPing <- " + arg);
+                    }
+                });
+            append.accept("(registered window.swingPing)");
         });
         JButton dispatchBtn = new JButton("Dispatch hello");
         dispatchBtn.setToolTipText(
-            "Call dispatch(Runnable) on both webviews; the Runnable runs " +
-            "on each native UI thread and reports back via the log.");
+            "Call dispatch(Runnable) on the webview; the Runnable runs " +
+            "on the native UI thread and reports back via the log.");
         dispatchBtn.addActionListener(e -> {
-            for (Map.Entry<String, WebViewComponent> en : targets.entrySet()) {
-                final String lbl = en.getKey();
-                en.getValue().dispatch(new Runnable() {
-                    @Override public void run() {
-                        append.accept(lbl + " dispatch ran on thread: " +
-                            Thread.currentThread().getName());
-                    }
-                });
-            }
+            wv.dispatch(new Runnable() {
+                @Override public void run() {
+                    append.accept("dispatch ran on thread: " +
+                        Thread.currentThread().getName());
+                }
+            });
+        });
+        JButton devtoolsBtn = new JButton("Open DevTools");
+        devtoolsBtn.setToolTipText(
+            "Open the platform's native Web Inspector / DevTools in a " +
+            "separate OS window.  Returns false on macOS (use right-click " +
+            "-> Inspect Element instead).");
+        devtoolsBtn.addActionListener(e -> {
+            boolean opened = wv.openDevTools();
+            append.accept("openDevTools() -> " + opened);
         });
         bindRow.add(bindLog);
         bindRow.add(bindPing);
         bindRow.add(dispatchBtn);
+        bindRow.add(devtoolsBtn);
 
         JPanel controls = new JPanel();
         controls.setLayout(new BoxLayout(controls, BoxLayout.Y_AXIS));
