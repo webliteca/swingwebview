@@ -87,8 +87,8 @@ public class WebViewHeavyweightDemo {
         JTextField urlField = new JTextField("https://example.com", 50);
         urlField.setToolTipText("Press Enter or click Go to navigate.");
         JButton go = new JButton("Go");
-        go.addActionListener(e -> wv.setUrl(urlField.getText().trim()));
-        urlField.addActionListener(e -> wv.setUrl(urlField.getText().trim()));
+        go.addActionListener(e -> wv.setUrl(resolveUrl(urlField.getText())));
+        urlField.addActionListener(e -> wv.setUrl(resolveUrl(urlField.getText())));
 
         // JComboBox in the toolbar -- drop-down should open over the
         // WebView area when "Browser" tab is selected.  This is the
@@ -108,9 +108,12 @@ public class WebViewHeavyweightDemo {
             int i = bookmark.getSelectedIndex();
             if (i <= 0) return;
             String selected = (String) bookmark.getSelectedItem();
-            String u = TEST_PAGE_LABEL.equals(selected) ? TEST_PAGE_URL : selected;
-            urlField.setText(u);
-            wv.setUrl(u);
+            // Display the label in the URL field instead of stuffing a
+            // multi-kilobyte data: URL into it; resolveUrl() reverses the
+            // label back to TEST_PAGE_URL if the user later presses Enter
+            // or Go without editing.
+            urlField.setText(selected);
+            wv.setUrl(resolveUrl(selected));
         });
 
         JCheckBox lightweightToggle = new JCheckBox("Lightweight popups");
@@ -182,14 +185,13 @@ public class WebViewHeavyweightDemo {
 
         // Have the Go button and bookmark dropdown drive both webviews
         // so the user can compare them side-by-side as they navigate.
-        go.addActionListener(e -> lwv.setUrl(urlField.getText().trim()));
-        urlField.addActionListener(e -> lwv.setUrl(urlField.getText().trim()));
+        go.addActionListener(e -> lwv.setUrl(resolveUrl(urlField.getText())));
+        urlField.addActionListener(e -> lwv.setUrl(resolveUrl(urlField.getText())));
         bookmark.addActionListener(e -> {
             int i = bookmark.getSelectedIndex();
             if (i <= 0) return;
             String selected = (String) bookmark.getSelectedItem();
-            String u = TEST_PAGE_LABEL.equals(selected) ? TEST_PAGE_URL : selected;
-            lwv.setUrl(u);
+            lwv.setUrl(resolveUrl(selected));
         });
 
         JPanel swingTab = new JPanel(new BorderLayout(8, 8));
@@ -226,6 +228,15 @@ public class WebViewHeavyweightDemo {
         frame.pack();
         frame.setLocationRelativeTo(null);
         frame.setVisible(true);
+    }
+
+    // Translates the URL-field text into the URL to navigate to.  The only
+    // non-identity mapping today is the (JS bridge test page) label, which
+    // expands back to its data: URL -- otherwise the multi-kilobyte URL
+    // would be stuffed into the URL field on bookmark selection.
+    private static String resolveUrl(String input) {
+        String trimmed = input == null ? "" : input.trim();
+        return TEST_PAGE_LABEL.equals(trimmed) ? TEST_PAGE_URL : trimmed;
     }
 
     /**
