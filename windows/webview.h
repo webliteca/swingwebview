@@ -741,6 +741,7 @@ using browser_engine = cocoa_wkwebview_engine;
 // EdgeHTML headers and libs
 #include <objbase.h>
 #include <winrt/Windows.Foundation.h>
+#include <winrt/Windows.Foundation.Collections.h>
 #include <winrt/Windows.Web.UI.Interop.h>
 #pragma comment(lib, "windowsapp")
 

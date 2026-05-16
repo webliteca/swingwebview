@@ -57,11 +57,16 @@ struct JawtLock {
     bool ok = false;
 
     JawtLock(JNIEnv *env, jobject component) {
+#if defined(JAWT_VERSION_9)
         awt.version = JAWT_VERSION_9;
         if (!JAWT_GetAWT(env, &awt)) {
             awt.version = JAWT_VERSION_1_4;
             if (!JAWT_GetAWT(env, &awt)) return;
         }
+#else
+        awt.version = JAWT_VERSION_1_4;
+        if (!JAWT_GetAWT(env, &awt)) return;
+#endif
         ds = awt.GetDrawingSurface(env, component);
         if (!ds) return;
         lock = ds->Lock(ds);
