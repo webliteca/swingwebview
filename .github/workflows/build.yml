@@ -21,10 +21,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-13          # Intel
+          # Both macOS builds run on macos-14 (arm64).  Intel runners
+          # (macos-13) are being phased out, and Xcode's SDK is universal
+          # so cross-compiling x86_64 from arm64 with `clang -arch x86_64`
+          # just works -- JNI headers, AWT, and the macOS frameworks all
+          # have x86_64 slices regardless of host arch.
+          - os: macos-14
+            mac_arch: x86_64
             native_dir: osx_64
             lib_name: libwebview.dylib
-          - os: macos-14          # Apple Silicon
+          - os: macos-14
+            mac_arch: arm64
             native_dir: osx_arm64
             lib_name: libwebview.dylib
           - os: ubuntu-24.04
@@ -58,13 +65,14 @@ jobs:
           java-version: '8'
 
       # ---------------- macOS -------------------------------------------------
-      - name: Build macOS native
+      - name: Build macOS native (${{ matrix.mac_arch }})
         if: runner.os == 'macOS'
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "src/${{ matrix.native_dir }}"
           c++ \
+              -arch ${{ matrix.mac_arch }} \
               -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/darwin" \
               -dynamiclib \
               src_c/webview_embed.cpp \
