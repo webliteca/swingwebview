@@ -198,6 +198,7 @@ jobs:
         with:
           distribution: liberica
           java-version: '11'
+          cache: maven
 
       - name: Download all native artifacts
         uses: actions/download-artifact@v4
@@ -217,41 +218,20 @@ jobs:
           echo "--- final native layout ---"
           find src -maxdepth 2 -type f \( -name '*.dylib' -o -name '*.so' -o -name '*.dll' \) | sort
 
-      - name: Compile WebView Java sources (target JDK 8 bytecode)
+      - name: Build WebView.jar with Maven
         shell: bash
+        # source/target 1.8 in pom.xml keeps the assembled jar runnable on
+        # JRE 8 even though we build it with JDK 11.
         run: |
           set -euo pipefail
-          mkdir -p build/classes-webview dist
-          find src -name '*.java' > build/wv-sources.txt
-          # --release 8 so the assembled jar still runs on a JRE 8 host
-          # even though we build it with JDK 11.
-          javac --release 8 -d build/classes-webview \
-              -classpath 'lib/*' @build/wv-sources.txt
-
-      - name: Stage and package WebView.jar
-        shell: bash
-        run: |
-          set -euo pipefail
-          STAGE=build/stage-webview
-          rm -rf "$STAGE"
-          mkdir -p "$STAGE"
-          cp -R build/classes-webview/. "$STAGE"/
-          # Copy each <native_dir> from src/ into the jar root so
-          # NativeLibraryUtil.getPlatformLibraryPath finds it.
-          for d in src/osx_64 src/osx_arm64 src/linux_64 src/linux_arm64 \
-                   src/windows_64 src/windows_arm64; do
-              if [ -d "$d" ]; then
-                  cp -R "$d" "$STAGE"/
-              fi
-          done
-          ( cd "$STAGE" && jar cf ../../dist/WebView.jar . )
+          mvn -B -DskipTests package
           echo "--- jar contents ---"
-          jar tf dist/WebView.jar | sort | head -80
-          ls -la dist/
+          jar tf target/WebView.jar | sort | head -80
+          ls -la target/
 
       - name: Upload WebView.jar
         uses: actions/upload-artifact@v4
         with:
           name: WebView-jar
-          path: dist/WebView.jar
+          path: target/WebView.jar
           if-no-files-found: error

@@ -1,1 +1,1 @@
-ant shaded-jar -Dplatforms.JDK_1.8.home=$JAVA_HOME
+mvn -DskipTests package
