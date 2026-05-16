@@ -22,24 +22,24 @@ generated_at: 2026-05-16T07:19:13-07:00
 - Repaint pixel surface at ~30Hz to feel responsive
   (`WebViewLightweightComponent.java:51`, `REPAINT_INTERVAL_MS =
   33`).
-- Platform support (`README.md:182`):
+- Platform support (`README.md ("Platform support" section)`):
   - **Linux** — full: rendering, mouse (click, drag, scroll,
     hover), keyboard (typing, Backspace, Delete, arrows,
     function keys, modifiers).
   - **macOS, Windows** — stubs: native entry points return 0
     from create, so the component silently fails to attach and
     shows its empty Swing background.
-- Known limitations documented at `README.md:216`:
+- Known limitations documented at `README.md ("Lightweight notes" section)`:
   - No IME / CJK composition — WebKit's IM context is disabled
     because input arrives already-decoded from AWT
     (`WebViewLightweightComponent.java:41`).
   - Right-click context menus and `<select>` dropdowns from
     inside the page log a GDK warning and don't visibly appear
-    (`README.md:223`).
+    (`README.md ("Lightweight notes" section)`).
 - The lightweight subclass currently does **not** wire init
   scripts, `eval`, or JS callbacks — phase 1 is rendering and
   input only (`WebViewLightweightComponent.java:244`).
-- Definition of Done: documented at `README.md:148`,
+- Definition of Done: documented at `README.md ("Quick start" section)`,
   exercised by the `WebViewHeavyweightDemo` toggle (which
   also shows a lightweight component side-by-side) and the
   `run-linux-demo.sh` script. No automated tests.
@@ -74,7 +74,7 @@ generated_at: 2026-05-16T07:19:13-07:00
   `GtkOffscreenWindow` on the GTK side, this component
   periodically snapshots the resulting cairo surface into a
   `BufferedImage`, and Swing composites the image normally
-  (`README.md:216`).
+  (`README.md ("Lightweight notes" section)`).
 - **AWT → GDK translation.** Mouse and key events are
   translated in pure Java (`GdkInput`) into GDK button numbers,
   GDK modifier masks, and GDK keysyms; the native side feeds
@@ -92,7 +92,7 @@ generated_at: 2026-05-16T07:19:13-07:00
 - **Bypass WebKit IM context.** WebKit's input method context
   is disabled native-side because AWT already decodes
   characters before they reach the component. The cost is no
-  CJK / IME composition support (`README.md:218`).
+  CJK / IME composition support (`README.md ("Lightweight notes" section)`).
 - **Trade-off accepted: per-frame copy.** Each frame the
   native side memcpy's cairo pixels into the Java int array
   via `webview_offscreen_snapshot`. Higher per-frame cost
@@ -357,7 +357,7 @@ File: `src/ca/weblite/webview/swing/WebViewLightweightComponent.java`
 - `OffscreenWebView.create` returns `null` for unsupported
   platforms or native failure rather than throwing
   (`OffscreenWebView.java:39`), so the Swing component can
-  degrade gracefully (`README.md:184`).
+  degrade gracefully (`README.md ("Platform support" section)`).
 - `min(1, w/h)` on create and resize prevents zero/negative
   dimensions from reaching the native engine, which would
   trigger GTK assertions

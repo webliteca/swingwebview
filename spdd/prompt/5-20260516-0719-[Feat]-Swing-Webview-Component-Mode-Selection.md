@@ -27,7 +27,7 @@ generated_at: 2026-05-16T07:19:13-07:00
 - `WebViewComponent.create(Mode mode)` lets callers pick
   explicitly without going through the property
   (`WebViewComponent.java:76`).
-- Definition of Done: documented in `README.md:131` ("Embedding
+- Definition of Done: documented in `README.md ("Choosing a mode" section)` ("Embedding
   WebView Directly in Swing") and exercised by the
   `WebViewHeavyweightDemo` (`demos/WebViewHeavyweightDemo/...`).
   No automated tests cover this factory.
@@ -56,15 +56,15 @@ generated_at: 2026-05-16T07:19:13-07:00
   lightweight because the heavyweight path on WebKitGTK reparented
   under a foreign-toolkit X11 parent has unreliable visible
   text-input feedback (caret blink, characters as typed). See
-  `README.md:182` and the inline comment at
+  `README.md ("Platform support" section)` and the inline comment at
   `WebViewComponent.java:106`. macOS/Windows get heavyweight
   because the lightweight path is currently a stub on those
-  platforms (`README.md:182`, `WebViewLightweightComponent.java:43`).
+  platforms (`README.md ("Platform support" section)`, `WebViewLightweightComponent.java:43`).
 - **Override is a system property, not a constructor flag.** A
   property keeps the call sites in callers identical across all
   platforms — `WebViewComponent.create()` — while still letting
   ops/devs flip the toggle from launchers
-  (`README.md:148`).
+  (`README.md ("Quick start" section)`).
 - **Configuration replay.** The abstract API allows callers to
   call `setUrl`, `addOnBeforeLoad`, `addJavascriptCallback`
   BEFORE the component is displayable; each concrete subclass is
@@ -80,7 +80,7 @@ generated_at: 2026-05-16T07:19:13-07:00
 - `src/ca/weblite/webview/swing/WebViewLightweightComponent.java`
   — lightweight subclass; implementation details in
   [[swing-lightweight-webview-embedding]].
-- `README.md:131` — user-facing platform/mode matrix and override
+- `README.md ("Choosing a mode" section)` — user-facing platform/mode matrix and override
   documentation.
 
 ## O · Operations
@@ -138,7 +138,7 @@ File: `src/ca/weblite/webview/swing/WebViewComponent.java`
 3. Constraints / Invariants:
    - The factory is the only blessed entry point; constructing
      either subclass directly is allowed (per
-     `README.md:155`) but loses platform-aware defaulting.
+     `README.md ("Choosing a mode" section)`) but loses platform-aware defaulting.
 
 ### 4. Declare Embedding API Surface
 File: `src/ca/weblite/webview/swing/WebViewComponent.java`
@@ -180,9 +180,9 @@ File: `src/ca/weblite/webview/swing/WebViewComponent.java`
 ## N · Norms
 - The system property name `ca.weblite.webview.mode` is part of
   the public surface — do not rename it. Document any new
-  property values in `README.md:131`.
+  property values in `README.md ("Choosing a mode" section)`.
 - The lightweight↔heavyweight platform matrix lives in
-  `README.md:182` and must be kept in sync with what
+  `README.md ("Platform support" section)` and must be kept in sync with what
   `resolveDefaultMode` actually returns and what each subclass
   actually supports.
 

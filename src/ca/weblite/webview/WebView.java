@@ -31,13 +31,11 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Encapsulates a WebBrowser window.  This class will interface directly with 
- * the ZSerge WebView via JNI.  I.e. It will load a the webview in the current 
- * process.  Currently running in-process doesn't play nice with other GUI toolkits
- * because it wants to run on the main thread, and it wants to run its own event 
- * loop.   There may be a way to make it play nice with existing toolkits like Swing,
- * but in the mean time, it is probably easier just to use the {@link WebViewCLIClient}
- * to launch the WebView in its own child process.
+ * Encapsulates a WebBrowser window.  This class interfaces directly with the
+ * ZSerge WebView via JNI and loads the webview in the current process.
+ * Running in-process owns the main thread and its own event loop, so this
+ * class is not suitable for use inside an existing Swing/JavaFX UI; use
+ * {@link ca.weblite.webview.swing.WebViewComponent} for that.
  * @author shannah
  */
 public class WebView {

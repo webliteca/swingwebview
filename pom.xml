@@ -11,7 +11,7 @@
     <packaging>jar</packaging>
 
     <name>WebView</name>
-    <description>Java port of Serge Zaitsev's webview, runnable as a CLI or library.</description>
+    <description>Java port of Serge Zaitsev's webview, embeddable in Swing applications.</description>
     <url>https://github.com/webliteca/swingwebview</url>
 
     <licenses>
@@ -68,18 +68,6 @@
         </resources>
 
         <plugins>
-            <plugin>
-                <artifactId>maven-jar-plugin</artifactId>
-                <version>3.4.1</version>
-                <configuration>
-                    <archive>
-                        <manifest>
-                            <mainClass>ca.weblite.webview.WebViewCLI</mainClass>
-                        </manifest>
-                    </archive>
-                </configuration>
-            </plugin>
-
             <plugin>
                 <groupId>org.sonatype.central</groupId>
                 <artifactId>central-publishing-maven-plugin</artifactId>

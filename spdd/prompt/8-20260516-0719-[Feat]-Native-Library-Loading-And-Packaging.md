@@ -30,7 +30,7 @@ generated_at: 2026-05-16T07:19:13-07:00
   needed (`WebViewNative.java:23`,
   `src/windows_64/`). The system Microsoft Edge WebView2 Runtime
   provides the actual Chromium binaries
-  (`README.md:184`).
+  (`README.md ("Platform support" section)`).
 - Definition of Done: indirectly validated by every other feature
   in this repo — if the native loader is broken, nothing else
   works. No standalone unit tests; smoke tested by the demos
@@ -117,10 +117,9 @@ generated_at: 2026-05-16T07:19:13-07:00
   pre-built native binaries packaged into the JAR.
 - `pom.xml:54` — Maven resource entries that include those
   per-architecture directories at JAR-build time.
-- `build-linux.sh`, `build-mac.sh`, `build-windows.sh`,
-  `build-shaded-jar.sh` — scripts that rebuild the native
-  binaries and copy them into the right `src/<arch>/`
-  directories.
+- `build-linux.sh`, `build-mac.sh`, `build-windows.sh` —
+  scripts that rebuild the native binaries and copy them into
+  the right `src/<arch>/` directories.
 
 ## O · Operations
 

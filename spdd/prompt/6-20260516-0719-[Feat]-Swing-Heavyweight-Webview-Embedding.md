@@ -8,7 +8,7 @@ generated_at: 2026-05-16T07:19:13-07:00
 ## R · Requirements
 - Embed a native WebView inside a Swing UI as a **heavyweight AWT
   child** so a single Java application can mix Swing widgets and
-  a real browser engine without launching a subprocess
+  a real browser engine in-process
   (`WebViewHeavyweightComponent.java:49`, `EmbeddedWebView.java:30`).
 - The component must:
   - Be a `JComponent` subclass that callers add to any Swing
@@ -25,16 +25,16 @@ generated_at: 2026-05-16T07:19:13-07:00
     time (`WebViewHeavyweightComponent.java:152`).
   - Resize the native peer when the Swing region changes
     (`WebViewHeavyweightComponent.java:191`).
-- Per-platform behaviour (`README.md:182`):
+- Per-platform behaviour (`README.md ("Platform support" section)`):
   - **macOS** (Cocoa / WKWebView): full fidelity — rendering,
     input, resize, tab visibility all work.
   - **Linux** (WebKitGTK / X11): rendering, mouse, scroll,
     resize, tab switching work. Visible text-input feedback
     (caret blink, character display) is unreliable — see
-    `README.md:182`.
+    `README.md ("Platform support" section)`.
   - **Windows** (WebView2): full fidelity on Windows 11 with the
     Edge WebView2 Runtime installed.
-- Definition of Done: documented by `README.md:191` ("Heavyweight
+- Definition of Done: documented by `README.md ("Heavyweight platform notes" section)` ("Heavyweight
   platform notes") and exercised by the `WebViewHeavyweightDemo`
   (`demos/WebViewHeavyweightDemo/...`). No automated tests cover
   this — it is GUI integration code.
@@ -82,7 +82,7 @@ generated_at: 2026-05-16T07:19:13-07:00
   embed strategy reparents the native browser as a child of that
   handle, so the host's event loop (Swing/AWT) drives input
   dispatch and visibility — `webview_run()` is never called for
-  embedded WebViews (`README.md:251`,
+  embedded WebViews (`README.md ("Heavyweight popup notes" section)`,
   `WebViewNative.java:108`).
 - **Deferred peer creation on first paint.** The native peer
   cannot be created safely in `addNotify` on macOS because the
@@ -100,7 +100,7 @@ generated_at: 2026-05-16T07:19:13-07:00
   popups (`JComboBox` dropdowns, tooltips, menus) render BEHIND
   it unless the application opts into heavyweight popups via
   `JPopupMenu.setDefaultLightWeightPopupEnabled(false)`
-  (`README.md:237`,
+  (`README.md ("Heavyweight popup notes" section)`,
   `WebViewHeavyweightDemo.java:40`).
 - **Click-to-focus handled native side on Linux.** The class
   used to install AWT mouse/focus listeners to forward focus
