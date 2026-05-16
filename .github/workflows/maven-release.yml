@@ -233,10 +233,13 @@ jobs:
 
       - name: Import GPG key
         shell: bash
-        run: |
-          echo "${{ secrets.GPG_PRIVATE_KEY }}" | base64 --decode | gpg --batch --import
         env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
           GPG_TTY: /dev/null
+        run: |
+          # --ignore-garbage tolerates trailing whitespace/CR from the secret;
+          # printf avoids the trailing newline echo would add.
+          printf '%s' "$GPG_PRIVATE_KEY" | base64 --decode --ignore-garbage | gpg --batch --import
 
       - name: Set Maven project version
         shell: bash
