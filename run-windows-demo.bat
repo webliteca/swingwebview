@@ -143,15 +143,16 @@ if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
 set "WEBVIEW2_DIR=%REPO_DIR%\windows\script\Microsoft.Web.WebView2.0.8.355"
 
 REM The WebView2 SDK is committed as the raw .nupkg (a zip).  Build expects
-REM the build/native/{include,x64} tree -- extract it on first run.
+REM the build/native/{include,x64} tree -- extract it on first run.  Use
+REM PowerShell's ZipFile API (resolved by absolute path) since Litecode's
+REM environment may strip System32 from PATH, taking tar.exe with it.
 if exist "%WEBVIEW2_DIR%\build\native\include\WebView2.h" goto :webview2_ready
 echo Extracting Microsoft.Web.WebView2.0.8.355.nupkg ...
-pushd "%WEBVIEW2_DIR%"
-tar -xf "Microsoft.Web.WebView2.0.8.355.nupkg"
-popd
+set "PWSH=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
+if not exist "%PWSH%" set "PWSH=powershell.exe"
+"%PWSH%" -NoProfile -Command "Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory('%WEBVIEW2_DIR%\Microsoft.Web.WebView2.0.8.355.nupkg', '%WEBVIEW2_DIR%')"
 if not exist "%WEBVIEW2_DIR%\build\native\include\WebView2.h" (
-    echo ERROR: failed to extract WebView2 SDK with tar.exe.
-    echo        Make sure tar.exe is on PATH ^(ships with Windows 10 1803+^).
+    echo ERROR: failed to extract WebView2 SDK.
     exit /b 1
 )
 :webview2_ready
