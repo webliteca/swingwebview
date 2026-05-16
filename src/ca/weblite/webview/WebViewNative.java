@@ -18,9 +18,9 @@ public class WebViewNative {
     
     static {
         try {
-            if (System.getProperty("os.name").toLowerCase().contains("win")) {
-                NativeLoader.loadLibrary("WebView2Loader");
-            }
+            // WebView2Loader is now statically linked into webview.dll on
+            // Windows (via WebView2LoaderStatic.lib), so we no longer need
+            // to extract+load a separate WebView2Loader.dll.
             // Make sure libjawt is in the process before our dylib is bound.
             // The embed engine references JAWT_GetAWT and AWT does not pull
             // libjawt in transitively on macOS, so without this the first

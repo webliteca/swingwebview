@@ -745,10 +745,20 @@ using browser_engine = cocoa_wkwebview_engine;
 #include <winrt/Windows.Web.UI.Interop.h>
 #pragma comment(lib, "windowsapp")
 
-// Edge/Chromium headers and libs
-#include "webview2.h"
+// Edge/Chromium headers and libs.  The standalone webview API in this header
+// originally used the legacy WebView2 SDK (0.8.355, IWebView2WebView), which
+// is incompatible with the modern Evergreen WebView2 runtime.  We've
+// migrated the embedded (Swing) path to the stable WebView2 SDK in
+// windows/webview_embed.cc; the standalone CLI path defined below is left
+// as a stub on Windows -- compiles, runtime no-op for the Chromium engine.
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
+
+// Minimal stand-ins so the rest of this file can compile without the legacy
+// WebView2 SDK headers.  The standalone "edge_chromium" browser below
+// becomes a no-op; callers wanting embedded WebView2 should use the JAWT /
+// Swing path in windows/webview_embed.cc instead.
+struct IWebView2WebView;
 
 namespace webview {
 
@@ -841,95 +851,18 @@ private:
 //
 // Edge/Chromium browser engine
 //
+// Stub.  The original implementation used the legacy WebView2 preview SDK
+// which can't talk to the modern Evergreen WebView2 runtime.  Embedded
+// usage (Swing/AWT) goes through windows/webview_embed.cc instead.
+// Standalone CLI usage on Windows would need a fresh implementation of
+// this class against the stable WebView2 SDK.
 class edge_chromium : public browser {
 public:
-  bool embed(HWND wnd, bool debug, msg_cb_t cb) override {
-    CoInitializeEx(nullptr, 0);
-    std::atomic_flag flag = ATOMIC_FLAG_INIT;
-    flag.test_and_set();
-    HRESULT res = CreateWebView2EnvironmentWithDetails(
-        nullptr, nullptr, nullptr,
-        new webview2_com_handler(wnd, [&](IWebView2WebView *webview) {
-          m_webview = webview;
-          flag.clear();
-        }));
-    if (res != S_OK) {
-      CoUninitialize();
-      return false;
-    }
-    MSG msg = {};
-    while (flag.test_and_set() && GetMessage(&msg, NULL, 0, 0)) {
-      TranslateMessage(&msg);
-      DispatchMessage(&msg);
-    }
-    init("window.external={invoke:s=>window.chrome.webview.postMessage(s)}");
-    return true;
-  }
-
-  void resize(HWND wnd) override {
-    if (m_webview == nullptr) {
-      return;
-    }
-    RECT bounds;
-    GetClientRect(wnd, &bounds);
-    m_webview->put_Bounds(bounds);
-  }
-
-  void navigate(const std::string url) override {
-    auto wurl = to_lpwstr(url);
-    m_webview->Navigate(wurl);
-    delete[] wurl;
-  }
-
-  void init(const std::string js) override {
-    LPCWSTR wjs = to_lpwstr(js);
-    m_webview->AddScriptToExecuteOnDocumentCreated(wjs, nullptr);
-    delete[] wjs;
-  }
-
-  void eval(const std::string js) override {
-    LPCWSTR wjs = to_lpwstr(js);
-    m_webview->ExecuteScript(wjs, nullptr);
-    delete[] wjs;
-  }
-
-private:
-  LPWSTR to_lpwstr(const std::string s) {
-    int n = MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, NULL, 0);
-    wchar_t *ws = new wchar_t[n];
-    MultiByteToWideChar(CP_UTF8, 0, s.c_str(), -1, ws, n);
-    return ws;
-  }
-
-  IWebView2WebView *m_webview = nullptr;
-
-  class webview2_com_handler
-      : public IWebView2CreateWebView2EnvironmentCompletedHandler,
-        public IWebView2CreateWebViewCompletedHandler {
-    using webview2_com_handler_cb_t = std::function<void(IWebView2WebView *)>;
-
-  public:
-    webview2_com_handler(HWND hwnd, webview2_com_handler_cb_t cb)
-        : m_window(hwnd), m_cb(cb) {}
-    ULONG STDMETHODCALLTYPE AddRef() { return 1; }
-    ULONG STDMETHODCALLTYPE Release() { return 1; }
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, LPVOID *ppv) {
-      return S_OK;
-    }
-    HRESULT STDMETHODCALLTYPE Invoke(HRESULT res, IWebView2Environment *env) {
-      env->CreateWebView(m_window, this);
-      return S_OK;
-    }
-    HRESULT STDMETHODCALLTYPE Invoke(HRESULT res, IWebView2WebView *webview) {
-      webview->AddRef();
-      m_cb(webview);
-      return S_OK;
-    }
-
-  private:
-    HWND m_window;
-    webview2_com_handler_cb_t m_cb;
-  };
+  bool embed(HWND, bool, msg_cb_t) override { return false; }
+  void resize(HWND) override {}
+  void navigate(const std::string) override {}
+  void init(const std::string) override {}
+  void eval(const std::string) override {}
 };
 
 class win32_edge_engine {

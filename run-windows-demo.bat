@@ -140,17 +140,30 @@ set "DLL_OUT=%REPO_DIR%\src\%NATIVE_DIR%"
 if not exist "%DLL_OUT%" mkdir "%DLL_OUT%"
 set "BUILD_DIR=%REPO_DIR%\build"
 if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
-set "WEBVIEW2_DIR=%REPO_DIR%\windows\script\Microsoft.Web.WebView2.0.8.355"
+REM The stable WebView2 SDK isn't redistributable in the repo; download it
+REM from NuGet on first run.  Pinned to a known-good version.  Linking is
+REM static (WebView2LoaderStatic.lib) so we don't have to ship a separate
+REM WebView2Loader.dll alongside webview.dll.
+set "WEBVIEW2_VERSION=1.0.2592.51"
+set "WEBVIEW2_DIR=%REPO_DIR%\windows\script\Microsoft.Web.WebView2.%WEBVIEW2_VERSION%"
+set "WEBVIEW2_NUPKG=%WEBVIEW2_DIR%\Microsoft.Web.WebView2.%WEBVIEW2_VERSION%.nupkg"
+set "WEBVIEW2_URL=https://www.nuget.org/api/v2/package/Microsoft.Web.WebView2/%WEBVIEW2_VERSION%"
 
-REM The WebView2 SDK is committed as the raw .nupkg (a zip).  Build expects
-REM the build/native/{include,x64} tree -- extract it on first run.  Use
-REM PowerShell's ZipFile API (resolved by absolute path) since Litecode's
-REM environment may strip System32 from PATH, taking tar.exe with it.
-if exist "%WEBVIEW2_DIR%\build\native\include\WebView2.h" goto :webview2_ready
-echo Extracting Microsoft.Web.WebView2.0.8.355.nupkg ...
 set "PWSH=%SystemRoot%\System32\WindowsPowerShell\v1.0\powershell.exe"
 if not exist "%PWSH%" set "PWSH=powershell.exe"
-"%PWSH%" -NoProfile -Command "Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory('%WEBVIEW2_DIR%\Microsoft.Web.WebView2.0.8.355.nupkg', '%WEBVIEW2_DIR%')"
+
+if exist "%WEBVIEW2_DIR%\build\native\include\WebView2.h" goto :webview2_ready
+if not exist "%WEBVIEW2_DIR%" mkdir "%WEBVIEW2_DIR%"
+if exist "%WEBVIEW2_NUPKG%" goto :webview2_extract
+echo Downloading Microsoft.Web.WebView2 %WEBVIEW2_VERSION% from NuGet ...
+"%PWSH%" -NoProfile -Command "$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '%WEBVIEW2_URL%' -OutFile '%WEBVIEW2_NUPKG%' -UseBasicParsing"
+if not exist "%WEBVIEW2_NUPKG%" (
+    echo ERROR: failed to download WebView2 SDK from %WEBVIEW2_URL%.
+    exit /b 1
+)
+:webview2_extract
+echo Extracting Microsoft.Web.WebView2.%WEBVIEW2_VERSION%.nupkg ...
+"%PWSH%" -NoProfile -Command "Add-Type -AssemblyName System.IO.Compression.FileSystem; [System.IO.Compression.ZipFile]::ExtractToDirectory('%WEBVIEW2_NUPKG%', '%WEBVIEW2_DIR%')"
 if not exist "%WEBVIEW2_DIR%\build\native\include\WebView2.h" (
     echo ERROR: failed to extract WebView2 SDK.
     exit /b 1
@@ -169,15 +182,15 @@ cl /nologo ^
     "%REPO_DIR%\windows\webview.cc" ^
     "%REPO_DIR%\windows\webview_embed.cc" ^
     /link /DLL ^
-    "%WEBVIEW2_DIR%\build\native\x64\WebView2Loader.dll.lib" ^
+    "%WEBVIEW2_DIR%\build\native\x64\WebView2LoaderStatic.lib" ^
     "%JAVA_HOME%\lib\jawt.lib" ^
+    advapi32.lib ole32.lib oleaut32.lib shlwapi.lib shell32.lib user32.lib version.lib winhttp.lib ^
     /OUT:"%BUILD_DIR%\webview.dll"
 if errorlevel 1 (
     echo ERROR: cl.exe build failed.
     exit /b 1
 )
 copy /Y "%BUILD_DIR%\webview.dll" "%DLL_OUT%\webview.dll" >nul
-copy /Y "%WEBVIEW2_DIR%\build\native\x64\WebView2Loader.dll" "%DLL_OUT%\WebView2Loader.dll" >nul
 echo Built %DLL_OUT%\webview.dll
 
 REM ---------------------------------------------------------------------------
@@ -198,7 +211,9 @@ REM ---------------------------------------------------------------------------
 REM 6. Build WebView.jar.  Layout inside the jar:
 REM      ca/weblite/webview/...     (classes)
 REM      windows_64/webview.dll     (loaded by NativeLoader.loadLibrary)
-REM      windows_64/WebView2Loader.dll
+REM
+REM WebView2Loader is statically linked into webview.dll so we don't need
+REM to ship a separate WebView2Loader.dll anymore.
 REM ---------------------------------------------------------------------------
 set "WV_JAR=%REPO_DIR%\dist\WebView.jar"
 if not exist "%REPO_DIR%\dist" mkdir "%REPO_DIR%\dist"
@@ -213,7 +228,6 @@ if errorlevel 1 (
     exit /b 1
 )
 copy /Y "%DLL_OUT%\webview.dll" "%STAGE%\%NATIVE_DIR%\webview.dll" >nul
-copy /Y "%DLL_OUT%\WebView2Loader.dll" "%STAGE%\%NATIVE_DIR%\WebView2Loader.dll" >nul
 pushd "%STAGE%"
 "%JAVA_HOME%\bin\jar.exe" cf "%WV_JAR%" .
 popd

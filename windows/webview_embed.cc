@@ -1,26 +1,23 @@
 /*
  * MIT License
  *
- * Copyright (c) 2019 Steve Hannah
- *
- * Embedded-mode webview support for Swing/AWT on Windows (WebView2).
+ * Embedded-mode WebView2 (Chromium-Edge) for Swing/AWT on Windows.
  *
  * Creates a child HWND of the JAWT-provided AWT Canvas HWND and hosts an
- * IWebView2WebView controller inside it.  The WebView2 environment is created
- * and operated on a dedicated worker thread per embedded WebView, which owns
- * the child HWND and pumps its own message queue.  Operations from Java
- * (navigate, eval, etc.) are marshaled to that thread with PostThreadMessage.
+ * ICoreWebView2Controller + ICoreWebView2 inside it.  The WebView2
+ * environment runs on a dedicated thread.  Operations from Java (navigate,
+ * eval, set_bounds, ...) marshal to that thread via PostThreadMessage.
  *
- * NOTE: This file is compiled alongside windows/webview.cc and uses the same
- * WebView2 SDK headers (Microsoft.Web.WebView2.0.8.355) bundled in
- * windows/script/.
+ * Built against the stable WebView2 SDK (Microsoft.Web.WebView2, 1.0.x),
+ * statically linked via WebView2LoaderStatic.lib.  Requires the system-wide
+ * WebView2 Runtime (ships with current Windows 11 / Edge).
  */
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 
 #include <atomic>
-#include <condition_variable>
+#include <cstdio>
 #include <functional>
 #include <map>
 #include <memory>
@@ -28,8 +25,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-
-#include <cstdio>
 
 #include <jawt.h>
 #include <jawt_md.h>
@@ -44,17 +39,10 @@
 
 namespace embed_win {
 
-using DispatchFn = std::function<void()>;
-
-struct Binding {
-    jobject fn;
-    jclass cls;
-    std::string name;
-};
-
-// Custom messages dispatched onto the WebView2 thread.
 static const UINT WM_EMBED_DISPATCH = WM_APP + 1;
-static const UINT WM_EMBED_QUIT = WM_APP + 2;
+static const UINT WM_EMBED_QUIT     = WM_APP + 2;
+
+using DispatchFn = std::function<void()>;
 
 struct JawtLock {
     JAWT awt{};
@@ -91,7 +79,6 @@ struct JawtLock {
         }
         ok = true;
     }
-
     ~JawtLock() {
         if (ds) {
             if (dsi) ds->FreeDrawingSurfaceInfo(dsi);
@@ -101,52 +88,111 @@ struct JawtLock {
     }
 };
 
+struct Binding {
+    std::string name;
+    jobject fn = nullptr;
+    jclass cls = nullptr;
+};
+
 struct Engine {
     HWND parent = nullptr;
     HWND child = nullptr;
     DWORD thread_id = 0;
     HANDLE thread = nullptr;
-    IWebView2WebView *webview = nullptr;
+    ICoreWebView2Controller *controller = nullptr;
+    ICoreWebView2 *webview = nullptr;
+    EventRegistrationToken message_token{};
     std::map<std::string, Binding *> bindings;
     JavaVM *jvm = nullptr;
     bool debug = false;
-
     std::mutex bindings_mutex;
 };
 
-// Forward declaration of the WebView2 COM handler implemented below.
-class CreateHandler;
-
-class CreateHandler
-    : public IWebView2CreateWebView2EnvironmentCompletedHandler,
-      public IWebView2CreateWebViewCompletedHandler {
+// IUnknown helper -- gives each WebView2 callback proper refcounting and
+// QueryInterface support.  The interfaces we implement are all single-
+// inheritance (Iface : IUnknown), so a templated base keeps boilerplate low.
+template <typename Iface>
+class CallbackBase : public Iface {
 public:
-    using cb_t = std::function<void(IWebView2WebView *)>;
-    CreateHandler(HWND hwnd, cb_t cb) : m_window(hwnd), m_cb(std::move(cb)) {}
-    ULONG STDMETHODCALLTYPE AddRef() override { return 1; }
-    ULONG STDMETHODCALLTYPE Release() override { return 1; }
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID, LPVOID *) override {
-        return S_OK;
+    ULONG STDMETHODCALLTYPE AddRef() override { return ++m_ref; }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG n = --m_ref;
+        if (n == 0) delete this;
+        return n;
     }
-    HRESULT STDMETHODCALLTYPE Invoke(HRESULT,
-                                     IWebView2Environment *env) override {
-        env->CreateWebView(m_window, this);
-        return S_OK;
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID iid, LPVOID *ppv) override {
+        if (!ppv) return E_POINTER;
+        if (iid == __uuidof(Iface) || iid == IID_IUnknown) {
+            *ppv = static_cast<Iface*>(this);
+            AddRef();
+            return S_OK;
+        }
+        *ppv = nullptr;
+        return E_NOINTERFACE;
     }
-    HRESULT STDMETHODCALLTYPE Invoke(HRESULT,
-                                     IWebView2WebView *webview) override {
-        webview->AddRef();
-        m_cb(webview);
+protected:
+    virtual ~CallbackBase() = default;
+private:
+    std::atomic<ULONG> m_ref{1};
+};
+
+class EnvHandler : public CallbackBase<
+    ICoreWebView2CreateCoreWebView2EnvironmentCompletedHandler> {
+public:
+    using Cb = std::function<void(HRESULT, ICoreWebView2Environment*)>;
+    explicit EnvHandler(Cb cb) : m_cb(std::move(cb)) {}
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT result,
+                                     ICoreWebView2Environment *env) override {
+        m_cb(result, env);
         return S_OK;
     }
 private:
-    HWND m_window;
-    cb_t m_cb;
+    Cb m_cb;
 };
 
-static void engine_on_message(Engine *e, const wchar_t *msg) {
+class ControllerHandler : public CallbackBase<
+    ICoreWebView2CreateCoreWebView2ControllerCompletedHandler> {
+public:
+    using Cb = std::function<void(HRESULT, ICoreWebView2Controller*)>;
+    explicit ControllerHandler(Cb cb) : m_cb(std::move(cb)) {}
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT result,
+                                     ICoreWebView2Controller *ctrl) override {
+        m_cb(result, ctrl);
+        return S_OK;
+    }
+private:
+    Cb m_cb;
+};
+
+// Forward declarations.
+static void engine_on_message(Engine *e, LPCWSTR msg);
+static std::wstring utf8_to_wide(const char *s);
+
+class MsgHandler : public CallbackBase<
+    ICoreWebView2WebMessageReceivedEventHandler> {
+public:
+    explicit MsgHandler(Engine *e) : m_engine(e) {}
+    HRESULT STDMETHODCALLTYPE Invoke(
+        ICoreWebView2 *,
+        ICoreWebView2WebMessageReceivedEventArgs *args) override {
+        if (!args) return S_OK;
+        LPWSTR msg = nullptr;
+        if (FAILED(args->TryGetWebMessageAsString(&msg)) || !msg) {
+            // Fallback: postMessage(object) -> JSON
+            args->get_WebMessageAsJson(&msg);
+        }
+        if (msg) {
+            engine_on_message(m_engine, msg);
+            CoTaskMemFree(msg);
+        }
+        return S_OK;
+    }
+private:
+    Engine *m_engine;
+};
+
+static void engine_on_message(Engine *e, LPCWSTR msg) {
     if (!msg) return;
-    // Convert wide string to UTF-8.
     int n = WideCharToMultiByte(CP_UTF8, 0, msg, -1, nullptr, 0, nullptr, nullptr);
     std::string s(n, '\0');
     WideCharToMultiByte(CP_UTF8, 0, msg, -1, &s[0], n, nullptr, nullptr);
@@ -185,10 +231,10 @@ static LRESULT CALLBACK EmbedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
     Engine *e = (Engine *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
     switch (msg) {
     case WM_SIZE:
-        if (e && e->webview) {
+        if (e && e->controller) {
             RECT r;
             GetClientRect(hwnd, &r);
-            e->webview->put_Bounds(r);
+            e->controller->put_Bounds(r);
         }
         return 0;
     default:
@@ -209,13 +255,13 @@ static ATOM ensure_class_registered() {
     return atom;
 }
 
-static void engine_thread(Engine *e, HWND parent, int width, int height,
-                          bool debug, std::atomic<bool> *ready,
+static void engine_thread(Engine *e, HWND /*parent*/, int width, int height,
+                          bool /*debug*/, std::atomic<bool> *ready,
                           std::atomic<bool> *ok) {
     ensure_class_registered();
     e->child = CreateWindowEx(0, "WebViewEmbedChild", "",
                               WS_CHILD | WS_VISIBLE,
-                              0, 0, width, height, parent,
+                              0, 0, width, height, e->parent,
                               nullptr, GetModuleHandle(nullptr), nullptr);
     if (!e->child) {
         WV_LOG("CreateWindowEx for child HWND failed: GetLastError=%lu",
@@ -226,50 +272,111 @@ static void engine_thread(Engine *e, HWND parent, int width, int height,
     SetWindowLongPtr(e->child, GWLP_USERDATA, (LONG_PTR)e);
 
     CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
-    std::atomic_flag flag = ATOMIC_FLAG_INIT;
-    flag.test_and_set();
 
-    auto *handler = new CreateHandler(e->child, [&](IWebView2WebView *wv) {
-        e->webview = wv;
-        flag.clear();
-    });
-    HRESULT res = CreateWebView2EnvironmentWithDetails(nullptr, nullptr,
-                                                       nullptr, handler);
-    if (res != S_OK) {
-        WV_LOG("CreateWebView2EnvironmentWithDetails failed: HRESULT=0x%08lx",
-               (unsigned long)res);
-        WV_LOG("  (this build uses the legacy WebView2 SDK 0.8.355.  Modern");
-        WV_LOG("   Edge runtimes may reject this API; consider upgrading to");
-        WV_LOG("   the stable WebView2 SDK and ICoreWebView2.)");
+    std::atomic_flag init_done = ATOMIC_FLAG_INIT;
+    init_done.test_and_set();
+    HRESULT init_res = S_OK;
+
+    auto *env_handler = new EnvHandler(
+        [&](HRESULT r, ICoreWebView2Environment *env) {
+            if (FAILED(r) || !env) {
+                WV_LOG("CreateCoreWebView2EnvironmentWithOptions "
+                       "completion failed: HRESULT=0x%08lx",
+                       (unsigned long)r);
+                init_res = r;
+                init_done.clear();
+                return;
+            }
+            auto *ctrl_handler = new ControllerHandler(
+                [&](HRESULT r2, ICoreWebView2Controller *ctrl) {
+                    if (FAILED(r2) || !ctrl) {
+                        WV_LOG("CreateCoreWebView2Controller completion "
+                               "failed: HRESULT=0x%08lx",
+                               (unsigned long)r2);
+                        init_res = r2;
+                        init_done.clear();
+                        return;
+                    }
+                    ctrl->AddRef();
+                    e->controller = ctrl;
+                    HRESULT r3 = ctrl->get_CoreWebView2(&e->webview);
+                    if (FAILED(r3) || !e->webview) {
+                        WV_LOG("get_CoreWebView2 failed: HRESULT=0x%08lx",
+                               (unsigned long)r3);
+                        init_res = r3;
+                        init_done.clear();
+                        return;
+                    }
+                    e->webview->AddRef();
+
+                    RECT rc;
+                    GetClientRect(e->child, &rc);
+                    ctrl->put_Bounds(rc);
+                    ctrl->put_IsVisible(TRUE);
+
+                    ICoreWebView2Settings *settings = nullptr;
+                    if (SUCCEEDED(e->webview->get_Settings(&settings)) &&
+                        settings) {
+                        settings->put_AreDevToolsEnabled(
+                            e->debug ? TRUE : FALSE);
+                        settings->put_AreDefaultContextMenusEnabled(TRUE);
+                        settings->Release();
+                    }
+
+                    // Shim window.external.invoke to use the modern
+                    // WebView2 message channel.  Existing demos and the
+                    // standalone API both call window.external.invoke.
+                    e->webview->AddScriptToExecuteOnDocumentCreated(
+                        L"window.external = { invoke: s => "
+                        L"window.chrome.webview.postMessage(s) };",
+                        nullptr);
+
+                    auto *mh = new MsgHandler(e);
+                    e->webview->add_WebMessageReceived(mh, &e->message_token);
+                    mh->Release();
+
+                    init_done.clear();
+                });
+            HRESULT r2 = env->CreateCoreWebView2Controller(
+                e->child, ctrl_handler);
+            ctrl_handler->Release();
+            if (FAILED(r2)) {
+                WV_LOG("CreateCoreWebView2Controller call failed: "
+                       "HRESULT=0x%08lx", (unsigned long)r2);
+                init_res = r2;
+                init_done.clear();
+            }
+        });
+    HRESULT res = CreateCoreWebView2EnvironmentWithOptions(
+        nullptr, nullptr, nullptr, env_handler);
+    env_handler->Release();
+    if (FAILED(res)) {
+        WV_LOG("CreateCoreWebView2EnvironmentWithOptions failed: "
+               "HRESULT=0x%08lx", (unsigned long)res);
+        if (res == HRESULT_FROM_WIN32(ERROR_FILE_NOT_FOUND)) {
+            WV_LOG("  The WebView2 runtime is not installed.  Install it:");
+            WV_LOG("  https://developer.microsoft.com/microsoft-edge/webview2/");
+        }
         *ok = false; *ready = true;
         return;
     }
 
-    // Pump messages until the controller is ready.
+    // Pump until env+controller flow completes.
     MSG msg{};
-    while (flag.test_and_set() && GetMessage(&msg, nullptr, 0, 0)) {
+    while (init_done.test_and_set() && GetMessage(&msg, nullptr, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
 
-    if (e->webview) {
-        RECT r;
-        GetClientRect(e->child, &r);
-        e->webview->put_Bounds(r);
-        // Wire up message bridge for window.external.invoke.
-        // (Simplified: we rely on AddScriptToExecuteOnDocumentCreated and a
-        //  WebMessageReceived equivalent.  See full SDK for details.)
+    if (!e->webview || FAILED(init_res)) {
+        WV_LOG("WebView2 init did not produce an ICoreWebView2");
+        *ok = false; *ready = true;
+        return;
     }
 
-    if (!e->webview) {
-        WV_LOG("Environment callback completed but no IWebView2WebView was "
-               "produced -- likely a WebView2 runtime mismatch with the "
-               "legacy 0.8.355 SDK.");
-    }
-    *ok = (e->webview != nullptr); *ready = true;
+    *ok = true; *ready = true;
 
-    // Main message loop for this WebView's thread.  Operations are
-    // dispatched here via PostThreadMessage(WM_EMBED_DISPATCH).
+    // Main loop -- Java -> native ops arrive as WM_EMBED_DISPATCH messages.
     while (GetMessage(&msg, nullptr, 0, 0)) {
         if (msg.message == WM_EMBED_DISPATCH) {
             auto *fn = (DispatchFn *)msg.lParam;
@@ -277,20 +384,19 @@ static void engine_thread(Engine *e, HWND parent, int width, int height,
             delete fn;
             continue;
         }
-        if (msg.message == WM_EMBED_QUIT) {
-            break;
-        }
+        if (msg.message == WM_EMBED_QUIT) break;
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
 
+    if (e->controller) {
+        e->controller->Close();
+        e->controller->Release();
+        e->controller = nullptr;
+    }
     if (e->webview) {
         e->webview->Release();
         e->webview = nullptr;
-    }
-    if (e->child) {
-        DestroyWindow(e->child);
-        e->child = nullptr;
     }
     CoUninitialize();
 }
@@ -334,12 +440,10 @@ static Engine *create_engine(JNIEnv *env, jobject component, int debug) {
     e->thread_id = GetThreadId(t.native_handle());
     e->thread = t.native_handle();
     t.detach();
-    // Spin briefly until the worker indicates readiness.
     while (!ready.load()) {
         Sleep(1);
     }
     if (!ok.load()) {
-        // Tell the thread to quit (best effort).
         PostThreadMessage(e->thread_id, WM_EMBED_QUIT, 0, 0);
         delete e;
         return nullptr;
@@ -352,7 +456,6 @@ static void destroy_engine(Engine *e) {
     if (e->thread_id) {
         PostThreadMessage(e->thread_id, WM_EMBED_QUIT, 0, 0);
     }
-    // The thread is detached; it tears down its own resources on quit.
     {
         std::lock_guard<std::mutex> lk(e->bindings_mutex);
         for (auto &kv : e->bindings) {
@@ -422,16 +525,37 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
             SetWindowPos(e->child, nullptr, x, y, w, h,
                          SWP_NOZORDER | SWP_NOACTIVATE);
         }
-        if (e->webview) {
+        if (e->controller) {
             RECT r{0, 0, w, h};
-            e->webview->put_Bounds(r);
+            e->controller->put_Bounds(r);
+        }
+    });
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1visible
+  (JNIEnv *, jclass, jlong wv, jint visible) {
+    auto *e = (Engine *)wv;
+    if (!e) return;
+    embed_win::dispatch_to_thread(e, [e, visible] {
+        if (e->controller) e->controller->put_IsVisible(visible != 0 ? TRUE : FALSE);
+        if (e->child) ShowWindow(e->child, visible != 0 ? SW_SHOWNA : SW_HIDE);
+    });
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1request_1focus
+  (JNIEnv *, jclass, jlong wv) {
+    auto *e = (Engine *)wv;
+    if (!e) return;
+    embed_win::dispatch_to_thread(e, [e] {
+        if (e->controller) {
+            e->controller->MoveFocus(COREWEBVIEW2_MOVE_FOCUS_REASON_PROGRAMMATIC);
         }
     });
 }
 
 JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1pump
   (JNIEnv *, jclass, jlong /*wv*/, jint /*wait*/) {
-    // The dedicated WebView2 worker thread handles its own pumping.
+    // Worker thread handles its own pumping.
     return 0;
 }
 
@@ -490,7 +614,6 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1bin
         e->bindings[b->name] = b;
     }
 
-    // Install the bind shim.
     std::string js =
         std::string("(function(){var n='") + b->name + "';" +
         "window[n]=function(){"
@@ -535,8 +658,8 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1dis
 
 // ---------------------------------------------------------------------------
 // Offscreen / lightweight JNI exports.  Lightweight is Linux-only today;
-// Windows stubs return 0 / no-op so the Java side falls back to the empty
-// Swing background (see WebViewLightweightComponent.addNotify).
+// Windows stubs return 0 / no-op so WebViewLightweightComponent falls back
+// to its empty Swing background.
 // ---------------------------------------------------------------------------
 
 extern "C" {
