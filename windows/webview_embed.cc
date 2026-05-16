@@ -520,12 +520,17 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1des
 }
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1bounds
-  (JNIEnv *, jclass, jlong wv, jint x, jint y, jint w, jint h) {
+  (JNIEnv *, jclass, jlong wv, jint /*x*/, jint /*y*/, jint w, jint h) {
     auto *e = (Engine *)wv;
     if (!e) return;
-    embed_win::dispatch_to_thread(e, [e, x, y, w, h] {
+    // The Java side sends x,y in AWT-window content-pane coordinates (used
+    // by the macOS WKWebView path, which is a sibling of the canvas).  On
+    // Windows our child HWND is parented directly under the canvas's HWND,
+    // so it should always sit at (0,0) relative to its parent -- using the
+    // window-relative x,y would offset us by the canvas's own position.
+    embed_win::dispatch_to_thread(e, [e, w, h] {
         if (e->child) {
-            SetWindowPos(e->child, nullptr, x, y, w, h,
+            SetWindowPos(e->child, nullptr, 0, 0, w, h,
                          SWP_NOZORDER | SWP_NOACTIVATE);
         }
         if (e->controller) {
