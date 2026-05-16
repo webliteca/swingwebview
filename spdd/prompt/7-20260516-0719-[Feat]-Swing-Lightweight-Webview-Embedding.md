@@ -62,9 +62,10 @@ generated_at: 2026-05-16T07:19:13-07:00
     `ConsoleDispatcher.dispatch`.  Both happen inside
     `addNotify()` immediately after engine creation.
 - Definition of Done: documented at `README.md ("Quick start" section)`,
-  exercised by the `WebViewHeavyweightDemo` toggle (which
-  also shows a lightweight component side-by-side) and the
-  `run-linux-demo.sh` script. No automated tests.
+  exercised by the `WebViewHeavyweightDemo` (which uses
+  `WebViewComponent.create()` so the lightweight engine is the
+  default on Linux) and the `run-linux-demo.sh` script. No
+  automated tests.
 
 ## E · Entities
 - **WebViewLightweightComponent** (extends `WebViewComponent`,
