@@ -18,8 +18,21 @@ public class WebViewNative {
     
     static {
         try {
-            if (System.getProperty("os.name").toLowerCase().contains("win")) {
-                NativeLoader.loadLibrary("WebView2Loader");
+            // WebView2Loader is now statically linked into webview.dll on
+            // Windows (via WebView2LoaderStatic.lib), so we no longer need
+            // to extract+load a separate WebView2Loader.dll.
+            // Make sure libjawt is in the process before our dylib is bound.
+            // The embed engine references JAWT_GetAWT and AWT does not pull
+            // libjawt in transitively on macOS, so without this the first
+            // JAWT call would dereference an unresolved symbol and SIGSEGV
+            // at PC=0 (the dyld lazy-binding stub never resolved it).
+            try {
+                System.loadLibrary("jawt");
+            } catch (UnsatisfiedLinkError ignored) {
+                // Some JDK distributions don't ship libjawt as a standalone
+                // loadable library, or AWT has already pulled it in.  In
+                // either case we can proceed; the symbol will resolve when
+                // the webview library is loaded next.
             }
             NativeLoader.loadLibrary("webview");
         } catch (IOException ex) {
@@ -89,5 +102,144 @@ native static void webview_bind(long w, String name,
                               WebViewNativeCallback fn, long arg);
 
 
-    
+// --------------------------------------------------------------------------
+// Swing / embedding API.
+//
+// These entry points allow a WebView to be created as a child of an existing
+// native window owned by another toolkit (typically Swing/AWT, via JAWT), so
+// the WebView can be embedded inside a heavyweight Component instead of
+// creating its own top-level window.  The host application is responsible
+// for driving its own UI event loop -- webview_run() is NOT called for
+// embedded WebViews.
+// --------------------------------------------------------------------------
+
+// Returns the native window handle of a Swing/AWT heavyweight Component, or 0.
+// Intended for diagnostics and advanced integrations; the embedded WebView
+// creation path resolves the handle internally and does not require this.
+// The handle is interpreted as:
+//   - Linux:   an X11 Window (XID) cast to a jlong.
+//   - macOS:   a pointer to a JAWT SurfaceLayers id cast to a jlong (only
+//              valid while the JAWT drawing surface is locked, which is not
+//              the case after this method returns -- use with care).
+//   - Windows: an HWND cast to a jlong.
+// The component must be displayable (addNotify() called) before invoking this.
+native static long jawt_get_window_handle(java.awt.Component c);
+
+// Creates a WebView attached to the given AWT Component.  The component must
+// be heavyweight and already displayable.  Returns an opaque pointer that
+// must be passed to the remaining webview_embed_* methods, or 0 on failure.
+native static long webview_embed_create(java.awt.Component parent, int debug);
+
+// Positions and resizes the embedded WebView within its parent.  Coordinates
+// are in the parent's local coordinate space, in pixels.
+native static void webview_embed_set_bounds(long w, int x, int y, int width, int height);
+
+// Pumps one iteration of the platform UI loop for the embedded WebView.
+// If waitForEvent is non-zero, the call blocks until at least one event has
+// been processed.  Otherwise it returns immediately after processing any
+// events that are already available.  This is only required on platforms
+// whose UI loop is not already being driven by the host (notably Linux/GTK,
+// where the GTK main loop is independent of AWT's X11 event loop).
+// On macOS and Windows this is a no-op when the host's event loop is already
+// running.
+native static int webview_embed_pump(long w, int waitForEvent);
+
+// Releases the resources associated with an embedded WebView and detaches it
+// from its native parent.  Equivalent to webview_destroy for embedded
+// instances but ensures any pump thread is stopped first.
+native static void webview_embed_destroy(long w);
+
+// The remaining embed entry points mirror their non-embedded counterparts but
+// operate on the opaque pointer returned by webview_embed_create.  They are
+// kept distinct so the embed engine implementation can evolve independently
+// from the legacy top-level WebView engine.
+native static void webview_embed_navigate(long w, String url);
+native static void webview_embed_init(long w, String js);
+native static void webview_embed_eval(long w, String js);
+native static void webview_embed_bind(long w, String name,
+                                      WebViewNativeCallback fn, long arg);
+native static void webview_embed_dispatch(long w, Runnable callback);
+
+// Show or hide the embedded WebView in-place.  Used to track Swing
+// visibility changes -- e.g., JTabbedPane tab switches, parent setVisible.
+// visible != 0 makes the native view visible; 0 hides it (without
+// destroying the engine).
+native static void webview_embed_set_visible(long w, int visible);
+
+// Hand keyboard / text-input focus to the embedded WebView.  On Linux
+// this calls XSetInputFocus on the embedded popup's X11 window so the
+// X server delivers key events to our GTK widget tree rather than to
+// the AWT top-level frame; on macOS it calls makeFirstResponder on the
+// WKWebView; on Windows it brings the WebView2 child HWND into focus.
+// Without this, keyboard input typed while the pointer is over the
+// WebView region goes nowhere because the AWT frame still holds
+// system focus.
+native static void webview_embed_request_focus(long w);
+
+
+// ---------------------------------------------------------------------------
+// Lightweight / offscreen API (currently Linux-only).
+//
+// The native engine renders the WebView into a GtkOffscreenWindow that
+// never touches the screen; Java pulls pixels via snapshot() and paints
+// them itself.  Bypasses all the AWT/GTK/X11 focus and frame-clock
+// negotiation that the heavyweight embed path has to fight on Linux.
+// ---------------------------------------------------------------------------
+
+// Create the offscreen engine with the given initial pixel dimensions.
+// Returns an opaque pointer (jlong) or 0 on unsupported platform / failure.
+native static long webview_offscreen_create(int w, int h, int debug);
+
+// Tear down the offscreen engine.
+native static void webview_offscreen_destroy(long peer);
+
+// Resize the offscreen WebView's viewport.  Pixel size; the WebView will
+// re-layout to fit.
+native static void webview_offscreen_resize(long peer, int w, int h);
+
+// Navigate the offscreen WebView to the given URL.
+native static void webview_offscreen_navigate(long peer, String url);
+
+// Copy the current pixel contents of the offscreen WebView into the given
+// Java int[] (assumed to hold at least w*h pixels in ARGB / 0xAARRGGBB
+// format, matching BufferedImage.TYPE_INT_ARGB).
+native static void webview_offscreen_snapshot(long peer, int[] pixels,
+                                              int w, int h);
+
+// Inject a mouse button press / release into the offscreen WebView.
+// press: 1 for press, 0 for release.
+// (x, y): pixel coords relative to the WebView.
+// button: 1 = primary, 2 = middle, 3 = secondary.
+// modifiers: bitmask of GDK modifier constants (GDK_SHIFT_MASK=1,
+//   GDK_CONTROL_MASK=4, GDK_MOD1_MASK=8 (alt), GDK_META_MASK=0x10000000).
+// click_count: 1 single, 2 double, 3+ triple.
+native static void webview_offscreen_mouse_button(long peer, int press,
+                                                  int x, int y, int button,
+                                                  int modifiers,
+                                                  int click_count);
+
+// Inject a mouse-move event.  Same coord / modifier semantics as
+// mouse_button.
+native static void webview_offscreen_mouse_motion(long peer, int x, int y,
+                                                  int modifiers);
+
+// Inject a smooth-scroll event.  dx/dy are scroll deltas in pixel-ish
+// units (GDK_SCROLL_SMOOTH semantics).
+native static void webview_offscreen_mouse_scroll(long peer, int x, int y,
+                                                  double dx, double dy,
+                                                  int modifiers);
+
+// Inject a key press / release into the offscreen WebView.
+// press: 1 for press, 0 for release.
+// keyval: a GDK keysym (printable ASCII characters use the char value
+//   directly; special keys use the GDK_KEY_xxx constants from
+//   gdk/gdkkeysyms.h, see ca.weblite.webview.GdkInput).
+// modifiers: bitmask of GDK modifier constants.
+// is_modifier_key: 1 if the keyval is itself a modifier (Shift, Ctrl,
+//   Alt, etc.) so WebKit can track modifier-up/down state.
+native static void webview_offscreen_key_event(long peer, int press,
+                                               int keyval, int modifiers,
+                                               int is_modifier_key);
+
+
 }

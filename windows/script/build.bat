@@ -36,8 +36,10 @@ cl /D "WEBVIEW_API=__declspec(dllexport)" ^
 	/I "%JAVA_HOME%\include" /I "%JAVA_HOME%\include\win32" ^
 	/I "%src_dir%\script\Microsoft.Web.WebView2.0.8.355\build\native\include" ^
 	"%src_dir%\script\Microsoft.Web.WebView2.0.8.355\build\native\x86\WebView2Loader.dll.lib" ^
+	"%JAVA_HOME%\lib\jawt.lib" ^
 	/std:c++17 /EHsc "/Fo%build_dir%"\ ^
-	"%src_dir%\webview.cc" /link /DLL "/OUT:%build_dir%\webview.dll"
+	"%src_dir%\webview.cc" "%src_dir%\webview_embed.cc" ^
+	/link /DLL "/OUT:%build_dir%\webview.dll"
 copy "%build_dir%\webview.dll" "%src_dir%\dll\x86"
 copy "%src_dir%\script\Microsoft.Web.WebView2.0.8.355\build\native\x86\WebView2Loader.dll" "%src_dir%\dll\x86"
 
@@ -48,8 +50,10 @@ cl /D "WEBVIEW_API=__declspec(dllexport)" ^
     /I "%JAVA_HOME%\include" /I "%JAVA_HOME%\include\win32" ^
 	/I "%src_dir%\script\Microsoft.Web.WebView2.0.8.355\build\native\include" ^
 	"%src_dir%\script\Microsoft.Web.WebView2.0.8.355\build\native\x64\WebView2Loader.dll.lib" ^
+	"%JAVA_HOME%\lib\jawt.lib" ^
 	/std:c++17 /EHsc "/Fo%build_dir%"\ ^
-	"%src_dir%\webview.cc" /link /DLL "/OUT:%build_dir%\webview.dll"
+	"%src_dir%\webview.cc" "%src_dir%\webview_embed.cc" ^
+	/link /DLL "/OUT:%build_dir%\webview.dll"
 copy "%build_dir%\webview.dll" "%src_dir%\dll\x64"
 copy "%src_dir%\script\Microsoft.Web.WebView2.0.8.355\build\native\x64\WebView2Loader.dll" "%build_dir%"
 copy "%src_dir%\script\Microsoft.Web.WebView2.0.8.355\build\native\x64\WebView2Loader.dll" "%src_dir%\dll\x64"

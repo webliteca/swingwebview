@@ -128,9 +128,138 @@ NOTE: The `show()` method will start a blocking event loop.
 
 WARNING: Currently the WebView is picky about being started on the main application thread.  On Mac you may need to add the "-XstartOnFirstThread" flag in the JVM.
 
-## Using Java API from Swing, JavaFX, or other UI Toolkit
+## Embedding WebView Directly in Swing
 
-The WebView class cannot be used from Swing, JavaFX, or any other existing UI toolkit because it starts its own event loop.  If you want to make use of the WebView from within such an app, you'll need to use the WebViewCLIClient class, which provides an interface to create and manage a WebView which runs inside its own subprocess.
+In addition to the out-of-process `WebViewCLIClient` approach, the library
+includes an in-process Swing embedding API in the
+`ca.weblite.webview.swing` package.  The recommended entry point is the
+abstract `WebViewComponent` and its static factory, which picks the best
+implementation for the current platform automatically:
+
+```java
+import ca.weblite.webview.swing.WebViewComponent;
+
+WebViewComponent wv = WebViewComponent.create();
+wv.setUrl("https://example.com");
+wv.setPreferredSize(new Dimension(900, 600));
+frame.add(wv, BorderLayout.CENTER);
+```
+
+`WebViewComponent.create()` returns a heavyweight implementation on
+macOS / Windows and a lightweight one on Linux (where the heavyweight
+path's visible text-input feedback is unreliable).  To force a specific
+mode, set the `ca.weblite.webview.mode` system property to
+`heavyweight` or `lightweight` (case-insensitive), or call
+`WebViewComponent.create(Mode.HEAVYWEIGHT)` / `Mode.LIGHTWEIGHT`
+explicitly.
+
+Internally there are two concrete subclasses, both extending
+`WebViewComponent`, which you can also instantiate directly if you
+need to:
+
+* **`WebViewHeavyweightComponent`** — embeds the native WebView as a child
+  of the underlying heavyweight AWT peer.  Renders directly to screen
+  pixels.  Native compositing means the highest fidelity and lowest
+  overhead, but interacts with Swing Z-order the way every heavyweight
+  AWT component does — it paints above any overlapping lightweight Swing
+  components in the same window (see "Heavyweight popup notes" below).
+* **`WebViewLightweightComponent`** — renders the WebView into an
+  offscreen surface, ships the pixels to Java, and Swing paints them
+  into a regular `JComponent`.  Composites cleanly with arbitrary Swing
+  widgets and Z-order.  Higher per-frame cost than heavyweight and
+  needs Swing-side input forwarding (which is wired for mouse and
+  keyboard).
+
+See the [Heavyweight Swing Demo](demos/WebViewHeavyweightDemo/README.md)
+for a working example exercising both modes side-by-side, plus
+interaction with surrounding Swing widgets (JComboBox dropdowns, tab
+switching).
+
+### Platform support matrix
+
+| Platform | Heavyweight | Lightweight |
+|---|---|---|
+| **macOS** (Cocoa / WKWebView) | ✅ Full (rendering, input, resize, tab visibility) | ⚠️ Stub — falls back to default Swing background |
+| **Linux** (WebKitGTK / X11) | ⚠️ Rendering, mouse, scroll, resize, tab switching work.  Visible text-input feedback (caret blink, characters appearing as typed) is **unreliable** because of how GTK frame-clock and focus interact with `XReparentWindow` under a foreign (non-GTK) parent. | ✅ **Full** — rendering + mouse (click, drag, scroll, hover) + keyboard (typing, Backspace, Delete, arrows, function keys, common modifiers) |
+| **Windows** (WebView2) | ✅ Full (rendering, input, resize, tab visibility) on Windows 11.  Requires the system-wide Microsoft Edge WebView2 Runtime (ships with current Windows 11 / Edge; install Evergreen from https://developer.microsoft.com/microsoft-edge/webview2/ on older Windows). | ⚠️ Stub |
+
+The `WebViewComponent.create()` factory already encodes these
+defaults, so most callers don't need to think about it.  A future
+cross-platform lightweight pass would make lightweight a sane default
+everywhere.
+
+### Heavyweight platform notes
+
+* **Linux (GTK / WebKitGTK / X11)** — the WebView's GTK window is
+  reparented under the JAWT-managed X11 window via `XReparentWindow`.
+  A dedicated GTK pump thread drives the WebKitGTK main loop
+  independently of AWT's X11 event loop.  A 60Hz `g_timeout` drives
+  the paint pipeline (the X11 GdkFrameClock won't pace itself on a
+  reparented popup that has no WM relationship).  Requires
+  `libwebkit2gtk-4.0-dev` or `libwebkit2gtk-4.1-dev` plus `libxt-dev`
+  (JDK 8's `jawt_md.h` pulls in X11 Intrinsics).
+* **macOS (Cocoa / WKWebView)** — the WKWebView is added as a real
+  subview of `NSWindow.contentView` (looked up through the layer
+  hierarchy from the JAWT `windowLayer`), so WebKit's CARemoteLayer
+  compositing engages and input dispatch goes through AppKit's normal
+  responder chain.  All input works end-to-end.
+* **Windows (WebView2)** — a child `HWND` is created under the AWT
+  canvas HWND and an `ICoreWebView2Controller` + `ICoreWebView2` are
+  hosted inside it (modern stable WebView2 SDK).  Each embedded
+  WebView runs on its own worker thread that pumps a private message
+  queue.  `WebView2LoaderStatic.lib` is linked statically so we ship
+  just `webview.dll`, no separate `WebView2Loader.dll`.  The system
+  WebView2 Runtime (part of Edge / Windows 11) provides the actual
+  Chromium binaries.
+
+### Lightweight notes
+
+The lightweight component renders WebKit into a `GtkOffscreenWindow`,
+snapshots `cairo_image_surface_t` pixels at ~30Hz into a
+`BufferedImage`, and paints that into the `JComponent` via
+`paintComponent`.  AWT `MouseEvent`s and `KeyEvent`s are translated to
+`GdkEvent`s and injected via `gtk_main_do_event`.  Notes:
+
+* The WebKitWebView's IM context is disabled because all input
+  arrives already-decoded from AWT.  This means CJK / IME composition
+  is **not** available in the lightweight component on Linux today.
+  Dead keys and Compose key sequences (e.g. `é`, `ñ`) work for
+  ASCII-Latin-1 layouts but not for IME-driven layouts.
+* Right-click context menus and `<select>` dropdowns from inside the
+  page log a `gdk_window_move_to_rect: assertion 'window->transient_for'`
+  warning and don't visibly appear — WebKit tries to position them
+  relative to a toplevel that doesn't exist in our offscreen model.
+  Not fatal; just a missing piece of UI for those interactions.
+* Heavyweight popup interop is *not* needed in lightweight mode —
+  Swing components like `JComboBox` and tooltips composite over the
+  WebView with their normal lightweight rendering.
+
+### Heavyweight popup notes
+
+When using `WebViewHeavyweightComponent`, native Swing popups
+(`JComboBox` dropdowns, `JMenu`, tooltips) render *behind* the
+WebView's heavyweight peer unless you opt into heavyweight popup
+mode at app start:
+
+```java
+JPopupMenu.setDefaultLightWeightPopupEnabled(false);
+ToolTipManager.sharedInstance().setLightWeightPopupEnabled(false);
+```
+
+This makes popups appear as real OS windows that sit above heavyweight
+peers.  See the heavyweight demo for the full pattern.  Lightweight
+mode does not need this.
+
+The embedded WebView does **not** call `webview_run()` and never takes
+ownership of the host application's event loop.
+
+## Using Java API from Swing, JavaFX, or other UI Toolkit (subprocess mode)
+
+The original `WebView` class cannot be used directly from Swing, JavaFX, or
+any other existing UI toolkit because it starts its own event loop.  If you
+want to use that class from such an app, you can use the `WebViewCLIClient`
+class, which provides an interface to create and manage a WebView running
+in its own subprocess.
 
 See the [Swing Demo](demos/WebViewSwingDemo/README.md) for a full example of this.
 
@@ -175,8 +304,9 @@ webview.close();
 
 #### Demos
 
-1. [Swing Demo](demos/WebViewSwingDemo/README.md) - A simple demo showing how to create and control a WebView from a Swing App.
-2. [Minimal Demo](demos/WebViewMinimalDemo/README.md) - A simple demo that only launches a WebView on the main thread.
+1. [Swing Demo](demos/WebViewSwingDemo/README.md) - A simple demo showing how to create and control a WebView from a Swing App (subprocess mode).
+2. [Heavyweight Swing Demo](demos/WebViewHeavyweightDemo/README.md) - In-process demo showing both heavyweight and lightweight embedding modes side-by-side, plus interop with surrounding Swing widgets (JComboBox dropdowns, tab visibility tracking).  Includes `run-mac-demo.sh`, `run-linux-demo.sh`, and `run-windows-demo.bat` one-shot launcher scripts at the project root.
+3. [Minimal Demo](demos/WebViewMinimalDemo/README.md) - A simple demo that only launches a WebView on the main thread.
 
 ## Supported Platforms
 
