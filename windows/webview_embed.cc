@@ -29,11 +29,18 @@
 #include <thread>
 #include <vector>
 
+#include <cstdio>
+
 #include <jawt.h>
 #include <jawt_md.h>
 
 #include "ca_weblite_webview_WebViewNative.h"
 #include "WebView2.h"
+
+#define WV_LOG(fmt, ...) do { \
+    fprintf(stderr, "[webview-embed] " fmt "\n", ##__VA_ARGS__); \
+    fflush(stderr); \
+} while (0)
 
 namespace embed_win {
 
@@ -211,6 +218,8 @@ static void engine_thread(Engine *e, HWND parent, int width, int height,
                               0, 0, width, height, parent,
                               nullptr, GetModuleHandle(nullptr), nullptr);
     if (!e->child) {
+        WV_LOG("CreateWindowEx for child HWND failed: GetLastError=%lu",
+               GetLastError());
         *ok = false; *ready = true;
         return;
     }
@@ -227,6 +236,11 @@ static void engine_thread(Engine *e, HWND parent, int width, int height,
     HRESULT res = CreateWebView2EnvironmentWithDetails(nullptr, nullptr,
                                                        nullptr, handler);
     if (res != S_OK) {
+        WV_LOG("CreateWebView2EnvironmentWithDetails failed: HRESULT=0x%08lx",
+               (unsigned long)res);
+        WV_LOG("  (this build uses the legacy WebView2 SDK 0.8.355.  Modern");
+        WV_LOG("   Edge runtimes may reject this API; consider upgrading to");
+        WV_LOG("   the stable WebView2 SDK and ICoreWebView2.)");
         *ok = false; *ready = true;
         return;
     }
@@ -247,6 +261,11 @@ static void engine_thread(Engine *e, HWND parent, int width, int height,
         //  WebMessageReceived equivalent.  See full SDK for details.)
     }
 
+    if (!e->webview) {
+        WV_LOG("Environment callback completed but no IWebView2WebView was "
+               "produced -- likely a WebView2 runtime mismatch with the "
+               "legacy 0.8.355 SDK.");
+    }
     *ok = (e->webview != nullptr); *ready = true;
 
     // Main message loop for this WebView's thread.  Operations are
@@ -284,10 +303,18 @@ static void dispatch_to_thread(Engine *e, DispatchFn fn) {
 
 static Engine *create_engine(JNIEnv *env, jobject component, int debug) {
     JawtLock lock(env, component);
-    if (!lock.ok || !lock.dsi->platformInfo) return nullptr;
+    if (!lock.ok || !lock.dsi->platformInfo) {
+        WV_LOG("JAWT lock failed (ok=%d dsi=%p)",
+               lock.ok ? 1 : 0,
+               lock.dsi ? lock.dsi->platformInfo : nullptr);
+        return nullptr;
+    }
     auto *info = (JAWT_Win32DrawingSurfaceInfo *)lock.dsi->platformInfo;
     HWND parent = info->hwnd;
-    if (!parent) return nullptr;
+    if (!parent) {
+        WV_LOG("JAWT platform info had no HWND");
+        return nullptr;
+    }
     RECT r;
     GetClientRect(parent, &r);
     int width = r.right - r.left;
