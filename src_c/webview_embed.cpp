@@ -1137,30 +1137,6 @@ static void gtk_off_navigate(OffEngine *e, std::string url) {
     });
 }
 
-static void gtk_off_init_script(OffEngine *e, std::string js) {
-    GtkPump::instance().run_async([=] {
-        if (!e->manager) return;
-        webkit_user_content_manager_add_script(
-            e->manager,
-            webkit_user_script_new(js.c_str(),
-                                   WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
-                                   WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
-                                   NULL, NULL));
-    });
-}
-
-static void gtk_off_eval(OffEngine *e, std::string js) {
-    GtkPump::instance().run_async([=] {
-        if (!e->web) return;
-        webkit_web_view_run_javascript(WEBKIT_WEB_VIEW(e->web), js.c_str(),
-                                       NULL, NULL, NULL);
-    });
-}
-
-static void gtk_off_bind(OffEngine *e, Binding *b) {
-    e->bindings[b->name] = b;
-}
-
 // Open the WebKitGTK Web Inspector for the offscreen WebView in a separate
 // OS-level GtkWindow.  The inspector belongs to the WebView's own
 // process and is unaffected by the host Swing window's visibility.
