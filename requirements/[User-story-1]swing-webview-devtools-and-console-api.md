@@ -174,10 +174,10 @@ Key points:
 - All listener `onMessage` callbacks are invoked on the Swing EDT.
 - Listeners added before the component is displayed are remembered and bound when the native peer is created.
 - Console capture is active regardless of the `debug` flag.
+- Uncaught script errors (`window` `error` event) and unhandled promise rejections (`unhandledrejection`) are also delivered to listeners as `ERROR`-level `ConsoleMessage`s. The engine's internal error reporter does not go through `window.console.error()`, so these are subscribed to separately by the same shim.
 
 ### Scope Out
 
-- Capturing uncaught JavaScript exceptions or unhandled promise rejections (`window.onerror`, `unhandledrejection`) — separate concern, separate story.
 - Capturing `console.table`, `console.group`, `console.trace`, `console.assert`, `console.count`, `console.dir`, etc. — only the five common level methods are intercepted.
 - Capturing stack traces for messages — only `sourceUrl` + `lineNumber` are exposed.
 - Faithful argument serialization for non-string arguments — non-strings are coerced via `String(arg)` join on the JS side; circular references are tolerated by skipping (no exception thrown into the page).
@@ -245,6 +245,16 @@ Key points:
 **Given** a `WebViewComponent` with two registered listeners where the first throws a `RuntimeException` inside `onMessage`,
 **When** the page calls `console.log("test")`,
 **Then** the second listener still receives the message, and the exception from the first listener is reported via standard EDT uncaught-exception handling but does not crash the WebView or the host app.
+
+#### AC13: Uncaught script errors surface as ERROR-level messages
+**Given** a `WebViewComponent` with a registered `ConsoleListener` and a loaded page,
+**When** the host evaluates a script that throws (e.g. `wv.eval("foo.bar()")` where `foo` is not defined) **or** the page executes a script that throws,
+**Then** the listener receives a `ConsoleMessage` with level `ERROR`, `text` containing the engine's error message (e.g. `ReferenceError: foo is not defined`), and — when the engine provides them — non-null `sourceUrl` and non-negative `lineNumber`.
+
+#### AC14: Unhandled Promise rejections surface as ERROR-level messages
+**Given** a `WebViewComponent` with a registered `ConsoleListener` and a page that executes `Promise.reject(new Error("boom"))` without a `.catch` handler,
+**When** the rejection settles,
+**Then** the listener receives a `ConsoleMessage` with level `ERROR` and `text` containing the rejection reason (e.g. `Error: boom`).
 
 ### Non-Functional Expectations
 

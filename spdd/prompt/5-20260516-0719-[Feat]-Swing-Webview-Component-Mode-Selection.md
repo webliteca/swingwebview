@@ -163,7 +163,13 @@ generated_at: 2026-05-16T07:19:13-07:00
   receiving output untouched), (b) post a canonical
   pipe-separated payload (see Norms) through the binding, and
   (c) suppress shim re-entry so a listener calling
-  `console.log` doesn't loop.
+  `console.log` doesn't loop.  In addition the shim
+  subscribes to `window`'s `error` and `unhandledrejection`
+  events and emits them as `ERROR`-level `ConsoleMessage`s
+  so uncaught script errors and rejected promises surface
+  through the same listener pipeline (they bypass the
+  console.* wrappers because the engine's internal error
+  reporter doesn't go through `window.console.error()`).
 - **EDT marshaling for listeners.** Native callbacks land on
   whichever native UI thread the engine runs on (AppKit main
   on macOS, GTK pump thread on Linux heavyweight and offscreen,

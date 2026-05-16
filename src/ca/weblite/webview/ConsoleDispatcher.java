@@ -35,21 +35,26 @@ public final class ConsoleDispatcher {
 
     /**
      * Canonical JavaScript shim injected at document-start into every page
-     * loaded by a {@code WebViewComponent}.  Wraps the five intercepted
-     * {@code console.*} methods (log/info/warn/error/debug); for each call:
+     * loaded by a {@code WebViewComponent}.  Two responsibilities:
      *
      * <ol>
-     *   <li>Invokes the original captured-by-closure method first, so the
-     *       platform's native DevTools Console panel and (on Linux debug
-     *       builds) stdout still see the output untouched.</li>
-     *   <li>Best-effort parses {@code new Error().stack} to recover the
-     *       source URL + line number of the caller.</li>
-     *   <li>Builds the canonical pipe-separated payload
-     *       {@code <LEVEL>|<sourceUrl>|<lineNumber>|<textLength>|<text>}.</li>
-     *   <li>Base64-encodes the UTF-8 bytes of that payload so it can pass
-     *       through the existing JSON-args bind channel without escape
-     *       interference, then calls
+     *   <li>Wraps the five intercepted {@code console.*} methods
+     *       (log/info/warn/error/debug).  For each call: invokes the
+     *       original captured-by-closure method first (so the platform's
+     *       native DevTools Console panel and, on Linux debug builds,
+     *       stdout still see the output untouched), best-effort parses
+     *       {@code new Error().stack} to recover the source URL + line
+     *       number, builds the canonical pipe-separated payload
+     *       {@code <LEVEL>|<sourceUrl>|<lineNumber>|<textLength>|<text>},
+     *       base64-encodes the UTF-8 bytes of it, and calls
      *       {@code window.__webview_console__(b64)}.</li>
+     *   <li>Subscribes to the {@code window}-level {@code error} and
+     *       {@code unhandledrejection} events and emits each as an
+     *       {@code ERROR}-level message.  The engine's internal error
+     *       reporter does NOT route through {@code window.console.error()}
+     *       so the {@code console.*} wrappers alone never see uncaught
+     *       script errors or rejected promises — this second hook is
+     *       what makes them visible to Java listeners.</li>
      * </ol>
      *
      * <p>The shim guards against re-entry (a listener calling
@@ -65,6 +70,14 @@ public final class ConsoleDispatcher {
       + "};"
       + "var b64=function(s){"
       + "  try{return btoa(unescape(encodeURIComponent(s)));}catch(e){return '';}"
+      + "};"
+      + "var postRaw=function(level,text,src,line){"
+      + "  try{"
+      + "    var payload=level+'|'+(src||'')+'|'+line+'|'+utf8len(text)+'|'+text;"
+      + "    if(window.__webview_console__){"
+      + "      window.__webview_console__(b64(payload));"
+      + "    }"
+      + "  }catch(e){}"
       + "};"
       + "var parseSrc=function(){"
       + "  try{"
@@ -87,10 +100,7 @@ public final class ConsoleDispatcher {
       + "      try{return String(a);}catch(e){return '[unstringifiable]';}"
       + "    }).join(' ');"
       + "    var loc=parseSrc();"
-      + "    var payload=level+'|'+loc[0]+'|'+loc[1]+'|'+utf8len(text)+'|'+text;"
-      + "    if(window.__webview_console__){"
-      + "      window.__webview_console__(b64(payload));"
-      + "    }"
+      + "    postRaw(level,text,loc[0],loc[1]);"
       + "  }catch(e){}"
       + "};"
       + "var levels=['log','info','warn','error','debug'];"
@@ -107,6 +117,28 @@ public final class ConsoleDispatcher {
       + "    };"
       + "  })(i);"
       + "}"
+      // Uncaught script errors (e.g. `foo.bar()` where `foo` is undefined,
+      // or anything that throws out of a script tag / eval()).  The engine
+      // emits these to its own logger but NOT to window.console.error,
+      // so the console.* wrappers above never see them.
+      + "window.addEventListener('error',function(e){"
+      + "  try{"
+      + "    var msg=(e&&e.message)||(e&&e.error&&e.error.message)||'unknown error';"
+      + "    if(e&&e.error&&e.error.stack){msg+='\\n'+e.error.stack;}"
+      + "    var src=(e&&e.filename)||'';"
+      + "    var line=(e&&typeof e.lineno==='number')?e.lineno:-1;"
+      + "    postRaw('ERROR',msg,src,line);"
+      + "  }catch(_){}"
+      + "},true);"
+      // Promise rejections that never get a .catch().
+      + "window.addEventListener('unhandledrejection',function(e){"
+      + "  try{"
+      + "    var r=e&&e.reason;"
+      + "    var msg=(r&&r.message)?r.message:String(r);"
+      + "    if(r&&r.stack){msg+='\\n'+r.stack;}"
+      + "    postRaw('ERROR',msg,'',-1);"
+      + "  }catch(_){}"
+      + "},true);"
       + "})();";
 
     /** Internal binding name reserved on every engine for console capture. */
