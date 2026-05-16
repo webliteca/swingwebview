@@ -1,9 +1,23 @@
-name: Build cross-platform jar
+# Release workflow: build cross-platform natives, then publish to Maven Central.
+#
+# Uses the modern Central Publishing Maven Plugin (org.sonatype.central:central-publishing-maven-plugin).
+#
+# Required GitHub Secrets (provided as webliteca org-level secrets):
+#   GPG_PRIVATE_KEY        - Base64-encoded GPG private key
+#   GPG_PASSPHRASE         - GPG key passphrase
+#   MAVEN_CENTRAL_USERNAME - Maven Central portal API token username
+#   MAVEN_CENTRAL_PASSWORD - Maven Central portal API token password
+#
+# Release process:
+#   git tag v1.0.0
+#   git push origin v1.0.0
+
+name: Release to Maven Central
 
 on:
   push:
-    branches: ['**']
-  pull_request:
+    tags:
+      - 'v*'
   workflow_dispatch:
 
 permissions:
@@ -11,21 +25,15 @@ permissions:
 
 jobs:
   # ---------------------------------------------------------------------------
-  # Six native build jobs.  Each compiles webview's native lib for one
-  # OS/arch combo on a matching GitHub-hosted runner and uploads the lib
-  # as an artifact named native-<native_dir>.  No demo runs (no display).
+  # Native builds, mirroring .github/workflows/build.yml.  Each job produces
+  # one platform's native lib and uploads it as native-<arch>.
   # ---------------------------------------------------------------------------
   native:
     name: native (${{ matrix.native_dir }})
     strategy:
-      fail-fast: false
+      fail-fast: true
       matrix:
         include:
-          # Both macOS builds run on macos-14 (arm64).  Intel runners
-          # (macos-13) are being phased out, and Xcode's SDK is universal
-          # so cross-compiling x86_64 from arm64 with `clang -arch x86_64`
-          # just works -- JNI headers, AWT, and the macOS frameworks all
-          # have x86_64 slices regardless of host arch.
           - os: macos-14
             mac_arch: x86_64
             native_dir: osx_64
@@ -54,20 +62,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Build against JDK 11.  Reason: Liberica (and Temurin) only have
-      # Windows ARM64 builds from JDK 11+ -- there's no JDK 8 distribution
-      # for Win-on-ARM.  Keeping the whole matrix on JDK 11 is simpler than
-      # per-matrix version overrides, and the JNI/JAWT headers are
-      # forward-compatible (the embed code gates JAWT_VERSION_9 behind
-      # `#if defined`).  The assembly job compiles the .java sources with
-      # `--release 8` so the resulting bytecode still runs on JRE 8.
       - name: Set up JDK 11
         uses: actions/setup-java@v4
         with:
           distribution: liberica
           java-version: '11'
 
-      # ---------------- macOS -------------------------------------------------
       - name: Build macOS native (${{ matrix.mac_arch }})
         if: runner.os == 'macOS'
         shell: bash
@@ -86,7 +86,6 @@ jobs:
               -Wl,-undefined,dynamic_lookup
           file "src/${{ matrix.native_dir }}/${{ matrix.lib_name }}"
 
-      # ---------------- Linux -------------------------------------------------
       - name: Install Linux deps
         if: runner.os == 'Linux'
         shell: bash
@@ -118,7 +117,6 @@ jobs:
               -shared -o "src/${{ matrix.native_dir }}/${{ matrix.lib_name }}"
           file "src/${{ matrix.native_dir }}/${{ matrix.lib_name }}"
 
-      # ---------------- Windows -----------------------------------------------
       - name: Set up MSVC environment
         if: runner.os == 'Windows'
         uses: ilammy/msvc-dev-cmd@v1
@@ -174,7 +172,6 @@ jobs:
           copy /Y "%BUILD_DIR%\webview.dll" "%DLL_OUT%\${{ matrix.lib_name }}"
           dir "%DLL_OUT%"
 
-      # ---------------- Artifact ----------------------------------------------
       - name: Upload native artifact
         uses: actions/upload-artifact@v4
         with:
@@ -183,15 +180,27 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # Assembly job: compile Java once, pull in every native artifact, package
-  # them into a single WebView.jar with NativeLibraryUtil-compatible layout.
+  # Deploy job: assemble all natives into src/<arch>/, set version from tag,
+  # sign artifacts, and publish to Maven Central via the Central Publishing
+  # Maven Plugin.  Only runs on v* tag pushes (and manual dispatch).
   # ---------------------------------------------------------------------------
-  jar:
-    name: WebView.jar (all platforms)
+  deploy:
+    name: Deploy to Maven Central
     needs: native
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+
+      - name: Determine release version
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF_NAME" == v* ]]; then
+            VERSION="${GITHUB_REF_NAME#v}"
+          else
+            VERSION="0.0.0-${GITHUB_SHA::7}"
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "Release version: $VERSION"
 
       - name: Set up JDK 11
         uses: actions/setup-java@v4
@@ -199,6 +208,10 @@ jobs:
           distribution: liberica
           java-version: '11'
           cache: maven
+          server-id: central
+          server-username: MAVEN_CENTRAL_USERNAME
+          server-password: MAVEN_CENTRAL_PASSWORD
+          overwrite-settings: true
 
       - name: Download all native artifacts
         uses: actions/download-artifact@v4
@@ -218,20 +231,39 @@ jobs:
           echo "--- final native layout ---"
           find src -maxdepth 2 -type f \( -name '*.dylib' -o -name '*.so' -o -name '*.dll' \) | sort
 
-      - name: Build WebView.jar with Maven
+      - name: Import GPG key
         shell: bash
-        # source/target 1.8 in pom.xml keeps the assembled jar runnable on
-        # JRE 8 even though we build it with JDK 11.
         run: |
-          set -euo pipefail
-          mvn -B -DskipTests package
-          echo "--- jar contents ---"
-          jar tf target/webview-*.jar | sort | head -80
-          ls -la target/
+          echo "${{ secrets.GPG_PRIVATE_KEY }}" | base64 --decode | gpg --batch --import
+        env:
+          GPG_TTY: /dev/null
 
-      - name: Upload WebView.jar
-        uses: actions/upload-artifact@v4
-        with:
-          name: WebView-jar
-          path: target/webview-*.jar
-          if-no-files-found: error
+      - name: Set Maven project version
+        shell: bash
+        run: |
+          mvn versions:set \
+            -DnewVersion="${{ env.VERSION }}" \
+            -DprocessAllModules=true \
+            -DgenerateBackupPoms=false \
+            --batch-mode -ntp
+
+      - name: Build and deploy
+        shell: bash
+        run: |
+          mvn -B clean deploy \
+            --batch-mode -ntp \
+            -DskipTests \
+            -Psign-artifacts \
+            -Dgpg.passphrase="$GPG_PASSPHRASE"
+        env:
+          GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
+          MAVEN_CENTRAL_USERNAME: ${{ secrets.MAVEN_CENTRAL_USERNAME }}
+          MAVEN_CENTRAL_PASSWORD: ${{ secrets.MAVEN_CENTRAL_PASSWORD }}
+
+      - name: Clean up GPG keys
+        if: always()
+        shell: bash
+        run: |
+          gpg --batch --yes --delete-secret-and-public-keys \
+            $(gpg --list-secret-keys --keyid-format long | grep sec | awk '{print $2}' | cut -d'/' -f2) 2>/dev/null || true
+          rm -rf ~/.gnupg
