@@ -4,11 +4,11 @@
 #   asdf install        # if using asdf
 #   mise install        # if using mise
 #
-# The project's javac.source / javac.target are 1.8 and the Ant build looks
-# for `platforms.JDK_1.8.home`, so we pin Java 8 here.  If you prefer to
-# develop on a newer LTS you can build with Java 17/21 and pass
-# `--release 8` (or `-source 1.8 -target 1.8`) -- the source code itself
-# stays 1.8-compatible.
+# The project's maven.compiler.source / maven.compiler.target are 1.8, so
+# we pin Java 8 here.  If you prefer to develop on a newer LTS you can
+# build with Java 17/21 -- the existing source/target settings still
+# produce JDK-8-compatible bytecode (pass `-Dmaven.compiler.release=8`
+# for stricter API checking).  The source code itself stays 1.8-compatible.
 #
 # We use Amazon Corretto 8 (an OpenJDK 8 build) because mise/asdf do not
 # ship Eclipse Temurin for Java 8 -- Temurin's mise registry starts at 11.
@@ -24,4 +24,4 @@
 #             WebView2 SDK is bundled under windows/script/.
 #
 java corretto-8.492.09.2
-ant 1.10.14
+maven 3.9.9

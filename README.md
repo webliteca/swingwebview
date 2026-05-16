@@ -318,14 +318,14 @@ This should work on Mac, Linux, and Windows.
 ~~~
 git clone https://github.com/shannah/webviewjar
 cd webviewjar
-ant jar
+mvn -DskipTests package
 ~~~
 
-This will create dist/WebView.jar, which can be run as an executable jar.
+This will create target/WebView.jar, which can be run as an executable jar.
 
 ### Troubleshooting
 
-ANT requires that the `platforms.JDK_1.8.home` system property is set to your JAVA_HOME.  If it complains about this, you can fix the issue by changing the `ant jar` command, above, to `ant jar -Dplatforms.JDK_1.8.home="$JAVA_HOME"`.
+The build targets Java 8 bytecode (`maven.compiler.source` / `maven.compiler.target` = `1.8` in `pom.xml`).  Builds work on JDK 8 and any newer LTS; if you want strict Java 8 API checking when building on JDK 9+, pass `-Dmaven.compiler.release=8`.
 
 ### Rebuilding Native Libs
 

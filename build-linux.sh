@@ -16,4 +16,4 @@ g++ -I${JAVA_HOME}/include -I${JAVA_HOME}/include/linux -fPIC -std=c++11 -Wall -
     $JAWT_LIB -lX11 \
     -shared -o libwebview.so
 mv libwebview.so src/linux_64/
-ant jar -Dplatforms.JDK_1.8.home=$JAVA_HOME
+mvn -DskipTests package
