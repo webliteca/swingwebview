@@ -98,7 +98,7 @@ for /f "delims=" %%V in ('dir /b /ad /on "%KITS_ROOT%\Include" 2^>nul') do (
 if "%SDK_VER%"=="" goto :sdk_check_done
 echo NOTE: vsdevcmd did not register a Windows SDK, but one is present
 echo       on disk.  Manually adding Windows SDK %SDK_VER% at %KITS_ROOT%.
-set "INCLUDE=%INCLUDE%;%KITS_ROOT%\Include\%SDK_VER%\ucrt;%KITS_ROOT%\Include\%SDK_VER%\um;%KITS_ROOT%\Include\%SDK_VER%\shared;%KITS_ROOT%\Include\%SDK_VER%\winrt"
+set "INCLUDE=%INCLUDE%;%KITS_ROOT%\Include\%SDK_VER%\ucrt;%KITS_ROOT%\Include\%SDK_VER%\um;%KITS_ROOT%\Include\%SDK_VER%\shared;%KITS_ROOT%\Include\%SDK_VER%\winrt;%KITS_ROOT%\Include\%SDK_VER%\cppwinrt"
 set "LIB=%LIB%;%KITS_ROOT%\Lib\%SDK_VER%\ucrt\x64;%KITS_ROOT%\Lib\%SDK_VER%\um\x64"
 set "SDK_OK=1"
 :sdk_check_done
@@ -141,6 +141,20 @@ if not exist "%DLL_OUT%" mkdir "%DLL_OUT%"
 set "BUILD_DIR=%REPO_DIR%\build"
 if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
 set "WEBVIEW2_DIR=%REPO_DIR%\windows\script\Microsoft.Web.WebView2.0.8.355"
+
+REM The WebView2 SDK is committed as the raw .nupkg (a zip).  Build expects
+REM the build/native/{include,x64} tree -- extract it on first run.
+if exist "%WEBVIEW2_DIR%\build\native\include\WebView2.h" goto :webview2_ready
+echo Extracting Microsoft.Web.WebView2.0.8.355.nupkg ...
+pushd "%WEBVIEW2_DIR%"
+tar -xf "Microsoft.Web.WebView2.0.8.355.nupkg"
+popd
+if not exist "%WEBVIEW2_DIR%\build\native\include\WebView2.h" (
+    echo ERROR: failed to extract WebView2 SDK with tar.exe.
+    echo        Make sure tar.exe is on PATH ^(ships with Windows 10 1803+^).
+    exit /b 1
+)
+:webview2_ready
 
 echo Building webview.dll (x64) ...
 cl /nologo ^
