@@ -116,8 +116,8 @@ echo WindowsSdkVersion   = %WindowsSdkVersion%
 echo UCRTVersion         = %UCRTVersion%
 echo.
 echo Headers physically present on disk:
-where /R "C:\Program Files (x86)\Windows Kits" windows.h 2>nul
-where /R "C:\Program Files (x86)\Windows Kits" crtdbg.h 2>nul
+"%SystemRoot%\System32\where.exe" /R "C:\Program Files (x86)\Windows Kits" windows.h 2>nul
+"%SystemRoot%\System32\where.exe" /R "C:\Program Files (x86)\Windows Kits" crtdbg.h 2>nul
 echo --------------------------------------------------------------------
 echo.
 echo Fix: open the Visual Studio Installer, click Modify on your VS 2022
@@ -205,7 +205,13 @@ if not exist "%REPO_DIR%\dist" mkdir "%REPO_DIR%\dist"
 set "STAGE=%BUILD_DIR%\stage-webview"
 if exist "%STAGE%" rmdir /s /q "%STAGE%"
 mkdir "%STAGE%\%NATIVE_DIR%"
-xcopy /e /q /y "%WV_CLASSES%\*" "%STAGE%\" >nul
+REM Litecode-style terminals can strip System32 from PATH, so call xcopy
+REM by its absolute path.
+"%SystemRoot%\System32\xcopy.exe" /e /q /y "%WV_CLASSES%\*" "%STAGE%\" >nul
+if errorlevel 1 (
+    echo ERROR: xcopy of compiled classes into the jar staging dir failed.
+    exit /b 1
+)
 copy /Y "%DLL_OUT%\webview.dll" "%STAGE%\%NATIVE_DIR%\webview.dll" >nul
 copy /Y "%DLL_OUT%\WebView2Loader.dll" "%STAGE%\%NATIVE_DIR%\WebView2Loader.dll" >nul
 pushd "%STAGE%"
