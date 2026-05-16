@@ -895,6 +895,37 @@ struct OffEngine {
     JavaVM *jvm = nullptr;
 };
 
+// Mirrors engine_on_message for the offscreen engine: parse the {name,
+// seq, args} envelope produced by the bind shim, look the binding up by
+// name, and forward the raw JSON payload to the Java callback's
+// WebViewNativeCallback.invoke(String, long).
+static void off_engine_on_message(OffEngine *e, const char *msg) {
+    if (msg == nullptr) return;
+    std::string s(msg);
+    auto pos = s.find("\"name\":\"");
+    if (pos == std::string::npos) return;
+    auto start = pos + 8;
+    auto end = s.find('"', start);
+    if (end == std::string::npos) return;
+    std::string name = s.substr(start, end - start);
+    auto it = e->bindings.find(name);
+    if (it == e->bindings.end()) return;
+    Binding *b = it->second;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        e->jvm->AttachCurrentThread((void **)&env, nullptr);
+        detach = true;
+    }
+    jmethodID mid = env->GetMethodID(b->cls, "invoke", "(Ljava/lang/String;J)V");
+    if (mid) {
+        jstring js = env->NewStringUTF(msg);
+        env->CallVoidMethod(b->fn, mid, js, (jlong)e);
+        env->DeleteLocalRef(js);
+    }
+    if (detach) e->jvm->DetachCurrentThread();
+}
+
 static OffEngine *gtk_off_create_engine(JNIEnv *env,
                                         int width, int height, jint debug) {
     if (width < 1) width = 1;
@@ -943,6 +974,32 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
         // editor-command lookup, which maps Backspace etc. correctly.
         webkit_web_view_set_input_method_context(
             WEBKIT_WEB_VIEW(e->web), NULL);
+
+        // Wire the "external" script-message handler so the bind shim's
+        // window.external.invoke(JSON) round-trips back into Java.  The
+        // shim and envelope are identical to the heavyweight engine --
+        // bindings are the single source of truth for the
+        // window.<name>(...) contract across both modes.
+        g_signal_connect(
+            e->manager, "script-message-received::external",
+            G_CALLBACK(+[](WebKitUserContentManager *m,
+                           WebKitJavascriptResult *r, gpointer arg) {
+                auto *eng = static_cast<OffEngine *>(arg);
+                JSCValue *v = webkit_javascript_result_get_js_value(r);
+                char *s = jsc_value_to_string(v);
+                off_engine_on_message(eng, s);
+                g_free(s);
+            }),
+            e);
+        webkit_user_content_manager_register_script_message_handler(
+            e->manager, "external");
+        webkit_user_content_manager_add_script(
+            e->manager,
+            webkit_user_script_new(
+                "window.external={invoke:function(s){"
+                "window.webkit.messageHandlers.external.postMessage(s);}};",
+                WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+                WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL));
 
         gtk_widget_set_size_request(e->web, e->width, e->height);
         gtk_container_add(GTK_CONTAINER(e->window), e->web);
@@ -1006,6 +1063,30 @@ static void gtk_off_destroy_engine(OffEngine *e) {
     }
     e->bindings.clear();
     delete e;
+}
+
+static void gtk_off_init_script(OffEngine *e, std::string js) {
+    GtkPump::instance().run_async([=] {
+        if (!e->manager) return;
+        webkit_user_content_manager_add_script(
+            e->manager,
+            webkit_user_script_new(js.c_str(),
+                                   WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+                                   WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+                                   NULL, NULL));
+    });
+}
+
+static void gtk_off_eval(OffEngine *e, std::string js) {
+    GtkPump::instance().run_async([=] {
+        if (!e->web) return;
+        webkit_web_view_run_javascript(WEBKIT_WEB_VIEW(e->web), js.c_str(),
+                                       NULL, NULL, NULL);
+    });
+}
+
+static void gtk_off_bind(OffEngine *e, Binding *b) {
+    e->bindings[b->name] = b;
 }
 
 static void gtk_off_resize(OffEngine *e, int w, int h) {
@@ -1945,5 +2026,93 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
 #else
     (void)peer; (void)press; (void)keyval; (void)modifiers;
     (void)is_modifier_key;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1init
+  (JNIEnv *env, jclass, jlong wv, jstring js) {
+    const char *s = env->GetStringUTFChars(js, nullptr);
+#ifdef WEBVIEW_GTK
+    embed::gtk_off_init_script((embed::OffEngine *)wv, s ? s : "");
+#else
+    (void)wv;
+#endif
+    env->ReleaseStringUTFChars(js, s);
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1eval
+  (JNIEnv *env, jclass, jlong wv, jstring js) {
+    const char *s = env->GetStringUTFChars(js, nullptr);
+#ifdef WEBVIEW_GTK
+    embed::gtk_off_eval((embed::OffEngine *)wv, s ? s : "");
+#else
+    (void)wv;
+#endif
+    env->ReleaseStringUTFChars(js, s);
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1bind
+  (JNIEnv *env, jclass, jlong wv, jstring name, jobject fn, jlong /*arg*/) {
+#ifdef WEBVIEW_GTK
+    auto *e = (embed::OffEngine *)wv;
+    if (!e) return;
+    const char *n = env->GetStringUTFChars(name, nullptr);
+    embed::Binding *b = new embed::Binding();
+    b->name = n ? n : "";
+    b->fn = env->NewGlobalRef(fn);
+    jclass cls = env->GetObjectClass(fn);
+    b->cls = (jclass)env->NewGlobalRef(cls);
+    env->DeleteLocalRef(cls);
+
+    // Byte-identical to the heavyweight bind shim at
+    // webview_embed.cpp:1791-1801 so the window.<name>(...) contract
+    // is the same in both modes.
+    std::string js =
+        std::string("(function(){var n='") + b->name + "';" +
+        "window[n]=function(){"
+        "  var me=window[n];"
+        "  if(!me.callbacks){me.callbacks={};me.errors={};}"
+        "  var seq=(me.lastSeq||0)+1;me.lastSeq=seq;"
+        "  var p=new Promise(function(res,rej){me.callbacks[seq]=res;me.errors[seq]=rej;});"
+        "  window.external.invoke(JSON.stringify({name:n,seq:seq,"
+        "    args:Array.prototype.slice.call(arguments)}));"
+        "  return p;"
+        "};})()";
+
+    embed::gtk_off_bind(e, b);
+    embed::gtk_off_init_script(e, js);
+    env->ReleaseStringUTFChars(name, n);
+#else
+    (void)env; (void)wv; (void)name; (void)fn;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1dispatch
+  (JNIEnv *env, jclass, jlong wv, jobject callback) {
+#ifdef WEBVIEW_GTK
+    auto *e = (embed::OffEngine *)wv;
+    if (!e) return;
+    JavaVM *jvm = e->jvm;
+    jobject ref = env->NewGlobalRef(callback);
+    jclass cls = env->GetObjectClass(callback);
+    jclass gcls = (jclass)env->NewGlobalRef(cls);
+    env->DeleteLocalRef(cls);
+
+    auto fn = [jvm, ref, gcls] {
+        JNIEnv *e2 = nullptr;
+        bool detach = false;
+        if (jvm->GetEnv((void **)&e2, JNI_VERSION_1_6) != JNI_OK) {
+            jvm->AttachCurrentThread((void **)&e2, nullptr);
+            detach = true;
+        }
+        jmethodID m = e2->GetMethodID(gcls, "run", "()V");
+        if (m) e2->CallVoidMethod(ref, m);
+        e2->DeleteGlobalRef(ref);
+        e2->DeleteGlobalRef(gcls);
+        if (detach) jvm->DetachCurrentThread();
+    };
+    embed::GtkPump::instance().run_async(fn);
+#else
+    (void)env; (void)wv; (void)callback;
 #endif
 }

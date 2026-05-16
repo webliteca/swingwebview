@@ -122,6 +122,14 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
     }
 
     @Override
+    public WebViewComponent dispatch(Runnable r) {
+        if (embedded != null) {
+            embedded.dispatch(r);
+        }
+        return this;
+    }
+
+    @Override
     public void dispose() {
         if (embedded != null) {
             EmbeddedWebView e = embedded;

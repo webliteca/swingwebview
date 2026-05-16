@@ -23,6 +23,10 @@ import java.awt.event.MouseWheelEvent;
 import java.awt.event.MouseWheelListener;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import javax.swing.Timer;
 
 /**
@@ -40,10 +44,19 @@ import javax.swing.Timer;
  * not available -- the WebKit input-method context is disabled because
  * all input arrives already-decoded from AWT.
  *
+ * <p><strong>JS interaction.</strong> {@link #eval},
+ * {@link #addOnBeforeLoad}, {@link #addJavascriptCallback}, and
+ * {@link #dispatch} delegate to the offscreen engine.  Init scripts and
+ * bindings registered before the component is displayable are buffered
+ * and replayed when {@code addNotify} creates the engine.  The
+ * {@code window.<name>(...)} contract for bound callbacks is identical
+ * to {@link WebViewHeavyweightComponent}.
+ *
  * <p><strong>Platform support.</strong> Linux only at the moment.  On
  * macOS and Windows the underlying native entry points are stubs that
  * return 0 from create, so this component will silently fail to attach
- * and show its empty Swing background.  Use
+ * and show its empty Swing background; the JS-interaction methods
+ * remain no-ops there alongside the rendering path.  Use
  * {@link WebViewHeavyweightComponent} on those platforms.
  */
 public class WebViewLightweightComponent extends WebViewComponent {
@@ -57,6 +70,9 @@ public class WebViewLightweightComponent extends WebViewComponent {
 
     private String pendingUrl = "about:blank";
     private boolean debug;
+    private final List<String> pendingInit = new ArrayList<String>();
+    private final Map<String, WebView.JavascriptCallback> pendingBindings =
+            new LinkedHashMap<String, WebView.JavascriptCallback>();
 
     public WebViewLightweightComponent() {
         setOpaque(true);
@@ -165,6 +181,12 @@ public class WebViewLightweightComponent extends WebViewComponent {
             return;
         }
         allocateBuffer(w, h);
+        for (String js : pendingInit) {
+            engine.addOnBeforeLoad(js);
+        }
+        for (Map.Entry<String, WebView.JavascriptCallback> b : pendingBindings.entrySet()) {
+            engine.addJavascriptCallback(b.getKey(), b.getValue());
+        }
         engine.navigate(pendingUrl);
         repaintTimer = new Timer(REPAINT_INTERVAL_MS, e -> repaint());
         repaintTimer.setRepeats(true);
@@ -241,20 +263,36 @@ public class WebViewLightweightComponent extends WebViewComponent {
 
     @Override
     public WebViewComponent addOnBeforeLoad(String js) {
-        // Phase 1: not yet wired through the offscreen path.
+        pendingInit.add(js);
+        if (engine != null) {
+            engine.addOnBeforeLoad(js);
+        }
         return this;
     }
 
     @Override
     public WebViewComponent eval(String js) {
-        // Phase 1: not yet wired through the offscreen path.
+        if (engine != null) {
+            engine.eval(js);
+        }
         return this;
     }
 
     @Override
     public WebViewComponent addJavascriptCallback(String name,
                                                   WebView.JavascriptCallback cb) {
-        // Phase 1: not yet wired through the offscreen path.
+        pendingBindings.put(name, cb);
+        if (engine != null) {
+            engine.addJavascriptCallback(name, cb);
+        }
+        return this;
+    }
+
+    @Override
+    public WebViewComponent dispatch(Runnable r) {
+        if (engine != null) {
+            engine.dispatch(r);
+        }
         return this;
     }
 
