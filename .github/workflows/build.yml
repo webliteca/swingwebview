@@ -54,15 +54,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Liberica (BellSoft) ships JDK 8 for all six OS/arch combos we
-      # target -- including Windows ARM64, which Corretto 8 doesn't have.
-      # Keeping the build on JDK 8 matches the project's .tool-versions
-      # and avoids any --release 8 dance in the assembly job.
-      - name: Set up JDK 8
+      # Build against JDK 11.  Reason: Liberica (and Temurin) only have
+      # Windows ARM64 builds from JDK 11+ -- there's no JDK 8 distribution
+      # for Win-on-ARM.  Keeping the whole matrix on JDK 11 is simpler than
+      # per-matrix version overrides, and the JNI/JAWT headers are
+      # forward-compatible (the embed code gates JAWT_VERSION_9 behind
+      # `#if defined`).  The assembly job compiles the .java sources with
+      # `--release 8` so the resulting bytecode still runs on JRE 8.
+      - name: Set up JDK 11
         uses: actions/setup-java@v4
         with:
           distribution: liberica
-          java-version: '8'
+          java-version: '11'
 
       # ---------------- macOS -------------------------------------------------
       - name: Build macOS native (${{ matrix.mac_arch }})
@@ -190,11 +193,11 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up JDK 8
+      - name: Set up JDK 11
         uses: actions/setup-java@v4
         with:
           distribution: liberica
-          java-version: '8'
+          java-version: '11'
 
       - name: Download all native artifacts
         uses: actions/download-artifact@v4
@@ -214,13 +217,16 @@ jobs:
           echo "--- final native layout ---"
           find src -maxdepth 2 -type f \( -name '*.dylib' -o -name '*.so' -o -name '*.dll' \) | sort
 
-      - name: Compile WebView Java sources
+      - name: Compile WebView Java sources (target JDK 8 bytecode)
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p build/classes-webview dist
           find src -name '*.java' > build/wv-sources.txt
-          javac -d build/classes-webview -classpath 'lib/*' @build/wv-sources.txt
+          # --release 8 so the assembled jar still runs on a JRE 8 host
+          # even though we build it with JDK 11.
+          javac --release 8 -d build/classes-webview \
+              -classpath 'lib/*' @build/wv-sources.txt
 
       - name: Stage and package WebView.jar
         shell: bash
