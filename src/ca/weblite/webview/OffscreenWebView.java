@@ -6,7 +6,7 @@
 package ca.weblite.webview;
 
 import java.util.ArrayList;
-import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -19,8 +19,17 @@ import java.util.Map;
  * pixels via {@link #snapshot} into a {@code BufferedImage}, render them
  * into a {@code JComponent}.
  *
+ * <p>Exposes the same JS-interaction surface as {@link EmbeddedWebView}:
+ * {@link #eval}, {@link #addOnBeforeLoad}, {@link #addJavascriptCallback}
+ * (which appears as {@code window.<name>} inside the page), and
+ * {@link #dispatch} for marshaling work onto the native UI thread.  The
+ * {@code window.<name>(...)} shim and round-trip envelope are shared
+ * verbatim with the embed engine so page authors see an identical
+ * contract in both modes.
+ *
  * <p>Currently Linux only -- macOS / Windows entry points are stubs that
- * return 0 from create.
+ * return 0 from create, so {@link #create} returns {@code null} on those
+ * platforms.
  *
  * <p>Most callers should not use this class directly; use
  * {@link ca.weblite.webview.swing.WebViewLightweightComponent}.
@@ -30,7 +39,7 @@ public class OffscreenWebView {
     private long peer;
     private final List<Object> heap = new ArrayList<Object>();
     private final Map<String, WebView.JavascriptCallback> bindings =
-        new HashMap<String, WebView.JavascriptCallback>();
+            new LinkedHashMap<String, WebView.JavascriptCallback>();
 
     private OffscreenWebView(long peer) {
         this.peer = peer;
@@ -112,8 +121,7 @@ public class OffscreenWebView {
     }
 
     /**
-     * Add a script to be evaluated each time a new document is created.
-     * Mirrors {@link EmbeddedWebView#addOnBeforeLoad}.
+     * Add a script to be evaluated at the start of every new document.
      */
     public OffscreenWebView addOnBeforeLoad(String js) {
         checkAlive();
@@ -122,8 +130,7 @@ public class OffscreenWebView {
     }
 
     /**
-     * Evaluate JavaScript in the current document.  Mirrors
-     * {@link EmbeddedWebView#eval}.
+     * Evaluate javascript in the current document.
      */
     public OffscreenWebView eval(String js) {
         checkAlive();
@@ -133,8 +140,9 @@ public class OffscreenWebView {
 
     /**
      * Bind a Java callback under {@code window.<name>} in the offscreen
-     * WebView's pages.  Mirrors
-     * {@link EmbeddedWebView#addJavascriptCallback}.
+     * page.  Structurally identical to
+     * {@link EmbeddedWebView#addJavascriptCallback}: the native side
+     * round-trips through the same {@code {name, seq, args}} envelope.
      */
     public OffscreenWebView addJavascriptCallback(final String name,
                                                   final WebView.JavascriptCallback cb) {
@@ -151,6 +159,26 @@ public class OffscreenWebView {
         };
         heap.add(fn);
         WebViewNative.webview_offscreen_bind(peer, name, fn, peer);
+        return this;
+    }
+
+    /**
+     * Dispatch a Runnable onto the offscreen WebView's native UI thread.
+     */
+    public OffscreenWebView dispatch(final Runnable r) {
+        checkAlive();
+        final Runnable wrapper = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    r.run();
+                } finally {
+                    heap.remove(this);
+                }
+            }
+        };
+        heap.add(wrapper);
+        WebViewNative.webview_offscreen_dispatch(peer, wrapper);
         return this;
     }
 

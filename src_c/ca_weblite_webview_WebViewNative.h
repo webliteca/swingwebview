@@ -305,6 +305,14 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
 
 /*
  * Class:     ca_weblite_webview_WebViewNative
+ * Method:    webview_offscreen_dispatch
+ * Signature: (JLjava/lang/Runnable;)V
+ */
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1dispatch
+  (JNIEnv *, jclass, jlong, jobject);
+
+/*
+ * Class:     ca_weblite_webview_WebViewNative
  * Method:    webview_offscreen_open_devtools
  * Signature: (J)I
  */

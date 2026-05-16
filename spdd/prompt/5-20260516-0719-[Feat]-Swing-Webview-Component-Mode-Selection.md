@@ -12,9 +12,9 @@ generated_at: 2026-05-16T07:19:13-07:00
   heavyweight peer or an offscreen-rendered lightweight component
   (`WebViewComponent.java:42`).
 - Public abstract API: `setUrl`/`getUrl`, `setDebug`,
-  `addOnBeforeLoad`, `eval`, `addJavascriptCallback`, `dispose`,
-  `isHeavyweight` (`WebViewComponent.java:122`–
-  `WebViewComponent.java:157`).
+  `addOnBeforeLoad`, `eval`, `addJavascriptCallback`,
+  `dispatch`, `dispose`, `isHeavyweight`
+  (`WebViewComponent.java:122`–`WebViewComponent.java:170`).
 - Public non-abstract API (defaulted on the base class so any
   future subclass inherits without rework):
   - `openDevTools(): boolean` — opens the platform's native
@@ -274,6 +274,13 @@ File: `src/ca/weblite/webview/swing/WebViewComponent.java`
    - `addJavascriptCallback(String name, WebView.JavascriptCallback cb): WebViewComponent`
      — buffered and replayed on attach
      (`WebViewComponent.java:148`).
+   - `dispatch(Runnable r): WebViewComponent` — marshal `r`
+     onto the native WebView's UI thread. No-op until the
+     component is displayable; transient work is not
+     buffered. Both the heavyweight and lightweight subclasses
+     delegate to the underlying engine
+     (`EmbeddedWebView.dispatch` /
+     `OffscreenWebView.dispatch`).
    - `dispose(): void` — release native resources; component is
      unusable afterward (`WebViewComponent.java:157`).
    - `isHeavyweight(): boolean` — defaults to `false`; only

@@ -164,6 +164,12 @@ public abstract class WebViewComponent extends JComponent {
                                                            WebView.JavascriptCallback cb);
 
     /**
+     * Dispatch a {@code Runnable} onto the native WebView's UI thread.  No-op
+     * until the component is displayable -- transient work is not buffered.
+     */
+    public abstract WebViewComponent dispatch(Runnable r);
+
+    /**
      * Release the native resources held by this component.  After calling
      * this method the component should not be used.  This is also called
      * automatically when the component is removed from its parent and its

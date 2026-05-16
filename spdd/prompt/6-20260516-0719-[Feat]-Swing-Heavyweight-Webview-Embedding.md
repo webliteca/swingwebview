@@ -330,6 +330,10 @@ File: `src/ca/weblite/webview/swing/WebViewHeavyweightComponent.java`
      state; then put in `pendingBindings`; if live, call
      `embedded.addJavascriptCallback` immediately
      (`WebViewHeavyweightComponent.java:115`).
+   - `dispatch(Runnable r)` — no-op until live; once
+     `embedded != null`, delegate to `embedded.dispatch(r)`.
+     Transient work is not buffered: a `Runnable` posted
+     before display has no defined moment to run.
    - `dispose()` — if peer exists, clear field then call
      `embedded.dispose()` (`WebViewHeavyweightComponent.java:124`).
    - `openDevTools(): boolean` — if `embedded == null` return

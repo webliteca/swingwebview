@@ -36,33 +36,30 @@ generated_at: 2026-05-16T07:19:13-07:00
   - Right-click context menus and `<select>` dropdowns from
     inside the page log a GDK warning and don't visibly appear
     (`README.md ("Lightweight notes" section)`).
-- The lightweight subclass wires init scripts, `eval`, and JS
-  callbacks through the offscreen path. The earlier "Phase 1:
-  not yet wired" stubs are replaced by real implementations
-  that delegate to new
-  `OffscreenWebView.addOnBeforeLoad`/`eval`/`addJavascriptCallback`
-  methods backed by new JNI entry points
-  `webview_offscreen_init`, `webview_offscreen_eval`, and
-  `webview_offscreen_bind`. This unblocks the console-capture
-  pipeline declared in
-  [[swing-webview-component-mode-selection]] and brings the
-  lightweight surface to parity with the heavyweight
-  component for JS interaction (rendering and input were
-  already at parity).
+- The lightweight subclass implements the full JS-interaction
+  surface defined in
+  [[swing-webview-component-mode-selection]]: `eval`,
+  `addJavascriptCallback`, `addOnBeforeLoad`, and
+  `dispatch(Runnable)`.  These delegate through the offscreen
+  GTK engine and share the same `window.<name>(...)` contract
+  as the heavyweight path; the earlier "Phase 1: not yet
+  wired" stubs are gone.  On macOS / Windows the offscreen
+  engine itself returns null from create, so the methods
+  silently no-op alongside the rendering path.
 - Implement the developer-visibility surface declared in
   [[swing-webview-component-mode-selection]]:
   - `openDevTools(): boolean` — when `debug=true` was set
     before display, opens the WebKitGTK Web Inspector for the
     offscreen WebView in a separate OS window and returns
-    `true`. Backed by the new JNI entry point
+    `true`.  Backed by the new JNI entry point
     `webview_offscreen_open_devtools`.
   - Console capture — install the canonical JS shim from
-    `ConsoleDispatcher.SHIM_JS` via the new
+    `ConsoleDispatcher.SHIM_JS` via
     `OffscreenWebView.addOnBeforeLoad`, bind
-    `__webview_console__` via the new
+    `__webview_console__` via
     `OffscreenWebView.addJavascriptCallback` to a callback
     that routes the raw payload into
-    `ConsoleDispatcher.dispatch`. Both happen inside
+    `ConsoleDispatcher.dispatch`.  Both happen inside
     `addNotify()` immediately after engine creation.
 - Definition of Done: documented at `README.md ("Quick start" section)`,
   exercised by the `WebViewHeavyweightDemo` toggle (which
@@ -101,20 +98,37 @@ generated_at: 2026-05-16T07:19:13-07:00
     name starting with `__webview_` (matches the canvas-5
     reserved-prefix norm).
 - **OffscreenWebView** (`OffscreenWebView.java:24`) — Low-level
-  JNI wrapper for the offscreen engine. Owns a `long peer`;
-  `peer == 0` means unsupported platform or disposed
-  (`OffscreenWebView.java:26`, `OffscreenWebView.java:38`).
-  Holds a `heap: List<Object>` to anchor JNI callbacks
-  against GC and a `bindings: Map<String, JavascriptCallback>`
-  map of currently bound JS callbacks — same shape as
-  `EmbeddedWebView`'s callback bookkeeping. Invariants:
+  JNI wrapper for the offscreen engine.  Owns:
+  - `peer: long` — native pointer; `0` means unsupported
+    platform or disposed (`OffscreenWebView.java:26`,
+    `OffscreenWebView.java:38`).
+  - `heap: List<Object>` — anchors JNI callbacks
+    (`WebViewNativeCallback`s, dispatch wrappers) against GC
+    while the native side still holds a function pointer.
+    Same invariant as the heavyweight `EmbeddedWebView.heap`
+    (`EmbeddedWebView.java:33`).
+  - `bindings: Map<String, WebView.JavascriptCallback>` — name
+    → Java callback for every bound `window.<name>` shim.
+    Mirrors `EmbeddedWebView.bindings`
+    (`EmbeddedWebView.java:34`).
+  Invariants:
   - `addOnBeforeLoad(js)`, `eval(js)`,
-    `addJavascriptCallback(name, cb)`, and
-    `openDevTools(): boolean` are new methods backed by new
-    JNI entry points `webview_offscreen_init`,
-    `webview_offscreen_eval`, `webview_offscreen_bind`,
-    `webview_offscreen_open_devtools`.
-  - All four go through `checkAlive` before invoking JNI.
+    `addJavascriptCallback(name, cb)`,
+    `dispatch(Runnable r)`, and `openDevTools(): boolean`
+    are backed by JNI entry points
+    `webview_offscreen_init`, `webview_offscreen_eval`,
+    `webview_offscreen_bind`, `webview_offscreen_dispatch`,
+    and `webview_offscreen_open_devtools` respectively.
+  - All five go through `checkAlive` before invoking JNI.
+- **WebViewLightweightComponent buffered configuration** —
+  alongside the existing `pendingUrl` and `debug` fields the
+  subclass holds `pendingInit: List<String>` and
+  `pendingBindings: Map<String, WebView.JavascriptCallback>`
+  so callers can register init scripts and JS callbacks BEFORE
+  `addNotify` creates the engine; both are replayed in
+  `addNotify` after `OffscreenWebView.create` returns non-null.
+  This satisfies the buffer/replay contract from
+  [[swing-webview-component-mode-selection]].
 - **GdkInput** (`GdkInput.java:17`) — translation table between
   AWT input constants and GDK constants. Pure functions; no
   state.
@@ -150,28 +164,29 @@ generated_at: 2026-05-16T07:19:13-07:00
   via `webview_offscreen_snapshot`. Higher per-frame cost
   than heavyweight compositing, but composites cleanly with
   Swing.
-- **JS bridge mirrors the heavyweight embed path.** The
-  offscreen engine already creates its `WebKitWebView` with a
-  `WebKitUserContentManager` (the engine struct at
-  `src_c/webview_embed.cpp` line 880-ff). Wiring init scripts
-  and JS callbacks is a near-direct port of the
-  embed-path code at `src_c/webview_embed.cpp:547-583`:
-  `webkit_user_content_manager_register_script_message_handler`
-  for the named binding, `webkit_user_content_manager_add_script`
-  with a `webkit_user_script_new` for `addOnBeforeLoad`, and
-  `webkit_web_view_run_javascript` for `eval`. The same
-  `engine_on_message` helper used by the embed path is reused
-  for the offscreen path's message callback.
+- **JS bridge — reused from the embed engine.** The offscreen
+  engine reuses the same `embed::gtk_eval`,
+  `embed::gtk_init_script`, `embed::gtk_bind`, and
+  `embed::GtkPump::run_async` helpers (and parallel offscreen
+  equivalents) that drive the heavyweight engine on Linux.
+  The `window.<name>(...)` JS shim and the
+  `{name, seq, args}` round-trip envelope from
+  `webview_embed.cpp:1791`–`webview_embed.cpp:1801` are
+  byte-identical so page authors see the same contract in
+  both modes.  The `OffEngine` struct already carries
+  `bindings`, `manager`, and `jvm` fields
+  (`webview_embed.cpp:887`) — the new JNI entries plug into
+  those.
 - **DevTools call is single-shot.** No state added on the
-  Java side. The native `webview_offscreen_open_devtools`
+  Java side.  The native `webview_offscreen_open_devtools`
   returns 0 if `enable_developer_extras` is FALSE on the
   engine's `WebKitSettings`; otherwise calls
   `webkit_web_inspector_show` on
-  `webkit_web_view_get_inspector(...)` and returns 1. Same
+  `webkit_web_view_get_inspector(...)` and returns 1.  Same
   null-guard + dispatch-to-GTK-pump-thread pattern as the
   embed path's `webview_embed_open_devtools`.
 - **Console bridge install is per engine-creation, not per
-  navigation.** Same rationale as the heavyweight path: the
+  navigation.**  Same rationale as the heavyweight path: the
   underlying `webkit_user_script_new` /
   `register_script_message_handler` machinery re-fires for
   every new document at document-start.
@@ -183,25 +198,25 @@ generated_at: 2026-05-16T07:19:13-07:00
   for the offscreen engine.
 - `src/ca/weblite/webview/GdkInput.java` — AWT-to-GDK
   translation tables.
-- `src/ca/weblite/webview/WebViewNative.java:180`–
-  `src/ca/weblite/webview/WebViewNative.java:242` — native
-  entry points for the offscreen engine
+- `src/ca/weblite/webview/WebViewNative.java` — native entry
+  points for the offscreen engine
   (`webview_offscreen_create`, `webview_offscreen_snapshot`,
-  `webview_offscreen_mouse_*`, `webview_offscreen_key_event`).
-  Adds four new declarations:
-  `webview_offscreen_init(long peer, String js): void`,
-  `webview_offscreen_eval(long peer, String js): void`,
-  `webview_offscreen_bind(long peer, String name, WebViewNativeCallback fn, long arg): void`,
-  `webview_offscreen_open_devtools(long peer): int`.
+  `webview_offscreen_mouse_*`, `webview_offscreen_key_event`,
+  `webview_offscreen_init`, `webview_offscreen_eval`,
+  `webview_offscreen_bind`, `webview_offscreen_dispatch`,
+  `webview_offscreen_open_devtools`).
 - `src/ca/weblite/webview/ConsoleDispatcher.java` (from
   [[swing-webview-component-mode-selection]]) — owned by the
   component; receives raw payloads from the internal
   `__webview_console__` binding callback registered in
   `addNotify`.
 - `src_c/webview_embed.cpp` — native implementation (shared
-  with embed path on Linux). Stubs on macOS/Windows. New
-  implementations of the four offscreen JNI methods listed
+  with embed path on Linux).  Stubs on macOS/Windows.  New
+  implementations of the five offscreen JNI methods listed
   above, in the offscreen-engine block around line 880-ff.
+- `src_c/ca_weblite_webview_WebViewNative.h` — generated JNI
+  header; declares the five new offscreen entries alongside
+  the existing ones.
 
 ## O · Operations
 
@@ -249,69 +264,79 @@ File: `src/ca/weblite/webview/OffscreenWebView.java`
 
 1. Responsibility: typed wrapper around the offscreen native
    engine; create, resize, navigate, snapshot, inject input,
-   dispose.
+   evaluate JS, register JS callbacks, dispatch work onto the
+   native thread, dispose.
 2. Fields:
-   - `peer: long` — native pointer; 0 means disposed/unsupported
-     (`OffscreenWebView.java:26`).
+   - `peer: long` — native pointer; 0 means disposed/unsupported.
+   - `heap: List<Object>` — anchors JNI callbacks and dispatch
+     wrappers; same anti-GC pattern as
+     `EmbeddedWebView.heap`.
+   - `bindings: Map<String, WebView.JavascriptCallback>` —
+     name-keyed Java callbacks for every bound JS function;
+     same shape as `EmbeddedWebView.bindings`.
 3. Methods:
    - `create(int width, int height, boolean debug): OffscreenWebView`
      - Logic: call
-       `webview_offscreen_create(max(1,w), max(1,h), debug?1:0)`
-       (`OffscreenWebView.java:37`); return `null` if the
-       native side returns 0 (unsupported platform)
-       (`OffscreenWebView.java:39`).
+       `webview_offscreen_create(max(1,w), max(1,h), debug?1:0)`;
+       return `null` if the native side returns 0 (unsupported
+       platform).
    - `setSize(int w, int h): OffscreenWebView` —
      `checkAlive`, call
-     `webview_offscreen_resize(peer, max(1,w), max(1,h))`
-     (`OffscreenWebView.java:49`).
-   - `navigate(String url)` — `webview_offscreen_navigate`
-     (`OffscreenWebView.java:57`).
+     `webview_offscreen_resize(peer, max(1,w), max(1,h))`.
+   - `navigate(String url)` — `webview_offscreen_navigate`.
    - `snapshot(int[] pixels, int w, int h)` — copy pixel
-     buffer; caller-owned int[] in 0xAARRGGBB layout
-     (`OffscreenWebView.java:68`).
+     buffer; caller-owned int[] in 0xAARRGGBB layout.
    - `mouseButton(boolean press, int x, int y, int button, int modifiers, int clickCount)`
-     — call `webview_offscreen_mouse_button`
-     (`OffscreenWebView.java:77`).
-   - `mouseMotion(int x, int y, int modifiers)`
-     (`OffscreenWebView.java:85`).
+     — call `webview_offscreen_mouse_button`.
+   - `mouseMotion(int x, int y, int modifiers)`.
    - `mouseScroll(int x, int y, double dx, double dy, int modifiers)`
-     — smooth-scroll deltas (`OffscreenWebView.java:91`).
+     — smooth-scroll deltas.
    - `keyEvent(boolean press, int keyval, int modifiers, boolean isModifierKey)`
-     — `webview_offscreen_key_event`
-     (`OffscreenWebView.java:99`).
+     — `webview_offscreen_key_event`.
+   - `addOnBeforeLoad(String js): OffscreenWebView` —
+     `checkAlive`, then
+     `WebViewNative.webview_offscreen_init(peer, js)`. Mirrors
+     `EmbeddedWebView.addOnBeforeLoad` semantics.
+   - `eval(String js): OffscreenWebView` — `checkAlive`, then
+     `WebViewNative.webview_offscreen_eval(peer, js)`. Mirrors
+     `EmbeddedWebView.eval`.
+   - `addJavascriptCallback(String name, WebView.JavascriptCallback cb): OffscreenWebView`
+     — `checkAlive`; put `name → cb` into `bindings`;
+     construct a `WebViewNativeCallback` whose `invoke(arg, wv)`
+     looks up `bindings.get(name)` and calls `c.run(arg)`;
+     anchor the callback in `heap`; call
+     `WebViewNative.webview_offscreen_bind(peer, name, fn, peer)`.
+     This is structurally identical to
+     `EmbeddedWebView.addJavascriptCallback`
+     (`EmbeddedWebView.java:139`).
+   - `dispatch(Runnable r): OffscreenWebView` — `checkAlive`;
+     wrap `r` in a self-removing `Runnable` that calls
+     `r.run()` then removes itself from `heap`; anchor wrapper
+     in `heap`; call
+     `WebViewNative.webview_offscreen_dispatch(peer, wrapper)`.
+     Mirrors `EmbeddedWebView.dispatch`
+     (`EmbeddedWebView.java:160`).
+   - `openDevTools(): boolean` — `checkAlive`; call
+     `WebViewNative.webview_offscreen_open_devtools(peer)`;
+     return `(result == 1)`.
    - `dispose(): void` — zero `peer` then call
-     `webview_offscreen_destroy` if non-zero
-     (`OffscreenWebView.java:108`). Clear the `heap` and
-     `bindings` collections on the same dispose path (parity
-     with `EmbeddedWebView.dispose`).
-   - `addOnBeforeLoad(String js): OffscreenWebView` (new)
-     - Logic: `checkAlive`; call
-       `webview_offscreen_init(peer, js)`. Returns `this` for
-       chaining.
-   - `eval(String js): OffscreenWebView` (new)
-     - Logic: `checkAlive`; call
-       `webview_offscreen_eval(peer, js)`. Returns `this`.
-   - `addJavascriptCallback(String name, JavascriptCallback cb): OffscreenWebView`
-     (new)
-     - Logic: `checkAlive`; store `name → cb` in `bindings`;
-       build a `WebViewNativeCallback` whose `invoke` looks up
-       the binding by name and forwards the arg to
-       `cb.run(arg)`; anchor the callback in `heap`; call
-       `webview_offscreen_bind(peer, name, fn, peer)`. Mirrors
-       `EmbeddedWebView.addJavascriptCallback`.
-   - `openDevTools(): boolean` (new)
-     - Logic: `checkAlive`; call
-       `WebViewNative.webview_offscreen_open_devtools(peer)`;
-       return `(result == 1)`.
+     `webview_offscreen_destroy` if non-zero; clear `heap` and
+     `bindings`.
 4. Constraints / Invariants:
    - All operations except `create` and `dispose` go through
-     `checkAlive` which throws after dispose
-     (`OffscreenWebView.java:116`).
+     `checkAlive` which throws after dispose.
    - Pixel layout is fixed at `0xAARRGGBB`, matching
      `BufferedImage.TYPE_INT_ARGB` — callers MUST allocate the
      buffer that way (`OffscreenWebView.java:64`).
-   - Native callbacks anchored in `heap` follow the same
-     GC-safety invariant as `EmbeddedWebView.heap`.
+   - The bind-shim JS that exposes `window.<name>(...)` is
+     installed natively (alongside `embed::gtk_bind` on the
+     heavyweight path) so the contract and envelope match the
+     heavyweight path exactly (see Approach — JS bridge).
+   - JNI callbacks MUST be anchored in `heap` for the
+     lifetime of their native registration, or the JVM would
+     collect them while the native engine still holds a
+     function pointer.  Same invariant as
+     `EmbeddedWebView.heap`.
 
 ### 3. Construct and Install Listeners — WebViewLightweightComponent ctor
 File: `src/ca/weblite/webview/swing/WebViewLightweightComponent.java`
@@ -378,16 +403,17 @@ File: `src/ca/weblite/webview/swing/WebViewLightweightComponent.java`
        `engine.addOnBeforeLoad(ConsoleDispatcher.SHIM_JS)`
        once, then
        `engine.addJavascriptCallback("__webview_console__",
-       payload -> consoleDispatcher.dispatch(payload))`. The
+       payload -> consoleDispatcher.dispatch(payload))`.  The
        reserved-name reject in the public
        `addJavascriptCallback` is bypassed here because this
        call goes directly through `engine`, not through
        `WebViewLightweightComponent.addJavascriptCallback`.
-       Replay `pendingInit` via `engine.addOnBeforeLoad` for
-       each entry; replay `pendingBindings` via
-       `engine.addJavascriptCallback`. Allocate the buffer,
-       navigate to `pendingUrl`, start a Swing `Timer` at
-       `REPAINT_INTERVAL_MS` repeatedly calling `repaint()`
+       Then replay `pendingInit` via `engine.addOnBeforeLoad`
+       and `pendingBindings` via
+       `engine.addJavascriptCallback`, both in registration
+       order.  Allocate the buffer, navigate to `pendingUrl`,
+       start a Swing `Timer` at `REPAINT_INTERVAL_MS`
+       repeatedly calling `repaint()`
        (`WebViewLightweightComponent.java:167`).
 3. Constraints / Invariants:
    - Failure to create the engine is silent — the component
@@ -450,39 +476,58 @@ File: `src/ca/weblite/webview/swing/WebViewLightweightComponent.java`
        `engine.setSize(w, h)`
        (`WebViewLightweightComponent.java:206`).
 
-### 8. Buffered API Wiring — eval / addOnBeforeLoad / addJavascriptCallback
+### 8. JS Interaction Surface — eval / addOnBeforeLoad / addJavascriptCallback / dispatch
 File: `src/ca/weblite/webview/swing/WebViewLightweightComponent.java`
 
-1. Responsibility: implement the abstract `WebViewComponent`
-   JS-interaction surface with the same buffer/replay pattern
-   used by `WebViewHeavyweightComponent`. The earlier
+1. Responsibility: implement the JS-interaction subset of the
+   `WebViewComponent` abstract contract — same buffer/replay
+   semantics that the heavyweight subclass uses in
+   [[swing-heavyweight-webview-embedding]].  The earlier
    "Phase 1: not yet wired" stubs are gone.
 2. Methods:
    - `addOnBeforeLoad(String js): WebViewComponent`
-     - Logic: append `js` to `pendingInit`. If
-       `engine != null`, also call `engine.addOnBeforeLoad(js)`
-       immediately so a live engine sees subsequent
-       additions. Return `this`.
+     - Logic: append `js` to `pendingInit`.  If `engine != null`
+       (component is displayable), also call
+       `engine.addOnBeforeLoad(js)` so the script applies on
+       the next navigation.  Return `this`.
    - `eval(String js): WebViewComponent`
-     - Logic: if `engine == null`, no-op (consistent with
-       the abstract contract that `eval` is a no-op until
-       displayable). Otherwise call `engine.eval(js)`. Return
-       `this`.
-   - `addJavascriptCallback(String name, JavascriptCallback cb): WebViewComponent`
+     - Logic: if `engine == null`, no-op (matches the
+       abstract contract's "no-op until displayable" — same
+       as heavyweight `WebViewHeavyweightComponent.eval`).
+       Otherwise call `engine.eval(js)`.  Return `this`.
+   - `addJavascriptCallback(String name, WebView.JavascriptCallback cb): WebViewComponent`
      - Logic: reject reserved-prefix names (any
        `name.startsWith("__webview_")`) with
        `IllegalArgumentException` BEFORE mutating any state.
-       Then put `name → cb` in `pendingBindings`. If
+       Then put `name → cb` into `pendingBindings`.  If
        `engine != null`, also call
-       `engine.addJavascriptCallback(name, cb)` immediately.
-       Return `this`.
+       `engine.addJavascriptCallback(name, cb)` so the binding
+       is live on the current document.  Return `this`.
+   - `dispatch(Runnable r): WebViewComponent`
+     - Logic: if `engine == null`, no-op (the work has nowhere
+       to run yet; `Runnable`s do not buffer because there is
+       no defined replay moment for transient work).  Otherwise
+       call `engine.dispatch(r)`.  Return `this`.
 3. Constraints / Invariants:
-   - Setters never reset their buffers — same pattern as
-     heavyweight (see §3 in
-     [[swing-heavyweight-webview-embedding]]).
-   - `pendingInit` and `pendingBindings` are replayed in
-     `addNotify()` AFTER the console bridge install, so the
-     shim is the first init-script installed.
+   - Buffered configuration is replayed in `addNotify` after
+     `OffscreenWebView.create` succeeds AND after the console
+     bridge is installed — see Operation 4.  This guarantees
+     the JS shim is the first init-script installed so it
+     observes every user init-script's console output.
+   - On macOS / Windows the create returns null and the
+     buffered state stays buffered forever, which is the
+     intentional graceful-degradation shape: callers see no
+     exception, the component renders blank, and switching to
+     heavyweight via the mode-selection property (see
+     [[swing-webview-component-mode-selection]]) yields a
+     fully working component without code changes.
+   - `pendingInit` and `pendingBindings` are never reset by
+     these setters — same convention as the heavyweight
+     subclass so a re-attach scenario would replay them.
+   - `dispatch` does not buffer because a `Runnable` posted
+     before the engine exists has no well-defined moment to
+     run; calling it before `addNotify` is a programmer
+     error that the contract chooses to silently absorb.
 
 ### 9. Open Native DevTools — openDevTools
 File: `src/ca/weblite/webview/swing/WebViewLightweightComponent.java`,
@@ -504,11 +549,11 @@ File: `src/ca/weblite/webview/swing/WebViewLightweightComponent.java`,
    (`src_c/webview_embed.cpp`, offscreen-engine block):
    - Look up the engine struct from the `long peer`.
    - Read `webkit_settings_get_enable_developer_extras` on
-     the engine's `WebKitSettings`. If FALSE, return 0.
+     the engine's `WebKitSettings`.  If FALSE, return 0.
    - Call `webkit_web_view_get_inspector(WEBKIT_WEB_VIEW(e->web))`.
      If NULL, return 0.
    - Call `webkit_web_inspector_show(inspector)` and return
-     1. Marshal to the GTK pump thread via the existing
+     1.  Marshal to the GTK pump thread via the existing
      dispatch pattern if not already on it.
 4. Constraints / Invariants:
    - The inspector appears as a normal GTK toplevel window
@@ -541,8 +586,15 @@ File: `src/ca/weblite/webview/swing/WebViewLightweightComponent.java`,
   `consoleDispatcher.dispatch(payload)` directly — no other
   Java work on the native thread.
 - `webview_offscreen_open_devtools` MUST NOT block the EDT
-  indefinitely. The native side dispatches to the GTK pump
+  indefinitely.  The native side dispatches to the GTK pump
   thread for the actual `webkit_web_inspector_show` call.
+- The `window.<name>(...)` bind shim and the
+  `{name, seq, args}` round-trip envelope are owned by the
+  heavyweight engine code at
+  `webview_embed.cpp:1791`–`webview_embed.cpp:1801` and reused
+  verbatim by the offscreen path.  Do NOT fork the shim for
+  the lightweight engine — page authors expect identical
+  semantics across both modes, and the shim is the contract.
 
 ## S · Safeguards
 - `OffscreenWebView.create` returns `null` for unsupported
@@ -582,16 +634,24 @@ File: `src/ca/weblite/webview/swing/WebViewLightweightComponent.java`,
   registered in `addNotify()` MUST be cleared on
   `removeNotify()` / `dispose()` via the existing
   `OffscreenWebView.dispose()` `heap.clear` / `bindings.clear`
-  step. A late native message arriving after dispose lands on
-  a now-disposed engine and is silently dropped by the
+  step.  A late native message arriving after dispose lands
+  on a now-disposed engine and is silently dropped by the
   native side's own peer-validity check.
 - The native `webview_offscreen_open_devtools` returns 0
   (never raises a JNI exception) for every failure path so
   the Java side never has to wrap the call in a try/catch.
-- `webview_offscreen_init` / `webview_offscreen_eval` /
-  `webview_offscreen_bind` MUST be no-ops on macOS/Windows
-  (where the offscreen engine is itself a stub returning
-  `peer == 0` from `webview_offscreen_create`). Java side
-  already routes those through `checkAlive`, so the
-  stub-returns-0 invariant carries through; no additional
-  per-method stubs are needed.
+- `eval`, `addJavascriptCallback`, `addOnBeforeLoad`, and
+  `dispatch` are all safe to call on platforms where the
+  offscreen engine never creates (macOS / Windows): the
+  `engine == null` guard silently absorbs the call and the
+  buffered configuration (where applicable) is held
+  indefinitely.  This matches the rendering path's
+  graceful-degradation invariant — a missing offscreen
+  engine never throws, only renders blank.  Java side
+  already routes the underlying JNI methods through
+  `checkAlive`, so the stub-returns-0 invariant carries
+  through; no additional per-method stubs are needed.
+- JNI callbacks registered via `addJavascriptCallback` and
+  wrappers passed to `dispatch` MUST live inside
+  `OffscreenWebView.heap` for the duration of their native
+  registration — the GC has no other reachability root.

@@ -129,6 +129,14 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
     }
 
     @Override
+    public WebViewComponent dispatch(Runnable r) {
+        if (embedded != null) {
+            embedded.dispatch(r);
+        }
+        return this;
+    }
+
+    @Override
     public boolean openDevTools() {
         if (embedded == null) return false;
         return embedded.openDevTools();

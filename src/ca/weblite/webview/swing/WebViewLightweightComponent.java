@@ -45,10 +45,19 @@ import javax.swing.Timer;
  * not available -- the WebKit input-method context is disabled because
  * all input arrives already-decoded from AWT.
  *
+ * <p><strong>JS interaction.</strong> {@link #eval},
+ * {@link #addOnBeforeLoad}, {@link #addJavascriptCallback}, and
+ * {@link #dispatch} delegate to the offscreen engine.  Init scripts and
+ * bindings registered before the component is displayable are buffered
+ * and replayed when {@code addNotify} creates the engine.  The
+ * {@code window.<name>(...)} contract for bound callbacks is identical
+ * to {@link WebViewHeavyweightComponent}.
+ *
  * <p><strong>Platform support.</strong> Linux only at the moment.  On
  * macOS and Windows the underlying native entry points are stubs that
  * return 0 from create, so this component will silently fail to attach
- * and show its empty Swing background.  Use
+ * and show its empty Swing background; the JS-interaction methods
+ * remain no-ops there alongside the rendering path.  Use
  * {@link WebViewHeavyweightComponent} on those platforms.
  */
 public class WebViewLightweightComponent extends WebViewComponent {
@@ -64,7 +73,7 @@ public class WebViewLightweightComponent extends WebViewComponent {
     private boolean debug;
     private final List<String> pendingInit = new ArrayList<String>();
     private final Map<String, WebView.JavascriptCallback> pendingBindings =
-        new LinkedHashMap<String, WebView.JavascriptCallback>();
+            new LinkedHashMap<String, WebView.JavascriptCallback>();
 
     public WebViewLightweightComponent() {
         setOpaque(true);
@@ -294,6 +303,14 @@ public class WebViewLightweightComponent extends WebViewComponent {
         pendingBindings.put(name, cb);
         if (engine != null) {
             engine.addJavascriptCallback(name, cb);
+        }
+        return this;
+    }
+
+    @Override
+    public WebViewComponent dispatch(Runnable r) {
+        if (engine != null) {
+            engine.dispatch(r);
         }
         return this;
     }

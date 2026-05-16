@@ -260,20 +260,28 @@ native static void webview_offscreen_key_event(long peer, int press,
                                                int keyval, int modifiers,
                                                int is_modifier_key);
 
-// Inject a script to be evaluated at the initialization of every new
-// document loaded by the offscreen WebView.  Mirrors webview_embed_init.
+// Install a JavaScript snippet that runs at the start of every new
+// document loaded into the offscreen WebView.  Mirrors webview_embed_init.
 // No-op on macOS/Windows (where the offscreen engine itself is a stub).
 native static void webview_offscreen_init(long peer, String js);
 
-// Evaluate JavaScript in the current document of the offscreen WebView.
-// Mirrors webview_embed_eval.  No-op on macOS/Windows.
+// Inject a JavaScript snippet into the current document of the offscreen
+// WebView.  Evaluation is asynchronous and the result is ignored -- use a
+// binding (webview_offscreen_bind) to round-trip values back from JS.
+// No-op on macOS/Windows.
 native static void webview_offscreen_eval(long peer, String js);
 
-// Bind a Java callback as a global JavaScript function under
-// window.<name>() in the offscreen WebView's pages.  Mirrors
-// webview_embed_bind.  No-op on macOS/Windows.
+// Bind a Java callback so it appears as a global JavaScript function
+// window.<name>(arg) inside the offscreen WebView.  The native engine
+// round-trips invocations through the same {name, seq, args} envelope as
+// the embed engine so page authors see an identical contract.
+// No-op on macOS/Windows.
 native static void webview_offscreen_bind(long peer, String name,
                                           WebViewNativeCallback fn, long arg);
+
+// Marshal a Runnable onto the offscreen engine's UI (GTK) thread.
+// Mirrors webview_embed_dispatch.
+native static void webview_offscreen_dispatch(long peer, Runnable callback);
 
 // Open the WebKitGTK Web Inspector for the offscreen WebView in a
 // separate OS window.  Returns 1 if opened, 0 if developer-extras was
