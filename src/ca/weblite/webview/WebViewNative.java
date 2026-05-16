@@ -176,6 +176,25 @@ native static void webview_embed_set_visible(long w, int visible);
 // system focus.
 native static void webview_embed_request_focus(long w);
 
+// Open the platform's native DevTools / Web Inspector in a separate OS
+// window.  Returns 1 if an inspector window was actually opened (or
+// re-focused, on platforms that focus an existing one), 0 if
+// unsupported, disabled (debug was not enabled at create time), or the
+// underlying SDK call failed.  Never throws via JNI.
+//
+// Per-platform behaviour:
+//   - Linux:   webkit_web_inspector_show on the engine's WebKitWebView.
+//              Returns 0 if developer-extras is FALSE on the engine's
+//              WebKitSettings.
+//   - macOS:   returns 0 unconditionally.  No public WKWebView API
+//              programmatically pops the inspector; the inspector is
+//              reachable via right-click -> Inspect Element or via the
+//              Safari Develop menu when developerExtrasEnabled and
+//              isInspectable were set at create time.
+//   - Windows: ICoreWebView2::OpenDevToolsWindow on the WebView2 worker
+//              thread.  Returns 0 if AreDevToolsEnabled is FALSE.
+native static int webview_embed_open_devtools(long w);
+
 
 // ---------------------------------------------------------------------------
 // Lightweight / offscreen API (currently Linux-only).
@@ -240,6 +259,27 @@ native static void webview_offscreen_mouse_scroll(long peer, int x, int y,
 native static void webview_offscreen_key_event(long peer, int press,
                                                int keyval, int modifiers,
                                                int is_modifier_key);
+
+// Inject a script to be evaluated at the initialization of every new
+// document loaded by the offscreen WebView.  Mirrors webview_embed_init.
+// No-op on macOS/Windows (where the offscreen engine itself is a stub).
+native static void webview_offscreen_init(long peer, String js);
+
+// Evaluate JavaScript in the current document of the offscreen WebView.
+// Mirrors webview_embed_eval.  No-op on macOS/Windows.
+native static void webview_offscreen_eval(long peer, String js);
+
+// Bind a Java callback as a global JavaScript function under
+// window.<name>() in the offscreen WebView's pages.  Mirrors
+// webview_embed_bind.  No-op on macOS/Windows.
+native static void webview_offscreen_bind(long peer, String name,
+                                          WebViewNativeCallback fn, long arg);
+
+// Open the WebKitGTK Web Inspector for the offscreen WebView in a
+// separate OS window.  Returns 1 if opened, 0 if developer-extras was
+// not enabled at create time, the engine has no inspector, or this
+// platform doesn't support the offscreen engine.  Never throws via JNI.
+native static int webview_offscreen_open_devtools(long peer);
 
 
 }

@@ -5,6 +5,11 @@
  */
 package ca.weblite.webview;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+
 /**
  * Low-level wrapper around an offscreen (lightweight) WebView native peer.
  *
@@ -14,9 +19,8 @@ package ca.weblite.webview;
  * pixels via {@link #snapshot} into a {@code BufferedImage}, render them
  * into a {@code JComponent}.
  *
- * <p>Phase 1 status: rendering only.  Mouse/keyboard event forwarding
- * isn't wired yet.  Currently Linux only -- macOS / Windows entry points
- * are stubs that return 0.
+ * <p>Currently Linux only -- macOS / Windows entry points are stubs that
+ * return 0 from create.
  *
  * <p>Most callers should not use this class directly; use
  * {@link ca.weblite.webview.swing.WebViewLightweightComponent}.
@@ -24,6 +28,9 @@ package ca.weblite.webview;
 public class OffscreenWebView {
 
     private long peer;
+    private final List<Object> heap = new ArrayList<Object>();
+    private final Map<String, WebView.JavascriptCallback> bindings =
+        new HashMap<String, WebView.JavascriptCallback>();
 
     private OffscreenWebView(long peer) {
         this.peer = peer;
@@ -104,12 +111,68 @@ public class OffscreenWebView {
             isModifierKey ? 1 : 0);
     }
 
+    /**
+     * Add a script to be evaluated each time a new document is created.
+     * Mirrors {@link EmbeddedWebView#addOnBeforeLoad}.
+     */
+    public OffscreenWebView addOnBeforeLoad(String js) {
+        checkAlive();
+        WebViewNative.webview_offscreen_init(peer, js);
+        return this;
+    }
+
+    /**
+     * Evaluate JavaScript in the current document.  Mirrors
+     * {@link EmbeddedWebView#eval}.
+     */
+    public OffscreenWebView eval(String js) {
+        checkAlive();
+        WebViewNative.webview_offscreen_eval(peer, js);
+        return this;
+    }
+
+    /**
+     * Bind a Java callback under {@code window.<name>} in the offscreen
+     * WebView's pages.  Mirrors
+     * {@link EmbeddedWebView#addJavascriptCallback}.
+     */
+    public OffscreenWebView addJavascriptCallback(final String name,
+                                                  final WebView.JavascriptCallback cb) {
+        checkAlive();
+        bindings.put(name, cb);
+        WebViewNativeCallback fn = new WebViewNativeCallback() {
+            @Override
+            public void invoke(String arg, long wv) {
+                WebView.JavascriptCallback c = bindings.get(name);
+                if (c != null) {
+                    c.run(arg);
+                }
+            }
+        };
+        heap.add(fn);
+        WebViewNative.webview_offscreen_bind(peer, name, fn, peer);
+        return this;
+    }
+
+    /**
+     * Open the WebKitGTK Web Inspector for the offscreen WebView in a
+     * separate OS window.  Returns {@code true} if opened, {@code false}
+     * if developer-extras was not enabled at create time or the engine
+     * has no inspector.
+     */
+    public boolean openDevTools() {
+        checkAlive();
+        return WebViewNative.webview_offscreen_open_devtools(peer) == 1;
+    }
+
     /** Release native resources. */
     public void dispose() {
         if (peer != 0L) {
             long p = peer;
             peer = 0L;
             WebViewNative.webview_offscreen_destroy(p);
+            heap.clear();
+            bindings.clear();
         }
     }
 

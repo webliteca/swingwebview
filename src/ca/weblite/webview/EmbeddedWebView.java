@@ -189,6 +189,18 @@ public class EmbeddedWebView {
     }
 
     /**
+     * Open the platform's native DevTools / Web Inspector in a separate OS
+     * window.  Returns {@code true} if an inspector window was actually
+     * opened (or focused-existing), {@code false} otherwise.  See
+     * {@link WebViewNative#webview_embed_open_devtools} for the per-platform
+     * semantics.
+     */
+    public boolean openDevTools() {
+        checkAlive();
+        return WebViewNative.webview_embed_open_devtools(peer) == 1;
+    }
+
+    /**
      * Release the native resources and detach from the parent.
      */
     public void dispose() {

@@ -5,8 +5,11 @@
  */
 package ca.weblite.webview.swing;
 
+import ca.weblite.webview.ConsoleDispatcher;
+import ca.weblite.webview.ConsoleListener;
 import ca.weblite.webview.WebView;
 
+import java.io.PrintStream;
 import javax.swing.JComponent;
 
 /**
@@ -40,6 +43,18 @@ import javax.swing.JComponent;
  * underlying native WebView.
  */
 public abstract class WebViewComponent extends JComponent {
+
+    /** Prefix on JS binding names reserved for this library's internal
+     *  channels.  Callers passing a name starting with this prefix to
+     *  {@link #addJavascriptCallback(String, WebView.JavascriptCallback)}
+     *  must be rejected with {@code IllegalArgumentException}. */
+    public static final String RESERVED_BINDING_PREFIX = "__webview_";
+
+    /** Per-component console fan-out hub.  Owned by every instance for the
+     *  lifetime of the component; survives the native peer's create/destroy
+     *  cycle so listeners registered before display still receive messages
+     *  once the engine attaches and the JS shim starts feeding them. */
+    protected final ConsoleDispatcher consoleDispatcher = new ConsoleDispatcher();
 
     /** Implementation mode for {@link #create(Mode)}. */
     public enum Mode {
@@ -155,4 +170,104 @@ public abstract class WebViewComponent extends JComponent {
      * peer is destroyed.
      */
     public abstract void dispose();
+
+    // ---------------------------------------------------------------------
+    // DevTools + console-capture API.
+    //
+    // openDevTools() defaults to returning false; subclasses override to
+    // delegate to their native peer's open-devtools call.  The four
+    // console-listener methods delegate to the per-component
+    // ConsoleDispatcher and therefore work uniformly across all subclasses
+    // without each one having to re-implement them.
+    // ---------------------------------------------------------------------
+
+    /**
+     * Open the platform's native DevTools / Web Inspector in a separate OS
+     * window.
+     *
+     * <p>Default implementation returns {@code false}.  First-party
+     * subclasses override to delegate to their native peer:
+     * <ul>
+     *   <li>On Linux (heavyweight or lightweight), opens the WebKitGTK Web
+     *       Inspector and returns {@code true}.</li>
+     *   <li>On Windows (heavyweight), opens the Chromium DevTools window
+     *       via {@code ICoreWebView2::OpenDevToolsWindow} and returns
+     *       {@code true}.</li>
+     *   <li>On macOS (heavyweight), returns {@code false} — no public
+     *       WKWebView API exists to programmatically pop the Web Inspector.
+     *       When {@code setDebug(true)} was called before display, the
+     *       inspector is still reachable via right-click &rarr; Inspect
+     *       Element or via the Safari Develop menu (on macOS 13.3+).</li>
+     * </ul>
+     *
+     * <p>Returns {@code false} when {@code setDebug(true)} was not called
+     * before display, when the component has not yet been displayed, or
+     * when the native call otherwise reports unsupported.
+     *
+     * <p>Safe to call from the EDT; the underlying native call is marshaled
+     * to the appropriate native UI thread by the subclass implementation
+     * and does not block the EDT beyond a normal native UI dispatch.
+     *
+     * <p>Idempotent — repeated calls while the inspector is already open
+     * are safe; the platform either focuses the existing window (Linux,
+     * Windows) or no-ops (macOS).
+     */
+    public boolean openDevTools() {
+        return false;
+    }
+
+    /**
+     * Register a listener to receive each {@code console.*} call captured
+     * from the embedded page.  The listener is invoked on the Swing Event
+     * Dispatch Thread so it may touch Swing state directly.
+     *
+     * <p>Listeners registered before the component is displayed are
+     * remembered and start receiving messages as soon as the native peer
+     * is created and the JS shim takes effect.
+     *
+     * <p>The same listener instance may be registered multiple times; it
+     * will then receive each message multiple times.  Each
+     * {@link #removeConsoleListener(ConsoleListener)} call removes one
+     * occurrence.
+     *
+     * @throws NullPointerException if {@code listener} is {@code null}.
+     */
+    public void addConsoleListener(ConsoleListener listener) {
+        consoleDispatcher.addListener(listener);
+    }
+
+    /**
+     * Unregister a previously-registered listener.  Silently does nothing
+     * if the listener was not registered.
+     */
+    public void removeConsoleListener(ConsoleListener listener) {
+        consoleDispatcher.removeListener(listener);
+    }
+
+    /**
+     * Redirect each captured console message, formatted via
+     * {@link ca.weblite.webview.ConsoleMessage#toString()}, to the given
+     * {@code PrintStream}.  Passing {@code null} clears the redirect.
+     *
+     * <p>The stream's existing character encoding is respected — the
+     * dispatcher writes through {@code PrintStream.println(String)} and
+     * does not impose a charset.  IO failures on the stream do not
+     * propagate out of the dispatch path; {@code PrintStream} itself
+     * swallows {@code IOException}.
+     *
+     * <p>Calling this method while a previous stream is set replaces it;
+     * the previous stream is not flushed or closed.
+     */
+    public void setConsoleOutput(PrintStream stream) {
+        consoleDispatcher.setOutputStream(stream);
+    }
+
+    /**
+     * @return the {@code PrintStream} currently set via
+     *         {@link #setConsoleOutput(PrintStream)}, or {@code null} if
+     *         no stream is set.
+     */
+    public PrintStream getConsoleOutput() {
+        return consoleDispatcher.getOutputStream();
+    }
 }

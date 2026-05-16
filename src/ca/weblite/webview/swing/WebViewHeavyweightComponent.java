@@ -5,6 +5,7 @@
  */
 package ca.weblite.webview.swing;
 
+import ca.weblite.webview.ConsoleDispatcher;
 import ca.weblite.webview.EmbeddedWebView;
 import ca.weblite.webview.WebView;
 
@@ -114,11 +115,23 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
     @Override
     public WebViewComponent addJavascriptCallback(String name,
                                                   WebView.JavascriptCallback cb) {
+        if (name != null && name.startsWith(RESERVED_BINDING_PREFIX)) {
+            throw new IllegalArgumentException(
+                "name is reserved for internal use: names starting with \""
+                + RESERVED_BINDING_PREFIX + "\" are not allowed (got \""
+                + name + "\")");
+        }
         pendingBindings.put(name, cb);
         if (embedded != null) {
             embedded.addJavascriptCallback(name, cb);
         }
         return this;
+    }
+
+    @Override
+    public boolean openDevTools() {
+        if (embedded == null) return false;
+        return embedded.openDevTools();
     }
 
     @Override
@@ -149,6 +162,20 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
             embedded = null;
             throw ex;
         }
+        // Install the console bridge BEFORE replaying user config so the
+        // shim observes every subsequent init script's console output,
+        // including any user init script that itself calls console.* at
+        // document-start.  Goes directly through `embedded` rather than
+        // through this component's addJavascriptCallback, which would
+        // reject the reserved-prefix name.
+        embedded.addOnBeforeLoad(ConsoleDispatcher.SHIM_JS);
+        embedded.addJavascriptCallback("__webview_console__",
+            new WebView.JavascriptCallback() {
+                @Override
+                public void run(String arg) {
+                    consoleDispatcher.dispatch(arg);
+                }
+            });
         for (String js : pendingInit) {
             embedded.addOnBeforeLoad(js);
         }

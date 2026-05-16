@@ -5,6 +5,7 @@
  */
 package ca.weblite.webview.swing;
 
+import ca.weblite.webview.ConsoleDispatcher;
 import ca.weblite.webview.GdkInput;
 import ca.weblite.webview.OffscreenWebView;
 import ca.weblite.webview.WebView;
@@ -23,6 +24,10 @@ import java.awt.event.MouseWheelEvent;
 import java.awt.event.MouseWheelListener;
 import java.awt.image.BufferedImage;
 import java.awt.image.DataBufferInt;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
 import javax.swing.Timer;
 
 /**
@@ -57,6 +62,9 @@ public class WebViewLightweightComponent extends WebViewComponent {
 
     private String pendingUrl = "about:blank";
     private boolean debug;
+    private final List<String> pendingInit = new ArrayList<String>();
+    private final Map<String, WebView.JavascriptCallback> pendingBindings =
+        new LinkedHashMap<String, WebView.JavascriptCallback>();
 
     public WebViewLightweightComponent() {
         setOpaque(true);
@@ -164,6 +172,24 @@ public class WebViewLightweightComponent extends WebViewComponent {
             // will fall back to the default Swing background.
             return;
         }
+        // Install the console bridge BEFORE replaying user config so the
+        // shim observes every user init script.  Goes directly through
+        // `engine` rather than this component's addJavascriptCallback,
+        // which would reject the reserved-prefix name.
+        engine.addOnBeforeLoad(ConsoleDispatcher.SHIM_JS);
+        engine.addJavascriptCallback("__webview_console__",
+            new WebView.JavascriptCallback() {
+                @Override
+                public void run(String arg) {
+                    consoleDispatcher.dispatch(arg);
+                }
+            });
+        for (String js : pendingInit) {
+            engine.addOnBeforeLoad(js);
+        }
+        for (Map.Entry<String, WebView.JavascriptCallback> ent : pendingBindings.entrySet()) {
+            engine.addJavascriptCallback(ent.getKey(), ent.getValue());
+        }
         allocateBuffer(w, h);
         engine.navigate(pendingUrl);
         repaintTimer = new Timer(REPAINT_INTERVAL_MS, e -> repaint());
@@ -241,21 +267,41 @@ public class WebViewLightweightComponent extends WebViewComponent {
 
     @Override
     public WebViewComponent addOnBeforeLoad(String js) {
-        // Phase 1: not yet wired through the offscreen path.
+        pendingInit.add(js);
+        if (engine != null) {
+            engine.addOnBeforeLoad(js);
+        }
         return this;
     }
 
     @Override
     public WebViewComponent eval(String js) {
-        // Phase 1: not yet wired through the offscreen path.
+        if (engine != null) {
+            engine.eval(js);
+        }
         return this;
     }
 
     @Override
     public WebViewComponent addJavascriptCallback(String name,
                                                   WebView.JavascriptCallback cb) {
-        // Phase 1: not yet wired through the offscreen path.
+        if (name != null && name.startsWith(RESERVED_BINDING_PREFIX)) {
+            throw new IllegalArgumentException(
+                "name is reserved for internal use: names starting with \""
+                + RESERVED_BINDING_PREFIX + "\" are not allowed (got \""
+                + name + "\")");
+        }
+        pendingBindings.put(name, cb);
+        if (engine != null) {
+            engine.addJavascriptCallback(name, cb);
+        }
         return this;
+    }
+
+    @Override
+    public boolean openDevTools() {
+        if (engine == null) return false;
+        return engine.openDevTools();
     }
 
     @Override

@@ -895,6 +895,36 @@ struct OffEngine {
     JavaVM *jvm = nullptr;
 };
 
+// Parallel of engine_on_message for OffEngine.  Receives the raw bind-shim
+// JSON wrapper from window.external.invoke, looks up the named binding,
+// and forwards the whole JSON string to the Java callback.
+static void off_engine_on_message(OffEngine *e, const char *msg) {
+    if (msg == nullptr) return;
+    std::string s(msg);
+    auto pos = s.find("\"name\":\"");
+    if (pos == std::string::npos) return;
+    auto start = pos + 8;
+    auto end = s.find('"', start);
+    if (end == std::string::npos) return;
+    std::string name = s.substr(start, end - start);
+    auto it = e->bindings.find(name);
+    if (it == e->bindings.end()) return;
+    Binding *b = it->second;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        e->jvm->AttachCurrentThread((void **)&env, nullptr);
+        detach = true;
+    }
+    jmethodID mid = env->GetMethodID(b->cls, "invoke", "(Ljava/lang/String;J)V");
+    if (mid) {
+        jstring js = env->NewStringUTF(msg);
+        env->CallVoidMethod(b->fn, mid, js, (jlong)e);
+        env->DeleteLocalRef(js);
+    }
+    if (detach) e->jvm->DetachCurrentThread();
+}
+
 static OffEngine *gtk_off_create_engine(JNIEnv *env,
                                         int width, int height, jint debug) {
     if (width < 1) width = 1;
@@ -923,6 +953,33 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
             webkit_settings_set_enable_developer_extras(s, TRUE);
             webkit_settings_set_enable_write_console_messages_to_stdout(s, TRUE);
         }
+
+        // Wire up the "external" script-message channel exactly as the
+        // embed path does (see gtk_create_engine lines 553-573).  This
+        // is what makes window.external.invoke -- and therefore the
+        // bind-shim's webview_offscreen_bind plumbing and the
+        // ConsoleDispatcher console capture -- work on the lightweight
+        // component.
+        g_signal_connect(
+            e->manager, "script-message-received::external",
+            G_CALLBACK(+[](WebKitUserContentManager *,
+                           WebKitJavascriptResult *r, gpointer arg) {
+                auto *eng = static_cast<OffEngine *>(arg);
+                JSCValue *v = webkit_javascript_result_get_js_value(r);
+                char *str = jsc_value_to_string(v);
+                off_engine_on_message(eng, str);
+                g_free(str);
+            }),
+            e);
+        webkit_user_content_manager_register_script_message_handler(
+            e->manager, "external");
+        webkit_user_content_manager_add_script(
+            e->manager,
+            webkit_user_script_new(
+                "window.external={invoke:function(s){"
+                "window.webkit.messageHandlers.external.postMessage(s);}};",
+                WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+                WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START, NULL, NULL));
 
         // Opaque white background so transparent / empty regions don't
         // surface premultiplied artefacts when blitted into Swing.
@@ -1027,6 +1084,71 @@ static void gtk_off_navigate(OffEngine *e, std::string url) {
             "[webview-embed] offscreen load_uri: %s\n", url.c_str());
         webkit_web_view_load_uri(WEBKIT_WEB_VIEW(e->web), url.c_str());
     });
+}
+
+static void gtk_off_init_script(OffEngine *e, std::string js) {
+    GtkPump::instance().run_async([=] {
+        if (!e->manager) return;
+        webkit_user_content_manager_add_script(
+            e->manager,
+            webkit_user_script_new(js.c_str(),
+                                   WEBKIT_USER_CONTENT_INJECT_TOP_FRAME,
+                                   WEBKIT_USER_SCRIPT_INJECT_AT_DOCUMENT_START,
+                                   NULL, NULL));
+    });
+}
+
+static void gtk_off_eval(OffEngine *e, std::string js) {
+    GtkPump::instance().run_async([=] {
+        if (!e->web) return;
+        webkit_web_view_run_javascript(WEBKIT_WEB_VIEW(e->web), js.c_str(),
+                                       NULL, NULL, NULL);
+    });
+}
+
+static void gtk_off_bind(OffEngine *e, Binding *b) {
+    e->bindings[b->name] = b;
+}
+
+// Open the WebKitGTK Web Inspector for the offscreen WebView in a separate
+// OS-level GtkWindow.  The inspector belongs to the WebView's own
+// process and is unaffected by the host Swing window's visibility.
+// Returns 1 on success, 0 if developer-extras is disabled or the
+// inspector is unavailable.
+static int gtk_off_open_devtools(OffEngine *e) {
+    if (!e || !e->web) return 0;
+    int result = 0;
+    GtkPump::instance().run_sync([&] {
+        if (!e->web) return;
+        WebKitSettings *s =
+            webkit_web_view_get_settings(WEBKIT_WEB_VIEW(e->web));
+        if (!s || !webkit_settings_get_enable_developer_extras(s)) return;
+        WebKitWebInspector *insp =
+            webkit_web_view_get_inspector(WEBKIT_WEB_VIEW(e->web));
+        if (!insp) return;
+        webkit_web_inspector_show(insp);
+        result = 1;
+    });
+    return result;
+}
+
+// Same idea for the heavyweight embed-path engine.  Lives here next to
+// the offscreen variant so both implementations are visible side by side.
+static int gtk_open_devtools(Engine *e) {
+    if (!e || !e->web) return 0;
+    int result = 0;
+    GtkPump::instance().run_sync([&] {
+        if (!e->web) return;
+        WebKitSettings *s =
+            webkit_web_view_get_settings(WEBKIT_WEB_VIEW(e->web));
+        if (!s || !webkit_settings_get_enable_developer_extras(s)) return;
+        WebKitWebInspector *insp =
+            webkit_web_view_get_inspector(WEBKIT_WEB_VIEW(e->web));
+        if (!insp) return;
+        webkit_web_inspector_show(insp);
+        result = 1;
+    });
+    return result;
 }
 
 // Mouse event injection.  Java listeners on WebViewLightweightComponent
@@ -1507,6 +1629,18 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
                                    sel("numberWithBool:"), YES);
             msg<void, id, id>(prefs, sel("setValue:forKey:"),
                               one, ns_str("developerExtrasEnabled"));
+            // macOS 13.3+ exposes -[WKWebView setInspectable:] as a
+            // public BOOL property; enabling it exposes the Web
+            // Inspector via the Safari Develop menu (remote inspection)
+            // and is required for right-click -> Inspect Element to
+            // function on those OS versions.  On macOS 12.x and earlier
+            // the selector does not exist and is silently skipped --
+            // the legacy developerExtrasEnabled flag alone is
+            // sufficient for in-process inspection there.
+            if (msg<BOOL>(e->webview, sel("respondsToSelector:"),
+                          sel("setInspectable:"))) {
+                msg<void, BOOL>(e->webview, sel("setInspectable:"), YES);
+            }
         }
         ok = true;
     });
@@ -1639,6 +1773,18 @@ static void cocoa_request_focus(Engine *e) {
 }
 
 static void cocoa_bind(Engine *e, Binding *b) { e->bindings[b->name] = b; }
+
+// macOS has no public API to programmatically open the Web Inspector; the
+// only public entry points are right-click -> Inspect Element (gated by
+// developerExtrasEnabled, already set in debug mode) and Safari ->
+// Develop menu (gated by setInspectable:YES, also set in debug mode).
+// Returning 0 signals to the Java side that no programmatic open
+// happened, so the boolean openDevTools() return surfaces the macOS
+// limitation honestly.
+static int cocoa_open_devtools(Engine *e) {
+    (void)e;
+    return 0;
+}
 
 #endif // WEBVIEW_COCOA
 
@@ -1945,5 +2091,91 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
 #else
     (void)peer; (void)press; (void)keyval; (void)modifiers;
     (void)is_modifier_key;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// DevTools open + offscreen JS bridge JNI exports.
+// ---------------------------------------------------------------------------
+
+JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1open_1devtools
+  (JNIEnv *, jclass, jlong wv) {
+#ifdef WEBVIEW_GTK
+    return (jint)embed::gtk_open_devtools((Engine *)wv);
+#elif defined(WEBVIEW_COCOA)
+    return (jint)embed::cocoa_open_devtools((Engine *)wv);
+#else
+    (void)wv;
+    return 0;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1init
+  (JNIEnv *env, jclass, jlong peer, jstring js) {
+#ifdef WEBVIEW_GTK
+    if (!peer || !js) return;
+    const char *s = env->GetStringUTFChars(js, nullptr);
+    embed::gtk_off_init_script((embed::OffEngine *)peer, s ? s : "");
+    env->ReleaseStringUTFChars(js, s);
+#else
+    (void)peer; (void)js;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1eval
+  (JNIEnv *env, jclass, jlong peer, jstring js) {
+#ifdef WEBVIEW_GTK
+    if (!peer || !js) return;
+    const char *s = env->GetStringUTFChars(js, nullptr);
+    embed::gtk_off_eval((embed::OffEngine *)peer, s ? s : "");
+    env->ReleaseStringUTFChars(js, s);
+#else
+    (void)peer; (void)js;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1bind
+  (JNIEnv *env, jclass, jlong peer, jstring name, jobject fn, jlong /*arg*/) {
+#ifdef WEBVIEW_GTK
+    auto *e = (embed::OffEngine *)peer;
+    if (!e) return;
+    const char *n = env->GetStringUTFChars(name, nullptr);
+    Binding *b = new Binding();
+    b->name = n ? n : "";
+    b->fn = env->NewGlobalRef(fn);
+    jclass cls = env->GetObjectClass(fn);
+    b->cls = (jclass)env->NewGlobalRef(cls);
+    env->DeleteLocalRef(cls);
+
+    // Install the same bind shim as the embed engine so callers can
+    // write window.<name>(args) and receive a JSON {name, seq, args}
+    // payload.  Identical to the embed path at webview_1embed_1bind.
+    std::string js =
+        std::string("(function(){var n='") + b->name + "';" +
+        "window[n]=function(){"
+        "  var me=window[n];"
+        "  if(!me.callbacks){me.callbacks={};me.errors={};}"
+        "  var seq=(me.lastSeq||0)+1;me.lastSeq=seq;"
+        "  var p=new Promise(function(res,rej){me.callbacks[seq]=res;me.errors[seq]=rej;});"
+        "  window.external.invoke(JSON.stringify({name:n,seq:seq,"
+        "    args:Array.prototype.slice.call(arguments)}));"
+        "  return p;"
+        "};})()";
+
+    embed::gtk_off_bind(e, b);
+    embed::gtk_off_init_script(e, js);
+    env->ReleaseStringUTFChars(name, n);
+#else
+    (void)env; (void)peer; (void)name; (void)fn;
+#endif
+}
+
+JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1open_1devtools
+  (JNIEnv *, jclass, jlong peer) {
+#ifdef WEBVIEW_GTK
+    return (jint)embed::gtk_off_open_devtools((embed::OffEngine *)peer);
+#else
+    (void)peer;
+    return 0;
 #endif
 }
