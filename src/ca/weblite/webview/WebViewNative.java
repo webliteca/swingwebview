@@ -227,6 +227,21 @@ native static int webview_embed_is_native_first_responder(long w);
 // between Swing widgets and the WebView.  Linux / Windows: stub (no-op).
 native static void webview_embed_set_focus_callback(long w, WebViewFocusCallback cb);
 
+// Register (or clear, by passing null) a callback invoked once per native
+// mouse-button press inside the embedded WebView's surface.  Used by the
+// heavyweight component to close any open Swing JPopupMenu when the user
+// clicks into the WebView -- the native peer receives clicks directly
+// from the OS and AWT's MouseGrabber AWTEventListener never sees them,
+// so without this hook open popups stay open inconsistently with the
+// rest of the Swing UI.  Fires for left / right / middle buttons.  The
+// callback is invoked on a native thread; the Java implementation must
+// marshal to the EDT before touching Swing state.  Per-platform event
+// source: Linux extends the existing gtk-gesture pressed handler; macOS
+// swizzles WKWebView mouseDown:/rightMouseDown:/otherMouseDown:; Windows
+// hooks WM_PARENTNOTIFY on the parent HWND.  Never throws via JNI; bad
+// inputs fall through silently.
+native static void webview_embed_set_click_callback(long w, WebViewClickCallback cb);
+
 // Force Win32 keyboard focus back to the AWT-owned parent HWND, so
 // subsequent keystrokes route to AWT instead of the WebView2 child
 // HWND.  Called from the Java-side global focus-owner listener when

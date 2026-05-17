@@ -374,9 +374,45 @@ struct Engine {
 
     JavaVM *jvm = nullptr;
 
+    // JNI global ref to the registered WebViewClickCallback, or nullptr.
+    // Invoked from the gtk_gesture_multi_press "pressed" handler each
+    // time the user presses a mouse button anywhere on the embedded
+    // WebKitWebView -- see Operation 13 of the heavyweight-embedding
+    // Canvas.  Cleared in gtk_destroy_engine BEFORE the widget is
+    // destroyed so a late press cannot fire into a freed ref.
+    jobject click_callback = nullptr;
+
     Engine() {}
     ~Engine() {}
 };
+
+// Invoke the Java WebViewClickCallback registered on the engine, if any.
+// Called from the GTK main thread; the Java callback is responsible for
+// marshalling to the EDT before touching Swing state.  Mirrors the cocoa
+// branch's fire_focus_callback shape but with no boolean payload because
+// WebViewClickCallback.invoke is a no-arg method.
+static void fire_click_callback(Engine *e) {
+    if (!e || !e->click_callback) return;
+    JavaVM *jvm = e->jvm;
+    if (!jvm) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        jvm->AttachCurrentThread((void **)&env, nullptr);
+        detach = true;
+    }
+    if (env) {
+        jclass cls = env->GetObjectClass(e->click_callback);
+        if (cls) {
+            jmethodID m = env->GetMethodID(cls, "invoke", "()V");
+            if (m) {
+                env->CallVoidMethod(e->click_callback, m);
+            }
+            env->DeleteLocalRef(cls);
+        }
+    }
+    if (detach) jvm->DetachCurrentThread();
+}
 
 static void engine_on_message(Engine *e, const char *msg) {
     if (msg == nullptr) return;
@@ -633,6 +669,15 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
                         "focus grabbed (web_xid=0x%lx)\n",
                         x, y,
                         wgw ? (unsigned long)GDK_WINDOW_XID(wgw) : 0UL);
+                    // Notify Java of the press so Swing can dismiss any
+                    // open JPopupMenu / JMenu / JComboBox dropdown.  AWT's
+                    // BasicPopupMenuUI MouseGrabber listener never sees
+                    // these clicks because they reach the embedded
+                    // WebKitWebView's GdkWindow directly rather than via
+                    // AWT's event queue.  Added AFTER the focus-grab work
+                    // above so the existing focus behaviour is preserved
+                    // exactly.
+                    fire_click_callback(eng);
                 };
             g_signal_connect(click, "pressed",
                              (GCallback)on_pressed, e);
@@ -752,6 +797,23 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
 
 static void gtk_destroy_engine(Engine *e) {
     if (!e) return;
+    // Release the click callback's JNI global ref BEFORE we destroy the
+    // GtkWidget tree so any pressed signal already dispatched but not yet
+    // run sees a null field instead of invoking a freed ref.  Symmetric
+    // with the click-callback clear in EmbeddedWebView.dispose() on the
+    // Java side -- belt-and-suspenders coverage for callbacks installed
+    // via setClickCallback that never made it through that path.
+    if (e->click_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm && e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->click_callback);
+        e->click_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     GtkPump::instance().run_sync([&] {
         if (e->redraw_timer_id) {
             g_source_remove(e->redraw_timer_id);
@@ -872,6 +934,25 @@ static void gtk_request_focus(Engine *e) {
 
 static void gtk_bind(Engine *e, Binding *b) {
     e->bindings[b->name] = b;
+}
+
+// Register (or clear, when cb is null) the Java WebViewClickCallback for
+// this engine.  The pressed signal handler installed in gtk_create_engine
+// fires this callback via fire_click_callback so Swing can dismiss any
+// open JPopupMenu when the user clicks into the WebView -- AWT's
+// MouseGrabber AWTEventListener cannot see those clicks because they
+// reach the WebKitWebView's GdkWindow directly rather than via AWT.
+// Always deletes any previously installed global ref before installing
+// the new one, even when cb is null.  Mirrors cocoa_set_focus_callback.
+static void gtk_set_click_callback(Engine *e, JNIEnv *env, jobject cb) {
+    if (!e) return;
+    if (e->click_callback) {
+        env->DeleteGlobalRef(e->click_callback);
+        e->click_callback = nullptr;
+    }
+    if (cb) {
+        e->click_callback = env->NewGlobalRef(cb);
+    }
 }
 
 // ===========================================================================
@@ -1493,6 +1574,15 @@ struct Engine {
     // Invoked by the swizzled becomeFirstResponder / resignFirstResponder
     // implementations.
     jobject focus_callback = nullptr;
+
+    // JNI global ref to the registered WebViewClickCallback, or nullptr.
+    // Invoked by the swizzled mouseDown: / rightMouseDown: /
+    // otherMouseDown: implementations after the original IMP has run, so
+    // Swing can dismiss any open JPopupMenu when the user clicks into
+    // the WebView -- AWT's MouseGrabber AWTEventListener cannot see
+    // those clicks because the heavyweight peer receives them through
+    // the AppKit responder chain rather than AWT's event queue.
+    jobject click_callback = nullptr;
 };
 
 // Process-global map from WKWebView (id) to its owning Engine*.  Populated
@@ -1660,6 +1750,112 @@ static void install_focus_swizzle() {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Mouse-down hook on WKWebView.
+//
+// We swizzle -[WKWebView mouseDown:], -[WKWebView rightMouseDown:], and
+// -[WKWebView otherMouseDown:] so we can notify Java each time the user
+// presses any mouse button inside the WebView.  This is the macOS half of
+// the cross-platform native click hook that drives Swing-side popup
+// dismissal: AWT's BasicPopupMenuUI MouseGrabber listener never sees
+// clicks that land in the WKWebView because they reach it via the AppKit
+// responder chain rather than through AWT's event queue, so an open
+// JPopupMenu would otherwise stay open when the user clicked the
+// WebView.
+//
+// Each swizzled implementation calls the original IMP FIRST so WebKit's
+// normal click handling (link clicks, text selection, form interaction,
+// becomeFirstResponder) is unaffected; the click callback fires
+// afterwards.  Swizzling is class-wide: any WKWebView in the process is
+// affected, including ones the host application created independently.
+// The g_webview_map lookup returns nullptr for those and we silently
+// skip the callback -- behaviour for unrelated WKWebViews is preserved.
+//
+// The Java callback runs on whatever thread AppKit drove the click on
+// (the AppKit main thread for normal user input); Java-side callers MUST
+// marshal to the EDT before touching Swing state.  See WebViewClickCallback
+// for the contract.
+// ---------------------------------------------------------------------------
+
+typedef void (*VoidFromIdSelEvent)(id, SEL, id);
+static VoidFromIdSelEvent g_orig_mouseDown = nullptr;
+static VoidFromIdSelEvent g_orig_rightMouseDown = nullptr;
+static VoidFromIdSelEvent g_orig_otherMouseDown = nullptr;
+static std::once_flag g_click_swizzle_once;
+
+static void fire_click_callback(Engine *e) {
+    if (!e || !e->click_callback) return;
+    JavaVM *jvm = e->jvm;
+    if (!jvm) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        jvm->AttachCurrentThread((void **)&env, nullptr);
+        detach = true;
+    }
+    if (env) {
+        jclass cls = env->GetObjectClass(e->click_callback);
+        if (cls) {
+            jmethodID m = env->GetMethodID(cls, "invoke", "()V");
+            if (m) {
+                env->CallVoidMethod(e->click_callback, m);
+            }
+            env->DeleteLocalRef(cls);
+        }
+    }
+    if (detach) jvm->DetachCurrentThread();
+}
+
+static void swizzled_mouse_down(id self, SEL _cmd, id event) {
+    if (g_orig_mouseDown) g_orig_mouseDown(self, _cmd, event);
+    Engine *eng = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_webview_map_mutex);
+        auto it = g_webview_map.find(self);
+        if (it != g_webview_map.end()) eng = it->second;
+    }
+    if (eng) fire_click_callback(eng);
+}
+
+static void swizzled_right_mouse_down(id self, SEL _cmd, id event) {
+    if (g_orig_rightMouseDown) g_orig_rightMouseDown(self, _cmd, event);
+    Engine *eng = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_webview_map_mutex);
+        auto it = g_webview_map.find(self);
+        if (it != g_webview_map.end()) eng = it->second;
+    }
+    if (eng) fire_click_callback(eng);
+}
+
+static void swizzled_other_mouse_down(id self, SEL _cmd, id event) {
+    if (g_orig_otherMouseDown) g_orig_otherMouseDown(self, _cmd, event);
+    Engine *eng = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_webview_map_mutex);
+        auto it = g_webview_map.find(self);
+        if (it != g_webview_map.end()) eng = it->second;
+    }
+    if (eng) fire_click_callback(eng);
+}
+
+static void install_click_swizzle() {
+    std::call_once(g_click_swizzle_once, [] {
+        Class wk = (Class)objc_cls("WKWebView");
+        if (!wk) return;
+        Method down = class_getInstanceMethod(wk, sel("mouseDown:"));
+        Method rdown = class_getInstanceMethod(wk, sel("rightMouseDown:"));
+        Method odown = class_getInstanceMethod(wk, sel("otherMouseDown:"));
+        if (!down || !rdown || !odown) return;
+        g_orig_mouseDown = (VoidFromIdSelEvent)method_setImplementation(
+            down, (IMP)swizzled_mouse_down);
+        g_orig_rightMouseDown = (VoidFromIdSelEvent)method_setImplementation(
+            rdown, (IMP)swizzled_right_mouse_down);
+        g_orig_otherMouseDown = (VoidFromIdSelEvent)method_setImplementation(
+            odown, (IMP)swizzled_other_mouse_down);
+    });
+}
+
 // Returns 1 if the engine's WKWebView (or a descendant view in its
 // subview hierarchy -- WebKit content view, etc.) is currently the
 // first responder of its NSWindow.  Synchronous query against AppKit
@@ -1706,6 +1902,23 @@ static void cocoa_set_focus_callback(Engine *e, JNIEnv *env, jobject cb) {
     }
 }
 
+// Register (or clear, when cb is null) the Java WebViewClickCallback for
+// this engine.  The swizzled mouseDown: / rightMouseDown: /
+// otherMouseDown: implementations call fire_click_callback for any
+// WKWebView found in g_webview_map; that function reads this field, so
+// installing the global ref here is the single place that wires Java
+// callbacks into the swizzled hot path.  Mirrors cocoa_set_focus_callback.
+static void cocoa_set_click_callback(Engine *e, JNIEnv *env, jobject cb) {
+    if (!e) return;
+    if (e->click_callback) {
+        env->DeleteGlobalRef(e->click_callback);
+        e->click_callback = nullptr;
+    }
+    if (cb) {
+        e->click_callback = env->NewGlobalRef(cb);
+    }
+}
+
 static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
                                    jlong /*display*/, jint debug) {
     auto *e = new Engine();
@@ -1736,6 +1949,11 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
         // BEFORE creating the WKWebView, so any becomeFirstResponder
         // calls during init are routed through our hook from the start.
         install_focus_swizzle();
+        // Same reasoning for the mouseDown: / rightMouseDown: /
+        // otherMouseDown: swizzle that drives native click notifications
+        // back to Swing (used for outside-click popup dismissal -- see
+        // Operation 13 of the heavyweight-embedding Canvas).
+        install_click_swizzle();
 
         e->config = msg(objc_cls("WKWebViewConfiguration"), sel("new"));
         e->manager = msg(e->config, sel("userContentController"));
@@ -1909,6 +2127,20 @@ static void cocoa_destroy_engine(Engine *e) {
         }
         if (env) env->DeleteGlobalRef(e->focus_callback);
         e->focus_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
+    // Same treatment for the click-callback global ref.  Cleared after
+    // the webview map entry above so the swizzled mouseDown: hooks read
+    // a null field instead of a freed ref if they race against destroy.
+    if (e->click_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->click_callback);
+        e->click_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
     cocoa_run_on_main([&] {
@@ -2441,6 +2673,17 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
   (JNIEnv *env, jclass, jlong wv, jobject cb) {
 #ifdef WEBVIEW_COCOA
     embed::cocoa_set_focus_callback((Engine *)wv, env, cb);
+#else
+    (void)env; (void)wv; (void)cb;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1click_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+#ifdef WEBVIEW_GTK
+    embed::gtk_set_click_callback((Engine *)wv, env, cb);
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_set_click_callback((Engine *)wv, env, cb);
 #else
     (void)env; (void)wv; (void)cb;
 #endif
