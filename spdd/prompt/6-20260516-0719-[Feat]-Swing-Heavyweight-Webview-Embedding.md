@@ -790,18 +790,40 @@ Files:
      triggering an editing command in this WebView.
    - Resolve the AWT focus owner via
      `KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusOwner()`.
-     If it is a `javax.swing.text.JTextComponent`, query the
-     native first-responder state via
-     `embedded.isNativeFirstResponder()`. If the WebView IS
-     the native first responder, override the Swing deferral
-     and continue with the WebView dispatch — the user has
-     clicked into the WebView and is interacting with it
-     even though AWT's focus owner stayed on the Swing
-     text widget. Only if the WebView is NOT the native
-     first responder do we return `false` to defer to
-     Swing's own Cut/Copy/Paste bindings on the focused
-     text widget (preserving sibling `JTextField` behaviour
-     when the user has genuinely clicked back on it).
+     Compute two boolean signals:
+     - `focusInWebView`: true iff the AWT focus owner is
+       non-null and is either this component or descended
+       from it (`focusOwner == this ||
+       SwingUtilities.isDescendingFrom(focusOwner, this)`).
+       This is the standard signal on Linux lightweight,
+       where the component calls
+       `requestFocusInWindow()` on mouse-pressed; it may
+       also be true on Windows when AWT focus is on the
+       embedded heavyweight `Canvas`.
+     - `nativeFocusOnWebView`:
+       `embedded.isNativeFirstResponder()`. macOS-specific
+       in practice (Linux / Windows native bodies stub to
+       return 0); on macOS this is the ONLY reliable signal
+       that the user is interacting with the WebView,
+       because AWT's focus owner stays on whichever Swing
+       component last had focus while the WKWebView holds
+       native first-responder status.
+   - **Default to deferring to Swing.** If both signals are
+     false, return `false` so AWT delivers the event to its
+     focus owner via the normal dispatch path. This is the
+     conservative gate that keeps a sibling `JTextField` (or
+     any other Swing component) working when the user is
+     interacting with it rather than the WebView. The
+     earlier "defer iff focus owner is a `JTextComponent`,
+     otherwise dispatch" gate was too permissive: any
+     non-text focus owner (a `JFrame`'s content pane, a
+     `null` focus owner during a focus transition, the AWT
+     focus owner being weirdly out-of-sync with native
+     focus on Windows) caused Ctrl+V to hijack to the
+     WebView even when the user was nowhere near it.
+   - Only when at least one of the two signals is true
+     do we call `embedded.executeEditingCommand(cmd)` and
+     return `true` to consume the event.
    - **Do NOT also require focus owner to be `this` or a
      descendant.** On macOS the heavyweight peer holds the
      real keyboard focus natively, and AWT's focus owner

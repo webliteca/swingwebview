@@ -238,25 +238,29 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         if (myWindow == null || !myWindow.isFocused()) {
             return false;
         }
+        // Default to deferring to Swing.  Only dispatch to the WebView
+        // when we have positive evidence the user is interacting with
+        // it: either AWT focus is inside the component (Linux
+        // lightweight / sometimes Windows), or the native WebView is
+        // first responder (macOS, where AWT focus stays on the previously
+        // focused Swing component while WKWebView holds AppKit focus).
         Component focusOwner = KeyboardFocusManager
             .getCurrentKeyboardFocusManager()
             .getFocusOwner();
-        if (focusOwner instanceof JTextComponent) {
-            // Only defer to Swing if the user has genuinely focused the
-            // text widget.  If they have since clicked into the WebView
-            // (so WKWebView is the native first responder but AWT focus
-            // owner is still the JTextComponent), override the deferral
-            // and route the shortcut to the WebView.
-            if (!embedded.isNativeFirstResponder()) {
-                return false;
-            }
+        boolean focusInWebView = focusOwner != null
+            && (focusOwner == this
+                || SwingUtilities.isDescendingFrom(focusOwner, this));
+        boolean nativeFocusOnWebView = embedded.isNativeFirstResponder();
+        if (!focusInWebView && !nativeFocusOnWebView) {
+            return false;
         }
         if (Boolean.getBoolean("ca.weblite.webview.debugShortcut")) {
             System.err.println(
                 "[webview-editing-shortcut] heavyweight dispatch cmd="
                 + cmd + " focusOwner="
                 + (focusOwner == null ? "null" : focusOwner.getClass().getName())
-                + " nativeFR=" + embedded.isNativeFirstResponder());
+                + " focusInWebView=" + focusInWebView
+                + " nativeFR=" + nativeFocusOnWebView);
         }
         embedded.executeEditingCommand(cmd);
         return true;

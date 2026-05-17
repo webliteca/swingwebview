@@ -757,21 +757,33 @@ Files:
      (`SwingUtilities.getWindowAncestor(this).isFocused()`).
    - Resolve the focus owner via
      `KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusOwner()`.
-     If it is a `javax.swing.text.JTextComponent`, return
-     `false` — defer to Swing's own Cut/Copy/Paste bindings
-     on the focused text widget so a sibling `JTextField` in
-     the same window keeps working.
-   - **Do NOT also require the focus owner to be `this` or a
-     descendant.** The same rationale as Canvas 6 applies:
-     window-focus + non-text-component gating is sufficient
-     and avoids the focus-owner-mismatch failure mode that
-     hit the heavyweight component on macOS. On Linux the
-     lightweight component is the AWT focus owner once the
-     user has clicked into it (via `requestFocusInWindow()`
-     in the mouse-pressed handler), so the gate normally
-     passes anyway — but the more permissive form is safer
-     for edge cases (focus stolen by a non-text Swing
-     widget, focus owner not yet set on first display, etc.).
+     **Default to deferring to Swing.** Only dispatch to
+     the WebView when the AWT focus owner is non-null AND
+     is either this component itself or a descendant
+     (`focusOwner == this ||
+     SwingUtilities.isDescendingFrom(focusOwner, this)`).
+     The lightweight component calls `requestFocusInWindow()`
+     in its mouse-pressed handler, so AWT focus reliably
+     reflects user intent. If the focus owner is anything
+     else — a sibling `JTextField`, a `JFrame` content
+     pane, `null` during a focus transition — return
+     `false` so AWT delivers the event to its focus owner
+     via the normal dispatch path.
+   - The heavyweight Canvas 6 dispatcher additionally
+     consults a native first-responder query for the
+     macOS-specific case where AWT focus stays on a Swing
+     component while WKWebView holds AppKit's first
+     responder. That signal does not apply on Linux
+     lightweight: the offscreen widget has no AppKit-style
+     first-responder semantics, and the AWT focus owner is
+     authoritative because the component grants itself
+     focus on every mouse-press into the widget.
+   - The earlier "defer iff focus owner is a
+     `JTextComponent`" gate was too permissive — any
+     non-text focus owner (a `JFrame`'s content pane, a
+     `null` focus owner during a focus transition) caused
+     the WebView to hijack the shortcut even when the user
+     was nowhere near it.
    - Otherwise call
      `engine.executeEditingCommand(cmd)` and return `true`
      to consume the event so the existing `KeyAdapter`

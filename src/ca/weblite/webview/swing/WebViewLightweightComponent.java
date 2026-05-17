@@ -288,10 +288,21 @@ public class WebViewLightweightComponent extends WebViewComponent {
         if (myWindow == null || !myWindow.isFocused()) {
             return false;
         }
+        // Default to deferring to Swing.  Only dispatch to the WebView
+        // when AWT focus is actually inside this component -- the
+        // lightweight requestFocusInWindow() on mouse-press means
+        // focusOwner reliably reflects user intent here.  Any other
+        // focus state (sibling Swing component, JFrame content pane,
+        // null during a focus transition) means the user is not
+        // interacting with the WebView and the shortcut should go to
+        // its Swing target unchanged.
         Component focusOwner = KeyboardFocusManager
             .getCurrentKeyboardFocusManager()
             .getFocusOwner();
-        if (focusOwner instanceof javax.swing.text.JTextComponent) {
+        boolean focusInWebView = focusOwner != null
+            && (focusOwner == this
+                || SwingUtilities.isDescendingFrom(focusOwner, this));
+        if (!focusInWebView) {
             return false;
         }
         if (Boolean.getBoolean("ca.weblite.webview.debugShortcut")) {
