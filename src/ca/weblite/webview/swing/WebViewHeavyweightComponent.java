@@ -10,6 +10,8 @@ import ca.weblite.webview.EditingCommand;
 import ca.weblite.webview.EmbeddedWebView;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewFocusCallback;
+import java.beans.PropertyChangeEvent;
+import java.beans.PropertyChangeListener;
 import javax.swing.text.JTextComponent;
 
 import java.awt.BorderLayout;
@@ -81,6 +83,7 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
     private final Map<String, WebView.JavascriptCallback> pendingBindings =
             new LinkedHashMap<String, WebView.JavascriptCallback>();
     private KeyEventDispatcher editingShortcutDispatcher;
+    private PropertyChangeListener focusOwnerListener;
     private JTextComponent suppressedCaretOwner;
     private boolean originalCaretVisible;
 
@@ -200,10 +203,27 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
                 .getCurrentKeyboardFocusManager()
                 .addKeyEventDispatcher(editingShortcutDispatcher);
         }
+        if (focusOwnerListener == null) {
+            focusOwnerListener = new PropertyChangeListener() {
+                @Override
+                public void propertyChange(PropertyChangeEvent evt) {
+                    handleFocusOwnerChange(evt.getNewValue());
+                }
+            };
+            KeyboardFocusManager
+                .getCurrentKeyboardFocusManager()
+                .addPropertyChangeListener("focusOwner", focusOwnerListener);
+        }
     }
 
     @Override
     public void removeNotify() {
+        if (focusOwnerListener != null) {
+            KeyboardFocusManager
+                .getCurrentKeyboardFocusManager()
+                .removePropertyChangeListener("focusOwner", focusOwnerListener);
+            focusOwnerListener = null;
+        }
         if (editingShortcutDispatcher != null) {
             KeyboardFocusManager
                 .getCurrentKeyboardFocusManager()
@@ -211,6 +231,28 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
             editingShortcutDispatcher = null;
         }
         super.removeNotify();
+    }
+
+    private void handleFocusOwnerChange(Object newOwner) {
+        if (embedded == null) return;
+        if (!(newOwner instanceof Component)) return;
+        Component owner = (Component) newOwner;
+        // Focus moved INTO the WebView -- no native release needed.
+        if (owner == this || SwingUtilities.isDescendingFrom(owner, this)) {
+            return;
+        }
+        // Focus moved to an unrelated top-level window -- not our problem.
+        Window myWindow = SwingUtilities.getWindowAncestor(this);
+        Window ownerWindow = SwingUtilities.getWindowAncestor(owner);
+        if (myWindow == null || ownerWindow != myWindow) {
+            return;
+        }
+        // AWT moved focus to a Swing component in our window that isn't
+        // part of the WebView.  On Windows, Win32 keyboard focus may still
+        // be on the WebView2 child HWND; force it back to the AWT parent
+        // HWND so the new Swing focus owner actually receives keystrokes.
+        // No-op on macOS / Linux.
+        embedded.releaseNativeFocus();
     }
 
     private boolean handleEditingShortcut(KeyEvent e) {

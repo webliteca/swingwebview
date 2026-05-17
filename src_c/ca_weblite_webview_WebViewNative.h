@@ -305,6 +305,14 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
 
 /*
  * Class:     ca_weblite_webview_WebViewNative
+ * Method:    webview_embed_release_native_focus
+ * Signature: (J)V
+ */
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1release_1native_1focus
+  (JNIEnv *, jclass, jlong);
+
+/*
+ * Class:     ca_weblite_webview_WebViewNative
  * Method:    webview_offscreen_init
  * Signature: (JLjava/lang/String;)V
  */

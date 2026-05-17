@@ -227,6 +227,14 @@ native static int webview_embed_is_native_first_responder(long w);
 // between Swing widgets and the WebView.  Linux / Windows: stub (no-op).
 native static void webview_embed_set_focus_callback(long w, WebViewFocusCallback cb);
 
+// Force Win32 keyboard focus back to the AWT-owned parent HWND, so
+// subsequent keystrokes route to AWT instead of the WebView2 child
+// HWND.  Called from the Java-side global focus-owner listener when
+// AWT moves its focus owner to a Swing component outside the WebView.
+// macOS / Linux: no-op (AppKit / X11 focus handling is already
+// adequate on those platforms).  Never throws via JNI.
+native static void webview_embed_release_native_focus(long w);
+
 
 // ---------------------------------------------------------------------------
 // Lightweight / offscreen API (currently Linux-only).

@@ -245,6 +245,19 @@ public class EmbeddedWebView {
     }
 
     /**
+     * Windows-only: force Win32 keyboard focus back to the AWT-owned parent
+     * HWND, so subsequent keystrokes route to AWT instead of the WebView2
+     * child HWND.  Used by the Java-side global focus-owner listener when
+     * AWT moves its focus owner to a Swing component outside the WebView.
+     * macOS / Linux: no-op.
+     */
+    public EmbeddedWebView releaseNativeFocus() {
+        checkAlive();
+        WebViewNative.webview_embed_release_native_focus(peer);
+        return this;
+    }
+
+    /**
      * Release the native resources and detach from the parent.
      */
     public void dispose() {

@@ -1002,7 +1002,7 @@ Files:
          `getCaret().setVisible(originalCaretVisible)` to
          restore, then null the field.
 8. Reverse direction (Swing component gains focus → WKWebView
-   resigns) is handled implicitly:
+   resigns) is handled implicitly on macOS:
    - User clicks `JTextField` → AWT moves focus to
      `JTextField` → AWT calls AppKit
      `makeFirstResponder:` on its NSView → WKWebView
@@ -1010,6 +1010,105 @@ Files:
      `resignFirstResponder` fires → callback with
      `became = false` → `handleNativeFocusChange(false)` →
      caret restored on `suppressedCaretOwner`.
+   - **On Windows the same implicit path does not work.**
+     When the WebView2 HWND holds Win32 keyboard focus and
+     the user clicks a Swing widget rendered inside the
+     AWT JFrame's HWND area (e.g. the URL `JTextField` in
+     the toolbar), AWT moves its Java-side focus owner to
+     the `JTextField`, but Win32 keyboard focus stays on
+     the WebView2 HWND because AWT does not automatically
+     `SetFocus` away from a focused child HWND. Subsequent
+     keystrokes (`Ctrl+V` etc.) still route to WebView2 via
+     Win32, bypassing AWT and the editing-shortcut
+     dispatcher entirely. The fix is a Windows-only
+     "release native focus" path described in Operation 12
+     below.
+
+### 12. Release Native Keyboard Focus on AWT Focus Move (Windows)
+Files:
+- `src/ca/weblite/webview/EmbeddedWebView.java`
+  (`releaseNativeFocus()` method)
+- `src/ca/weblite/webview/WebViewNative.java` (one new
+  JNI declaration)
+- `src/ca/weblite/webview/swing/WebViewHeavyweightComponent.java`
+  (global `KeyboardFocusManager` property listener that
+  calls `releaseNativeFocus()` when AWT focus moves to a
+  non-WebView component)
+- `src_c/webview_embed.cpp` (no-op body on macOS / Linux)
+- `windows/webview_embed.cc` (Win32 `SetFocus` body with
+  `AttachThreadInput` for the cross-thread case)
+- Headers: declarations on both `src_c` and `windows` header.
+
+1. Responsibility: ensure Win32 keyboard focus follows AWT
+   focus on Windows. When the user shifts AWT focus away
+   from the embedded WebView, force Win32 to deliver
+   subsequent keyboard input to the AWT-owned parent HWND
+   instead of the WebView2 child HWND.
+2. New JNI declaration on `WebViewNative`:
+   `native static void webview_embed_release_native_focus(long w)`.
+   Returns void; never throws.
+3. New method on `EmbeddedWebView`:
+   `releaseNativeFocus(): EmbeddedWebView` — `checkAlive`,
+   then call the JNI entry. Pure side-effect; does not
+   touch `heap` or `bindings`.
+4. Native bodies:
+   - macOS (Cocoa branch): no-op. AppKit already handles
+     focus correctly via the responder chain — when AWT
+     moves focus to a Swing component it calls
+     `makeFirstResponder:` on its own NSView, which kicks
+     WKWebView out of first responder. The swizzled
+     `resignFirstResponder` hook fires and restores Swing
+     caret state. No native action needed here.
+   - Linux (GTK branch): no-op. AWT/X11 focus handling is
+     adequate for the heavyweight path on Linux today;
+     re-introducing native focus mutation from Java would
+     risk the rendering regression documented at
+     `WebViewHeavyweightComponent.java:223`.
+   - Windows (WebView2): dispatch to the WebView2 worker
+     thread via the existing
+     `embed_win::dispatch_to_thread` helper. On the worker
+     thread: obtain the AWT parent HWND from `e->parent`;
+     attach the worker thread's input state to the AWT
+     thread (via `AttachThreadInput(workerTid, parentTid,
+     TRUE)`); call `SetFocus(e->parent)`; detach. The
+     `AttachThreadInput` step is mandatory — Win32 focus
+     is per-thread, and `SetFocus` from a thread that does
+     not own the target HWND silently no-ops without the
+     attach.
+5. `WebViewHeavyweightComponent` integration:
+   - Add field `private PropertyChangeListener focusOwnerListener`
+     (null until `addNotify`).
+   - In `addNotify()`, after the editing-shortcut dispatcher
+     is installed, build a `PropertyChangeListener` for the
+     `"focusOwner"` property and register it on
+     `KeyboardFocusManager.getCurrentKeyboardFocusManager()`.
+     The listener:
+     - Reads the new value (the new focus owner).
+     - Returns immediately if `embedded == null` or the new
+       value is `null`.
+     - Returns immediately if the new value is `this` or a
+       descendant of `this` (focus moved INTO the WebView;
+       no native release needed).
+     - Returns immediately if the new value's window
+       ancestor is not this component's window (focus
+       moved to an unrelated window).
+     - Otherwise calls `embedded.releaseNativeFocus()`.
+   - In `removeNotify()`, before the editing-shortcut
+     dispatcher is unregistered, unregister the
+     `focusOwnerListener` and null the field.
+6. Constraints / Invariants:
+   - The listener is global (fires for every focus change
+     in the JVM). Short-circuit checks MUST be cheap to
+     avoid burdening unrelated focus traffic.
+   - `releaseNativeFocus()` is `void` and MUST NOT raise a
+     JNI exception; failure paths (bad HWND, no
+     controller, AttachThreadInput failure) log via the
+     existing `WV_LOG` pattern and return without
+     throwing.
+   - The listener MUST be unregistered in `removeNotify()`
+     to avoid leaking the component through the
+     `KeyboardFocusManager`'s strong reference (same
+     lifecycle norm as the editing-shortcut dispatcher).
 9. Constraints / Invariants:
    - The swizzle MUST be installed exactly once per JVM —
      guard with `std::call_once`. `method_setImplementation`

@@ -2446,6 +2446,14 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
 #endif
 }
 
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1release_1native_1focus
+  (JNIEnv *, jclass, jlong wv) {
+    // No-op on macOS and Linux: AppKit / X11 focus handling is already
+    // adequate.  Windows has its own implementation in
+    // windows/webview_embed.cc that performs the cross-thread SetFocus.
+    (void)wv;
+}
+
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1init
   (JNIEnv *env, jclass, jlong wv, jstring js) {
     const char *s = env->GetStringUTFChars(js, nullptr);

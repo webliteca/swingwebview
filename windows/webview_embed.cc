@@ -765,6 +765,45 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
     // JNI symbol must exist for System.loadLibrary to resolve.
 }
 
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1release_1native_1focus
+  (JNIEnv *, jclass, jlong wv) {
+    // When AWT moves its Java-side focus owner to a Swing component, Win32
+    // keyboard focus does NOT automatically follow -- if the user had
+    // clicked into the WebView2 child HWND first, that HWND keeps focus
+    // and steals subsequent keystrokes from AWT.  Force focus back to
+    // the AWT-owned parent HWND so the new Swing focus owner actually
+    // receives keystrokes.
+    //
+    // Win32 focus is per-thread.  The WebView2 worker thread is the one
+    // currently holding focus (on the WebView2 HWND it owns); AWT's
+    // parent HWND is owned by the AWT EDT thread.  SetFocus across
+    // threads silently no-ops unless the calling thread has attached
+    // input state to the target thread via AttachThreadInput.  Dispatch
+    // the work to the WebView2 worker (so we're on the thread holding
+    // focus), attach input to the AWT thread, then SetFocus on the
+    // parent HWND.
+    auto *e = (Engine *)wv;
+    if (!e || !e->parent) return;
+    embed_win::dispatch_to_thread(e, [e] {
+        HWND parent = e->parent;
+        if (!parent) return;
+        DWORD self_tid = GetCurrentThreadId();
+        DWORD parent_tid = GetWindowThreadProcessId(parent, nullptr);
+        if (parent_tid == 0) return;
+        if (parent_tid != self_tid) {
+            if (!AttachThreadInput(self_tid, parent_tid, TRUE)) {
+                WV_LOG("AttachThreadInput failed: %lu",
+                       (unsigned long)GetLastError());
+                return;
+            }
+            SetFocus(parent);
+            AttachThreadInput(self_tid, parent_tid, FALSE);
+        } else {
+            SetFocus(parent);
+        }
+    });
+}
+
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1execute_1editing_1command
   (JNIEnv *, jclass, jlong wv, jint cmdId) {
     auto *e = (Engine *)wv;
