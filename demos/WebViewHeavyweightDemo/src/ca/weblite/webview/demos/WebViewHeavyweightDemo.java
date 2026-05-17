@@ -162,6 +162,21 @@ public class WebViewHeavyweightDemo {
                 lightweightToggle.isSelected());
         });
 
+        // ----- Tabs -----
+        JTabbedPane tabs = new JTabbedPane();
+
+        // "+ New WebView Tab" instantiates a second (third, ...) WebView in
+        // the same JVM.  Before the fix for issue #21 this reliably crashed
+        // the JVM with SIGSEGV in objc_registerClassPair on macOS the first
+        // time it was clicked (second WebView in the process).  After the
+        // fix the new tab opens normally.
+        JButton newTabBtn = new JButton("+ New WebView Tab");
+        newTabBtn.setToolTipText(
+            "Create an additional WebView in a new tab.  Reproduces " +
+            "issue #21 on macOS: instantiating a second WKWebView in the " +
+            "same process used to crash in objc_registerClassPair.");
+        newTabBtn.addActionListener(e -> addWebViewTab(tabs));
+
         JPanel toolbar = new JPanel(new BorderLayout(8, 4));
         JPanel toolbarWest = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 4));
         toolbarWest.add(new JLabel("URL:"));
@@ -169,12 +184,10 @@ public class WebViewHeavyweightDemo {
         toolbarWest.add(go);
         JPanel toolbarEast = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 4));
         toolbarEast.add(bookmark);
+        toolbarEast.add(newTabBtn);
         toolbarEast.add(lightweightToggle);
         toolbar.add(toolbarWest, BorderLayout.CENTER);
         toolbar.add(toolbarEast, BorderLayout.EAST);
-
-        // ----- Tabs -----
-        JTabbedPane tabs = new JTabbedPane();
 
         JPanel webviewTab = new JPanel(new BorderLayout());
         webviewTab.add(wv, BorderLayout.CENTER);
@@ -255,6 +268,50 @@ public class WebViewHeavyweightDemo {
     private static String resolveUrl(String input) {
         String trimmed = input == null ? "" : input.trim();
         return TEST_PAGE_LABEL.equals(trimmed) ? TEST_PAGE_URL : trimmed;
+    }
+
+    // Running count of additional WebView tabs spawned by the "+ New
+    // WebView Tab" button, used for the tab title.
+    private static int extraWebViewCount = 0;
+
+    private static void addWebViewTab(JTabbedPane tabs) {
+        extraWebViewCount++;
+        int n = extraWebViewCount + 1;   // first extra tab is "WebView 2"
+
+        WebViewComponent extra = WebViewComponent.create();
+        extra.setDebug(true);
+        extra.setUrl("https://example.com");
+        extra.setPreferredSize(new Dimension(900, 600));
+
+        JPanel panel = new JPanel(new BorderLayout());
+        panel.add(extra, BorderLayout.CENTER);
+
+        String title = "WebView " + n;
+        tabs.addTab(title, panel);
+        int idx = tabs.indexOfComponent(panel);
+
+        // Tab header with a small "x" close button so the user can dispose
+        // the extra WebView without leaking native peers.
+        JPanel tabHeader = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 0));
+        tabHeader.setOpaque(false);
+        tabHeader.add(new JLabel(title));
+        JButton close = new JButton("x");
+        close.setMargin(new java.awt.Insets(0, 4, 0, 4));
+        close.setFocusable(false);
+        close.setToolTipText("Close this WebView tab.");
+        close.addActionListener(ev -> {
+            int curIdx = tabs.indexOfComponent(panel);
+            if (curIdx >= 0) tabs.removeTabAt(curIdx);
+            // removeNotify() on the WebViewComponent will dispose the
+            // native peer.
+        });
+        tabHeader.add(close);
+        tabs.setTabComponentAt(idx, tabHeader);
+
+        tabs.setSelectedIndex(idx);
+
+        System.err.println("[demo] Spawned " + title
+            + " (heavyweight=" + extra.isHeavyweight() + ")");
     }
 
     /**
