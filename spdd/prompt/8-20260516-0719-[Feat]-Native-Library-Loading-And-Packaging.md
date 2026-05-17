@@ -10,11 +10,12 @@ generated_at: 2026-05-16T07:19:13-07:00
   `libwebview.dylib`, `webview.dll`) inside the WebView JAR and
   load the right one at JVM startup automatically — no manual
   `System.loadLibrary` calls in caller code (`WebViewNative.java:19`,
-  `pom.xml:54`).
+  `pom.xml:55`).
 - Resolve the current platform via `os.name` + `os.arch` and map
-  to a directory inside the JAR (`linux_64`, `osx_64`, `osx_arm64`,
-  `windows_32`, `windows_64`, etc.)
-  (`NativeLibraryUtil.java:84`).
+  to a directory inside the JAR. The Maven-Central artifact ships
+  exactly six combinations: `linux_64`, `linux_arm64`, `osx_64`,
+  `osx_arm64`, `windows_64`, `windows_arm64`
+  (`NativeLibraryUtil.java:84`, `pom.xml:67-73`).
 - Extract the native binary to a temp file and load it via
   `System.load(absolutePath)`. Fall back to
   `System.loadLibrary` first in case the OS dynamic linker can
@@ -28,8 +29,8 @@ generated_at: 2026-05-16T07:19:13-07:00
 - On Windows the `WebView2Loader.lib` is statically linked into
   `webview.dll` so no separate `WebView2Loader.dll` extraction is
   needed (`WebViewNative.java:23`,
-  `src/windows_64/`). The system Microsoft Edge WebView2 Runtime
-  provides the actual Chromium binaries
+  `.github/workflows/build.yml:171`). The system Microsoft Edge
+  WebView2 Runtime provides the actual Chromium binaries
   (`README.md ("Platform support" section)`).
 - Definition of Done: indirectly validated by every other feature
   in this repo — if the native loader is broken, nothing else
@@ -84,10 +85,12 @@ generated_at: 2026-05-16T07:19:13-07:00
 - **Per-architecture directory inside the jar.** The Maven
   resource configuration explicitly packages native
   subdirectories (`linux_64/**`, `linux_arm64/**`, `osx_64/**`,
-  `osx_arm64/**`, `windows_32/**`, `windows_64/**`,
-  `windows_arm64/**`) inside the JAR
-  (`pom.xml:54`). At runtime, the extractor maps
-  `Architecture.LINUX_64` → `linux_64/libwebview.so`, etc.
+  `osx_arm64/**`, `windows_64/**`, `windows_arm64/**`) inside the
+  JAR (`pom.xml:65-75`). The source directory for the resource
+  is `natives/` at the repo root — **not** `src/`. `natives/` is
+  gitignored; its contents are produced by `build-*.sh` locally or
+  the per-platform CI matrix on release. At runtime, the extractor
+  maps `Architecture.LINUX_64` → `linux_64/libwebview.so`, etc.
 - **Leftover cleanup, not pinning.** Extracted native files live
   in the OS temp directory and are deleted if older than 5
   minutes when the next process starts
@@ -109,17 +112,33 @@ generated_at: 2026-05-16T07:19:13-07:00
   `WebappJniExtractor`) — JAR → temp-file extraction.
 - `src/ca/weblite/webview/nativelib/MxSysInfo.java` — optional
   fine-grained platform descriptor.
-- `src/linux_64/libwebview.so`,
-  `src/osx_64/libwebview.dylib`,
-  `src/windows_64/webview.dll`,
-  `src/windows_64/WebView2Loader.dll` (historical — now
-  statically linked, see `WebViewNative.java:23`) — the
-  pre-built native binaries packaged into the JAR.
-- `pom.xml:54` — Maven resource entries that include those
-  per-architecture directories at JAR-build time.
+- `natives/<arch>/<libname>` — the build-output location for
+  per-platform native binaries. **Gitignored**; not checked into
+  the source tree. Populated by `build-*.sh` (local) or the
+  per-platform CI matrix (release). The expected six combinations
+  are `linux_64/libwebview.so`, `linux_arm64/libwebview.so`,
+  `osx_64/libwebview.dylib`, `osx_arm64/libwebview.dylib`,
+  `windows_64/webview.dll`, `windows_arm64/webview.dll`.
+  `WebView2Loader.lib` is statically linked into `webview.dll`
+  on Windows so no separate `WebView2Loader.dll` ships in the jar
+  (`.github/workflows/build.yml:171`).
+- `pom.xml:65-75` — Maven resource entries that copy each
+  per-architecture directory from `natives/<arch>/` into
+  `target/classes/<arch>/` at JAR-build time, so they land at the
+  jar root where `NativeLibraryUtil.getPlatformLibraryPath`
+  expects them.
 - `build-linux.sh`, `build-mac.sh`, `build-windows.sh` —
-  scripts that rebuild the native binaries and copy them into
-  the right `src/<arch>/` directories.
+  developer scripts that build a single-platform native lib for
+  the host OS/arch and drop it under `natives/<arch>/`. A local
+  `mvn package` after one of these produces a jar containing only
+  that host's native lib (sufficient for local smoke testing).
+- `.github/workflows/build.yml` and
+  `.github/workflows/maven-release.yml` — the canonical six-way
+  build pipeline. A `native` matrix job per platform produces and
+  uploads one artifact; an assembly/deploy job downloads all six,
+  lays them into `natives/<arch>/`, asserts all six are present,
+  and runs `mvn package`/`deploy`. This is the only path that
+  produces the cross-platform fat jar shipped to Maven Central.
 
 ## O · Operations
 
@@ -215,18 +234,72 @@ File: `src/ca/weblite/webview/WebViewNative.java`
 ### 5. Pack Native Binaries — pom.xml resources
 File: `pom.xml`
 
-1. Responsibility: ensure each per-architecture native
-   directory is included in the JAR.
-2. Logic: the `<resources>` section explicitly enumerates
-   `linux_64/**`, `linux_arm64/**`, `osx_64/**`, `osx_arm64/**`,
-   `windows_32/**`, `windows_64/**`, `windows_arm64/**` from the
-   `src/` source directory (`pom.xml:54`).
+1. Responsibility: copy each per-architecture native directory
+   from the (gitignored) `natives/` build-output root into
+   `target/classes/<arch>/` so the JAR-packaging step bundles
+   them at the jar root.
+2. Logic: the `<resources>` section sets `<directory>natives</directory>`
+   and explicitly enumerates `linux_64/**`, `linux_arm64/**`,
+   `osx_64/**`, `osx_arm64/**`, `windows_64/**`, `windows_arm64/**`
+   (`pom.xml:65-75`). `windows_32` is **not** included — it was
+   dropped when the CI matrix was reduced to the six
+   currently-supported combinations.
 3. Constraints / Invariants:
-   - Adding a new architecture requires both a fresh native
-     build (one of the `build-*.sh` scripts) AND a new
-     `<include>` line here. `[DRIFT]` from typical Maven
-     layouts (which use `src/main/resources/`) — this repo
-     reuses `src/` for both Java and native binaries.
+   - Adding a new architecture requires three coordinated edits:
+     a new `<include>` line here, a new matrix entry in **both**
+     CI workflows (see Operation 6), and (typically) a new
+     `Architecture` enum value plus `getPlatformLibraryName`
+     branch in `NativeLibraryUtil.java`.
+   - `natives/` is a **build output**, not a source location.
+     `mvn clean` does not delete it (it lives outside `target/`),
+     but it is not in version control. A clean checkout produces
+     an empty-of-natives jar until either a `build-*.sh` script
+     or the CI pipeline populates it. This is deliberate — it
+     prevents the prior "stale checked-in binary" failure mode
+     where consumers silently shipped outdated natives.
+
+### 6. Cross-Platform Release Build — CI workflows
+Files: `.github/workflows/build.yml`,
+`.github/workflows/maven-release.yml`
+
+1. Responsibility: produce a single Maven-Central-ready jar that
+   contains all six platform+arch native libraries. Each native
+   must be compiled on a runner of its matching OS/arch — there
+   is no cross-compilation path.
+2. Logic (two-phase, identical structure in both workflows):
+   - **Phase 1 — `native` matrix job.** Six parallel runs, one
+     per `(os, native_dir, lib_name)` tuple
+     (`maven-release.yml:36-60`). Each builds the native lib
+     into `natives/<native_dir>/<lib_name>` and uploads it as
+     an artifact named `native-<native_dir>` with
+     `if-no-files-found: error` so an empty build fails fast
+     (`maven-release.yml:175-180`).
+     `fail-fast: true` on the matrix aborts the release if any
+     platform fails (`maven-release.yml:34`).
+   - **Phase 2 — assembly/deploy job.** `needs: native` gates
+     this on all six succeeding. Downloads every `native-*`
+     artifact, copies each into `natives/<arch>/`, then runs a
+     **6-platform-presence assertion** that fails the job if
+     any of the six expected directories is empty
+     (`maven-release.yml:234-249`). Only then does
+     `mvn deploy` run.
+3. Constraints / Invariants:
+   - The presence assertion's `required=(...)` array is the
+     authoritative list of platforms shipped. It must stay in
+     sync with the matrix in Phase 1 and the `<include>` list
+     in `pom.xml`. Drift between any two of those three lists
+     either silently drops a platform from the jar or hangs
+     the release.
+   - macOS x86_64 is cross-compiled from an `arm64` runner via
+     `clang -arch x86_64` because GitHub is phasing out Intel
+     macOS runners (`maven-release.yml:37-43`). This relies on
+     the macOS SDK being universal — it is, today.
+   - Windows builds statically link `WebView2LoaderStatic.lib`
+     so the published jar carries only `webview.dll`, no
+     `WebView2Loader.dll` (`build.yml:171`).
+   - `build.yml` runs on every push/PR to `master`, producing
+     a downloadable jar artifact but not publishing. Only
+     `maven-release.yml` publishes, gated on `v*` tag pushes.
 
 ## N · Norms
 - Use `NativeLoader.loadLibrary` (or rely on the static
@@ -238,11 +311,20 @@ File: `pom.xml`
   need to be available to the OS dynamic linker as transitive
   deps (`NativeLoader.java:67`). The current build does not
   use this mechanism.
-- When adding a new architecture, update the `Architecture`
-  enum (`NativeLibraryUtil.java:84`), the
-  `getPlatformLibraryName` switch (`NativeLibraryUtil.java:227`),
-  the `<include>` list in `pom.xml`, and one of the
-  `build-*.sh` scripts to actually produce the binary.
+- When adding a new architecture, update **all** of the
+  following in a single commit, or the release will silently
+  ship a degraded jar:
+  - the `Architecture` enum (`NativeLibraryUtil.java:84`),
+  - the `getPlatformLibraryName` switch
+    (`NativeLibraryUtil.java:227`),
+  - the `<include>` list in `pom.xml`,
+  - a new matrix entry in **both**
+    `.github/workflows/build.yml` and
+    `.github/workflows/maven-release.yml`,
+  - the `required=(...)` array in the "Verify all 6 platforms
+    are present" step of both workflows,
+  - one of the `build-*.sh` scripts (or a new one) for local
+    builds on the matching OS/arch.
 
 ## S · Safeguards
 - `WebViewNative` swallows `IOException` from the loader and

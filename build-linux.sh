@@ -15,5 +15,6 @@ g++ -I${JAVA_HOME}/include -I${JAVA_HOME}/include/linux -fPIC -std=c++11 -Wall -
     `pkg-config --libs gtk+-3.0 $WEBKIT_PKG` \
     $JAWT_LIB -lX11 \
     -shared -o libwebview.so
-mv libwebview.so src/linux_64/
+mkdir -p natives/linux_64
+mv libwebview.so natives/linux_64/
 mvn -DskipTests package
