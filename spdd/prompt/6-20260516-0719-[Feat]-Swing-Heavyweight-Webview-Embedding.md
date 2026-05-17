@@ -131,6 +131,26 @@ generated_at: 2026-05-16T07:19:13-07:00
     build, the Windows native body MAY be a no-op stub that
     returns immediately — but the JNI entry point must still
     exist so the Java caller is platform-uniform.
+- Popup dismissal on click into the WebView: when a Swing
+  `JPopupMenu`, `JMenu`, `JComboBox` dropdown, or any other
+  `JPopupMenu`-based popup is currently visible and the user
+  presses any mouse button (left, right, middle) anywhere inside
+  the heavyweight WebView's native area, the popup MUST close,
+  matching the standard Swing dismiss-on-outside-click behavior
+  that `BasicPopupMenuUI.MouseGrabber` provides for clicks on
+  pure-Swing widgets. The native peer (X11 child window on
+  Linux, `WKWebView` NSView on macOS, WebView2 child HWND on
+  Windows) receives mouse events directly from the OS without
+  going through AWT's event queue, so `MouseGrabber`'s
+  `AWTEventListener` never sees the press and the popup would
+  otherwise stay open — surprising to users and inconsistent
+  with the rest of the Swing UI. The click itself MUST still
+  reach the WebView for normal handling (link clicks, text
+  selection, form interaction, focus grab) — only the
+  popup-dismiss side-effect is restored. The lightweight
+  component (`WebViewLightweightComponent`) is unaffected
+  because its mouse events flow through AWT and `MouseGrabber`
+  sees them naturally.
 - Definition of Done: documented by `README.md ("Heavyweight platform notes" section)` ("Heavyweight
   platform notes") and exercised by the `WebViewHeavyweightDemo`
   (`demos/WebViewHeavyweightDemo/...`). No automated tests cover
@@ -174,6 +194,17 @@ generated_at: 2026-05-16T07:19:13-07:00
     `true` to consume the event. Short-circuits to `false`
     when `embedded == null` so a late event during teardown
     cannot call JNI on a disposed peer.
+  - Registers a native click callback on `EmbeddedWebView` in
+    `createPeer()` (via `embedded.setClickCallback(...)`) whose
+    handler marshals to the EDT and calls
+    `MenuSelectionManager.defaultManager().clearSelectedPath()`
+    to dismiss any open Swing popup. The callback is cleared
+    implicitly by `EmbeddedWebView.dispose()` (which calls
+    `setClickCallback(null)` before tearing down the native
+    peer), so the component does not manage its lifecycle
+    explicitly. The handler MUST be scoped narrowly: only the
+    popup-dismiss side-effect, no focus mutation, no JNI calls
+    into the embedded peer.
 - **EmbeddedCanvas** (inner class, extends `Canvas`,
   `WebViewHeavyweightComponent.java:186`) — the heavyweight peer
   that JAWT can lock to obtain a native window handle. Invariants:
@@ -207,6 +238,24 @@ generated_at: 2026-05-16T07:19:13-07:00
     Pure side-effect; does not touch `heap` or `bindings`.
     Native side is responsible for marshaling to the correct
     UI thread (AppKit main / GTK main / WebView2 worker).
+  - New method `setClickCallback(WebViewClickCallback cb): EmbeddedWebView`
+    — `checkAlive`; when `cb` is non-null anchor it in `heap`
+    so the JVM doesn't collect it while the native side holds
+    a global ref; delegate to
+    `WebViewNative.webview_embed_set_click_callback(peer, cb)`.
+    Passing `null` clears any prior callback. `dispose()` calls
+    `setClickCallback(null)` BEFORE `webview_embed_destroy`
+    runs, symmetric with the existing `setFocusCallback(null)`
+    cleanup, so a late native click event during teardown
+    cannot fire into a freed global ref.
+- **WebViewClickCallback** (new public functional interface,
+  `src/ca/weblite/webview/WebViewClickCallback.java`). Single
+  method `void invoke()` — fired once per native mouse-button
+  press inside the embedded WebView, on any button (left,
+  right, middle). Mirrors the shape of the existing
+  `WebViewFocusCallback` (no payload — purely a notification).
+  Invoked from a native thread; implementations MUST marshal
+  to the EDT themselves before touching any Swing state.
 - **EditingCommand** (new public enum,
   `src/ca/weblite/webview/EditingCommand.java`). Stable
   contract between Java and the JNI bridge — the integer IDs
@@ -355,6 +404,43 @@ generated_at: 2026-05-16T07:19:13-07:00
   targets the focused frame's selection internally. Windows
   uses `document.execCommand` via `ExecuteScript` for the
   same focus-aware semantics.
+- **Native click notification for Swing popup dismissal.**
+  Heavyweight native peers receive mouse events directly from
+  the OS, so Swing's `BasicPopupMenuUI.MouseGrabber`
+  `AWTEventListener` never sees clicks that land inside the
+  WebView. Without explicit cooperation, an open `JPopupMenu` /
+  `JMenu` / `JComboBox` dropdown stays open when the user
+  clicks in the WebView — surprising behavior that breaks the
+  principle of least astonishment relative to the rest of the
+  Swing UI. The fix is a thin native hook per platform that
+  fires a Java callback once per native mouse-button press; the
+  Java handler marshals to the EDT and calls
+  `MenuSelectionManager.defaultManager().clearSelectedPath()`
+  to dismiss any open popup. The click itself still flows to
+  the WebView for normal handling — only the popup-dismiss
+  side-effect is restored. Per-platform hook site:
+  - **Linux** (WebKitGTK): extend the existing
+    `gtk_gesture_multi_press_new` "pressed" handler that
+    already runs the click-to-focus grab; fire the click
+    callback alongside the focus-grab work, do not replace it.
+  - **macOS** (WKWebView): swizzle `-[WKWebView mouseDown:]`,
+    `-[WKWebView rightMouseDown:]`, and
+    `-[WKWebView otherMouseDown:]` analogously to the existing
+    first-responder swizzle. Call the original IMP first so
+    WebKit's normal click handling is unaffected, then look up
+    the engine and fire the callback. Use the existing
+    `g_webview_map` so swizzles installed in this process do
+    not affect unrelated `WKWebView`s; install the three
+    selector swizzles once per JVM via `std::call_once`.
+  - **Windows** (WebView2): hook `WM_PARENTNOTIFY` in the
+    existing `EmbedWndProc`. Windows posts `WM_PARENTNOTIFY` to
+    the parent HWND when a direct child receives `WM_LBUTTONDOWN`,
+    `WM_RBUTTONDOWN`, `WM_MBUTTONDOWN`, or `WM_XBUTTONDOWN`; the
+    low word of `wParam` identifies which. Fire the callback for
+    any of those four cases, then forward to `DefWindowProc`.
+  The hook is the canonical mechanism for surfacing in-WebView
+  user input back to Swing for purposes AWT's event queue would
+  normally handle.
 
 ## S · Structure
 - `src/ca/weblite/webview/swing/WebViewHeavyweightComponent.java`
@@ -371,6 +457,12 @@ generated_at: 2026-05-16T07:19:13-07:00
   enum with `CUT(1)`, `COPY(2)`, `PASTE(3)`, `SELECT_ALL(4)`
   and `int getNativeId()`. The enum is the only thing callers
   pass through `EmbeddedWebView.executeEditingCommand`.
+- `src/ca/weblite/webview/WebViewClickCallback.java` (new) —
+  public `@FunctionalInterface` with `void invoke()`. Passed
+  through `EmbeddedWebView.setClickCallback`; invoked by the
+  per-platform native click hook once per mouse-button press
+  inside the heavyweight WebView's native surface. Mirrors the
+  shape of the existing `WebViewFocusCallback`.
 - `src/ca/weblite/webview/ConsoleDispatcher.java` (from
   [[swing-webview-component-mode-selection]]) — owned by the
   component; receives raw payloads from the internal
@@ -391,7 +483,14 @@ generated_at: 2026-05-16T07:19:13-07:00
   WebView2 worker) and invokes the per-platform editing-command
   primitive (`[NSApp sendAction:to:nil from:webview]` /
   `webkit_web_view_execute_editing_command` /
-  `webview->ExecuteScript("document.execCommand(...)")`).
+  `webview->ExecuteScript("document.execCommand(...)")`). Both
+  sources also gain a function exported as
+  `Java_..._webview_1embed_1set_1click_1callback` that stores
+  a JNI global ref on the engine; the per-platform native
+  mouse-press hook (gtk-gesture extension on Linux,
+  `mouseDown:`/`rightMouseDown:`/`otherMouseDown:` swizzle on
+  macOS, `WM_PARENTNOTIFY` on Windows) reads that ref and
+  invokes the Java callback's `invoke()` method.
 - `demos/WebViewHeavyweightDemo/...` — interactive demo that
   exercises the trickier scenarios (combo-box popups over the
   WebView, `JTabbedPane` tab visibility, and on-demand
@@ -1182,6 +1281,201 @@ Files:
      `webview_embed_destroy` so the swizzled hooks don't
      fire into a freed callback.
 
+### 13. Native Click Notification for Popup Dismissal
+Files:
+- `src/ca/weblite/webview/WebViewClickCallback.java` (new
+  functional interface)
+- `src/ca/weblite/webview/EmbeddedWebView.java`
+  (`setClickCallback(WebViewClickCallback cb)` + cleanup in
+  `dispose()`)
+- `src/ca/weblite/webview/WebViewNative.java` (one new JNI
+  declaration)
+- `src/ca/weblite/webview/swing/WebViewHeavyweightComponent.java`
+  (click callback registration in `createPeer()` and the
+  `handleNativeClick()` EDT handler)
+- `src_c/webview_embed.cpp` (Linux gtk-gesture extension +
+  macOS `mouseDown:` / `rightMouseDown:` / `otherMouseDown:`
+  swizzles + JNI dispatcher)
+- `src_c/ca_weblite_webview_WebViewNative.h` + Windows header
+  (declarations)
+- `windows/webview_embed.cc` (`WM_PARENTNOTIFY` hook in
+  `EmbedWndProc` + Windows JNI body)
+
+1. Responsibility: turn user mouse-button presses anywhere
+   inside the embedded heavyweight WebView's native surface
+   into a Swing-side popup-dismiss action, so an open
+   `JPopupMenu` / `JMenu` / `JComboBox` dropdown closes when
+   the user clicks into the WebView — matching the standard
+   Swing dismiss-on-outside-click behavior that
+   `BasicPopupMenuUI.MouseGrabber` provides for clicks on
+   pure-Swing widgets. The click is still delivered to the
+   WebView for its normal handling (link navigation, text
+   selection, form interaction, focus grab); only the
+   popup-dismiss side-effect that AWT's event queue would
+   normally deliver is restored via a native hook.
+2. New public Java functional interface
+   `ca.weblite.webview.WebViewClickCallback`:
+   - Single method `void invoke()`. No payload — purely a
+     notification. Mirrors the shape of `WebViewFocusCallback`.
+   - Documented to be invoked from a native thread;
+     implementations MUST marshal to the EDT themselves
+     before touching Swing state.
+3. `EmbeddedWebView` additions:
+   - `setClickCallback(WebViewClickCallback cb): EmbeddedWebView`
+     — `checkAlive`; if `cb` is non-null anchor it in `heap`;
+     call
+     `WebViewNative.webview_embed_set_click_callback(peer, cb)`.
+     Passing `null` clears any prior callback.
+   - `dispose()` modification: BEFORE the existing
+     `webview_embed_destroy` call (and after / next to the
+     existing `setFocusCallback(null)` clear), call
+     `setClickCallback(null)`. Wrap in `try { ... } catch
+     (Throwable ignored) {}` exactly like the existing
+     focus-callback clear, so a JNI exception during teardown
+     cannot prevent destroy.
+4. New JNI declaration on `WebViewNative`:
+   `native static void webview_embed_set_click_callback(long w, WebViewClickCallback cb)`.
+   Stores a JNI global ref to `cb` on the engine. Passing
+   `null` clears + deletes any prior global ref. Returns
+   `void`; MUST NOT raise a JNI exception.
+5. Per-platform native event source:
+   - **Linux** (`src_c/webview_embed.cpp`, `gtk_*` branch):
+     extend the existing `gtk_gesture_multi_press_new`
+     "pressed" handler that already runs the X11 + GTK focus
+     grab on every mouse-button press in the WebView. After
+     the existing focus-grab work (do NOT replace or move
+     it), call `fire_click_callback(eng)`. Add a
+     `fire_click_callback(Engine *e)` function that mirrors
+     the `fire_focus_callback` shape on the cocoa branch but
+     takes no boolean argument (the Java callback's `invoke()`
+     method has signature `()V`). Add `jobject click_callback`
+     to the Linux `Engine` struct (default `nullptr`). Add
+     `gtk_set_click_callback(Engine *e, JNIEnv *env, jobject cb)`
+     that deletes any previous global ref and installs a new
+     one via `NewGlobalRef`, or leaves the field `nullptr` when
+     `cb` is `null`. Clean up the global ref in
+     `gtk_destroy_engine` BEFORE destroying the GtkWidget so
+     a late press cannot fire into a freed ref. The fire
+     happens on the GTK main thread; the Java-side callback
+     is responsible for marshalling to the EDT.
+   - **macOS** (`src_c/webview_embed.cpp`, `cocoa_*` branch):
+     swizzle `-[WKWebView mouseDown:]`,
+     `-[WKWebView rightMouseDown:]`, and
+     `-[WKWebView otherMouseDown:]` analogously to the
+     existing first-responder swizzle (see Operation 11.5a).
+     Use the same `g_webview_map` lookup so unrelated
+     `WKWebView` instances are unaffected. Install all three
+     selector swizzles in a single `std::call_once` block.
+     Each swizzled implementation MUST call the original IMP
+     first (so WebKit's normal click handling — text
+     selection, link clicks, form interaction, focus grab —
+     is unaffected), then look up the engine and invoke
+     `fire_click_callback(eng)`. Saved-IMP statics follow the
+     same pattern as the existing `g_orig_becomeFirstResponder`
+     / `g_orig_resignFirstResponder` plumbing. Add
+     `jobject click_callback` to the cocoa `Engine` struct.
+     Add `cocoa_set_click_callback(Engine *e, JNIEnv *env, jobject cb)`.
+     Clean up the global ref in `cocoa_destroy_engine` BEFORE
+     the engine map entry is removed.
+     Reuse `fire_focus_callback`'s JNIEnv-attach pattern for
+     `fire_click_callback` (look up the engine's JavaVM,
+     attach the current thread if needed, find the `invoke`
+     method, call it, detach if we attached).
+   - **Windows** (`windows/webview_embed.cc`): hook
+     `WM_PARENTNOTIFY` in the existing `EmbedWndProc`. Windows
+     posts `WM_PARENTNOTIFY` to the parent HWND when a direct
+     child receives `WM_LBUTTONDOWN`, `WM_RBUTTONDOWN`,
+     `WM_MBUTTONDOWN`, or `WM_XBUTTONDOWN`; the low word of
+     `wParam` identifies which message triggered it. The
+     parent HWND in our setup is `e->child` (the
+     `WebViewEmbedChild` window we create in `engine_thread`),
+     and the WebView2 child HWND is its direct child, so
+     mouse-down events bubble through `WM_PARENTNOTIFY` to us.
+     Add a `case WM_PARENTNOTIFY:` in `EmbedWndProc` that
+     switches on `LOWORD(wp)` for the four down-message
+     constants, calls `fire_click_callback(e)` for any of
+     them, then falls through to `DefWindowProc`. Add
+     `jobject click_callback` to the Windows `Engine` struct.
+     Add `win_set_click_callback(Engine *e, JNIEnv *env, jobject cb)`.
+     Cleanup in the destroy path BEFORE the worker thread
+     teardown (symmetric to the existing focus_callback
+     cleanup at the same spot).
+6. JNI dispatcher (`Java_..._webview_1embed_1set_1click_1callback`):
+   - `src_c/webview_embed.cpp`: under `#ifdef WEBVIEW_COCOA`
+     dispatch to `embed::cocoa_set_click_callback`; under
+     `#ifdef WEBVIEW_GTK` dispatch to
+     `embed::gtk_set_click_callback`; `#else` no-op fallback
+     that silently drops the call. Pattern mirrors the
+     existing `Java_..._webview_1embed_1set_1focus_1callback`
+     dispatcher.
+   - `windows/webview_embed.cc`: Windows JNI body calls
+     `win_set_click_callback`.
+7. `WebViewHeavyweightComponent` integration:
+   - In `createPeer()` AFTER the existing `setFocusCallback`
+     call: also call `embedded.setClickCallback(...)` with a
+     callback that schedules `handleNativeClick()` on the EDT
+     via `SwingUtilities.invokeLater`. The lambda capture is
+     anchored by `EmbeddedWebView.heap` via `setClickCallback`.
+   - New private method `handleNativeClick(): void` on the
+     EDT: call
+     `javax.swing.MenuSelectionManager.defaultManager().clearSelectedPath()`.
+     Nothing else — no focus mutation, no JNI calls into the
+     embedded peer, no logging in the hot path.
+   - No `addNotify` / `removeNotify` work is required for the
+     click callback. Lifecycle is owned end-to-end by
+     `EmbeddedWebView`: `createPeer()` installs it,
+     `dispose()` (called from `EmbeddedCanvas.removeNotify`)
+     clears it via the embedded peer's own teardown.
+8. Constraints / Invariants:
+   - The Java callback MUST be safe to invoke from a native
+     thread. The implementation marshals to the EDT
+     internally (via `SwingUtilities.invokeLater`); callers do
+     NOT need to register from the EDT or pre-marshal.
+   - `webview_embed_set_click_callback` is `void` and MUST
+     NOT raise a JNI exception. Bad inputs (null engine
+     pointer, JNI lookup failure) fall through silently —
+     same contract as `webview_embed_set_focus_callback`.
+   - The callback fires for every mouse button (left, right,
+     middle). Standard Swing closes popups on any outside
+     click, so the WebView must match. On Linux this is
+     achieved by leaving the existing
+     `gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(click), 0)`
+     in place (button 0 = any). On macOS this requires
+     swizzling all three `mouseDown:` / `rightMouseDown:` /
+     `otherMouseDown:` selectors. On Windows
+     `WM_PARENTNOTIFY` already covers all four button-down
+     messages.
+   - The Linux gesture handler also performs focus-grab work
+     (XSetInputFocus on the WebKitWebView's X11 window,
+     `gtk_widget_grab_focus`); the click-callback fire is
+     added ALONGSIDE that work, not instead of it. The
+     existing focus behavior MUST be preserved exactly —
+     this Operation only adds a call, it does not modify the
+     focus path.
+   - The macOS `mouseDown:` swizzle (and its
+     `rightMouseDown:` / `otherMouseDown:` siblings) MUST
+     call the original IMP FIRST so WebKit's normal click
+     handling is unaffected; the click callback fires after
+     the IMP returns.
+   - Cleanup ordering: `EmbeddedWebView.dispose()` calls
+     `setClickCallback(null)` BEFORE `webview_embed_destroy`,
+     symmetric with the existing `setFocusCallback(null)`
+     cleanup. A late native click event during teardown must
+     land on a `nullptr` callback field and silently no-op.
+   - The macOS swizzle MUST be installed exactly once per
+     JVM — guard with `std::call_once`.
+     `method_setImplementation` is destructive on
+     re-application and would corrupt the original-IMP save
+     for any of the three selectors.
+   - The Java handler MUST be scoped narrowly:
+     `MenuSelectionManager.defaultManager().clearSelectedPath()`
+     and nothing else. Adding focus mutations or JNI calls
+     here would re-introduce the focus tangles documented in
+     Operations 11 and 12.
+   - `clearSelectedPath()` is a no-op when no popup is
+     currently selected, so the callback can fire on every
+     click without worrying about the current popup state.
+
 ## N · Norms
 - All AWT/JAWT interaction must respect the rule that the
   native peer is only valid while the host AWT Component is
@@ -1245,6 +1539,16 @@ Files:
   fall through silently or log via the existing
   `WV_LOG`/`fprintf(stderr, ...)` pattern. Java callers must
   not need to wrap the call in try/catch.
+- The native click hook (`WebViewClickCallback` registered via
+  `EmbeddedWebView.setClickCallback`) is the canonical
+  mechanism for surfacing user mouse input from inside the
+  heavyweight WebView back to Swing for purposes that AWT's
+  event queue would normally handle — Swing popup dismissal
+  today; future needs (focus negotiation, analytics, custom
+  drag-source detection) should reuse the same callback rather
+  than adding new native hooks per use case. Keep the Java
+  handler narrowly scoped so the call cost is bounded for
+  every WebView click.
 
 ## S · Safeguards
 - `EmbeddedWebView.attach` validates `parent != null` AND
@@ -1304,3 +1608,18 @@ Files:
   calling `checkAlive`, so callers get a clear error rather
   than the JNI layer mishandling an undefined `cmdId`. The
   exception message MUST name the parameter (`"cmd"`).
+- `EmbeddedWebView.setClickCallback(null)` clears the JNI
+  global ref and deletes it cleanly. `EmbeddedWebView.dispose()`
+  calls `setClickCallback(null)` BEFORE `webview_embed_destroy`
+  (symmetric with the existing `setFocusCallback(null)` clear)
+  so a late native click event in flight during teardown lands
+  on a `nullptr` callback field and silently no-ops instead of
+  invoking JNI on a freed global ref.
+- The Java click handler in `WebViewHeavyweightComponent`
+  (`handleNativeClick`) MUST call
+  `MenuSelectionManager.defaultManager().clearSelectedPath()`
+  and nothing else. Touching focus, the embedded peer, or any
+  other Swing state from this handler risks re-introducing the
+  focus tangles documented in Operations 11 and 12, and the
+  handler runs on every WebView click so any extra work pays
+  per-click cost.
