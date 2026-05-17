@@ -789,7 +789,14 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1rel
     // queue to the parent HWND in the EDT's queue.
     auto *e = (Engine *)wv;
     if (!e || !e->parent) return;
-    HWND parent = e->parent;
+    // The JAWT-provided HWND on Windows is the heavyweight Canvas peer,
+    // NOT the JFrame's HWND.  The URL JTextField is a lightweight Swing
+    // component drawn inside the JFrame's HWND area; for Win32 keystrokes
+    // to reach AWT and be routed to the JTextField, we need focus on the
+    // top-level window, not on the Canvas (which is a sibling of the
+    // toolbar containing the JTextField).
+    HWND target = GetAncestor(e->parent, GA_ROOT);
+    if (!target) target = e->parent;
     DWORD edt_tid = GetCurrentThreadId();
     DWORD wv2_tid = e->thread_id;
     bool debug = getenv("WEBVIEW_DEBUG_SHORTCUT") != nullptr;
@@ -804,22 +811,22 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1rel
             return;
         }
         HWND prev = GetFocus();
-        HWND now = SetFocus(parent);
+        HWND now = SetFocus(target);
         AttachThreadInput(edt_tid, wv2_tid, FALSE);
         if (debug) {
-            WV_LOG("[webview-focus] SetFocus(parent=%p) prev=%p after=%p "
-                   "now=%p edt=%lu wv2=%lu",
-                   (void *)parent, (void *)prev, (void *)now,
-                   (void *)GetFocus(),
+            WV_LOG("[webview-focus] SetFocus(target=%p canvas=%p) prev=%p "
+                   "after=%p now=%p edt=%lu wv2=%lu",
+                   (void *)target, (void *)e->parent,
+                   (void *)prev, (void *)now, (void *)GetFocus(),
                    (unsigned long)edt_tid, (unsigned long)wv2_tid);
         }
     } else {
         HWND prev = GetFocus();
-        HWND now = SetFocus(parent);
+        HWND now = SetFocus(target);
         if (debug) {
-            WV_LOG("[webview-focus] same-thread SetFocus(parent=%p) "
+            WV_LOG("[webview-focus] same-thread SetFocus(target=%p) "
                    "prev=%p after=%p now=%p",
-                   (void *)parent, (void *)prev, (void *)now,
+                   (void *)target, (void *)prev, (void *)now,
                    (void *)GetFocus());
         }
     }

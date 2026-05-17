@@ -10,6 +10,8 @@ import ca.weblite.webview.EditingCommand;
 import ca.weblite.webview.EmbeddedWebView;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewFocusCallback;
+import java.awt.AWTEvent;
+import java.awt.event.AWTEventListener;
 import java.beans.PropertyChangeEvent;
 import java.beans.PropertyChangeListener;
 import javax.swing.text.JTextComponent;
@@ -84,6 +86,7 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
             new LinkedHashMap<String, WebView.JavascriptCallback>();
     private KeyEventDispatcher editingShortcutDispatcher;
     private PropertyChangeListener focusOwnerListener;
+    private AWTEventListener globalMouseListener;
     private JTextComponent suppressedCaretOwner;
     private boolean originalCaretVisible;
 
@@ -214,10 +217,32 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
                 .getCurrentKeyboardFocusManager()
                 .addPropertyChangeListener("focusOwner", focusOwnerListener);
         }
+        // Belt-and-suspenders mouse listener: PropertyChangeListener on
+        // focusOwner may not fire on Windows when Win32 keyboard focus is
+        // on a foreign HWND (WebView2's child HWND) -- AWT's internal
+        // focus tracking can desync.  An AWTEventListener for mouse
+        // events fires for every mouse press in the JVM regardless of
+        // focus state, so it can reliably trigger the native focus
+        // release when the user clicks outside the WebView.
+        if (globalMouseListener == null) {
+            globalMouseListener = new AWTEventListener() {
+                @Override
+                public void eventDispatched(AWTEvent event) {
+                    handleGlobalMouseEvent(event);
+                }
+            };
+            Toolkit.getDefaultToolkit().addAWTEventListener(
+                globalMouseListener, AWTEvent.MOUSE_EVENT_MASK);
+        }
     }
 
     @Override
     public void removeNotify() {
+        if (globalMouseListener != null) {
+            Toolkit.getDefaultToolkit()
+                .removeAWTEventListener(globalMouseListener);
+            globalMouseListener = null;
+        }
         if (focusOwnerListener != null) {
             KeyboardFocusManager
                 .getCurrentKeyboardFocusManager()
@@ -231,6 +256,35 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
             editingShortcutDispatcher = null;
         }
         super.removeNotify();
+    }
+
+    private void handleGlobalMouseEvent(AWTEvent event) {
+        if (embedded == null) return;
+        if (event.getID() != java.awt.event.MouseEvent.MOUSE_PRESSED) return;
+        Object src = event.getSource();
+        if (!(src instanceof Component)) return;
+        Component target = (Component) src;
+        boolean debug = Boolean.getBoolean("ca.weblite.webview.debugShortcut");
+        // Click landed inside the WebView -- WebView2 is taking focus
+        // legitimately, no native release needed.
+        if (target == this || SwingUtilities.isDescendingFrom(target, this)) {
+            if (debug) System.err.println(
+                "[webview-focus] mouse-press ignored (inside WebView): "
+                + target.getClass().getName());
+            return;
+        }
+        Window myWindow = SwingUtilities.getWindowAncestor(this);
+        Window targetWindow = SwingUtilities.getWindowAncestor(target);
+        if (myWindow == null || targetWindow != myWindow) {
+            if (debug) System.err.println(
+                "[webview-focus] mouse-press ignored (different window): "
+                + target.getClass().getName());
+            return;
+        }
+        if (debug) System.err.println(
+            "[webview-focus] mouse-press releaseNativeFocus on target="
+            + target.getClass().getName());
+        embedded.releaseNativeFocus();
     }
 
     private void handleFocusOwnerChange(Object newOwner) {
