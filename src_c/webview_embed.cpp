@@ -1681,6 +1681,14 @@ static BoolFromIdSel g_orig_becomeFirstResponder = nullptr;
 static BoolFromIdSel g_orig_resignFirstResponder = nullptr;
 static std::once_flag g_focus_swizzle_once;
 
+// WKScriptMessageHandler delegate class used by every Cocoa engine for the
+// window.external.invoke bridge.  objc_allocateClassPair returns Nil if the
+// class name is already registered, so the allocation/registration MUST run
+// exactly once per JVM -- the same pattern as g_focus_swizzle_once above.
+// See issue #21 and the Canvas constraint on cocoa_create_engine.
+static std::once_flag g_webview_embed_delegate_once;
+static Class g_webview_embed_delegate_cls = nil;
+
 static void fire_focus_callback(Engine *e, bool became) {
     if (!e || !e->focus_callback) return;
     JavaVM *jvm = e->jvm;
@@ -1748,6 +1756,27 @@ static void install_focus_swizzle() {
         g_orig_resignFirstResponder = (BoolFromIdSel)method_setImplementation(
             resign, (IMP)swizzled_resign_first_responder);
     });
+}
+
+static Class get_webview_embed_delegate_cls() {
+    std::call_once(g_webview_embed_delegate_once, [] {
+        Class c = objc_allocateClassPair((Class)objc_cls("NSObject"),
+                                         "WebviewEmbedDelegate", 0);
+        class_addProtocol(c, objc_getProtocol("WKScriptMessageHandler"));
+        class_addMethod(
+            c,
+            sel("userContentController:didReceiveScriptMessage:"),
+            (IMP)(+[](id self, SEL, id, id m) {
+                Engine *eng = (Engine *)objc_getAssociatedObject(self, "eng");
+                id body = msg(m, sel("body"));
+                const char *s = msg<const char *>(body, sel("UTF8String"));
+                engine_on_message(eng, s);
+            }),
+            "v@:@@");
+        objc_registerClassPair(c);
+        g_webview_embed_delegate_cls = c;
+    });
+    return g_webview_embed_delegate_cls;
 }
 
 // ---------------------------------------------------------------------------
@@ -2046,22 +2075,10 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
         }
 
         // External-message bridge: register a script message handler.
-        // We allocate a tiny ObjC class on the fly to receive messages.
-        Class delegate_cls = objc_allocateClassPair((Class)objc_cls("NSObject"),
-                                                    "WebviewEmbedDelegate", 0);
-        class_addProtocol(delegate_cls,
-                          objc_getProtocol("WKScriptMessageHandler"));
-        class_addMethod(
-            delegate_cls,
-            sel("userContentController:didReceiveScriptMessage:"),
-            (IMP)(+[](id self, SEL, id, id m) {
-                Engine *eng = (Engine *)objc_getAssociatedObject(self, "eng");
-                id body = msg(m, sel("body"));
-                const char *s = msg<const char *>(body, sel("UTF8String"));
-                engine_on_message(eng, s);
-            }),
-            "v@:@@");
-        objc_registerClassPair(delegate_cls);
+        // The ObjC delegate class is registered exactly once per JVM (see
+        // get_webview_embed_delegate_cls); every engine instantiates a
+        // fresh delegate object from the cached Class.
+        Class delegate_cls = get_webview_embed_delegate_cls();
         id delegate = msg((id)delegate_cls, sel("new"));
         objc_setAssociatedObject(delegate, "eng", (id)e, OBJC_ASSOCIATION_ASSIGN);
         msg<void, id, id>(e->manager,
