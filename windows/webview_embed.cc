@@ -105,11 +105,39 @@ struct Engine {
     ICoreWebView2Controller *controller = nullptr;
     ICoreWebView2 *webview = nullptr;
     EventRegistrationToken message_token{};
+    EventRegistrationToken got_focus_token{};
+    EventRegistrationToken lost_focus_token{};
     std::map<std::string, Binding *> bindings;
     JavaVM *jvm = nullptr;
     bool debug = false;
     std::mutex bindings_mutex;
+    // JNI global ref to the registered WebViewFocusCallback, or nullptr.
+    // Invoked from the WebView2 controller's GotFocus / LostFocus events.
+    jobject focus_callback = nullptr;
 };
+
+static void fire_focus_callback(Engine *e, bool became) {
+    if (!e || !e->focus_callback) return;
+    JavaVM *jvm = e->jvm;
+    if (!jvm) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        jvm->AttachCurrentThread((void **)&env, nullptr);
+        detach = true;
+    }
+    if (env) {
+        jclass cls = env->GetObjectClass(e->focus_callback);
+        if (cls) {
+            jmethodID m = env->GetMethodID(cls, "invoke", "(Z)V");
+            if (m) {
+                env->CallVoidMethod(e->focus_callback, m, (jboolean)became);
+            }
+            env->DeleteLocalRef(cls);
+        }
+    }
+    if (detach) jvm->DetachCurrentThread();
+}
 
 // IUnknown helper -- gives each WebView2 callback proper refcounting and
 // QueryInterface support.  The interfaces we implement are all single-
@@ -170,6 +198,20 @@ private:
 // Forward declarations.
 static void engine_on_message(Engine *e, LPCWSTR msg);
 static std::wstring utf8_to_wide(const char *s);
+
+class FocusHandler : public CallbackBase<
+    ICoreWebView2FocusChangedEventHandler> {
+public:
+    FocusHandler(Engine *e, bool became) : m_engine(e), m_became(became) {}
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2Controller *,
+                                     IUnknown *) override {
+        fire_focus_callback(m_engine, m_became);
+        return S_OK;
+    }
+private:
+    Engine *m_engine;
+    bool m_became;
+};
 
 class MsgHandler : public CallbackBase<
     ICoreWebView2WebMessageReceivedEventHandler> {
@@ -338,6 +380,19 @@ static void engine_thread(Engine *e, HWND /*parent*/, int width, int height,
                     e->webview->add_WebMessageReceived(mh, &e->message_token);
                     mh->Release();
 
+                    // Hook GotFocus / LostFocus on the controller so the
+                    // Java side can suppress and restore the previously-
+                    // focused JTextComponent's caret while WebView2 holds
+                    // Win32 keyboard focus.  Two separate handler
+                    // instances because the same callback signature has
+                    // no way to distinguish got vs lost from the args.
+                    auto *gh = new FocusHandler(e, true);
+                    ctrl->add_GotFocus(gh, &e->got_focus_token);
+                    gh->Release();
+                    auto *lh = new FocusHandler(e, false);
+                    ctrl->add_LostFocus(lh, &e->lost_focus_token);
+                    lh->Release();
+
                     init_done.clear();
                 });
             HRESULT r2 = env->CreateCoreWebView2Controller(
@@ -458,6 +513,22 @@ static void destroy_engine(Engine *e) {
     if (!e) return;
     if (e->thread_id) {
         PostThreadMessage(e->thread_id, WM_EMBED_QUIT, 0, 0);
+    }
+    // Release the focus callback global ref BEFORE the WebView2 worker
+    // thread tears down -- the GotFocus / LostFocus handlers can fire
+    // during teardown (LostFocus in particular fires when the controller
+    // is closed) and we don't want them invoking a callback into a freed
+    // Java global ref.
+    if (e->focus_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->focus_callback);
+        e->focus_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
     }
     {
         std::lock_guard<std::mutex> lk(e->bindings_mutex);
@@ -759,10 +830,22 @@ JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1is_
 }
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1focus_1callback
-  (JNIEnv *, jclass, jlong, jobject) {
-    // No-op on Windows: the macOS-specific WKWebView swizzle has no
-    // counterpart on WebView2.  The Java side still calls this so the
-    // JNI symbol must exist for System.loadLibrary to resolve.
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    // Store the Java callback (JNI global ref) on the Engine.  The
+    // ICoreWebView2 GotFocus / LostFocus handlers (registered during
+    // engine creation) read this field and invoke the callback so the
+    // Java side can mirror WebView2's focus state into Swing -- e.g.,
+    // suppress and restore the previously-focused JTextComponent's
+    // caret while WebView2 holds Win32 keyboard focus.
+    auto *e = (Engine *)wv;
+    if (!e) return;
+    if (e->focus_callback) {
+        env->DeleteGlobalRef(e->focus_callback);
+        e->focus_callback = nullptr;
+    }
+    if (cb) {
+        e->focus_callback = env->NewGlobalRef(cb);
+    }
 }
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1release_1native_1focus

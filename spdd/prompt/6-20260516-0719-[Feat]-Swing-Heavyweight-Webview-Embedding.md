@@ -82,7 +82,7 @@ generated_at: 2026-05-16T07:19:13-07:00
   AWT focus chain and the AppKit responder chain is the
   defining wrinkle of the AWT-embedded WKWebView setup; the
   dispatcher's gating logic exists to bridge it.
-- Visual focus cooperation (macOS only): when the user shifts
+- Visual focus cooperation (macOS + Windows): when the user shifts
   interaction to the WebView (WKWebView becomes the native
   first responder), the previously-focused Swing
   `JTextComponent` (if any) MUST have its caret hidden so
@@ -942,7 +942,26 @@ Files:
    - `native static void webview_embed_set_focus_callback(long w, WebViewFocusCallback cb)`.
      Stores a JNI global ref to `cb` on the engine. Passing
      `null` clears + deletes any prior global ref.
-5. Native swizzle (`src_c/webview_embed.cpp`, Cocoa branch):
+5. Per-platform focus-event source:
+   - **macOS**: WKWebView class swizzle. See step 5a below.
+   - **Windows**: hook
+     `ICoreWebView2Controller::add_GotFocus` and
+     `add_LostFocus` during engine creation; the registered
+     `FocusHandler` instances call `fire_focus_callback`
+     with `became=true` and `became=false` respectively.
+     `set_focus_callback` stores the Java callback's JNI
+     global ref on the Engine; the FocusHandler reads it.
+     `destroy_engine` releases the global ref BEFORE the
+     WebView2 worker tears down so LostFocus during
+     teardown does not invoke a freed callback.
+   - **Linux**: no current implementation; the offscreen
+     WebKitGTK widget does not have an AppKit-style focus
+     event that maps to "user shifted interaction to the
+     web view." Acceptable for now: the lightweight engine
+     on Linux is in-process and already gets AWT focus
+     correctly via `requestFocusInWindow()`.
+
+5a. Native swizzle (`src_c/webview_embed.cpp`, Cocoa branch):
    - Maintain a process-global `std::map<id, Engine *>
      g_webview_to_engine` guarded by `g_webview_map_mutex`.
      Populated in `cocoa_create_engine` after WKWebView
