@@ -285,6 +285,14 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
             "[webview-focus] mouse-press releaseNativeFocus on target="
             + target.getClass().getName());
         embedded.releaseNativeFocus();
+        // Also restore the suppressed caret in case the native LostFocus
+        // event won't fire reliably -- WebView2 only fires LostFocus when
+        // its hosted content (an inner DOM element) loses focus.  If the
+        // user clicked the page background without selecting anything,
+        // no inner element ever held focus, so LostFocus never fires when
+        // we forcibly release Win32 focus via SetFocus.  Restoring here
+        // makes the path independent of the native event.
+        restoreSuppressedCaret();
     }
 
     private void handleFocusOwnerChange(Object newOwner) {
@@ -452,11 +460,27 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
                 }
             }
         } else {
-            if (suppressedCaretOwner != null && suppressedCaretOwner.getCaret() != null) {
-                suppressedCaretOwner.getCaret().setVisible(originalCaretVisible);
-            }
-            suppressedCaretOwner = null;
+            restoreSuppressedCaret();
         }
+    }
+
+    private void restoreSuppressedCaret() {
+        if (suppressedCaretOwner == null) return;
+        JTextComponent jtc = suppressedCaretOwner;
+        suppressedCaretOwner = null;
+        if (jtc.getCaret() != null) {
+            jtc.getCaret().setVisible(true);
+        }
+        // setVisible(true) sets the field, but DefaultCaret only restarts
+        // its blink timer on a focusGained event.  In the AWT-vs-Win32
+        // focus-desync scenario (Win32 focus moved to WebView2 while
+        // AWT's focus owner stayed on the JTextField), AWT never fired
+        // a focusLost/focusGained pair on the JTextField, so DefaultCaret
+        // believes it never lost focus -- but its blink state may be
+        // dead anyway.  Dispatch a synthetic FOCUS_GAINED to retrigger
+        // DefaultCaret.focusGained, which restarts the blink timer.
+        jtc.dispatchEvent(new java.awt.event.FocusEvent(
+            jtc, java.awt.event.FocusEvent.FOCUS_GAINED));
     }
 
     private void sizeNative() {
