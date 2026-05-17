@@ -1133,6 +1133,25 @@ Files:
      guard with `std::call_once`. `method_setImplementation`
      is destructive on re-application and would corrupt
      the original-IMP save.
+   - The `WebviewEmbedDelegate` Objective-C class — the
+     `WKScriptMessageHandler` used inside
+     `cocoa_create_engine` to receive
+     `window.external.invoke` messages — MUST be allocated
+     and registered exactly once per JVM, using the same
+     `std::call_once` pattern as the focus swizzle above,
+     with the resulting `Class` cached in a file-scope
+     static. Every subsequent engine creation re-uses the
+     cached `Class` and instantiates a fresh delegate
+     object via `[Class new]` (then
+     `objc_setAssociatedObject(..., "eng", ...)` to bind
+     the per-engine receiver). `objc_allocateClassPair`
+     returns `Nil` when a class with the requested name is
+     already registered, so an unguarded re-allocation on
+     the second engine creation would feed a null `Class`
+     to `objc_registerClassPair` and crash the JVM with
+     SIGSEGV — see issue #21. `class_addProtocol`,
+     `class_addMethod`, and `objc_registerClassPair` MUST
+     run only inside the `std::call_once` body.
    - The Engine ↔ WKWebView map MUST be guarded by a
      mutex — `becomeFirstResponder` can fire on the AppKit
      main thread while `cocoa_create_engine` /
