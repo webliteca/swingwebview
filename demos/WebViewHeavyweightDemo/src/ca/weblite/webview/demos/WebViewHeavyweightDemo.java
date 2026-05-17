@@ -13,8 +13,10 @@ package ca.weblite.webview.demos;
 
 import ca.weblite.webview.ConsoleListener;
 import ca.weblite.webview.ConsoleMessage;
+import ca.weblite.webview.DomTarget;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.swing.WebViewComponent;
+import ca.weblite.webview.swing.WebViewContextMenu;
 
 import java.awt.BorderLayout;
 import java.awt.Dimension;
@@ -32,6 +34,7 @@ import javax.swing.JComboBox;
 import javax.swing.JFrame;
 import javax.swing.JLabel;
 import javax.swing.JList;
+import javax.swing.JMenuItem;
 import javax.swing.JPanel;
 import javax.swing.JPopupMenu;
 import javax.swing.JScrollPane;
@@ -162,6 +165,99 @@ public class WebViewHeavyweightDemo {
                 lightweightToggle.isSelected());
         });
 
+        // ----- Context menu -----
+        // Attaches a Swing JPopupMenu builder via the new
+        // WebViewContextMenu helper, so right-clicks in the page route to
+        // host-built menus instead of the platform default.  Menu items
+        // feed back into the surrounding Swing app (URL bar, navigation,
+        // log) so this is a real integration rather than a standalone toy.
+        java.util.function.Function<ca.weblite.webview.WebViewMouseEvent, JPopupMenu> ctxBuilder = event -> {
+            DomTarget t = event.target();
+            logArea.append("[ctx] " + event + "\n");
+            logArea.setCaretPosition(logArea.getDocument().getLength());
+
+            JPopupMenu menu = new JPopupMenu();
+            JMenuItem header = new JMenuItem(t.tagName()
+                + (t.id().isEmpty() ? "" : "#" + t.id())
+                + " @ (" + event.clientX() + "," + event.clientY() + ")");
+            header.setEnabled(false);
+            menu.add(header);
+            menu.addSeparator();
+
+            if (t.linkHref() != null) {
+                final String href = t.linkHref();
+                JMenuItem loadHere = new JMenuItem("Load link in this WebView");
+                loadHere.addActionListener(a -> {
+                    urlField.setText(href);
+                    wv.setUrl(href);
+                });
+                menu.add(loadHere);
+                JMenuItem copyToUrlBar = new JMenuItem("Copy link to URL bar");
+                copyToUrlBar.addActionListener(a -> urlField.setText(href));
+                menu.add(copyToUrlBar);
+            }
+            if (t.imageSrc() != null) {
+                final String src = t.imageSrc();
+                String shortSrc = src.length() > 40
+                    ? src.substring(0, 40) + "..." : src;
+                JMenuItem logImg = new JMenuItem("Log image URL: " + shortSrc);
+                logImg.addActionListener(a ->
+                    logArea.append("[ctx] image src: " + src + "\n"));
+                menu.add(logImg);
+            }
+            if (!t.selectionText().isEmpty()) {
+                JMenuItem logSel = new JMenuItem(
+                    "Log selection (" + t.selectionText().length() + " chars)");
+                logSel.addActionListener(a ->
+                    logArea.append("[ctx] selection: \""
+                        + t.selectionText() + "\"\n"));
+                menu.add(logSel);
+            }
+            if (t.isContentEditable()) {
+                JMenuItem editHint = new JMenuItem(
+                    "Editable element (use Cmd/Ctrl+C/V/X/A)");
+                editHint.setEnabled(false);
+                menu.add(editHint);
+            }
+
+            menu.addSeparator();
+            JMenuItem reload = new JMenuItem("Reload page");
+            reload.addActionListener(a -> wv.setUrl(wv.getUrl()));
+            menu.add(reload);
+            JMenuItem devtools = new JMenuItem("Open DevTools");
+            devtools.addActionListener(a -> {
+                boolean opened = wv.openDevTools();
+                logArea.append("[ctx] openDevTools() -> " + opened + "\n");
+            });
+            menu.add(devtools);
+            return menu;
+        };
+
+        // 1-element holder so the toggle lambda can swap out the helper.
+        // WebViewContextMenu instances are single-use w.r.t. attachTo, so
+        // re-checking the toggle constructs a fresh helper rather than
+        // reusing the old one -- matches the canvas's intentional contract.
+        final WebViewContextMenu[] ctxMenuRef = new WebViewContextMenu[] {
+            new WebViewContextMenu(ctxBuilder).attachTo(wv)
+        };
+
+        JCheckBox contextMenuToggle = new JCheckBox("Context menu", true);
+        contextMenuToggle.setToolTipText(
+            "When checked, right-clicking in the WebView shows the host's " +
+            "Java-built JPopupMenu and suppresses the platform's default " +
+            "context menu.  Uncheck to detach the helper and see the " +
+            "platform default again (Inspect Element, etc., when debug=true).");
+        contextMenuToggle.addActionListener(e -> {
+            if (contextMenuToggle.isSelected()) {
+                ctxMenuRef[0] = new WebViewContextMenu(ctxBuilder).attachTo(wv);
+                logArea.append("[ctx] attached -- platform default menu suppressed\n");
+            } else if (ctxMenuRef[0] != null) {
+                ctxMenuRef[0].detach();
+                ctxMenuRef[0] = null;
+                logArea.append("[ctx] detached -- platform default menu restored\n");
+            }
+        });
+
         // ----- Tabs -----
         JTabbedPane tabs = new JTabbedPane();
 
@@ -185,6 +281,7 @@ public class WebViewHeavyweightDemo {
         JPanel toolbarEast = new JPanel(new FlowLayout(FlowLayout.RIGHT, 4, 4));
         toolbarEast.add(bookmark);
         toolbarEast.add(newTabBtn);
+        toolbarEast.add(contextMenuToggle);
         toolbarEast.add(lightweightToggle);
         toolbar.add(toolbarWest, BorderLayout.CENTER);
         toolbar.add(toolbarEast, BorderLayout.EAST);
@@ -200,7 +297,11 @@ public class WebViewHeavyweightDemo {
             "the embedded page.  Lines are formatted as " +
             "[LEVEL] source:line text.  Listeners fire on the EDT and the " +
             "shim is installed at document-start, so this includes calls " +
-            "that run before the first navigation completes.");
+            "that run before the first navigation completes.\n\n" +
+            "Lines prefixed [ctx] come from the WebViewContextMenu helper: " +
+            "each right-click in the WebView logs the event and its DOM " +
+            "target descriptor, plus any item the user picks from the " +
+            "Java-built JPopupMenu.");
         logExplainer.setEditable(false);
         logExplainer.setLineWrap(true);
         logExplainer.setWrapStyleWord(true);
