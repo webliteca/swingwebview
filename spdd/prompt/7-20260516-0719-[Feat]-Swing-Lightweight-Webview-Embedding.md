@@ -61,6 +61,36 @@ generated_at: 2026-05-16T07:19:13-07:00
     that routes the raw payload into
     `ConsoleDispatcher.dispatch`.  Both happen inside
     `addNotify()` immediately after engine creation.
+- Clipboard & editing-command shortcuts (Linux only — the
+  lightweight engine is a stub on macOS / Windows): pressing
+  `Ctrl + C` / `V` / `X` / `A` while the AWT focus owner is
+  inside the lightweight component performs Copy / Paste /
+  Cut / Select-All against whatever has the in-page focus
+  inside the offscreen WebView. The implementation reuses
+  the `EditingCommand` enum defined in
+  [[swing-heavyweight-webview-embedding]] (same stable JNI
+  ABI: `CUT=1`, `COPY=2`, `PASTE=3`, `SELECT_ALL=4`) and
+  follows the same Java-side mechanism: a
+  `KeyEventDispatcher` installed in `addNotify` and removed
+  in `removeNotify`, plus a new JNI entry
+  `webview_offscreen_execute_editing_command(long peer, int cmdId)`
+  that on the GTK main thread calls
+  `webkit_web_view_execute_editing_command(WEBKIT_WEB_VIEW(e->web),
+  WEBKIT_EDITING_COMMAND_*)`. The existing AWT
+  `KeyListener` → `GdkInput.translateKeyCode` →
+  `engine.keyEvent` forwarding does NOT handle these
+  shortcuts: for `Ctrl+letter` AWT delivers `keyChar` as the
+  control character (e.g. `Ctrl+C` yields `0x03`), so
+  `GdkInput.translateKeyCode` falls through to `keyChar` and
+  the synthesized GDK event arrives at WebKit as
+  `(keyval=0x03, state=GDK_CONTROL_MASK)` — which WebKit's
+  accelerator handler does not recognise as the Cut/Copy/
+  Paste shortcut. Going directly to
+  `webkit_web_view_execute_editing_command` bypasses the
+  accelerator pipeline entirely. macOS / Windows lightweight
+  remain stubs — the dispatcher is still installed there but
+  its `engine == null` short-circuit makes it a no-op,
+  matching the existing rendering-path stub semantics.
 - Definition of Done: documented at `README.md ("Quick start" section)`,
   exercised by the `WebViewHeavyweightDemo` (which uses
   `WebViewComponent.create()` so the lightweight engine is the
@@ -98,6 +128,31 @@ generated_at: 2026-05-16T07:19:13-07:00
   - Overrides `addJavascriptCallback(name, cb)` to reject any
     name starting with `__webview_` (matches the canvas-5
     reserved-prefix norm).
+  - `editingShortcutDispatcher: KeyEventDispatcher` —
+    `null` until `addNotify`, non-null and registered on
+    `KeyboardFocusManager.getCurrentKeyboardFocusManager()`
+    between `addNotify` and the matching `removeNotify`.
+    Detects the standard platform shortcut + `C` / `V` /
+    `X` / `A` on `KEY_PRESSED` whose AWT focus owner is the
+    component or a descendant, forwards them to
+    `OffscreenWebView.executeEditingCommand`, and returns
+    `true` to consume the event so the AWT `KeyAdapter`
+    forwarding in `installKeyListener()` does NOT also feed
+    the Ctrl+letter event into the offscreen WebView (which
+    would arrive as a stray `Ctrl+\x03` synthesized GDK
+    event that the page's text field would not interpret as
+    a copy command and might insert as a control glyph).
+    Short-circuits to `false` when `engine == null` so the
+    dispatcher is a no-op on macOS / Windows where the
+    offscreen engine never creates, and during teardown
+    between `engine.dispose()` and `removeNotify`
+    unregistering the dispatcher.
+- **EditingCommand** — defined in
+  [[swing-heavyweight-webview-embedding]] at
+  `src/ca/weblite/webview/EditingCommand.java`; reused here
+  verbatim. The lightweight path does NOT redefine it; it
+  consumes the same enum with the same stable JNI ABI
+  (`CUT=1, COPY=2, PASTE=3, SELECT_ALL=4`).
 - **OffscreenWebView** (`OffscreenWebView.java:24`) — Low-level
   JNI wrapper for the offscreen engine.  Owns:
   - `peer: long` — native pointer; `0` means unsupported
@@ -113,6 +168,14 @@ generated_at: 2026-05-16T07:19:13-07:00
     Mirrors `EmbeddedWebView.bindings`
     (`EmbeddedWebView.java:34`).
   Invariants:
+  - New method `executeEditingCommand(EditingCommand cmd): OffscreenWebView`
+    — rejects null `cmd` with `NullPointerException("cmd")`
+    BEFORE `checkAlive`; otherwise calls
+    `WebViewNative.webview_offscreen_execute_editing_command(peer, cmd.getNativeId())`.
+    Pure side-effect; does NOT touch `heap` or `bindings`.
+    Mirrors `EmbeddedWebView.executeEditingCommand` from
+    [[swing-heavyweight-webview-embedding]] — same signature,
+    same null-arg semantics, same checkAlive guard.
   - `addOnBeforeLoad(js)`, `eval(js)`,
     `addJavascriptCallback(name, cb)`,
     `dispatch(Runnable r)`, and `openDevTools(): boolean`
@@ -191,6 +254,44 @@ generated_at: 2026-05-16T07:19:13-07:00
   underlying `webkit_user_script_new` /
   `register_script_message_handler` machinery re-fires for
   every new document at document-start.
+- **Editing-command shortcuts bypass synthetic key dispatch.**
+  The existing AWT-`KeyListener` → `GdkInput.translateKeyCode`
+  → `engine.keyEvent` forwarding cannot deliver Ctrl+C/V/X/A
+  to WebKit's accelerator handler:
+  - On `Ctrl+letter`, AWT delivers `KeyEvent.getKeyChar()`
+    as the control character (e.g. `0x03` for Ctrl+C, the
+    ASCII ETX), not the letter `'c'` (`0x63`).
+    `GdkInput.translateKeyCode` first looks up
+    `vkToGdkKeysym(vkCode)`, which only maps non-character
+    special keys; for `VK_C` it returns 0, so the function
+    falls through to `keyChar` and synthesizes the GDK
+    event with `keyval=0x03`. WebKit's clipboard
+    accelerator handler is bound to `(Ctrl, 'c')`
+    (`keyval=0x63`), so the event is ignored.
+  - Fixing `GdkInput.translateKeyCode` to prefer the letter
+    keysym for `Ctrl+letter` is not enough on its own:
+    WebKit's accelerator handling on synthetic key events
+    injected via `gtk_main_do_event` into an offscreen
+    widget is known to be unreliable (the same family of
+    bugs that already required `gtk-im-context-simple` to
+    keep Backspace from being committed as `0x08`). The
+    fix needs to bypass the accelerator pipeline.
+  Solution: install a `KeyEventDispatcher` on
+  `KeyboardFocusManager.getCurrentKeyboardFocusManager()`
+  in `addNotify` (above AWT focus-owner dispatch, so it
+  sees the event before the component's existing
+  `KeyAdapter` does). When the modifier+letter combination
+  matches, dispatch directly to a new JNI entry point
+  that calls `webkit_web_view_execute_editing_command` on
+  the GTK pump thread, then consume the event by returning
+  `true` so the existing `KeyAdapter` does NOT also forward
+  a stray `Ctrl+\x03` synthesized key event. The
+  editing-command primitive targets the focused frame's
+  selection internally, matching the heavyweight path's
+  behaviour exactly (see Canvas 6's "Editing-command JNI
+  bridge resolves against the in-page responder, not the
+  engine itself"). The same `EditingCommand` enum is reused
+  so the JNI ABI is identical across both modes.
 
 ## S · Structure
 - `src/ca/weblite/webview/swing/WebViewLightweightComponent.java`
@@ -205,7 +306,11 @@ generated_at: 2026-05-16T07:19:13-07:00
   `webview_offscreen_mouse_*`, `webview_offscreen_key_event`,
   `webview_offscreen_init`, `webview_offscreen_eval`,
   `webview_offscreen_bind`, `webview_offscreen_dispatch`,
-  `webview_offscreen_open_devtools`).
+  `webview_offscreen_open_devtools`,
+  `webview_offscreen_execute_editing_command`).
+- `src/ca/weblite/webview/EditingCommand.java` —
+  defined in [[swing-heavyweight-webview-embedding]];
+  consumed here without modification.
 - `src/ca/weblite/webview/ConsoleDispatcher.java` (from
   [[swing-webview-component-mode-selection]]) — owned by the
   component; receives raw payloads from the internal
@@ -215,9 +320,17 @@ generated_at: 2026-05-16T07:19:13-07:00
   with embed path on Linux).  Stubs on macOS/Windows.  New
   implementations of the five offscreen JNI methods listed
   above, in the offscreen-engine block around line 880-ff.
+  Adds one further entry under the Linux branch:
+  `gtk_off_execute_editing_command(OffEngine *e, int cmdId)`,
+  exported via `Java_..._webview_1offscreen_1execute_1editing_1command`.
 - `src_c/ca_weblite_webview_WebViewNative.h` — generated JNI
   header; declares the five new offscreen entries alongside
-  the existing ones.
+  the existing ones, plus the new
+  `webview_offscreen_execute_editing_command` declaration.
+- `windows/webview_embed.cc` and
+  `windows/ca_weblite_webview_WebViewNative.h` — Windows
+  stub of the new offscreen JNI entry, matching the existing
+  offscreen-stub pattern (the offscreen engine is Linux-only).
 
 ## O · Operations
 
@@ -565,6 +678,151 @@ File: `src/ca/weblite/webview/swing/WebViewLightweightComponent.java`,
      and then calling `openDevTools()` again must re-open
      it; native behaviour is idempotent.
 
+### 10. Lightweight Editing-Command Shortcut Dispatch
+Files:
+- `src/ca/weblite/webview/OffscreenWebView.java`
+  (`executeEditingCommand` method — see Operation 2)
+- `src/ca/weblite/webview/WebViewNative.java`
+  (new `webview_offscreen_execute_editing_command` declaration)
+- `src/ca/weblite/webview/swing/WebViewLightweightComponent.java`
+  (dispatcher install / uninstall + dispatch logic)
+- `src_c/webview_embed.cpp` (offscreen-engine block:
+  `gtk_off_execute_editing_command` + JNI export)
+- `windows/webview_embed.cc` (offscreen stub JNI export)
+
+1. Responsibility: turn AWT platform-shortcut + C/V/X/A
+   `KEY_PRESSED` events whose focus owner is inside the
+   `WebViewLightweightComponent` into the correct
+   editing-command invocation against whatever has in-page
+   focus inside the offscreen WebView, on Linux.
+2. EditingCommand enum: reused unchanged from
+   [[swing-heavyweight-webview-embedding]] (Operation 10).
+   This Canvas does NOT redefine it.
+3. Java entry point declaration (`WebViewNative.java`):
+   - `native static void webview_offscreen_execute_editing_command(long w, int cmdId)`.
+   - Header regeneration is required (see
+     [[native-library-loading-and-packaging]]).
+4. Dispatcher install / remove in
+   `WebViewLightweightComponent`:
+   - Add field
+     `private KeyEventDispatcher editingShortcutDispatcher`
+     (default `null`).
+   - Override `addNotify()`: call `super.addNotify()` first;
+     do the existing engine-creation / console-bridge /
+     replay / repaint-timer work; then, if
+     `editingShortcutDispatcher == null`, build a new
+     `KeyEventDispatcher` with the logic in step 5; assign
+     to the field; register via
+     `KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(...)`.
+     The dispatcher MUST be installed even when
+     `OffscreenWebView.create` returned `null` (macOS /
+     Windows) — its `engine == null` short-circuit makes it
+     a no-op there, matching the existing graceful-degrade
+     semantics.
+   - Override `removeNotify()`: BEFORE the existing
+     `engine.dispose()` / buffer clear / super sequence, if
+     `editingShortcutDispatcher != null` call
+     `KeyboardFocusManager.getCurrentKeyboardFocusManager().removeKeyEventDispatcher(editingShortcutDispatcher)`
+     and null the field. Doing this before
+     `engine.dispose()` means a late event mid-teardown
+     either sees the dispatcher already gone (Swing's
+     default handling runs) or sees the dispatcher still
+     installed but `engine` already cleared (the
+     `engine == null` short-circuit absorbs it).
+5. Dispatcher logic — byte-identical to Canvas 6 Operation
+   10 step 5 except for the
+   `embedded == null` check, which becomes `engine == null`:
+   - Return `false` immediately if
+     `e.getID() != KeyEvent.KEY_PRESSED`.
+   - Read the cached
+     `static final int SHORTCUT_MASK =
+     Toolkit.getDefaultToolkit().getMenuShortcutKeyMask()`
+     (Java 8 compat — the Ex variants are Java 10+, and the
+     project targets 1.8 per `pom.xml`).
+   - Return `false` if
+     `(e.getModifiers() & SHORTCUT_MASK) != SHORTCUT_MASK`.
+   - Switch on `e.getKeyCode()`:
+     - `VK_C` → `EditingCommand.COPY`
+     - `VK_V` → `EditingCommand.PASTE`
+     - `VK_X` → `EditingCommand.CUT`
+     - `VK_A` → `EditingCommand.SELECT_ALL`
+     - default → return `false`.
+   - Return `false` if `engine == null` — the component is
+     mid-attach or mid-teardown, or running on macOS /
+     Windows where the offscreen engine never created.
+   - Return `false` if the component is not currently showing
+     (`isShowing()`).
+   - Return `false` if the component's window ancestor is not
+     focused
+     (`SwingUtilities.getWindowAncestor(this).isFocused()`).
+   - Resolve the focus owner via
+     `KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusOwner()`.
+     If it is a `javax.swing.text.JTextComponent`, return
+     `false` — defer to Swing's own Cut/Copy/Paste bindings
+     on the focused text widget so a sibling `JTextField` in
+     the same window keeps working.
+   - **Do NOT also require the focus owner to be `this` or a
+     descendant.** The same rationale as Canvas 6 applies:
+     window-focus + non-text-component gating is sufficient
+     and avoids the focus-owner-mismatch failure mode that
+     hit the heavyweight component on macOS. On Linux the
+     lightweight component is the AWT focus owner once the
+     user has clicked into it (via `requestFocusInWindow()`
+     in the mouse-pressed handler), so the gate normally
+     passes anyway — but the more permissive form is safer
+     for edge cases (focus stolen by a non-text Swing
+     widget, focus owner not yet set on first display, etc.).
+   - Otherwise call
+     `engine.executeEditingCommand(cmd)` and return `true`
+     to consume the event so the existing `KeyAdapter`
+     (installed by `installKeyListener()`) does NOT also
+     forward a stray `Ctrl+\x03` synthesized GDK key event
+     into the offscreen WebView.
+6. Linux native body (`src_c/webview_embed.cpp`,
+   offscreen-engine block):
+   - `static void gtk_off_execute_editing_command(OffEngine *e, int cmdId)`.
+   - Switch on `cmdId`: pick
+     `WEBKIT_EDITING_COMMAND_CUT` /
+     `WEBKIT_EDITING_COMMAND_COPY` /
+     `WEBKIT_EDITING_COMMAND_PASTE` /
+     `WEBKIT_EDITING_COMMAND_SELECT_ALL`. Unknown cmdIds
+     return immediately without dispatching.
+   - Marshal to the GTK pump thread via the existing
+     `embed::GtkPump::instance().run_async(...)` helper used
+     elsewhere in the offscreen block (`webview_embed.cpp:284`).
+     The lambda null-guards `e` and `e->web` before calling
+     `webkit_web_view_execute_editing_command(WEBKIT_WEB_VIEW(e->web), command)`.
+   - Same shape as `gtk_execute_editing_command` for the
+     heavyweight engine (Canvas 6 Operation 10 step 7), just
+     reading from `OffEngine` instead of `Engine`.
+7. JNI export
+   `Java_..._webview_1offscreen_1execute_1editing_1command`
+   in `src_c/webview_embed.cpp`:
+   - `#ifdef WEBVIEW_GTK` — dispatches to
+     `gtk_off_execute_editing_command((OffEngine *)wv, (int)cmdId)`.
+   - `#else` — no-op stub matching the rest of the offscreen
+     exports' Linux-only pattern.
+8. Windows stub JNI export in `windows/webview_embed.cc`:
+   - No-op body (`{}`), matching the existing offscreen
+     stubs (`webview_offscreen_init`, `_eval`, etc.) at the
+     bottom of the file. The offscreen engine is Linux-only;
+     callers on Windows hit this stub via the Java side
+     when `engine == null`, which the dispatcher already
+     short-circuits — but the JNI symbol MUST exist or
+     `System.loadLibrary` would fail to link.
+9. Constraints / Invariants:
+   - The native function is `void` and MUST NOT raise a JNI
+     exception for any failure path (unsupported `cmdId`,
+     missing engine pointer, native error). The Java side
+     does NOT wrap calls in try/catch.
+   - The integer `cmdId` contract is fixed:
+     `1=CUT, 2=COPY, 3=PASTE, 4=SELECT_ALL`. This is the
+     same contract as
+     `webview_embed_execute_editing_command` in
+     [[swing-heavyweight-webview-embedding]] — they MUST
+     stay in sync. Renumbering or reusing existing IDs is a
+     breaking change across both native + Java boundaries.
+
 ## N · Norms
 - AWT event handlers always check `engine == null` and return
   early; do not assume the offscreen engine is alive
@@ -596,6 +854,49 @@ File: `src/ca/weblite/webview/swing/WebViewLightweightComponent.java`,
   verbatim by the offscreen path.  Do NOT fork the shim for
   the lightweight engine — page authors expect identical
   semantics across both modes, and the shim is the contract.
+- The lightweight editing-shortcut `KeyEventDispatcher` MUST
+  return `true` for every event it forwards to
+  `OffscreenWebView.executeEditingCommand`. Returning `false`
+  would let the AWT `KeyAdapter` from
+  `installKeyListener()` ALSO forward the event via
+  `GdkInput.translateKeyCode` → `engine.keyEvent`, which on
+  `Ctrl+letter` synthesizes a GDK event with the control
+  character as the keysym. That stray event either fires
+  the editing command a second time inside an unexpected
+  context or — more commonly — inserts a control glyph into
+  the focused text field. Consuming the event is mandatory.
+- The lightweight editing-shortcut dispatcher MUST detect
+  the platform shortcut modifier via
+  `Toolkit.getDefaultToolkit().getMenuShortcutKeyMask()` and
+  compare against `KeyEvent.getModifiers()`. The Ex variants
+  (`getMenuShortcutKeyMaskEx` / `getModifiersEx`) are Java
+  10+ only; the project's `pom.xml` targets Java 1.8, so
+  the legacy modifier API is the correct choice. Hardcoding
+  `InputEvent.CTRL_MASK` is wrong even though the
+  lightweight engine is currently Linux-only — the
+  dispatcher is still wired on macOS / Windows (where it
+  short-circuits on `engine == null`), and the cross-platform
+  helper is the convention the heavyweight Canvas already
+  established.
+- The lightweight editing-shortcut dispatcher MUST be
+  registered in `addNotify` and unregistered in
+  `removeNotify`, with unregistration happening BEFORE the
+  existing `engine.dispose()` / buffer clear sequence in
+  `removeNotify`. A dispatcher left registered across
+  `removeNotify` would keep the component reachable from
+  the focus manager's strong reference and prevent both
+  Java GC and the native peer release that
+  `OffscreenWebView.dispose` performs via
+  `webview_offscreen_destroy`.
+- `webview_offscreen_execute_editing_command` is `void` and
+  MUST NOT raise a JNI exception. All failure paths (bad
+  `cmdId`, null engine, native call failure) MUST fall
+  through silently or log via the existing
+  `WV_LOG`/`fprintf(stderr, ...)` pattern. Java callers
+  must not need to wrap the call in try/catch. This is the
+  same contract as the heavyweight
+  `webview_embed_execute_editing_command` norm in
+  [[swing-heavyweight-webview-embedding]].
 
 ## S · Safeguards
 - `OffscreenWebView.create` returns `null` for unsupported
@@ -656,3 +957,27 @@ File: `src/ca/weblite/webview/swing/WebViewLightweightComponent.java`,
   wrappers passed to `dispatch` MUST live inside
   `OffscreenWebView.heap` for the duration of their native
   registration — the GC has no other reachability root.
+- The lightweight editing-shortcut `KeyEventDispatcher` MUST
+  short-circuit to `false` when `engine == null`. This
+  covers three cases: (a) macOS / Windows where
+  `OffscreenWebView.create` returned `null` — the
+  dispatcher is still registered (consistent install path
+  across platforms) but every event passes through; (b)
+  Linux during teardown between the dispatcher's
+  removeNotify-side unregistration and `engine.dispose`;
+  (c) any race window where `engine` is being assigned/cleared
+  by another thread (`addNotify` / `removeNotify` are both
+  EDT-driven, but a `KeyEventDispatcher` can fire from any
+  AWT-event-dispatch thread, and the JVM publishes the
+  field write before the dispatcher runs).
+- The dispatcher MUST also short-circuit when the AWT focus
+  owner is `null` or not a descendant of this component —
+  keystrokes typed into a sibling `JTextField` or another
+  window MUST continue to use Swing's default handling
+  untouched.
+- `OffscreenWebView.executeEditingCommand` rejects a `null`
+  `EditingCommand` argument with `NullPointerException`
+  BEFORE calling `checkAlive`, mirroring the heavyweight
+  `EmbeddedWebView.executeEditingCommand` safeguard from
+  [[swing-heavyweight-webview-embedding]]. The exception
+  message MUST name the parameter (`"cmd"`).

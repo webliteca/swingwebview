@@ -711,6 +711,9 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
 JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1open_1devtools
   (JNIEnv *, jclass, jlong) { return 0; }
 
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1execute_1editing_1command
+  (JNIEnv *, jclass, jlong, jint) {}
+
 JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1open_1devtools
   (JNIEnv *, jclass, jlong wv) {
     auto *e = (Engine *)wv;
@@ -745,6 +748,44 @@ JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1ope
         Sleep(1);
     }
     return (jint)result.load();
+}
+
+JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1is_1native_1first_1responder
+  (JNIEnv *, jclass, jlong) {
+    // Windows has no notion of "first responder"; the focus-cooperation
+    // dispatcher heuristic is macOS-only.  Returning 0 means the Java
+    // dispatcher falls back to its standard AWT-focus-owner gating.
+    return 0;
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1focus_1callback
+  (JNIEnv *, jclass, jlong, jobject) {
+    // No-op on Windows: the macOS-specific WKWebView swizzle has no
+    // counterpart on WebView2.  The Java side still calls this so the
+    // JNI symbol must exist for System.loadLibrary to resolve.
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1execute_1editing_1command
+  (JNIEnv *, jclass, jlong wv, jint cmdId) {
+    auto *e = (Engine *)wv;
+    if (!e) return;
+    // WebView2 exposes no first-class editing-command IPC; route via
+    // document.execCommand on the WebView2 worker thread.  This reliably
+    // triggers the focused element's clipboard handlers and matches the
+    // semantics we get from the Cocoa / GTK sides.  Fire-and-forget --
+    // no callback, no result wait.
+    const wchar_t *js = nullptr;
+    switch (cmdId) {
+        case 1: js = L"document.execCommand('cut')";       break;
+        case 2: js = L"document.execCommand('copy')";      break;
+        case 3: js = L"document.execCommand('paste')";     break;
+        case 4: js = L"document.execCommand('selectAll')"; break;
+        default: return;
+    }
+    std::wstring wjs = js;
+    embed_win::dispatch_to_thread(e, [e, wjs] {
+        if (e->webview) e->webview->ExecuteScript(wjs.c_str(), nullptr);
+    });
 }
 
 } // extern "C"

@@ -6,13 +6,18 @@
 package ca.weblite.webview.swing;
 
 import ca.weblite.webview.ConsoleDispatcher;
+import ca.weblite.webview.EditingCommand;
 import ca.weblite.webview.GdkInput;
 import ca.weblite.webview.OffscreenWebView;
 import ca.weblite.webview.WebView;
 
 import java.awt.Color;
+import java.awt.Component;
 import java.awt.Dimension;
 import java.awt.Graphics;
+import java.awt.KeyEventDispatcher;
+import java.awt.KeyboardFocusManager;
+import java.awt.Toolkit;
 import java.awt.event.ComponentAdapter;
 import java.awt.event.ComponentEvent;
 import java.awt.event.KeyAdapter;
@@ -28,6 +33,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import javax.swing.SwingUtilities;
 import javax.swing.Timer;
 
 /**
@@ -64,6 +70,16 @@ public class WebViewLightweightComponent extends WebViewComponent {
 
     private static final int REPAINT_INTERVAL_MS = 33; // ~30fps
 
+    /**
+     * Cached value of {@link Toolkit#getMenuShortcutKeyMask()}.  The Ex
+     * variant is Java 10+ and this project targets Java 1.8 in
+     * {@code pom.xml}; the legacy API pairs with
+     * {@code KeyEvent.getModifiers()}.
+     */
+    @SuppressWarnings("deprecation")
+    private static final int SHORTCUT_MASK =
+            Toolkit.getDefaultToolkit().getMenuShortcutKeyMask();
+
     private OffscreenWebView engine;
     private BufferedImage buffer;
     private int[] pixelArray;
@@ -74,6 +90,7 @@ public class WebViewLightweightComponent extends WebViewComponent {
     private final List<String> pendingInit = new ArrayList<String>();
     private final Map<String, WebView.JavascriptCallback> pendingBindings =
             new LinkedHashMap<String, WebView.JavascriptCallback>();
+    private KeyEventDispatcher editingShortcutDispatcher;
 
     public WebViewLightweightComponent() {
         setOpaque(true);
@@ -178,7 +195,11 @@ public class WebViewLightweightComponent extends WebViewComponent {
         if (engine == null) {
             // Unsupported platform or native failure -- leave the
             // engine null so subsequent ops are no-ops.  paintComponent
-            // will fall back to the default Swing background.
+            // will fall back to the default Swing background.  Still
+            // install the editing-shortcut dispatcher so its install
+            // path is uniform across platforms; its engine-null
+            // short-circuit makes it a no-op here.
+            installEditingShortcutDispatcher();
             return;
         }
         // Install the console bridge BEFORE replaying user config so the
@@ -204,10 +225,17 @@ public class WebViewLightweightComponent extends WebViewComponent {
         repaintTimer = new Timer(REPAINT_INTERVAL_MS, e -> repaint());
         repaintTimer.setRepeats(true);
         repaintTimer.start();
+        installEditingShortcutDispatcher();
     }
 
     @Override
     public void removeNotify() {
+        if (editingShortcutDispatcher != null) {
+            KeyboardFocusManager
+                .getCurrentKeyboardFocusManager()
+                .removeKeyEventDispatcher(editingShortcutDispatcher);
+            editingShortcutDispatcher = null;
+        }
         if (repaintTimer != null) {
             repaintTimer.stop();
             repaintTimer = null;
@@ -220,6 +248,60 @@ public class WebViewLightweightComponent extends WebViewComponent {
         buffer = null;
         pixelArray = null;
         super.removeNotify();
+    }
+
+    private void installEditingShortcutDispatcher() {
+        if (editingShortcutDispatcher != null) return;
+        editingShortcutDispatcher = new KeyEventDispatcher() {
+            @Override
+            public boolean dispatchKeyEvent(KeyEvent e) {
+                return handleEditingShortcut(e);
+            }
+        };
+        KeyboardFocusManager
+            .getCurrentKeyboardFocusManager()
+            .addKeyEventDispatcher(editingShortcutDispatcher);
+    }
+
+    private boolean handleEditingShortcut(KeyEvent e) {
+        if (e.getID() != KeyEvent.KEY_PRESSED) {
+            return false;
+        }
+        if ((e.getModifiers() & SHORTCUT_MASK) != SHORTCUT_MASK) {
+            return false;
+        }
+        EditingCommand cmd;
+        switch (e.getKeyCode()) {
+            case KeyEvent.VK_C: cmd = EditingCommand.COPY;       break;
+            case KeyEvent.VK_V: cmd = EditingCommand.PASTE;      break;
+            case KeyEvent.VK_X: cmd = EditingCommand.CUT;        break;
+            case KeyEvent.VK_A: cmd = EditingCommand.SELECT_ALL; break;
+            default: return false;
+        }
+        if (engine == null) {
+            return false;
+        }
+        if (!isShowing()) {
+            return false;
+        }
+        java.awt.Window myWindow = SwingUtilities.getWindowAncestor(this);
+        if (myWindow == null || !myWindow.isFocused()) {
+            return false;
+        }
+        Component focusOwner = KeyboardFocusManager
+            .getCurrentKeyboardFocusManager()
+            .getFocusOwner();
+        if (focusOwner instanceof javax.swing.text.JTextComponent) {
+            return false;
+        }
+        if (Boolean.getBoolean("ca.weblite.webview.debugShortcut")) {
+            System.err.println(
+                "[webview-editing-shortcut] lightweight dispatch cmd="
+                + cmd + " focusOwner="
+                + (focusOwner == null ? "null" : focusOwner.getClass().getName()));
+        }
+        engine.executeEditingCommand(cmd);
+        return true;
     }
 
     @Override

@@ -281,6 +281,30 @@ JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1ope
 
 /*
  * Class:     ca_weblite_webview_WebViewNative
+ * Method:    webview_embed_execute_editing_command
+ * Signature: (JI)V
+ */
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1execute_1editing_1command
+  (JNIEnv *, jclass, jlong, jint);
+
+/*
+ * Class:     ca_weblite_webview_WebViewNative
+ * Method:    webview_embed_is_native_first_responder
+ * Signature: (J)I
+ */
+JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1is_1native_1first_1responder
+  (JNIEnv *, jclass, jlong);
+
+/*
+ * Class:     ca_weblite_webview_WebViewNative
+ * Method:    webview_embed_set_focus_callback
+ * Signature: (JLca/weblite/webview/WebViewFocusCallback;)V
+ */
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1focus_1callback
+  (JNIEnv *, jclass, jlong, jobject);
+
+/*
+ * Class:     ca_weblite_webview_WebViewNative
  * Method:    webview_offscreen_init
  * Signature: (JLjava/lang/String;)V
  */
@@ -318,6 +342,14 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
  */
 JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1open_1devtools
   (JNIEnv *, jclass, jlong);
+
+/*
+ * Class:     ca_weblite_webview_WebViewNative
+ * Method:    webview_offscreen_execute_editing_command
+ * Signature: (JI)V
+ */
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1execute_1editing_1command
+  (JNIEnv *, jclass, jlong, jint);
 
 #ifdef __cplusplus
 }

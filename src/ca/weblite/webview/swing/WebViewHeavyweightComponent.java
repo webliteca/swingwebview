@@ -6,14 +6,20 @@
 package ca.weblite.webview.swing;
 
 import ca.weblite.webview.ConsoleDispatcher;
+import ca.weblite.webview.EditingCommand;
 import ca.weblite.webview.EmbeddedWebView;
 import ca.weblite.webview.WebView;
+import ca.weblite.webview.WebViewFocusCallback;
+import javax.swing.text.JTextComponent;
 
 import java.awt.BorderLayout;
 import java.awt.Canvas;
+import java.awt.Component;
 import java.awt.Dimension;
 import java.awt.Insets;
+import java.awt.KeyboardFocusManager;
 import java.awt.Point;
+import java.awt.Toolkit;
 import java.awt.Window;
 import java.awt.event.ComponentAdapter;
 import java.awt.event.ComponentEvent;
@@ -21,8 +27,10 @@ import java.awt.event.FocusAdapter;
 import java.awt.event.FocusEvent;
 import java.awt.event.HierarchyEvent;
 import java.awt.event.HierarchyListener;
+import java.awt.event.KeyEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
+import java.awt.KeyEventDispatcher;
 import javax.swing.SwingUtilities;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -49,6 +57,21 @@ import java.util.Map;
  */
 public class WebViewHeavyweightComponent extends WebViewComponent {
 
+    /**
+     * Cached value of {@link Toolkit#getMenuShortcutKeyMask()}.  The mask
+     * never changes once the JVM is up, but reading it is a JNI call that
+     * we would otherwise repeat for every key event globally.  Static-final
+     * keeps the dispatcher hot-path branch-free.
+     *
+     * <p>The Ex variant ({@code getMenuShortcutKeyMaskEx}) is Java 10+ only
+     * and this project targets Java 1.8; the legacy API returns the
+     * old-style {@code InputEvent.CTRL_MASK} / {@code META_MASK} that pairs
+     * with {@code KeyEvent.getModifiers()}.
+     */
+    @SuppressWarnings("deprecation")
+    private static final int SHORTCUT_MASK =
+            Toolkit.getDefaultToolkit().getMenuShortcutKeyMask();
+
     private final EmbeddedCanvas canvas;
     private EmbeddedWebView embedded;
 
@@ -57,6 +80,9 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
     private final List<String> pendingInit = new ArrayList<String>();
     private final Map<String, WebView.JavascriptCallback> pendingBindings =
             new LinkedHashMap<String, WebView.JavascriptCallback>();
+    private KeyEventDispatcher editingShortcutDispatcher;
+    private JTextComponent suppressedCaretOwner;
+    private boolean originalCaretVisible;
 
     public WebViewHeavyweightComponent() {
         setLayout(new BorderLayout());
@@ -160,6 +186,82 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         return d;
     }
 
+    @Override
+    public void addNotify() {
+        super.addNotify();
+        if (editingShortcutDispatcher == null) {
+            editingShortcutDispatcher = new KeyEventDispatcher() {
+                @Override
+                public boolean dispatchKeyEvent(KeyEvent e) {
+                    return handleEditingShortcut(e);
+                }
+            };
+            KeyboardFocusManager
+                .getCurrentKeyboardFocusManager()
+                .addKeyEventDispatcher(editingShortcutDispatcher);
+        }
+    }
+
+    @Override
+    public void removeNotify() {
+        if (editingShortcutDispatcher != null) {
+            KeyboardFocusManager
+                .getCurrentKeyboardFocusManager()
+                .removeKeyEventDispatcher(editingShortcutDispatcher);
+            editingShortcutDispatcher = null;
+        }
+        super.removeNotify();
+    }
+
+    private boolean handleEditingShortcut(KeyEvent e) {
+        if (e.getID() != KeyEvent.KEY_PRESSED) {
+            return false;
+        }
+        if ((e.getModifiers() & SHORTCUT_MASK) != SHORTCUT_MASK) {
+            return false;
+        }
+        EditingCommand cmd;
+        switch (e.getKeyCode()) {
+            case KeyEvent.VK_C: cmd = EditingCommand.COPY;       break;
+            case KeyEvent.VK_V: cmd = EditingCommand.PASTE;      break;
+            case KeyEvent.VK_X: cmd = EditingCommand.CUT;        break;
+            case KeyEvent.VK_A: cmd = EditingCommand.SELECT_ALL; break;
+            default: return false;
+        }
+        if (embedded == null) {
+            return false;
+        }
+        if (!isShowing()) {
+            return false;
+        }
+        Window myWindow = SwingUtilities.getWindowAncestor(this);
+        if (myWindow == null || !myWindow.isFocused()) {
+            return false;
+        }
+        Component focusOwner = KeyboardFocusManager
+            .getCurrentKeyboardFocusManager()
+            .getFocusOwner();
+        if (focusOwner instanceof JTextComponent) {
+            // Only defer to Swing if the user has genuinely focused the
+            // text widget.  If they have since clicked into the WebView
+            // (so WKWebView is the native first responder but AWT focus
+            // owner is still the JTextComponent), override the deferral
+            // and route the shortcut to the WebView.
+            if (!embedded.isNativeFirstResponder()) {
+                return false;
+            }
+        }
+        if (Boolean.getBoolean("ca.weblite.webview.debugShortcut")) {
+            System.err.println(
+                "[webview-editing-shortcut] heavyweight dispatch cmd="
+                + cmd + " focusOwner="
+                + (focusOwner == null ? "null" : focusOwner.getClass().getName())
+                + " nativeFR=" + embedded.isNativeFirstResponder());
+        }
+        embedded.executeEditingCommand(cmd);
+        return true;
+    }
+
     private void createPeer() {
         if (embedded != null || !canvas.isDisplayable()) {
             return;
@@ -192,6 +294,50 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         }
         embedded.navigate(pendingUrl);
         sizeNative();
+        // Install the native focus callback so we can mirror WKWebView's
+        // first-responder state into Swing's visual focus indicators.
+        // The lambda is anchored in EmbeddedWebView.heap via
+        // setFocusCallback so the JVM doesn't collect it while the
+        // native side holds a global ref.
+        embedded.setFocusCallback(new WebViewFocusCallback() {
+            @Override
+            public void invoke(boolean became) {
+                SwingUtilities.invokeLater(new Runnable() {
+                    @Override
+                    public void run() {
+                        handleNativeFocusChange(became);
+                    }
+                });
+            }
+        });
+    }
+
+    private void handleNativeFocusChange(boolean became) {
+        if (became) {
+            if (suppressedCaretOwner != null) {
+                // Already suppressed a caret in a prior transition; the
+                // native first-responder state can flip during page
+                // navigation or transient widget focus inside the page,
+                // and we don't want to overwrite the saved restore state.
+                return;
+            }
+            Component owner = KeyboardFocusManager
+                .getCurrentKeyboardFocusManager()
+                .getFocusOwner();
+            if (owner instanceof JTextComponent) {
+                JTextComponent jtc = (JTextComponent) owner;
+                suppressedCaretOwner = jtc;
+                if (jtc.getCaret() != null) {
+                    originalCaretVisible = jtc.getCaret().isVisible();
+                    jtc.getCaret().setVisible(false);
+                }
+            }
+        } else {
+            if (suppressedCaretOwner != null && suppressedCaretOwner.getCaret() != null) {
+                suppressedCaretOwner.getCaret().setVisible(originalCaretVisible);
+            }
+            suppressedCaretOwner = null;
+        }
     }
 
     private void sizeNative() {
