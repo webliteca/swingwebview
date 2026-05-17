@@ -774,34 +774,55 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1rel
     // the AWT-owned parent HWND so the new Swing focus owner actually
     // receives keystrokes.
     //
-    // Win32 focus is per-thread.  The WebView2 worker thread is the one
-    // currently holding focus (on the WebView2 HWND it owns); AWT's
-    // parent HWND is owned by the AWT EDT thread.  SetFocus across
-    // threads silently no-ops unless the calling thread has attached
-    // input state to the target thread via AttachThreadInput.  Dispatch
-    // the work to the WebView2 worker (so we're on the thread holding
-    // focus), attach input to the AWT thread, then SetFocus on the
-    // parent HWND.
+    // Win32 focus is per-thread.  The WebView2 worker thread holds focus
+    // on its own HWND; the AWT-owned parent HWND lives on the EDT.  We
+    // need to share input state between the two before SetFocus can
+    // transfer focus across them.
+    //
+    // Done synchronously on the calling thread (the EDT, since this
+    // JNI is invoked from the global focus-owner PropertyChangeListener
+    // on the EDT) -- not via dispatch_to_thread, because the WebView2
+    // worker may be busy with rendering or JS and we want SetFocus to
+    // happen BEFORE the user's next keystroke.  AttachThreadInput merges
+    // the two threads' input queues, so SetFocus from the EDT will
+    // transfer focus from the WebView2 HWND in the worker thread's
+    // queue to the parent HWND in the EDT's queue.
     auto *e = (Engine *)wv;
     if (!e || !e->parent) return;
-    embed_win::dispatch_to_thread(e, [e] {
-        HWND parent = e->parent;
-        if (!parent) return;
-        DWORD self_tid = GetCurrentThreadId();
-        DWORD parent_tid = GetWindowThreadProcessId(parent, nullptr);
-        if (parent_tid == 0) return;
-        if (parent_tid != self_tid) {
-            if (!AttachThreadInput(self_tid, parent_tid, TRUE)) {
-                WV_LOG("AttachThreadInput failed: %lu",
+    HWND parent = e->parent;
+    DWORD edt_tid = GetCurrentThreadId();
+    DWORD wv2_tid = e->thread_id;
+    bool debug = getenv("WEBVIEW_DEBUG_SHORTCUT") != nullptr;
+    if (wv2_tid != 0 && wv2_tid != edt_tid) {
+        if (!AttachThreadInput(edt_tid, wv2_tid, TRUE)) {
+            if (debug) {
+                WV_LOG("[webview-focus] AttachThreadInput(edt=%lu,wv2=%lu) "
+                       "failed: %lu",
+                       (unsigned long)edt_tid, (unsigned long)wv2_tid,
                        (unsigned long)GetLastError());
-                return;
             }
-            SetFocus(parent);
-            AttachThreadInput(self_tid, parent_tid, FALSE);
-        } else {
-            SetFocus(parent);
+            return;
         }
-    });
+        HWND prev = GetFocus();
+        HWND now = SetFocus(parent);
+        AttachThreadInput(edt_tid, wv2_tid, FALSE);
+        if (debug) {
+            WV_LOG("[webview-focus] SetFocus(parent=%p) prev=%p after=%p "
+                   "now=%p edt=%lu wv2=%lu",
+                   (void *)parent, (void *)prev, (void *)now,
+                   (void *)GetFocus(),
+                   (unsigned long)edt_tid, (unsigned long)wv2_tid);
+        }
+    } else {
+        HWND prev = GetFocus();
+        HWND now = SetFocus(parent);
+        if (debug) {
+            WV_LOG("[webview-focus] same-thread SetFocus(parent=%p) "
+                   "prev=%p after=%p now=%p",
+                   (void *)parent, (void *)prev, (void *)now,
+                   (void *)GetFocus());
+        }
+    }
 }
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1execute_1editing_1command

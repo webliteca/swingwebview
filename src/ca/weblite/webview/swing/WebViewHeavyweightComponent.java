@@ -234,19 +234,38 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
     }
 
     private void handleFocusOwnerChange(Object newOwner) {
-        if (embedded == null) return;
-        if (!(newOwner instanceof Component)) return;
+        boolean debug = Boolean.getBoolean("ca.weblite.webview.debugShortcut");
+        if (embedded == null) {
+            if (debug) System.err.println(
+                "[webview-focus] focusOwner change ignored: embedded == null");
+            return;
+        }
+        if (!(newOwner instanceof Component)) {
+            if (debug) System.err.println(
+                "[webview-focus] focusOwner change ignored: newOwner not Component ("
+                + (newOwner == null ? "null" : newOwner.getClass().getName()) + ")");
+            return;
+        }
         Component owner = (Component) newOwner;
         // Focus moved INTO the WebView -- no native release needed.
         if (owner == this || SwingUtilities.isDescendingFrom(owner, this)) {
+            if (debug) System.err.println(
+                "[webview-focus] focusOwner change ignored: focus moved into WebView ("
+                + owner.getClass().getName() + ")");
             return;
         }
         // Focus moved to an unrelated top-level window -- not our problem.
         Window myWindow = SwingUtilities.getWindowAncestor(this);
         Window ownerWindow = SwingUtilities.getWindowAncestor(owner);
         if (myWindow == null || ownerWindow != myWindow) {
+            if (debug) System.err.println(
+                "[webview-focus] focusOwner change ignored: different window ("
+                + owner.getClass().getName() + ")");
             return;
         }
+        if (debug) System.err.println(
+            "[webview-focus] releaseNativeFocus on focusOwner="
+            + owner.getClass().getName());
         // AWT moved focus to a Swing component in our window that isn't
         // part of the WebView.  On Windows, Win32 keyboard focus may still
         // be on the WebView2 child HWND; force it back to the AWT parent
