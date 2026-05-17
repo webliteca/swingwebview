@@ -8,6 +8,8 @@ package ca.weblite.webview.swing;
 import ca.weblite.webview.ConsoleDispatcher;
 import ca.weblite.webview.ConsoleListener;
 import ca.weblite.webview.WebView;
+import ca.weblite.webview.WebViewMouseDispatcher;
+import ca.weblite.webview.WebViewMouseListener;
 
 import java.io.PrintStream;
 import javax.swing.JComponent;
@@ -55,6 +57,12 @@ public abstract class WebViewComponent extends JComponent {
      *  cycle so listeners registered before display still receive messages
      *  once the engine attaches and the JS shim starts feeding them. */
     protected final ConsoleDispatcher consoleDispatcher = new ConsoleDispatcher();
+
+    /** Per-component DOM mouse-event fan-out hub.  Same lifecycle and
+     *  buffer-pre-attach semantics as {@link #consoleDispatcher}: listeners
+     *  registered before display are remembered and start receiving events
+     *  once the native peer attaches and the JS shim is installed. */
+    protected final WebViewMouseDispatcher mouseDispatcher = new WebViewMouseDispatcher(this);
 
     /** Implementation mode for {@link #create(Mode)}. */
     public enum Mode {
@@ -275,5 +283,89 @@ public abstract class WebViewComponent extends JComponent {
      */
     public PrintStream getConsoleOutput() {
         return consoleDispatcher.getOutputStream();
+    }
+
+    // ---------------------------------------------------------------------
+    // DOM mouse-event listener API.
+    //
+    // Registering at least one listener auto-suppresses the platform's
+    // built-in context menu while the listener is registered; the explicit
+    // override below can re-enable the platform default.  Callbacks fire on
+    // the Swing EDT; exceptions thrown from listeners are caught by the
+    // dispatcher and forwarded to the JVM default uncaught-exception
+    // handler.
+    //
+    // These methods are concrete on the base class because they don't
+    // depend on subclass state — they delegate to the per-instance
+    // dispatcher.  Subclasses install the dispatcher's bridge (JS shim +
+    // reserved binding + flag sink) in their peer-bring-up paths.
+    // ---------------------------------------------------------------------
+
+    /**
+     * Register a listener for DOM mouse events observed in the embedded
+     * page.  As of this release the only event kind fired is
+     * {@code contextmenu} (right-click).  Registering any listener
+     * auto-suppresses the platform's default context menu unless
+     * {@link #setDefaultContextMenuEnabled(boolean)} has been used to
+     * explicitly re-enable it.  Listeners registered before the component
+     * is displayed are remembered and start receiving events when the
+     * native peer attaches.
+     *
+     * <p>Callbacks are invoked on the Swing EDT.  Exceptions thrown from
+     * the listener are caught and forwarded to
+     * {@link Thread#getDefaultUncaughtExceptionHandler()}; they do not
+     * propagate to other listeners or to the native engine.
+     *
+     * @throws NullPointerException if {@code listener} is {@code null}.
+     */
+    public final WebViewComponent addWebViewMouseListener(WebViewMouseListener listener) {
+        mouseDispatcher.addListener(listener);
+        return this;
+    }
+
+    /**
+     * Unregister a previously-registered listener.  Silently does nothing
+     * if the listener was not registered.  Removing the last listener
+     * restores the platform's default context menu (unless
+     * {@link #setDefaultContextMenuEnabled(boolean)} has independently
+     * disabled it).
+     */
+    public final WebViewComponent removeWebViewMouseListener(WebViewMouseListener listener) {
+        mouseDispatcher.removeListener(listener);
+        return this;
+    }
+
+    /**
+     * Explicitly override the default-context-menu policy.  By default the
+     * platform menu is on while no listener is registered and off while at
+     * least one is.  Calling {@code setDefaultContextMenuEnabled(true)}
+     * forces the platform menu on even when listeners are registered (the
+     * listeners still fire).  Calling {@code setDefaultContextMenuEnabled(false)}
+     * forces the menu off; with no listeners this means right-click does
+     * nothing visible.
+     *
+     * <p>The setting persists across page navigations within the same
+     * component lifetime.
+     *
+     * <p>Asynchronous note: the platform engines apply the suppression flag
+     * via an async {@code eval}; a right-click within the sub-ms window
+     * between this setter returning and the flag actually propagating uses
+     * the old value.  Practically irrelevant given human gesture latency
+     * but documented here for completeness.
+     */
+    public final WebViewComponent setDefaultContextMenuEnabled(boolean enabled) {
+        mouseDispatcher.setDefaultEnabled(enabled);
+        return this;
+    }
+
+    /**
+     * @return the effective {@code defaultEnabled} setting (the value most
+     * recently passed to {@link #setDefaultContextMenuEnabled(boolean)},
+     * or {@code true} when never set).  Note: this is the explicit override
+     * value, not the effective <em>suppress</em> state &mdash; that depends
+     * on whether any listener is also registered.
+     */
+    public final boolean isDefaultContextMenuEnabled() {
+        return mouseDispatcher.isDefaultEnabled();
     }
 }
