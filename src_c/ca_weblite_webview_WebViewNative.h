@@ -305,6 +305,14 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
 
 /*
  * Class:     ca_weblite_webview_WebViewNative
+ * Method:    webview_embed_set_click_callback
+ * Signature: (JLca/weblite/webview/WebViewClickCallback;)V
+ */
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1click_1callback
+  (JNIEnv *, jclass, jlong, jobject);
+
+/*
+ * Class:     ca_weblite_webview_WebViewNative
  * Method:    webview_embed_release_native_focus
  * Signature: (J)V
  */

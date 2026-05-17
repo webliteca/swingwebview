@@ -114,6 +114,14 @@ struct Engine {
     // JNI global ref to the registered WebViewFocusCallback, or nullptr.
     // Invoked from the WebView2 controller's GotFocus / LostFocus events.
     jobject focus_callback = nullptr;
+    // JNI global ref to the registered WebViewClickCallback, or nullptr.
+    // Invoked from the WM_PARENTNOTIFY hook in EmbedWndProc each time the
+    // WebView2 child HWND receives a mouse-button-down message -- see
+    // Operation 13 of the heavyweight-embedding Canvas.  Used by the
+    // Swing wrapper to dismiss any open JPopupMenu when the user clicks
+    // into the WebView (AWT's MouseGrabber AWTEventListener never sees
+    // those clicks because they reach the WebView2 HWND directly).
+    jobject click_callback = nullptr;
 };
 
 static void fire_focus_callback(Engine *e, bool became) {
@@ -132,6 +140,34 @@ static void fire_focus_callback(Engine *e, bool became) {
             jmethodID m = env->GetMethodID(cls, "invoke", "(Z)V");
             if (m) {
                 env->CallVoidMethod(e->focus_callback, m, (jboolean)became);
+            }
+            env->DeleteLocalRef(cls);
+        }
+    }
+    if (detach) jvm->DetachCurrentThread();
+}
+
+// Invoke the Java WebViewClickCallback registered on the engine, if any.
+// Called from EmbedWndProc when WM_PARENTNOTIFY arrives with a mouse-down
+// trigger; the Java callback marshals to the EDT internally before
+// touching Swing state.  Mirrors fire_focus_callback shape but the Java
+// method has signature ()V (no boolean payload).
+static void fire_click_callback(Engine *e) {
+    if (!e || !e->click_callback) return;
+    JavaVM *jvm = e->jvm;
+    if (!jvm) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        jvm->AttachCurrentThread((void **)&env, nullptr);
+        detach = true;
+    }
+    if (env) {
+        jclass cls = env->GetObjectClass(e->click_callback);
+        if (cls) {
+            jmethodID m = env->GetMethodID(cls, "invoke", "()V");
+            if (m) {
+                env->CallVoidMethod(e->click_callback, m);
             }
             env->DeleteLocalRef(cls);
         }
@@ -282,6 +318,30 @@ static LRESULT CALLBACK EmbedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) 
             e->controller->put_Bounds(r);
         }
         return 0;
+    case WM_PARENTNOTIFY:
+        // Windows posts WM_PARENTNOTIFY to the parent HWND whenever a
+        // direct child receives a mouse-button-down message.  Our child
+        // HWND ("WebViewEmbedChild") is the immediate parent of the
+        // WebView2-created HWND, so a click on the WebView2 surface
+        // arrives here as WM_PARENTNOTIFY with LOWORD(wParam) carrying
+        // the original message id.  This is the Windows half of the
+        // cross-platform native click hook used to dismiss any open
+        // Swing JPopupMenu when the user clicks into the WebView -- AWT's
+        // MouseGrabber AWTEventListener never sees these clicks because
+        // they reach the WebView2 HWND directly rather than through AWT.
+        if (e) {
+            switch (LOWORD(wp)) {
+            case WM_LBUTTONDOWN:
+            case WM_RBUTTONDOWN:
+            case WM_MBUTTONDOWN:
+            case WM_XBUTTONDOWN:
+                fire_click_callback(e);
+                break;
+            default:
+                break;
+            }
+        }
+        return DefWindowProc(hwnd, msg, wp, lp);
     default:
         return DefWindowProc(hwnd, msg, wp, lp);
     }
@@ -528,6 +588,21 @@ static void destroy_engine(Engine *e) {
         }
         if (env) env->DeleteGlobalRef(e->focus_callback);
         e->focus_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
+    // Same treatment for the click callback global ref.  Cleared after
+    // the focus callback above but before the worker thread teardown so
+    // a late WM_PARENTNOTIFY arriving during destruction reads a null
+    // field instead of invoking a freed ref.
+    if (e->click_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->click_callback);
+        e->click_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
     {
@@ -845,6 +920,26 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
     }
     if (cb) {
         e->focus_callback = env->NewGlobalRef(cb);
+    }
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1click_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    // Store the Java callback (JNI global ref) on the Engine.  The
+    // WM_PARENTNOTIFY hook in EmbedWndProc reads this field and invokes
+    // the callback for every WM_LBUTTONDOWN / WM_RBUTTONDOWN /
+    // WM_MBUTTONDOWN / WM_XBUTTONDOWN that the WebView2 child HWND
+    // receives, so Swing can dismiss any open JPopupMenu when the user
+    // clicks into the WebView.  Without this hook AWT's MouseGrabber
+    // AWTEventListener never sees the click and the popup stays open.
+    auto *e = (Engine *)wv;
+    if (!e) return;
+    if (e->click_callback) {
+        env->DeleteGlobalRef(e->click_callback);
+        e->click_callback = nullptr;
+    }
+    if (cb) {
+        e->click_callback = env->NewGlobalRef(cb);
     }
 }
 

@@ -245,6 +245,25 @@ public class EmbeddedWebView {
     }
 
     /**
+     * Register (or clear, by passing {@code null}) a callback invoked once per
+     * native mouse-button press inside the embedded WebView's surface.  Used
+     * by the heavyweight component to dismiss any open Swing popup when the
+     * user clicks into the WebView -- the native peer takes clicks directly
+     * from the OS so AWT's {@code BasicPopupMenuUI.MouseGrabber} listener
+     * never fires for them.  Fires for left / right / middle buttons.  The
+     * callback runs on a native thread; implementations must marshal to the
+     * EDT before touching Swing state.
+     */
+    public EmbeddedWebView setClickCallback(WebViewClickCallback cb) {
+        checkAlive();
+        if (cb != null) {
+            heap.add(cb);
+        }
+        WebViewNative.webview_embed_set_click_callback(peer, cb);
+        return this;
+    }
+
+    /**
      * Windows-only: force Win32 keyboard focus back to the AWT-owned parent
      * HWND, so subsequent keystrokes route to AWT instead of the WebView2
      * child HWND.  Used by the Java-side global focus-owner listener when
@@ -269,6 +288,18 @@ public class EmbeddedWebView {
             // not yet zero.
             try {
                 WebViewNative.webview_embed_set_focus_callback(p, null);
+            } catch (Throwable ignored) {
+                // Don't let a clear-callback failure prevent destroy.
+            }
+            // Same reasoning for the click callback: the native click hook
+            // (gtk gesture pressed handler on Linux, swizzled mouseDown:
+            // on macOS, WM_PARENTNOTIFY on Windows) can fire any time the
+            // user has the pointer over the WebView, including races
+            // against teardown.  Clearing the global ref here guarantees
+            // a late press lands on a null callback field and silently
+            // no-ops instead of invoking JNI on a freed ref.
+            try {
+                WebViewNative.webview_embed_set_click_callback(p, null);
             } catch (Throwable ignored) {
                 // Don't let a clear-callback failure prevent destroy.
             }

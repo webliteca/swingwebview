@@ -9,6 +9,7 @@ import ca.weblite.webview.ConsoleDispatcher;
 import ca.weblite.webview.EditingCommand;
 import ca.weblite.webview.EmbeddedWebView;
 import ca.weblite.webview.WebView;
+import ca.weblite.webview.WebViewClickCallback;
 import ca.weblite.webview.WebViewFocusCallback;
 import java.awt.AWTEvent;
 import java.awt.event.AWTEventListener;
@@ -35,6 +36,7 @@ import java.awt.event.KeyEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
 import java.awt.KeyEventDispatcher;
+import javax.swing.MenuSelectionManager;
 import javax.swing.SwingUtilities;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -437,6 +439,37 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
                 });
             }
         });
+        // Install the native click callback so a press inside the
+        // WebView's native surface can drive Swing's outside-click popup
+        // dismissal -- AWT's MouseGrabber AWTEventListener never sees
+        // these presses because the heavyweight peer receives them
+        // directly from the OS.  The lambda is anchored in
+        // EmbeddedWebView.heap via setClickCallback so the JVM does not
+        // collect it while the native side holds a global ref.
+        embedded.setClickCallback(new WebViewClickCallback() {
+            @Override
+            public void invoke() {
+                SwingUtilities.invokeLater(new Runnable() {
+                    @Override
+                    public void run() {
+                        handleNativeClick();
+                    }
+                });
+            }
+        });
+    }
+
+    private void handleNativeClick() {
+        // Close any open Swing popup (JPopupMenu, JMenu, JComboBox
+        // dropdown, tooltip).  Standard Swing dismisses popups when the
+        // user clicks outside them via BasicPopupMenuUI's MouseGrabber
+        // AWTEventListener -- but that listener only sees mouse events
+        // that flow through AWT's event queue, and the heavyweight
+        // native peer receives clicks directly from the OS.  Forwarding
+        // the dismiss action here restores the expected behaviour.
+        // clearSelectedPath() is a no-op when no popup is selected, so
+        // it is safe to call on every click without checking first.
+        MenuSelectionManager.defaultManager().clearSelectedPath();
     }
 
     private void handleNativeFocusChange(boolean became) {
