@@ -53,14 +53,22 @@
         <sourceDirectory>src</sourceDirectory>
         <testSourceDirectory>test</testSourceDirectory>
         <resources>
+            <!--
+                Native libs are not checked into git. They are produced
+                by build-{linux,mac,windows}.sh (locally) or by the
+                per-platform CI matrix (.github/workflows/*.yml) and
+                deposited under natives/<arch>/. Maven copies them into
+                target/classes/<arch>/ so they land at the jar root,
+                where NativeLibraryUtil.getPlatformLibraryPath expects
+                to find them at runtime.
+            -->
             <resource>
-                <directory>src</directory>
+                <directory>natives</directory>
                 <includes>
                     <include>linux_64/**</include>
                     <include>linux_arm64/**</include>
                     <include>osx_64/**</include>
                     <include>osx_arm64/**</include>
-                    <include>windows_32/**</include>
                     <include>windows_64/**</include>
                     <include>windows_arm64/**</include>
                 </includes>

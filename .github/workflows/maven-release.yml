@@ -73,18 +73,18 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "src/${{ matrix.native_dir }}"
+          mkdir -p "natives/${{ matrix.native_dir }}"
           c++ \
               -arch ${{ matrix.mac_arch }} \
               -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/darwin" \
               -dynamiclib \
               src_c/webview_embed.cpp \
-              -o "src/${{ matrix.native_dir }}/${{ matrix.lib_name }}" \
+              -o "natives/${{ matrix.native_dir }}/${{ matrix.lib_name }}" \
               -DWEBVIEW_COCOA=1 \
               -std=c++11 \
               -framework WebKit -framework Cocoa -framework QuartzCore \
               -Wl,-undefined,dynamic_lookup
-          file "src/${{ matrix.native_dir }}/${{ matrix.lib_name }}"
+          file "natives/${{ matrix.native_dir }}/${{ matrix.lib_name }}"
 
       - name: Install Linux deps
         if: runner.os == 'Linux'
@@ -100,7 +100,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p "src/${{ matrix.native_dir }}"
+          mkdir -p "natives/${{ matrix.native_dir }}"
           if pkg-config --exists webkit2gtk-4.1; then
             WEBKIT_PKG=webkit2gtk-4.1
           else
@@ -114,8 +114,8 @@ jobs:
               src_c/webview.c src_c/webview_embed.cpp \
               $(pkg-config --libs gtk+-3.0 "$WEBKIT_PKG") \
               -lX11 -ldl \
-              -shared -o "src/${{ matrix.native_dir }}/${{ matrix.lib_name }}"
-          file "src/${{ matrix.native_dir }}/${{ matrix.lib_name }}"
+              -shared -o "natives/${{ matrix.native_dir }}/${{ matrix.lib_name }}"
+          file "natives/${{ matrix.native_dir }}/${{ matrix.lib_name }}"
 
       - name: Set up MSVC environment
         if: runner.os == 'Windows'
@@ -149,7 +149,7 @@ jobs:
           setlocal enableextensions
           set "REPO_DIR=%CD%"
           set "BUILD_DIR=%REPO_DIR%\build"
-          set "DLL_OUT=%REPO_DIR%\src\${{ matrix.native_dir }}"
+          set "DLL_OUT=%REPO_DIR%\natives\${{ matrix.native_dir }}"
           set "WEBVIEW2_DIR=%REPO_DIR%\windows\script\Microsoft.Web.WebView2.1.0.2592.51"
           if not exist "%BUILD_DIR%" mkdir "%BUILD_DIR%"
           if not exist "%DLL_OUT%" mkdir "%DLL_OUT%"
@@ -176,7 +176,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: native-${{ matrix.native_dir }}
-          path: src/${{ matrix.native_dir }}/${{ matrix.lib_name }}
+          path: natives/${{ matrix.native_dir }}/${{ matrix.lib_name }}
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
@@ -219,17 +219,34 @@ jobs:
           path: native-artifacts
           pattern: native-*
 
-      - name: Lay natives into src/<arch>/
+      - name: Lay natives into natives/<arch>/
         shell: bash
         run: |
           set -euo pipefail
           for d in native-artifacts/native-*; do
             arch="$(basename "$d" | sed 's/^native-//')"
-            mkdir -p "src/$arch"
-            cp -v "$d"/* "src/$arch/"
+            mkdir -p "natives/$arch"
+            cp -v "$d"/* "natives/$arch/"
           done
           echo "--- final native layout ---"
-          find src -maxdepth 2 -type f \( -name '*.dylib' -o -name '*.so' -o -name '*.dll' \) | sort
+          find natives -maxdepth 2 -type f \( -name '*.dylib' -o -name '*.so' -o -name '*.dll' \) | sort
+
+      - name: Verify all 6 platforms are present
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(linux_64 linux_arm64 osx_64 osx_arm64 windows_64 windows_arm64)
+          missing=()
+          for arch in "${required[@]}"; do
+            if ! compgen -G "natives/$arch/*" > /dev/null; then
+              missing+=("$arch")
+            fi
+          done
+          if (( ${#missing[@]} > 0 )); then
+            echo "Refusing to publish: missing natives for ${missing[*]}" >&2
+            exit 1
+          fi
+          echo "All 6 platforms present."
 
       - name: Import GPG key
         shell: bash

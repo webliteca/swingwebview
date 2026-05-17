@@ -1,6 +1,7 @@
 dist
 build
 target
+natives
 .DS_Store
 private
 .litecode/

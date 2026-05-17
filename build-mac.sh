@@ -7,4 +7,5 @@ c++ -I${JAVA_HOME}/include -I${JAVA_HOME}/include/darwin -dynamiclib \
     -DWEBVIEW_COCOA=1 -DOBJC_OLD_DISPATCH_PROTOTYPES=1 -std=c++11 \
     -framework WebKit -framework Cocoa -framework QuartzCore \
     -L${JAVA_HOME}/lib -ljawt
-mv libwebview.dylib src/osx_64/
+mkdir -p natives/osx_64
+mv libwebview.dylib natives/osx_64/

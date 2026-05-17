@@ -221,18 +221,30 @@ when building on JDK 9+.
 
 ### Rebuilding native libs
 
-The repo ships pre-built native libs under `src/windows_32`,
-`src/windows_64`, `src/osx_64`, `src/linux_64`, and `src/linux_arm64`.
-To rebuild them:
+The native libraries are **not** checked into git. Locally, you build
+them for your own platform and they get bundled into your
+`target/*.jar`. For the Maven Central release, the
+`.github/workflows/maven-release.yml` workflow builds all 6
+platform+arch combinations (`linux_64`, `linux_arm64`, `osx_64`,
+`osx_arm64`, `windows_64`, `windows_arm64`) on matching GitHub-hosted
+runners and merges them into a single jar before publishing.
+
+To build for your local platform:
 
 1. Run `build-mac.sh` / `build-linux.sh` / `build-windows.sh` on the
-   matching platform.  These rebuild the native sources and copy the
-   binaries into the appropriate `src/<platform>` directory.
-2. Mac and Linux native sources are under `src_c/`.  Windows native
+   matching platform. These compile the native sources and drop the
+   binaries into `natives/<platform>/`, which Maven then picks up as a
+   resource during `mvn package`. The `natives/` directory is
+   gitignored.
+2. Mac and Linux native sources are under `src_c/`. Windows native
    sources are under `windows/`.
 3. On Windows you need Visual Studio installed (VS 2019 works; earlier
-   versions likely do too).  The `build-windows.sh` script runs under
+   versions likely do too). The `build-windows.sh` script runs under
    git bash.
+
+A locally-built jar will only contain the native lib for whichever
+platform you ran the build on. The cross-platform fat jar comes only
+from the CI release.
 
 ## License
 
