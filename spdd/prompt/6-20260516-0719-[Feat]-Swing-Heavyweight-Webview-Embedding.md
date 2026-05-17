@@ -394,7 +394,11 @@ generated_at: 2026-05-16T07:19:13-07:00
   `webview->ExecuteScript("document.execCommand(...)")`).
 - `demos/WebViewHeavyweightDemo/...` — interactive demo that
   exercises the trickier scenarios (combo-box popups over the
-  WebView, `JTabbedPane` tab visibility).
+  WebView, `JTabbedPane` tab visibility, and on-demand
+  instantiation of additional WebView instances in the same
+  JVM via a "+ New WebView Tab" toolbar button — the issue
+  #21 repro for the macOS `WebviewEmbedDelegate` once-per-JVM
+  registration constraint).
 
 ## O · Operations
 
