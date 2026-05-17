@@ -37,6 +37,19 @@ The `WebViewComponent.create()` factory picks the right mode for the
 current platform (heavyweight on macOS / Windows, lightweight on
 Linux), so most callers don't need to think about it.
 
+### Clipboard & editing shortcuts
+
+The standard platform shortcut (`Cmd` on macOS, `Ctrl` on Linux /
+Windows) + `C` / `V` / `X` / `A` performs Copy / Paste / Cut /
+Select-All inside the embedded WebView on all platforms.  A
+`KeyEventDispatcher` installed on the component routes the shortcut to
+the native editing primitive — `[WKWebView copy:/paste:/cut:/selectAll:]`
+on macOS, `webkit_web_view_execute_editing_command` on Linux,
+`document.execCommand` on Windows.  Sibling Swing widgets (a
+`JTextField` in a toolbar above the WebView, etc.) keep their default
+shortcut handling — the dispatcher only fires when the user is actually
+interacting with the WebView.
+
 ## Quick start
 
 ```java
@@ -158,6 +171,30 @@ snapshots `cairo_image_surface_t` pixels at ~30Hz into a
   just `webview.dll`, no separate `WebView2Loader.dll`.  The system
   WebView2 Runtime (part of Edge / Windows 11) provides the actual
   Chromium binaries.
+
+### Focus cooperation (macOS + Windows heavyweight)
+
+The AWT focus chain and the native focus chain (AppKit responder /
+Win32 keyboard focus) are independent on these platforms, and the
+heavyweight WebView's native peer holds native focus in a way AWT
+doesn't observe.  Two consequences are handled automatically:
+
+* When the user clicks into the WebView, the previously-focused Swing
+  `JTextComponent`'s caret is hidden (visual cue that typing now lands
+  in the WebView).  macOS hooks `becomeFirstResponder` on the
+  `WKWebView` via a runtime class swizzle; Windows hooks
+  `ICoreWebView2Controller::add_GotFocus`.
+* When the user clicks back to a Swing component in the same window,
+  the suppressed caret is restored and its blink timer is restarted
+  via a synthetic `FocusEvent.FOCUS_GAINED`.  On Windows we
+  additionally force Win32 keyboard focus back to the JFrame HWND
+  (cross-thread `SetFocus` via `AttachThreadInput`) so subsequent
+  keystrokes actually reach the Swing component — WebView2 otherwise
+  keeps Win32 focus on its child HWND and steals keystrokes.
+
+For debugging, set `-Dca.weblite.webview.debugShortcut=true` (Java
+side) and `WEBVIEW_DEBUG_SHORTCUT=1` (native side) to log the
+dispatcher decisions and Win32 `SetFocus` calls.
 
 ## Demo
 
