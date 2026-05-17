@@ -193,6 +193,25 @@ public class OffscreenWebView {
         return WebViewNative.webview_offscreen_open_devtools(peer) == 1;
     }
 
+    /**
+     * Execute a platform editing command (Cut / Copy / Paste / Select-All)
+     * against the offscreen WebView's current focused element.  The native
+     * call marshals to the GTK pump thread on its own, so this is safe to
+     * invoke from the EDT without blocking.  No-op on macOS / Windows
+     * (the offscreen engine is Linux-only).
+     *
+     * @param cmd the editing command to perform; must not be null.
+     */
+    public OffscreenWebView executeEditingCommand(EditingCommand cmd) {
+        if (cmd == null) {
+            throw new NullPointerException("cmd");
+        }
+        checkAlive();
+        WebViewNative.webview_offscreen_execute_editing_command(
+            peer, cmd.getNativeId());
+        return this;
+    }
+
     /** Release native resources. */
     public void dispose() {
         if (peer != 0L) {

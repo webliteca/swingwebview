@@ -201,11 +201,77 @@ public class EmbeddedWebView {
     }
 
     /**
+     * Execute a platform editing command (Cut / Copy / Paste / Select-All)
+     * against the embedded WebView's current focused element.  The native
+     * call marshals to the correct UI thread (AppKit main / GTK main /
+     * WebView2 worker) on its own, so this is safe to invoke from the EDT
+     * without blocking.
+     *
+     * @param cmd the editing command to perform; must not be null.
+     */
+    public EmbeddedWebView executeEditingCommand(EditingCommand cmd) {
+        if (cmd == null) {
+            throw new NullPointerException("cmd");
+        }
+        checkAlive();
+        WebViewNative.webview_embed_execute_editing_command(peer, cmd.getNativeId());
+        return this;
+    }
+
+    /**
+     * @return {@code true} if the native WebView (or one of its inner views) is
+     * the current first responder of its window.  macOS-specific; Linux /
+     * Windows always return {@code false}.  Returns {@code false} after dispose
+     * without throwing.
+     */
+    public boolean isNativeFirstResponder() {
+        if (peer == 0L) return false;
+        return WebViewNative.webview_embed_is_native_first_responder(peer) == 1;
+    }
+
+    /**
+     * Register (or clear, by passing {@code null}) a callback invoked when the
+     * native WebView becomes / resigns first responder.  The callback runs on
+     * a native thread; implementations must marshal to the EDT before touching
+     * Swing state.
+     */
+    public EmbeddedWebView setFocusCallback(WebViewFocusCallback cb) {
+        checkAlive();
+        if (cb != null) {
+            heap.add(cb);
+        }
+        WebViewNative.webview_embed_set_focus_callback(peer, cb);
+        return this;
+    }
+
+    /**
+     * Windows-only: force Win32 keyboard focus back to the AWT-owned parent
+     * HWND, so subsequent keystrokes route to AWT instead of the WebView2
+     * child HWND.  Used by the Java-side global focus-owner listener when
+     * AWT moves its focus owner to a Swing component outside the WebView.
+     * macOS / Linux: no-op.
+     */
+    public EmbeddedWebView releaseNativeFocus() {
+        checkAlive();
+        WebViewNative.webview_embed_release_native_focus(peer);
+        return this;
+    }
+
+    /**
      * Release the native resources and detach from the parent.
      */
     public void dispose() {
         if (peer != 0L) {
             long p = peer;
+            // Clear any native focus callback BEFORE we hand off to destroy,
+            // so the swizzled responder hooks never fire into a freed Java
+            // global ref.  checkAlive would still pass here since peer is
+            // not yet zero.
+            try {
+                WebViewNative.webview_embed_set_focus_callback(p, null);
+            } catch (Throwable ignored) {
+                // Don't let a clear-callback failure prevent destroy.
+            }
             peer = 0L;
             WebViewNative.webview_embed_destroy(p);
             heap.clear();

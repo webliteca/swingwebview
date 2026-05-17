@@ -1159,6 +1159,30 @@ static int gtk_off_open_devtools(OffEngine *e) {
     return result;
 }
 
+// Execute Cut/Copy/Paste/SelectAll against the focused frame of the
+// offscreen WebKitGTK widget.  Mirrors gtk_execute_editing_command for
+// the heavyweight engine -- same switch-on-cmdId + GtkPump::run_async +
+// webkit_web_view_execute_editing_command pattern, just over OffEngine.
+//
+// cmdId values are the EditingCommand contract: 1=CUT, 2=COPY, 3=PASTE,
+// 4=SELECT_ALL.  Unknown cmdIds are silently dropped.
+static void gtk_off_execute_editing_command(OffEngine *e, int cmdId) {
+    if (!e || !e->web) return;
+    const char *command = nullptr;
+    switch (cmdId) {
+        case 1: command = WEBKIT_EDITING_COMMAND_CUT;        break;
+        case 2: command = WEBKIT_EDITING_COMMAND_COPY;       break;
+        case 3: command = WEBKIT_EDITING_COMMAND_PASTE;      break;
+        case 4: command = WEBKIT_EDITING_COMMAND_SELECT_ALL; break;
+        default: return;
+    }
+    GtkPump::instance().run_async([e, command] {
+        if (!e || !e->web) return;
+        webkit_web_view_execute_editing_command(
+            WEBKIT_WEB_VIEW(e->web), command);
+    });
+}
+
 // Same idea for the heavyweight embed-path engine.  Lives here next to
 // the offscreen variant so both implementations are visible side by side.
 static int gtk_open_devtools(Engine *e) {
@@ -1176,6 +1200,30 @@ static int gtk_open_devtools(Engine *e) {
         result = 1;
     });
     return result;
+}
+
+// Execute Cut/Copy/Paste/SelectAll on the focused frame of the embedded
+// WebKitGTK widget.  Marshals to the GTK pump thread asynchronously; the
+// editing-command primitive operates against the WebView's current focused
+// frame internally, so we don't have to do focus-routing ourselves.
+//
+// cmdId values are the EditingCommand contract: 1=CUT, 2=COPY, 3=PASTE,
+// 4=SELECT_ALL.  Unknown cmdIds are silently dropped.
+static void gtk_execute_editing_command(Engine *e, int cmdId) {
+    if (!e || !e->web) return;
+    const char *command = nullptr;
+    switch (cmdId) {
+        case 1: command = WEBKIT_EDITING_COMMAND_CUT;        break;
+        case 2: command = WEBKIT_EDITING_COMMAND_COPY;       break;
+        case 3: command = WEBKIT_EDITING_COMMAND_PASTE;      break;
+        case 4: command = WEBKIT_EDITING_COMMAND_SELECT_ALL; break;
+        default: return;
+    }
+    GtkPump::instance().run_async([e, command] {
+        if (!e || !e->web) return;
+        webkit_web_view_execute_editing_command(
+            WEBKIT_WEB_VIEW(e->web), command);
+    });
 }
 
 // Mouse event injection.  Java listeners on WebViewLightweightComponent
@@ -1440,7 +1488,20 @@ struct Engine {
     // host_view is NSWindow.contentView and we have to honor the caller's
     // (x,y) and translate AWT top-left coords into Cocoa bottom-left.
     bool host_is_awt = false;
+
+    // JNI global ref to the registered WebViewFocusCallback, or nullptr.
+    // Invoked by the swizzled becomeFirstResponder / resignFirstResponder
+    // implementations.
+    jobject focus_callback = nullptr;
 };
+
+// Process-global map from WKWebView (id) to its owning Engine*.  Populated
+// in cocoa_create_engine after WKWebView alloc; cleared in
+// cocoa_destroy_engine.  Guarded by g_webview_map_mutex because the
+// swizzled responder hooks fire on the AppKit main thread while
+// create/destroy run on EDT-driven native code.
+static std::mutex g_webview_map_mutex;
+static std::map<id, Engine *> g_webview_map;
 
 static void cocoa_run_on_main(std::function<void()> f) {
     // If we're already on the AppKit main thread, just run f inline; otherwise
@@ -1509,6 +1570,142 @@ static void engine_on_message(Engine *e, const char *msg) {
     if (detach) e->jvm->DetachCurrentThread();
 }
 
+// ---------------------------------------------------------------------------
+// First-responder hook on WKWebView.
+//
+// We swizzle becomeFirstResponder / resignFirstResponder on the WKWebView
+// class so we can mirror the native focus state back into Swing.  Swizzling
+// is class-wide: it affects every WKWebView in the process, including any
+// the host application created independently of this library.  That's
+// fine because each swizzled implementation looks up the receiver in
+// g_webview_map and silently no-ops if we don't own it.
+//
+// The Java callback is invoked via JNI on whatever thread AppKit drove
+// the responder change on (typically the AppKit main thread).  Java-side
+// callers MUST marshal to the EDT before touching Swing state -- the
+// callback contract documents this explicitly.
+// ---------------------------------------------------------------------------
+
+typedef BOOL (*BoolFromIdSel)(id, SEL);
+static BoolFromIdSel g_orig_becomeFirstResponder = nullptr;
+static BoolFromIdSel g_orig_resignFirstResponder = nullptr;
+static std::once_flag g_focus_swizzle_once;
+
+static void fire_focus_callback(Engine *e, bool became) {
+    if (!e || !e->focus_callback) return;
+    JavaVM *jvm = e->jvm;
+    if (!jvm) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        jvm->AttachCurrentThread((void **)&env, nullptr);
+        detach = true;
+    }
+    if (env) {
+        jclass cls = env->GetObjectClass(e->focus_callback);
+        if (cls) {
+            jmethodID m = env->GetMethodID(cls, "invoke", "(Z)V");
+            if (m) {
+                env->CallVoidMethod(e->focus_callback, m, (jboolean)became);
+            }
+            env->DeleteLocalRef(cls);
+        }
+    }
+    if (detach) jvm->DetachCurrentThread();
+}
+
+static BOOL swizzled_become_first_responder(id self, SEL _cmd) {
+    BOOL result = g_orig_becomeFirstResponder
+        ? g_orig_becomeFirstResponder(self, _cmd)
+        : NO;
+    if (result) {
+        Engine *eng = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_webview_map_mutex);
+            auto it = g_webview_map.find(self);
+            if (it != g_webview_map.end()) eng = it->second;
+        }
+        if (eng) fire_focus_callback(eng, true);
+    }
+    return result;
+}
+
+static BOOL swizzled_resign_first_responder(id self, SEL _cmd) {
+    BOOL result = g_orig_resignFirstResponder
+        ? g_orig_resignFirstResponder(self, _cmd)
+        : NO;
+    if (result) {
+        Engine *eng = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_webview_map_mutex);
+            auto it = g_webview_map.find(self);
+            if (it != g_webview_map.end()) eng = it->second;
+        }
+        if (eng) fire_focus_callback(eng, false);
+    }
+    return result;
+}
+
+static void install_focus_swizzle() {
+    std::call_once(g_focus_swizzle_once, [] {
+        Class wk = (Class)objc_cls("WKWebView");
+        if (!wk) return;
+        Method become = class_getInstanceMethod(wk, sel("becomeFirstResponder"));
+        Method resign = class_getInstanceMethod(wk, sel("resignFirstResponder"));
+        if (!become || !resign) return;
+        g_orig_becomeFirstResponder = (BoolFromIdSel)method_setImplementation(
+            become, (IMP)swizzled_become_first_responder);
+        g_orig_resignFirstResponder = (BoolFromIdSel)method_setImplementation(
+            resign, (IMP)swizzled_resign_first_responder);
+    });
+}
+
+// Returns 1 if the engine's WKWebView (or a descendant view in its
+// subview hierarchy -- WebKit content view, etc.) is currently the
+// first responder of its NSWindow.  Synchronous query against AppKit
+// main thread state; safe to call from EDT during a key press
+// (NOT during NSEventTrackingRunLoopMode, but Cmd+C isn't a tracking
+// event).
+static int cocoa_is_first_responder(Engine *e) {
+    if (!e || !e->webview) return 0;
+    int result = 0;
+    cocoa_run_on_main([&] {
+        if (!e->webview) return;
+        id window = msg(e->webview, sel("window"));
+        if (!window) return;
+        id fr = msg(window, sel("firstResponder"));
+        if (!fr) return;
+        // Walk the responder's view-hierarchy chain looking for the
+        // WKWebView.  The actual first responder is often an inner
+        // WebKit content view, not the WKWebView itself.
+        SEL is_kind_of_view = sel("isKindOfClass:");
+        id view_cls = objc_cls("NSView");
+        if (!msg<BOOL, id>(fr, is_kind_of_view, view_cls)) {
+            // First responder isn't an NSView (e.g. NSWindow itself) --
+            // not us.
+            return;
+        }
+        for (id v = fr; v; v = msg(v, sel("superview"))) {
+            if (v == e->webview) {
+                result = 1;
+                return;
+            }
+        }
+    });
+    return result;
+}
+
+static void cocoa_set_focus_callback(Engine *e, JNIEnv *env, jobject cb) {
+    if (!e) return;
+    if (e->focus_callback) {
+        env->DeleteGlobalRef(e->focus_callback);
+        e->focus_callback = nullptr;
+    }
+    if (cb) {
+        e->focus_callback = env->NewGlobalRef(cb);
+    }
+}
+
 static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
                                    jlong /*display*/, jint debug) {
     auto *e = new Engine();
@@ -1535,12 +1732,24 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
 
     bool ok = false;
     cocoa_run_on_main([&] {
+        // Install the WKWebView first-responder swizzle once per JVM
+        // BEFORE creating the WKWebView, so any becomeFirstResponder
+        // calls during init are routed through our hook from the start.
+        install_focus_swizzle();
+
         e->config = msg(objc_cls("WKWebViewConfiguration"), sel("new"));
         e->manager = msg(e->config, sel("userContentController"));
         e->webview = msg(objc_cls("WKWebView"), sel("alloc"));
         e->webview = msg<id, CGRect, id>(
             e->webview, sel("initWithFrame:configuration:"),
             CGRectMake(0, 0, 800, 600), e->config);
+
+        // Register the WKWebView in the engine map so the swizzled
+        // responder hooks can find their Engine pointer.
+        {
+            std::lock_guard<std::mutex> lk(g_webview_map_mutex);
+            g_webview_map[e->webview] = e;
+        }
 
         // Find a hostable NSView.  Walk up the windowLayer's superlayer
         // chain and use whatever NSView class we encounter to reach the
@@ -1680,6 +1889,28 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
 
 static void cocoa_destroy_engine(Engine *e) {
     if (!e) return;
+    // Drop the webview from the engine map BEFORE any teardown work --
+    // the swizzled responder hooks can fire at any moment during destroy
+    // (AppKit unwinds the view hierarchy and resigns first responder),
+    // and we don't want them invoking a callback into a freed Engine.
+    if (e->webview) {
+        std::lock_guard<std::mutex> lk(g_webview_map_mutex);
+        g_webview_map.erase(e->webview);
+    }
+    // Drop the focus-callback global ref (if any) on the EDT-driven
+    // thread that holds the JNIEnv -- we cannot delete a global ref
+    // from inside the AppKit-main lambda below without re-attaching.
+    if (e->focus_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->focus_callback);
+        e->focus_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     cocoa_run_on_main([&] {
         if (e->webview) {
             // If we added the WKWebView as a subview, remove it before
@@ -1811,6 +2042,54 @@ static void cocoa_bind(Engine *e, Binding *b) { e->bindings[b->name] = b; }
 static int cocoa_open_devtools(Engine *e) {
     (void)e;
     return 0;
+}
+
+// Dispatch Cut/Copy/Paste/SelectAll directly to the embedded WKWebView.
+// Initial design used [NSApp sendAction:... to:nil from:webview] so the
+// responder chain would route to the inner focused DOM element, but in
+// the AWT-embedded setup (WKWebView parented under NSWindow.contentView,
+// which is AWT's NSView) the AppKit first responder is not reliably the
+// WKWebView -- AWT keeps system focus on its own view -- so the
+// responder walk never reaches WKWebView and the action no-ops.
+//
+// Sending the action directly to WKWebView side-steps the chain entirely.
+// WKWebView's implementations of cut:/copy:/paste:/selectAll: delegate to
+// the WebKit page's current selection / focused element internally, so
+// the operation hits the correct in-page target regardless of AppKit
+// first-responder state.  Guard with respondsToSelector: so a missing
+// selector on an older SDK fails silently instead of aborting.
+//
+// cmdId values are the EditingCommand contract: 1=CUT, 2=COPY, 3=PASTE,
+// 4=SELECT_ALL.  Unknown cmdIds are silently dropped.
+static void cocoa_execute_editing_command(Engine *e, int cmdId) {
+    if (!e || !e->webview) return;
+    SEL action = nullptr;
+    const char *name = nullptr;
+    switch (cmdId) {
+        case 1: action = sel("cut:");        name = "cut:";        break;
+        case 2: action = sel("copy:");       name = "copy:";       break;
+        case 3: action = sel("paste:");      name = "paste:";      break;
+        case 4: action = sel("selectAll:");  name = "selectAll:";  break;
+        default: return;
+    }
+    cocoa_run_on_main_async([=] {
+        if (!e->webview) return;
+        if (!msg<BOOL, SEL>(e->webview, sel("respondsToSelector:"),
+                            action)) {
+            if (getenv("WEBVIEW_DEBUG_SHORTCUT")) {
+                fprintf(stderr,
+                    "[webview-editing-shortcut] cocoa: WKWebView does not "
+                    "respond to %s, dropping\n", name);
+            }
+            return;
+        }
+        if (getenv("WEBVIEW_DEBUG_SHORTCUT")) {
+            fprintf(stderr,
+                "[webview-editing-shortcut] cocoa: dispatching %s "
+                "directly to WKWebView %p\n", name, (void *)e->webview);
+        }
+        msg<void, id>(e->webview, action, (id)nullptr);
+    });
 }
 
 #endif // WEBVIEW_COCOA
@@ -2137,6 +2416,44 @@ JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1ope
 #endif
 }
 
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1execute_1editing_1command
+  (JNIEnv *, jclass, jlong wv, jint cmdId) {
+#ifdef WEBVIEW_GTK
+    embed::gtk_execute_editing_command((Engine *)wv, (int)cmdId);
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_execute_editing_command((Engine *)wv, (int)cmdId);
+#else
+    (void)wv; (void)cmdId;
+#endif
+}
+
+JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1is_1native_1first_1responder
+  (JNIEnv *, jclass, jlong wv) {
+#ifdef WEBVIEW_COCOA
+    return (jint)embed::cocoa_is_first_responder((Engine *)wv);
+#else
+    (void)wv;
+    return 0;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1focus_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+#ifdef WEBVIEW_COCOA
+    embed::cocoa_set_focus_callback((Engine *)wv, env, cb);
+#else
+    (void)env; (void)wv; (void)cb;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1release_1native_1focus
+  (JNIEnv *, jclass, jlong wv) {
+    // No-op on macOS and Linux: AppKit / X11 focus handling is already
+    // adequate.  Windows has its own implementation in
+    // windows/webview_embed.cc that performs the cross-thread SetFocus.
+    (void)wv;
+}
+
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1init
   (JNIEnv *env, jclass, jlong wv, jstring js) {
     const char *s = env->GetStringUTFChars(js, nullptr);
@@ -2232,5 +2549,15 @@ JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
 #else
     (void)wv;
     return 0;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1execute_1editing_1command
+  (JNIEnv *, jclass, jlong wv, jint cmdId) {
+#ifdef WEBVIEW_GTK
+    embed::gtk_off_execute_editing_command(
+        (embed::OffEngine *)wv, (int)cmdId);
+#else
+    (void)wv; (void)cmdId;
 #endif
 }

@@ -6,14 +6,24 @@
 package ca.weblite.webview.swing;
 
 import ca.weblite.webview.ConsoleDispatcher;
+import ca.weblite.webview.EditingCommand;
 import ca.weblite.webview.EmbeddedWebView;
 import ca.weblite.webview.WebView;
+import ca.weblite.webview.WebViewFocusCallback;
+import java.awt.AWTEvent;
+import java.awt.event.AWTEventListener;
+import java.beans.PropertyChangeEvent;
+import java.beans.PropertyChangeListener;
+import javax.swing.text.JTextComponent;
 
 import java.awt.BorderLayout;
 import java.awt.Canvas;
+import java.awt.Component;
 import java.awt.Dimension;
 import java.awt.Insets;
+import java.awt.KeyboardFocusManager;
 import java.awt.Point;
+import java.awt.Toolkit;
 import java.awt.Window;
 import java.awt.event.ComponentAdapter;
 import java.awt.event.ComponentEvent;
@@ -21,8 +31,10 @@ import java.awt.event.FocusAdapter;
 import java.awt.event.FocusEvent;
 import java.awt.event.HierarchyEvent;
 import java.awt.event.HierarchyListener;
+import java.awt.event.KeyEvent;
 import java.awt.event.MouseAdapter;
 import java.awt.event.MouseEvent;
+import java.awt.KeyEventDispatcher;
 import javax.swing.SwingUtilities;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -49,6 +61,21 @@ import java.util.Map;
  */
 public class WebViewHeavyweightComponent extends WebViewComponent {
 
+    /**
+     * Cached value of {@link Toolkit#getMenuShortcutKeyMask()}.  The mask
+     * never changes once the JVM is up, but reading it is a JNI call that
+     * we would otherwise repeat for every key event globally.  Static-final
+     * keeps the dispatcher hot-path branch-free.
+     *
+     * <p>The Ex variant ({@code getMenuShortcutKeyMaskEx}) is Java 10+ only
+     * and this project targets Java 1.8; the legacy API returns the
+     * old-style {@code InputEvent.CTRL_MASK} / {@code META_MASK} that pairs
+     * with {@code KeyEvent.getModifiers()}.
+     */
+    @SuppressWarnings("deprecation")
+    private static final int SHORTCUT_MASK =
+            Toolkit.getDefaultToolkit().getMenuShortcutKeyMask();
+
     private final EmbeddedCanvas canvas;
     private EmbeddedWebView embedded;
 
@@ -57,6 +84,11 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
     private final List<String> pendingInit = new ArrayList<String>();
     private final Map<String, WebView.JavascriptCallback> pendingBindings =
             new LinkedHashMap<String, WebView.JavascriptCallback>();
+    private KeyEventDispatcher editingShortcutDispatcher;
+    private PropertyChangeListener focusOwnerListener;
+    private AWTEventListener globalMouseListener;
+    private JTextComponent suppressedCaretOwner;
+    private boolean originalCaretVisible;
 
     public WebViewHeavyweightComponent() {
         setLayout(new BorderLayout());
@@ -160,6 +192,203 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         return d;
     }
 
+    @Override
+    public void addNotify() {
+        super.addNotify();
+        if (editingShortcutDispatcher == null) {
+            editingShortcutDispatcher = new KeyEventDispatcher() {
+                @Override
+                public boolean dispatchKeyEvent(KeyEvent e) {
+                    return handleEditingShortcut(e);
+                }
+            };
+            KeyboardFocusManager
+                .getCurrentKeyboardFocusManager()
+                .addKeyEventDispatcher(editingShortcutDispatcher);
+        }
+        if (focusOwnerListener == null) {
+            focusOwnerListener = new PropertyChangeListener() {
+                @Override
+                public void propertyChange(PropertyChangeEvent evt) {
+                    handleFocusOwnerChange(evt.getNewValue());
+                }
+            };
+            KeyboardFocusManager
+                .getCurrentKeyboardFocusManager()
+                .addPropertyChangeListener("focusOwner", focusOwnerListener);
+        }
+        // Belt-and-suspenders mouse listener: PropertyChangeListener on
+        // focusOwner may not fire on Windows when Win32 keyboard focus is
+        // on a foreign HWND (WebView2's child HWND) -- AWT's internal
+        // focus tracking can desync.  An AWTEventListener for mouse
+        // events fires for every mouse press in the JVM regardless of
+        // focus state, so it can reliably trigger the native focus
+        // release when the user clicks outside the WebView.
+        if (globalMouseListener == null) {
+            globalMouseListener = new AWTEventListener() {
+                @Override
+                public void eventDispatched(AWTEvent event) {
+                    handleGlobalMouseEvent(event);
+                }
+            };
+            Toolkit.getDefaultToolkit().addAWTEventListener(
+                globalMouseListener, AWTEvent.MOUSE_EVENT_MASK);
+        }
+    }
+
+    @Override
+    public void removeNotify() {
+        if (globalMouseListener != null) {
+            Toolkit.getDefaultToolkit()
+                .removeAWTEventListener(globalMouseListener);
+            globalMouseListener = null;
+        }
+        if (focusOwnerListener != null) {
+            KeyboardFocusManager
+                .getCurrentKeyboardFocusManager()
+                .removePropertyChangeListener("focusOwner", focusOwnerListener);
+            focusOwnerListener = null;
+        }
+        if (editingShortcutDispatcher != null) {
+            KeyboardFocusManager
+                .getCurrentKeyboardFocusManager()
+                .removeKeyEventDispatcher(editingShortcutDispatcher);
+            editingShortcutDispatcher = null;
+        }
+        super.removeNotify();
+    }
+
+    private void handleGlobalMouseEvent(AWTEvent event) {
+        if (embedded == null) return;
+        if (event.getID() != java.awt.event.MouseEvent.MOUSE_PRESSED) return;
+        Object src = event.getSource();
+        if (!(src instanceof Component)) return;
+        Component target = (Component) src;
+        boolean debug = Boolean.getBoolean("ca.weblite.webview.debugShortcut");
+        // Click landed inside the WebView -- WebView2 is taking focus
+        // legitimately, no native release needed.
+        if (target == this || SwingUtilities.isDescendingFrom(target, this)) {
+            if (debug) System.err.println(
+                "[webview-focus] mouse-press ignored (inside WebView): "
+                + target.getClass().getName());
+            return;
+        }
+        Window myWindow = SwingUtilities.getWindowAncestor(this);
+        Window targetWindow = SwingUtilities.getWindowAncestor(target);
+        if (myWindow == null || targetWindow != myWindow) {
+            if (debug) System.err.println(
+                "[webview-focus] mouse-press ignored (different window): "
+                + target.getClass().getName());
+            return;
+        }
+        if (debug) System.err.println(
+            "[webview-focus] mouse-press releaseNativeFocus on target="
+            + target.getClass().getName());
+        embedded.releaseNativeFocus();
+        // Also restore the suppressed caret in case the native LostFocus
+        // event won't fire reliably -- WebView2 only fires LostFocus when
+        // its hosted content (an inner DOM element) loses focus.  If the
+        // user clicked the page background without selecting anything,
+        // no inner element ever held focus, so LostFocus never fires when
+        // we forcibly release Win32 focus via SetFocus.  Restoring here
+        // makes the path independent of the native event.
+        restoreSuppressedCaret();
+    }
+
+    private void handleFocusOwnerChange(Object newOwner) {
+        boolean debug = Boolean.getBoolean("ca.weblite.webview.debugShortcut");
+        if (embedded == null) {
+            if (debug) System.err.println(
+                "[webview-focus] focusOwner change ignored: embedded == null");
+            return;
+        }
+        if (!(newOwner instanceof Component)) {
+            if (debug) System.err.println(
+                "[webview-focus] focusOwner change ignored: newOwner not Component ("
+                + (newOwner == null ? "null" : newOwner.getClass().getName()) + ")");
+            return;
+        }
+        Component owner = (Component) newOwner;
+        // Focus moved INTO the WebView -- no native release needed.
+        if (owner == this || SwingUtilities.isDescendingFrom(owner, this)) {
+            if (debug) System.err.println(
+                "[webview-focus] focusOwner change ignored: focus moved into WebView ("
+                + owner.getClass().getName() + ")");
+            return;
+        }
+        // Focus moved to an unrelated top-level window -- not our problem.
+        Window myWindow = SwingUtilities.getWindowAncestor(this);
+        Window ownerWindow = SwingUtilities.getWindowAncestor(owner);
+        if (myWindow == null || ownerWindow != myWindow) {
+            if (debug) System.err.println(
+                "[webview-focus] focusOwner change ignored: different window ("
+                + owner.getClass().getName() + ")");
+            return;
+        }
+        if (debug) System.err.println(
+            "[webview-focus] releaseNativeFocus on focusOwner="
+            + owner.getClass().getName());
+        // AWT moved focus to a Swing component in our window that isn't
+        // part of the WebView.  On Windows, Win32 keyboard focus may still
+        // be on the WebView2 child HWND; force it back to the AWT parent
+        // HWND so the new Swing focus owner actually receives keystrokes.
+        // No-op on macOS / Linux.
+        embedded.releaseNativeFocus();
+    }
+
+    private boolean handleEditingShortcut(KeyEvent e) {
+        if (e.getID() != KeyEvent.KEY_PRESSED) {
+            return false;
+        }
+        if ((e.getModifiers() & SHORTCUT_MASK) != SHORTCUT_MASK) {
+            return false;
+        }
+        EditingCommand cmd;
+        switch (e.getKeyCode()) {
+            case KeyEvent.VK_C: cmd = EditingCommand.COPY;       break;
+            case KeyEvent.VK_V: cmd = EditingCommand.PASTE;      break;
+            case KeyEvent.VK_X: cmd = EditingCommand.CUT;        break;
+            case KeyEvent.VK_A: cmd = EditingCommand.SELECT_ALL; break;
+            default: return false;
+        }
+        if (embedded == null) {
+            return false;
+        }
+        if (!isShowing()) {
+            return false;
+        }
+        Window myWindow = SwingUtilities.getWindowAncestor(this);
+        if (myWindow == null || !myWindow.isFocused()) {
+            return false;
+        }
+        // Default to deferring to Swing.  Only dispatch to the WebView
+        // when we have positive evidence the user is interacting with
+        // it: either AWT focus is inside the component (Linux
+        // lightweight / sometimes Windows), or the native WebView is
+        // first responder (macOS, where AWT focus stays on the previously
+        // focused Swing component while WKWebView holds AppKit focus).
+        Component focusOwner = KeyboardFocusManager
+            .getCurrentKeyboardFocusManager()
+            .getFocusOwner();
+        boolean focusInWebView = focusOwner != null
+            && (focusOwner == this
+                || SwingUtilities.isDescendingFrom(focusOwner, this));
+        boolean nativeFocusOnWebView = embedded.isNativeFirstResponder();
+        if (!focusInWebView && !nativeFocusOnWebView) {
+            return false;
+        }
+        if (Boolean.getBoolean("ca.weblite.webview.debugShortcut")) {
+            System.err.println(
+                "[webview-editing-shortcut] heavyweight dispatch cmd="
+                + cmd + " focusOwner="
+                + (focusOwner == null ? "null" : focusOwner.getClass().getName())
+                + " focusInWebView=" + focusInWebView
+                + " nativeFR=" + nativeFocusOnWebView);
+        }
+        embedded.executeEditingCommand(cmd);
+        return true;
+    }
+
     private void createPeer() {
         if (embedded != null || !canvas.isDisplayable()) {
             return;
@@ -192,6 +421,66 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         }
         embedded.navigate(pendingUrl);
         sizeNative();
+        // Install the native focus callback so we can mirror WKWebView's
+        // first-responder state into Swing's visual focus indicators.
+        // The lambda is anchored in EmbeddedWebView.heap via
+        // setFocusCallback so the JVM doesn't collect it while the
+        // native side holds a global ref.
+        embedded.setFocusCallback(new WebViewFocusCallback() {
+            @Override
+            public void invoke(boolean became) {
+                SwingUtilities.invokeLater(new Runnable() {
+                    @Override
+                    public void run() {
+                        handleNativeFocusChange(became);
+                    }
+                });
+            }
+        });
+    }
+
+    private void handleNativeFocusChange(boolean became) {
+        if (became) {
+            if (suppressedCaretOwner != null) {
+                // Already suppressed a caret in a prior transition; the
+                // native first-responder state can flip during page
+                // navigation or transient widget focus inside the page,
+                // and we don't want to overwrite the saved restore state.
+                return;
+            }
+            Component owner = KeyboardFocusManager
+                .getCurrentKeyboardFocusManager()
+                .getFocusOwner();
+            if (owner instanceof JTextComponent) {
+                JTextComponent jtc = (JTextComponent) owner;
+                suppressedCaretOwner = jtc;
+                if (jtc.getCaret() != null) {
+                    originalCaretVisible = jtc.getCaret().isVisible();
+                    jtc.getCaret().setVisible(false);
+                }
+            }
+        } else {
+            restoreSuppressedCaret();
+        }
+    }
+
+    private void restoreSuppressedCaret() {
+        if (suppressedCaretOwner == null) return;
+        JTextComponent jtc = suppressedCaretOwner;
+        suppressedCaretOwner = null;
+        if (jtc.getCaret() != null) {
+            jtc.getCaret().setVisible(true);
+        }
+        // setVisible(true) sets the field, but DefaultCaret only restarts
+        // its blink timer on a focusGained event.  In the AWT-vs-Win32
+        // focus-desync scenario (Win32 focus moved to WebView2 while
+        // AWT's focus owner stayed on the JTextField), AWT never fired
+        // a focusLost/focusGained pair on the JTextField, so DefaultCaret
+        // believes it never lost focus -- but its blink state may be
+        // dead anyway.  Dispatch a synthetic FOCUS_GAINED to retrigger
+        // DefaultCaret.focusGained, which restarts the blink timer.
+        jtc.dispatchEvent(new java.awt.event.FocusEvent(
+            jtc, java.awt.event.FocusEvent.FOCUS_GAINED));
     }
 
     private void sizeNative() {

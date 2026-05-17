@@ -195,6 +195,46 @@ native static void webview_embed_request_focus(long w);
 //              thread.  Returns 0 if AreDevToolsEnabled is FALSE.
 native static int webview_embed_open_devtools(long w);
 
+// Execute a platform editing command (Cut / Copy / Paste / Select-All)
+// against the embedded WebView's current focused element.  cmdId is the
+// stable integer from {@link EditingCommand#getNativeId()}; the contract
+// is 1=CUT, 2=COPY, 3=PASTE, 4=SELECT_ALL.  Never throws via JNI -- bad
+// cmdIds or null engines fall through silently.
+//
+// Per-platform behaviour:
+//   - macOS:   [NSApp sendAction:@selector(cut:|copy:|paste:|selectAll:)
+//              to:nil from:webview] on the AppKit main thread.  to:nil
+//              resolves against the first responder, which under a
+//              focused contentEditable or <input> is the inner DOM
+//              element.
+//   - Linux:   webkit_web_view_execute_editing_command on the GTK main
+//              thread.
+//   - Windows: webview->ExecuteScript("document.execCommand(...)") on
+//              the WebView2 worker thread.
+native static void webview_embed_execute_editing_command(long w, int cmdId);
+
+// Returns 1 if the engine's WKWebView (or one of its inner views) is the
+// current first responder of its NSWindow, 0 otherwise.  macOS only;
+// Linux / Windows return 0 unconditionally.  Used by the editing-shortcut
+// dispatcher to override the JTextComponent-deferral when the user has
+// clicked into the WebView but AWT focus stayed on a sibling text widget.
+native static int webview_embed_is_native_first_responder(long w);
+
+// Register (or clear, by passing null) a callback to be invoked when the
+// engine's WKWebView becomes / resigns first responder.  Used by the
+// heavyweight component to drive visual focus cooperation -- suppress and
+// restore Swing JTextComponent carets as the user shifts interaction
+// between Swing widgets and the WebView.  Linux / Windows: stub (no-op).
+native static void webview_embed_set_focus_callback(long w, WebViewFocusCallback cb);
+
+// Force Win32 keyboard focus back to the AWT-owned parent HWND, so
+// subsequent keystrokes route to AWT instead of the WebView2 child
+// HWND.  Called from the Java-side global focus-owner listener when
+// AWT moves its focus owner to a Swing component outside the WebView.
+// macOS / Linux: no-op (AppKit / X11 focus handling is already
+// adequate on those platforms).  Never throws via JNI.
+native static void webview_embed_release_native_focus(long w);
+
 
 // ---------------------------------------------------------------------------
 // Lightweight / offscreen API (currently Linux-only).
@@ -288,6 +328,14 @@ native static void webview_offscreen_dispatch(long peer, Runnable callback);
 // not enabled at create time, the engine has no inspector, or this
 // platform doesn't support the offscreen engine.  Never throws via JNI.
 native static int webview_offscreen_open_devtools(long peer);
+
+// Execute a platform editing command (Cut / Copy / Paste / Select-All)
+// against the offscreen WebView's current focused element.  cmdId is the
+// stable integer from {@link EditingCommand#getNativeId()} -- the same
+// 1=CUT, 2=COPY, 3=PASTE, 4=SELECT_ALL ABI as
+// webview_embed_execute_editing_command.  Linux only; macOS / Windows
+// stubs no-op.  Never throws via JNI.
+native static void webview_offscreen_execute_editing_command(long peer, int cmdId);
 
 
 }

@@ -62,6 +62,75 @@ generated_at: 2026-05-16T07:19:13-07:00
   macOS 13.3+. On macOS 12.x and earlier the selector does
   not exist and is skipped — right-click → Inspect Element
   still works via the existing `developerExtrasEnabled` flag.
+- Clipboard & editing-command shortcuts: pressing the standard
+  platform shortcut modifier + `C` / `V` / `X` / `A` MUST
+  perform Copy / Paste / Cut / Select-All against whatever has
+  the in-page focus inside the native WebView whenever the
+  user is "interacting with" the WebView. "Interacting with"
+  the WebView means: the user's current input target is the
+  WebView, which we detect via the native first-responder
+  state on macOS — if AppKit's first responder is the
+  `WKWebView` (or any inner view of it), the WebView is the
+  active target regardless of which Swing component holds the
+  AWT focus owner. Concretely: if a sibling `JTextField` in
+  the same window happened to be the last Swing component to
+  receive focus, but the user has since clicked into the
+  WebView (so AppKit promoted `WKWebView` to first responder
+  while AWT's focus owner stayed on the `JTextField`),
+  Cmd+C MUST copy from the WebView's selection — NOT from
+  the `JTextField`. This bidirectional asymmetry between the
+  AWT focus chain and the AppKit responder chain is the
+  defining wrinkle of the AWT-embedded WKWebView setup; the
+  dispatcher's gating logic exists to bridge it.
+- Visual focus cooperation (macOS + Windows): when the user shifts
+  interaction to the WebView (WKWebView becomes the native
+  first responder), the previously-focused Swing
+  `JTextComponent` (if any) MUST have its caret hidden so
+  the user gets a visual cue that typing now lands in the
+  WebView. When the user shifts back to the Swing component
+  (WKWebView resigns first responder — which happens
+  automatically when AWT moves focus to a Swing component,
+  because AWT calls AppKit `makeFirstResponder:` on its
+  NSView), the previously-suppressed caret MUST be restored.
+  The cooperation is one-directional in implementation but
+  bidirectional in observable behaviour: the
+  WebView-became-FR direction needs an explicit Cocoa hook
+  because AWT doesn't observe AppKit responder changes; the
+  WebView-resigned-FR direction is driven by AWT's own
+  focus → AppKit sync as a side-effect of the user clicking
+  the Swing component, after which our resign hook restores
+  caret state. Crucially: the WebView-became-FR handler MUST
+  NOT call `requestFocusInWindow()` on the WebView component
+  — AWT would then call AppKit `makeFirstResponder:` on its
+  NSView and kick WKWebView right back out of first
+  responder, cutting off keyboard input to the page.
+   The modifier is `Cmd` on macOS and `Ctrl`
+  on Linux / Windows; the component detects it via
+  `Toolkit.getDefaultToolkit().getMenuShortcutKeyMaskEx()`
+  rather than hardcoding either mask. Implementation lives
+  in the heavyweight component (`KeyEventDispatcher` installed
+  in `addNotify` / removed in `removeNotify`) plus a new
+  cross-platform JNI entry point
+  `webview_embed_execute_editing_command(long peer, int cmdId)`:
+  - **macOS** (WKWebView): on the AppKit main thread, call
+    `[NSApp sendAction:@selector(cut:|copy:|paste:|selectAll:)
+    to:nil from:webview]`. Targeting `nil` resolves against
+    the first responder, which under a focused contentEditable
+    or `<input>` is the in-page element — directly addressing
+    the `WKWebView` would short-circuit that resolution.
+  - **Linux** (WebKitGTK): on the GTK main thread, call
+    `webkit_web_view_execute_editing_command(WEBKIT_WEB_VIEW(e->web),
+    WEBKIT_EDITING_COMMAND_CUT | _COPY | _PASTE | _SELECT_ALL)`.
+  - **Windows** (WebView2): on the WebView2 worker thread, call
+    `webview->ExecuteScript("document.execCommand('cut'|'copy'|'paste'|'selectAll')")`.
+    WebView2 has no first-class editing-command IPC, and
+    `document.execCommand` reliably routes through the focused
+    element's clipboard handlers. If a follow-up confirms that
+    WebView2's own `AcceleratorKeyPressed` default already
+    covers Ctrl+C/V/X/A end-to-end on every supported Windows
+    build, the Windows native body MAY be a no-op stub that
+    returns immediately — but the JNI entry point must still
+    exist so the Java caller is platform-uniform.
 - Definition of Done: documented by `README.md ("Heavyweight platform notes" section)` ("Heavyweight
   platform notes") and exercised by the `WebViewHeavyweightDemo`
   (`demos/WebViewHeavyweightDemo/...`). No automated tests cover
@@ -92,6 +161,19 @@ generated_at: 2026-05-16T07:19:13-07:00
   - Overrides `addJavascriptCallback(name, cb)` to reject any
     name starting with `__webview_` (matches the canvas-5
     reserved-prefix norm).
+  - `editingShortcutDispatcher: KeyEventDispatcher` —
+    `null` whenever the component is not currently displayable.
+    Non-null exactly between `addNotify()` and the matching
+    `removeNotify()`. When non-null it is also registered on
+    `KeyboardFocusManager.getCurrentKeyboardFocusManager()`,
+    and `removeNotify()` MUST unregister it. The dispatcher
+    intercepts platform-shortcut + C/V/X/A `KEY_PRESSED`
+    events whose AWT focus owner is the component or a
+    descendant, forwards them to
+    `EmbeddedWebView.executeEditingCommand`, and returns
+    `true` to consume the event. Short-circuits to `false`
+    when `embedded == null` so a late event during teardown
+    cannot call JNI on a disposed peer.
 - **EmbeddedCanvas** (inner class, extends `Canvas`,
   `WebViewHeavyweightComponent.java:186`) — the heavyweight peer
   that JAWT can lock to obtain a native window handle. Invariants:
@@ -119,6 +201,24 @@ generated_at: 2026-05-16T07:19:13-07:00
     The native call is responsible for marshaling to the
     correct UI thread on platforms that require it
     (Windows: WebView2 worker; macOS: AppKit main).
+  - New method `executeEditingCommand(EditingCommand cmd): EmbeddedWebView`
+    — `checkAlive`, then call
+    `WebViewNative.webview_embed_execute_editing_command(peer, cmd.nativeId)`.
+    Pure side-effect; does not touch `heap` or `bindings`.
+    Native side is responsible for marshaling to the correct
+    UI thread (AppKit main / GTK main / WebView2 worker).
+- **EditingCommand** (new public enum,
+  `src/ca/weblite/webview/EditingCommand.java`). Stable
+  contract between Java and the JNI bridge — the integer IDs
+  MUST match what the native side dispatches on.
+  - Values: `CUT(1)`, `COPY(2)`, `PASTE(3)`, `SELECT_ALL(4)`.
+  - Each value carries a `private final int nativeId`
+    exposed via `int getNativeId()`. The integer IDs are
+    part of the JNI ABI: renumbering them is a breaking
+    change across native + Java boundaries and MUST be
+    avoided. New commands (e.g. `UNDO`, `REDO`) MUST be
+    appended with new IDs rather than reusing or shifting
+    existing ones.
 
 ## A · Approach
 - **Heavyweight peer hosts the native view.** AWT/JAWT exposes a
@@ -187,6 +287,74 @@ generated_at: 2026-05-16T07:19:13-07:00
   `AddScriptToExecuteOnDocumentCreated` machinery re-fires at
   document-start for every new document. No re-install on
   page change is required.
+- **Editing-command shortcuts driven from Java, not from
+  AppKit / X11.** The standard platform Cut/Copy/Paste/Select-All
+  shortcuts (`Cmd+C/V/X/A` on macOS, `Ctrl+C/V/X/A` elsewhere)
+  do not work out-of-the-box on any platform when the WebView
+  is embedded as a heavyweight AWT peer:
+  - On macOS, AWT's NSEvent dispatch consumes
+    `Cmd`-modified key events for its own key-equivalent
+    handling before WKWebView's `performKeyEquivalent:` is
+    given a chance.
+  - On Linux, the focused X11 window is the embedded
+    WebKitGTK widget (after `XSetInputFocus`), but AWT does
+    not route a corresponding `KeyEvent` back through the
+    Swing focus owner, and the GTK side never installs a
+    key-binding for the AWT shortcut.
+  - On Windows, WebView2 *usually* handles Ctrl+C/V/X/A
+    natively, but the AWT focus owner may still intercept
+    them in some configurations.
+  Two alternatives were rejected:
+  1. Install a synthetic AppKit `Edit` menu into
+     `NSApp.mainMenu`. Functional but mutates the host
+     application's menu bar — a destructive side-effect for
+     library code. It is also macOS-only, so the cross-platform
+     problem still needs a different mechanism for Linux and
+     Windows.
+  2. Install a Swing `KeyListener` on the embedded `Canvas`.
+     Unreliable: with the heavyweight peer holding native
+     focus, AWT's focus owner is the canvas, but the
+     `KeyListener` runs after AWT's own shortcut consumption.
+  Chosen mechanism: a single `KeyEventDispatcher` registered
+  on `KeyboardFocusManager.getCurrentKeyboardFocusManager()`
+  in `addNotify()` and unregistered in `removeNotify()`. This
+  sits ABOVE the AWT focus-owner-level dispatch, so it sees
+  modifier + C/V/X/A `KEY_PRESSED` events before AWT can
+  consume them. The dispatcher gates on the AWT focus owner
+  being the component or a descendant, calls
+  `EmbeddedWebView.executeEditingCommand(cmd)`, and returns
+  `true` to consume the event. The same pattern is reusable
+  in the lightweight component (see
+  [[swing-lightweight-webview-embedding]]); that integration
+  is a separate Canvas update.
+- **Editing-command JNI bridge dispatches the action directly
+  to the engine.** Initial design used
+  `[NSApp sendAction:@selector(...) to:nil from:webview]` so
+  AppKit would walk the responder chain to the inner focused
+  element. **That doesn't work for the AWT-embedded case**:
+  the WKWebView is parented under `NSWindow.contentView` (an
+  AWT-owned NSView), and even after the user clicks inside the
+  WebView, AppKit's first responder is not reliably the
+  WKWebView — AWT installs its own NSView keyDown handling on
+  contentView and the AppKit first responder ends up on AWT's
+  view rather than the WKWebView (consistent with the
+  pre-existing "AWT keeps system focus until told otherwise"
+  comment on `EmbeddedWebView.requestFocus`). With `to:nil`,
+  `sendAction` walks the chain starting at first responder
+  and never reaches WKWebView, so `copy:` / `paste:` / etc.
+  no-op. The fix is to **send the action directly to the
+  WKWebView**: `[webview cut:nil]` / `[webview copy:nil]` /
+  `[webview paste:nil]` / `[webview selectAll:nil]`.
+  WKWebView's implementations of these four standard
+  `NSResponder` selectors delegate to the WebKit page's
+  current selection / focused element internally — they do
+  NOT require WKWebView to be first responder. Guard with
+  `respondsToSelector:` so older SDKs without one of the
+  selectors fail gracefully. Linux uses
+  `webkit_web_view_execute_editing_command`, which already
+  targets the focused frame's selection internally. Windows
+  uses `document.execCommand` via `ExecuteScript` for the
+  same focus-aware semantics.
 
 ## S · Structure
 - `src/ca/weblite/webview/swing/WebViewHeavyweightComponent.java`
@@ -196,8 +364,13 @@ generated_at: 2026-05-16T07:19:13-07:00
 - `src/ca/weblite/webview/WebViewNative.java:131`–
   `src/ca/weblite/webview/WebViewNative.java:177` — native
   entry points (`webview_embed_create`,
-  `webview_embed_navigate`, etc.). Adds one new declaration:
-  `native static int webview_embed_open_devtools(long w)`.
+  `webview_embed_navigate`, etc.). Adds two new declarations:
+  `native static int webview_embed_open_devtools(long w)` and
+  `native static void webview_embed_execute_editing_command(long w, int cmdId)`.
+- `src/ca/weblite/webview/EditingCommand.java` (new) — public
+  enum with `CUT(1)`, `COPY(2)`, `PASTE(3)`, `SELECT_ALL(4)`
+  and `int getNativeId()`. The enum is the only thing callers
+  pass through `EmbeddedWebView.executeEditingCommand`.
 - `src/ca/weblite/webview/ConsoleDispatcher.java` (from
   [[swing-webview-component-mode-selection]]) — owned by the
   component; receives raw payloads from the internal
@@ -211,7 +384,14 @@ generated_at: 2026-05-16T07:19:13-07:00
   the Windows file gains the WebView2-worker-marshalled
   implementation. The macOS `cocoa_create_engine` block is
   extended to call `setInspectable:YES` under
-  `respondsToSelector` when `debug=true`.
+  `respondsToSelector` when `debug=true`. Both native sources
+  also gain a function exported as
+  `Java_..._webview_1embed_1execute_1editing_1command` that
+  marshals to the correct UI thread (AppKit main / GTK main /
+  WebView2 worker) and invokes the per-platform editing-command
+  primitive (`[NSApp sendAction:to:nil from:webview]` /
+  `webkit_web_view_execute_editing_command` /
+  `webview->ExecuteScript("document.execCommand(...)")`).
 - `demos/WebViewHeavyweightDemo/...` — interactive demo that
   exercises the trickier scenarios (combo-box popups over the
   WebView, `JTabbedPane` tab visibility).
@@ -273,6 +453,16 @@ File: `src/ca/weblite/webview/EmbeddedWebView.java`
    - `dispose(): void` — if `peer != 0`, zero it, call
      `webview_embed_destroy`, clear `heap` and `bindings`
      (`EmbeddedWebView.java:194`).
+   - `executeEditingCommand(EditingCommand cmd): EmbeddedWebView` (new)
+     - Logic: null-check `cmd` (throw `NullPointerException`
+       with a message naming the parameter); `checkAlive`;
+       call
+       `WebViewNative.webview_embed_execute_editing_command(peer, cmd.getNativeId())`;
+       `return this`. Pure side-effect; does NOT touch
+       `heap` or `bindings`. The native call is responsible
+       for marshalling to the correct UI thread; the Java
+       caller MUST be allowed to invoke this from the EDT
+       without blocking.
    - `openDevTools(): boolean` (new)
      - Logic: `checkAlive`; call
        `WebViewNative.webview_embed_open_devtools(peer)`;
@@ -521,6 +711,454 @@ inside the `if (e->debug)` branch).
    - This change is wholly inside `if (e->debug) { ... }`;
      `debug=false` runs are entirely unaffected.
 
+### 10. Editing-Command Shortcut Dispatch
+Files:
+- `src/ca/weblite/webview/EditingCommand.java` (new enum)
+- `src/ca/weblite/webview/EmbeddedWebView.java`
+  (`executeEditingCommand` — see Operation 1)
+- `src/ca/weblite/webview/WebViewNative.java`
+  (new `webview_embed_execute_editing_command` declaration)
+- `src/ca/weblite/webview/swing/WebViewHeavyweightComponent.java`
+  (dispatcher install / uninstall + dispatch logic)
+- `src_c/webview_embed.cpp` (cocoa + gtk native bodies)
+- `windows/webview_embed.cc` (WebView2 native body)
+
+1. Responsibility: turn AWT platform-shortcut + C/V/X/A
+   `KEY_PRESSED` events whose focus owner is inside the
+   `WebViewHeavyweightComponent` into the correct
+   editing-command invocation against whatever has in-page
+   focus inside the native WebView, on every supported
+   platform.
+2. EditingCommand enum:
+   - Declared `public enum EditingCommand` in package
+     `ca.weblite.webview` with values `CUT(1)`, `COPY(2)`,
+     `PASTE(3)`, `SELECT_ALL(4)`.
+   - `private final int nativeId` set by the constructor;
+     public accessor `int getNativeId()`.
+   - Numeric IDs are part of the JNI ABI: they MUST match
+     the switch statement in the native bodies. Reusing or
+     shifting an existing ID is a breaking change.
+3. Java entry point declaration (`WebViewNative.java`):
+   - `native static void webview_embed_execute_editing_command(long w, int cmdId)`.
+   - Header regeneration is required (see
+     [[native-library-loading-and-packaging]]).
+4. Dispatcher install / remove in
+   `WebViewHeavyweightComponent`:
+   - Add field
+     `private KeyEventDispatcher editingShortcutDispatcher`
+     (default `null`).
+   - Override `addNotify()`: call `super.addNotify()` first;
+     if `editingShortcutDispatcher == null`, build a new
+     `KeyEventDispatcher` (lambda or inner class) with the
+     logic in step 5; assign to the field; register via
+     `KeyboardFocusManager.getCurrentKeyboardFocusManager().addKeyEventDispatcher(...)`.
+   - Override `removeNotify()`: if
+     `editingShortcutDispatcher != null`, call
+     `KeyboardFocusManager.getCurrentKeyboardFocusManager().removeKeyEventDispatcher(editingShortcutDispatcher)`,
+     then null the field. Call `super.removeNotify()` last
+     (matching the existing `dispose()`-before-super ordering
+     used by `EmbeddedCanvas.removeNotify`).
+5. Dispatcher logic (executed for every AWT key event in the
+   JVM, MUST short-circuit cheaply for events it does not
+   handle):
+   - Return `false` immediately if
+     `e.getID() != KeyEvent.KEY_PRESSED`.
+   - Compute `int shortcutMask =
+     Toolkit.getDefaultToolkit().getMenuShortcutKeyMask()`
+     (Java 8 compatible — the project targets 1.8 in
+     `pom.xml`, so `getMenuShortcutKeyMaskEx` is unavailable).
+     Cache it in a `static final` field on the dispatcher
+     class to avoid re-reading on every key event.
+   - Return `false` if
+     `(e.getModifiers() & shortcutMask) != shortcutMask`.
+   - Switch on `e.getKeyCode()`:
+     - `VK_C` → `EditingCommand.COPY`
+     - `VK_V` → `EditingCommand.PASTE`
+     - `VK_X` → `EditingCommand.CUT`
+     - `VK_A` → `EditingCommand.SELECT_ALL`
+     - default → return `false`.
+   - Return `false` if `embedded == null` — the component is
+     mid-attach or mid-teardown; let Swing's default handler
+     run.
+   - Return `false` if the component is not currently showing
+     (`isShowing()`).
+   - Return `false` if the component's window ancestor is
+     not focused
+     (`SwingUtilities.getWindowAncestor(this).isFocused()`).
+     `KeyEventDispatcher` fires for every key event in the
+     JVM; this gate keeps a key press in another window from
+     triggering an editing command in this WebView.
+   - Resolve the AWT focus owner via
+     `KeyboardFocusManager.getCurrentKeyboardFocusManager().getFocusOwner()`.
+     Compute two boolean signals:
+     - `focusInWebView`: true iff the AWT focus owner is
+       non-null and is either this component or descended
+       from it (`focusOwner == this ||
+       SwingUtilities.isDescendingFrom(focusOwner, this)`).
+       This is the standard signal on Linux lightweight,
+       where the component calls
+       `requestFocusInWindow()` on mouse-pressed; it may
+       also be true on Windows when AWT focus is on the
+       embedded heavyweight `Canvas`.
+     - `nativeFocusOnWebView`:
+       `embedded.isNativeFirstResponder()`. macOS-specific
+       in practice (Linux / Windows native bodies stub to
+       return 0); on macOS this is the ONLY reliable signal
+       that the user is interacting with the WebView,
+       because AWT's focus owner stays on whichever Swing
+       component last had focus while the WKWebView holds
+       native first-responder status.
+   - **Default to deferring to Swing.** If both signals are
+     false, return `false` so AWT delivers the event to its
+     focus owner via the normal dispatch path. This is the
+     conservative gate that keeps a sibling `JTextField` (or
+     any other Swing component) working when the user is
+     interacting with it rather than the WebView. The
+     earlier "defer iff focus owner is a `JTextComponent`,
+     otherwise dispatch" gate was too permissive: any
+     non-text focus owner (a `JFrame`'s content pane, a
+     `null` focus owner during a focus transition, the AWT
+     focus owner being weirdly out-of-sync with native
+     focus on Windows) caused Ctrl+V to hijack to the
+     WebView even when the user was nowhere near it.
+   - Only when at least one of the two signals is true
+     do we call `embedded.executeEditingCommand(cmd)` and
+     return `true` to consume the event.
+   - **Do NOT also require focus owner to be `this` or a
+     descendant.** On macOS the heavyweight peer holds the
+     real keyboard focus natively, and AWT's focus owner
+     stays on whatever Swing component had it before (often
+     the root pane of the JFrame, which is an ANCESTOR of
+     this component, so an `isDescendingFrom(focusOwner, this)`
+     check returns false and the dispatcher silently bails
+     out — the exact failure mode that the first iteration
+     of this Canvas hit on macOS).
+   - Otherwise call
+     `embedded.executeEditingCommand(cmd)` and return `true`
+     to consume the event.
+6. macOS native body (`src_c/webview_embed.cpp`,
+   `cocoa_*` branch):
+   - Marshal to the AppKit main thread via
+     `cocoa_run_on_main_async` (the existing helper used by
+     `cocoa_navigate` / `cocoa_eval`).
+   - Switch on `cmdId`: build the appropriate `SEL` from
+     `sel("cut:")`, `sel("copy:")`, `sel("paste:")`,
+     `sel("selectAll:")`. Default branch returns without
+     dispatching.
+   - Send the action **directly to the WKWebView**, NOT via
+     the responder chain. Use the existing `msg<>()` helper:
+     `msg<void, id>(e->webview, action, (id)nullptr)`.
+     Guard with `respondsToSelector:` so a missing selector
+     on an older WebKit fails silently instead of aborting
+     the process. Do NOT use
+     `[NSApp sendAction:to:nil from:webview]` — see Approach
+     for the AWT first-responder mismatch that makes
+     responder-chain dispatch unreliable in this embedded
+     setup.
+7. Linux native body (`src_c/webview_embed.cpp`,
+   `gtk_*` branch):
+   - Marshal to the GTK main thread via the existing
+     `gtk_run_on_main_async` (or equivalent dispatch) used by
+     `gtk_navigate`.
+   - Switch on `cmdId`: pick
+     `WEBKIT_EDITING_COMMAND_CUT` /
+     `WEBKIT_EDITING_COMMAND_COPY` /
+     `WEBKIT_EDITING_COMMAND_PASTE` /
+     `WEBKIT_EDITING_COMMAND_SELECT_ALL` (the WebKitGTK
+     header defines these as `const char*` macros).
+   - Call
+     `webkit_web_view_execute_editing_command(WEBKIT_WEB_VIEW(e->web), command)`.
+8. Windows native body (`windows/webview_embed.cc`):
+   - Marshal to the WebView2 worker thread via the existing
+     `PostThreadMessage` pattern.
+   - Switch on `cmdId` to a string literal
+     `"document.execCommand('cut')"`,
+     `"document.execCommand('copy')"`,
+     `"document.execCommand('paste')"`,
+     `"document.execCommand('selectAll')"`.
+   - Call `webview->ExecuteScript(js, nullptr)` (no
+     callback — fire-and-forget; logging on failure
+     `HRESULT` only).
+   - If a follow-up confirms WebView2 already handles these
+     shortcuts natively when the embedded HWND has focus,
+     the implementation MAY become an early return after the
+     thread-marshal — but the JNI entry MUST stay so the Java
+     caller is unchanged.
+9. Constraints / Invariants:
+   - The native function is `void` and MUST NOT raise a JNI
+     exception for any failure path (unsupported `cmdId`,
+     missing engine pointer, native error). The Java side
+     does NOT wrap calls in try/catch.
+   - The integer `cmdId` contract is fixed:
+     `1=CUT, 2=COPY, 3=PASTE, 4=SELECT_ALL`. Any future
+     command MUST use a new positive integer; existing IDs
+     MUST NOT be reused.
+
+### 11. Bidirectional Focus Cooperation
+Files:
+- `src/ca/weblite/webview/WebViewFocusCallback.java` (new
+  functional interface)
+- `src/ca/weblite/webview/EmbeddedWebView.java`
+  (`isNativeFirstResponder()`, `setFocusCallback(...)`)
+- `src/ca/weblite/webview/WebViewNative.java` (two new JNI
+  declarations)
+- `src/ca/weblite/webview/swing/WebViewHeavyweightComponent.java`
+  (focus callback install + caret-suppression handler)
+- `src_c/webview_embed.cpp` (WKWebView class swizzle + engine
+  map + JNI bodies)
+- `src_c/ca_weblite_webview_WebViewNative.h` + Windows header
+  (declarations)
+- `windows/webview_embed.cc` (no-op stubs)
+
+1. Responsibility: bridge the AWT focus chain and the
+   AppKit responder chain so (a) `Cmd+C/V/X/A` works in the
+   WebView even when AWT focus owner is a sibling
+   `JTextComponent`, and (b) visual focus indicators
+   (`JTextComponent` carets) reflect where the user is
+   actually interacting.
+2. New public Java functional interface
+   `ca.weblite.webview.WebViewFocusCallback`:
+   - Single method `void invoke(boolean became)`. `became`
+     is `true` when WKWebView gained native first responder,
+     `false` when it resigned.
+3. `EmbeddedWebView` additions:
+   - `isNativeFirstResponder(): boolean` — JNI sync query;
+     returns `false` if `peer == 0`. Implemented natively as
+     a walk up the NSView superview chain from the
+     `NSWindow.firstResponder` looking for the WKWebView
+     (so both the WKWebView itself and any inner WebKit
+     content view count as "the WebView is focused").
+   - `setFocusCallback(WebViewFocusCallback cb): EmbeddedWebView`
+     — anchors `cb` in `heap` (so JVM doesn't GC it while
+     native holds a global ref) and calls
+     `WebViewNative.webview_embed_set_focus_callback(peer, cb)`.
+     Passing `null` clears any prior callback.
+4. New JNI declarations on `WebViewNative`:
+   - `native static int webview_embed_is_native_first_responder(long w)`.
+     Returns 1 if the engine's WKWebView (or one of its
+     descendants) is the current `firstResponder` of its
+     `NSWindow`, 0 otherwise. macOS-only behaviour;
+     Linux / Windows return 0.
+   - `native static void webview_embed_set_focus_callback(long w, WebViewFocusCallback cb)`.
+     Stores a JNI global ref to `cb` on the engine. Passing
+     `null` clears + deletes any prior global ref.
+5. Per-platform focus-event source:
+   - **macOS**: WKWebView class swizzle. See step 5a below.
+   - **Windows**: hook
+     `ICoreWebView2Controller::add_GotFocus` and
+     `add_LostFocus` during engine creation; the registered
+     `FocusHandler` instances call `fire_focus_callback`
+     with `became=true` and `became=false` respectively.
+     `set_focus_callback` stores the Java callback's JNI
+     global ref on the Engine; the FocusHandler reads it.
+     `destroy_engine` releases the global ref BEFORE the
+     WebView2 worker tears down so LostFocus during
+     teardown does not invoke a freed callback.
+   - **Linux**: no current implementation; the offscreen
+     WebKitGTK widget does not have an AppKit-style focus
+     event that maps to "user shifted interaction to the
+     web view." Acceptable for now: the lightweight engine
+     on Linux is in-process and already gets AWT focus
+     correctly via `requestFocusInWindow()`.
+
+5a. Native swizzle (`src_c/webview_embed.cpp`, Cocoa branch):
+   - Maintain a process-global `std::map<id, Engine *>
+     g_webview_to_engine` guarded by `g_webview_map_mutex`.
+     Populated in `cocoa_create_engine` after WKWebView
+     alloc; cleared in `cocoa_destroy_engine`.
+   - On first engine creation (guard with `std::call_once`),
+     swizzle `-[WKWebView becomeFirstResponder]` and
+     `-[WKWebView resignFirstResponder]` via
+     `class_getInstanceMethod` +
+     `method_setImplementation`. Save the original IMPs in
+     statics so the swizzled implementations can call
+     through.
+   - Swizzled implementations: call the original IMP first
+     (capturing the BOOL result); if it returned YES, look
+     up the receiver in `g_webview_to_engine` (under the
+     mutex). If an `Engine *` is found AND that engine has
+     a non-null `focus_callback` global ref, invoke the
+     Java callback on a thread that's attached to the JVM.
+     **Marshal to the EDT via the callback itself**: the
+     Java callback is a small lambda that schedules
+     `handleNativeFocusChange(became)` via
+     `SwingUtilities.invokeLater`, so the JNI call only
+     needs to invoke a non-EDT callback method.
+   - The swizzle affects all WKWebViews in the process,
+     including any unrelated ones. The engine-map lookup
+     returns null for those, and we just skip the callback —
+     the original implementation is still called, so
+     behaviour for non-our WKWebViews is unaffected.
+6. `Engine` struct (Cocoa) additions:
+   - `jobject focus_callback` — JNI global ref to the
+     registered `WebViewFocusCallback`, or `nullptr`. Set
+     by `webview_embed_set_focus_callback`; deleted on
+     replace and on `cocoa_destroy_engine`.
+7. `WebViewHeavyweightComponent` integration:
+   - Add fields:
+     - `private javax.swing.text.JTextComponent suppressedCaretOwner` (null when no caret is suppressed).
+     - `private boolean originalCaretVisible` — value to
+       restore when WKWebView resigns.
+   - In `createPeer()` after `EmbeddedWebView.attach`
+     succeeds, call
+     `embedded.setFocusCallback(became -> SwingUtilities.invokeLater(() -> handleNativeFocusChange(became)))`.
+     (The lambda must be anchored — `EmbeddedWebView.heap`
+     handles this via `setFocusCallback`.)
+   - `handleNativeFocusChange(boolean became)` runs on the
+     EDT:
+     - If `became == true`:
+       - If `suppressedCaretOwner != null`, return
+         (idempotent; we already suppressed a caret in a
+         previous transition).
+       - Query the AWT focus owner. If it is a
+         `JTextComponent`, record it as
+         `suppressedCaretOwner`, record its
+         `getCaret().isVisible()` as
+         `originalCaretVisible`, and call
+         `getCaret().setVisible(false)`.
+     - If `became == false`:
+       - If `suppressedCaretOwner != null`, call
+         `getCaret().setVisible(originalCaretVisible)` to
+         restore, then null the field.
+8. Reverse direction (Swing component gains focus → WKWebView
+   resigns) is handled implicitly on macOS:
+   - User clicks `JTextField` → AWT moves focus to
+     `JTextField` → AWT calls AppKit
+     `makeFirstResponder:` on its NSView → WKWebView
+     resigns first responder → swizzled
+     `resignFirstResponder` fires → callback with
+     `became = false` → `handleNativeFocusChange(false)` →
+     caret restored on `suppressedCaretOwner`.
+   - **On Windows the same implicit path does not work.**
+     When the WebView2 HWND holds Win32 keyboard focus and
+     the user clicks a Swing widget rendered inside the
+     AWT JFrame's HWND area (e.g. the URL `JTextField` in
+     the toolbar), AWT moves its Java-side focus owner to
+     the `JTextField`, but Win32 keyboard focus stays on
+     the WebView2 HWND because AWT does not automatically
+     `SetFocus` away from a focused child HWND. Subsequent
+     keystrokes (`Ctrl+V` etc.) still route to WebView2 via
+     Win32, bypassing AWT and the editing-shortcut
+     dispatcher entirely. The fix is a Windows-only
+     "release native focus" path described in Operation 12
+     below.
+
+### 12. Release Native Keyboard Focus on AWT Focus Move (Windows)
+Files:
+- `src/ca/weblite/webview/EmbeddedWebView.java`
+  (`releaseNativeFocus()` method)
+- `src/ca/weblite/webview/WebViewNative.java` (one new
+  JNI declaration)
+- `src/ca/weblite/webview/swing/WebViewHeavyweightComponent.java`
+  (global `KeyboardFocusManager` property listener that
+  calls `releaseNativeFocus()` when AWT focus moves to a
+  non-WebView component)
+- `src_c/webview_embed.cpp` (no-op body on macOS / Linux)
+- `windows/webview_embed.cc` (Win32 `SetFocus` body with
+  `AttachThreadInput` for the cross-thread case)
+- Headers: declarations on both `src_c` and `windows` header.
+
+1. Responsibility: ensure Win32 keyboard focus follows AWT
+   focus on Windows. When the user shifts AWT focus away
+   from the embedded WebView, force Win32 to deliver
+   subsequent keyboard input to the AWT-owned parent HWND
+   instead of the WebView2 child HWND.
+2. New JNI declaration on `WebViewNative`:
+   `native static void webview_embed_release_native_focus(long w)`.
+   Returns void; never throws.
+3. New method on `EmbeddedWebView`:
+   `releaseNativeFocus(): EmbeddedWebView` — `checkAlive`,
+   then call the JNI entry. Pure side-effect; does not
+   touch `heap` or `bindings`.
+4. Native bodies:
+   - macOS (Cocoa branch): no-op. AppKit already handles
+     focus correctly via the responder chain — when AWT
+     moves focus to a Swing component it calls
+     `makeFirstResponder:` on its own NSView, which kicks
+     WKWebView out of first responder. The swizzled
+     `resignFirstResponder` hook fires and restores Swing
+     caret state. No native action needed here.
+   - Linux (GTK branch): no-op. AWT/X11 focus handling is
+     adequate for the heavyweight path on Linux today;
+     re-introducing native focus mutation from Java would
+     risk the rendering regression documented at
+     `WebViewHeavyweightComponent.java:223`.
+   - Windows (WebView2): dispatch to the WebView2 worker
+     thread via the existing
+     `embed_win::dispatch_to_thread` helper. On the worker
+     thread: obtain the AWT parent HWND from `e->parent`;
+     attach the worker thread's input state to the AWT
+     thread (via `AttachThreadInput(workerTid, parentTid,
+     TRUE)`); call `SetFocus(e->parent)`; detach. The
+     `AttachThreadInput` step is mandatory — Win32 focus
+     is per-thread, and `SetFocus` from a thread that does
+     not own the target HWND silently no-ops without the
+     attach.
+5. `WebViewHeavyweightComponent` integration:
+   - Add field `private PropertyChangeListener focusOwnerListener`
+     (null until `addNotify`).
+   - In `addNotify()`, after the editing-shortcut dispatcher
+     is installed, build a `PropertyChangeListener` for the
+     `"focusOwner"` property and register it on
+     `KeyboardFocusManager.getCurrentKeyboardFocusManager()`.
+     The listener:
+     - Reads the new value (the new focus owner).
+     - Returns immediately if `embedded == null` or the new
+       value is `null`.
+     - Returns immediately if the new value is `this` or a
+       descendant of `this` (focus moved INTO the WebView;
+       no native release needed).
+     - Returns immediately if the new value's window
+       ancestor is not this component's window (focus
+       moved to an unrelated window).
+     - Otherwise calls `embedded.releaseNativeFocus()`.
+   - In `removeNotify()`, before the editing-shortcut
+     dispatcher is unregistered, unregister the
+     `focusOwnerListener` and null the field.
+6. Constraints / Invariants:
+   - The listener is global (fires for every focus change
+     in the JVM). Short-circuit checks MUST be cheap to
+     avoid burdening unrelated focus traffic.
+   - `releaseNativeFocus()` is `void` and MUST NOT raise a
+     JNI exception; failure paths (bad HWND, no
+     controller, AttachThreadInput failure) log via the
+     existing `WV_LOG` pattern and return without
+     throwing.
+   - The listener MUST be unregistered in `removeNotify()`
+     to avoid leaking the component through the
+     `KeyboardFocusManager`'s strong reference (same
+     lifecycle norm as the editing-shortcut dispatcher).
+9. Constraints / Invariants:
+   - The swizzle MUST be installed exactly once per JVM —
+     guard with `std::call_once`. `method_setImplementation`
+     is destructive on re-application and would corrupt
+     the original-IMP save.
+   - The Engine ↔ WKWebView map MUST be guarded by a
+     mutex — `becomeFirstResponder` can fire on the AppKit
+     main thread while `cocoa_create_engine` /
+     `cocoa_destroy_engine` run on EDT-driven native code.
+   - `handleNativeFocusChange` MUST run on the EDT. The
+     native callback path itself does NOT need to be on
+     the EDT; the Java-side lambda invokes
+     `SwingUtilities.invokeLater` to marshal.
+   - The handler MUST NOT call `requestFocusInWindow()` or
+     any other AWT method that would propagate focus to
+     AppKit — that would kick WKWebView back out of first
+     responder AND cut off keyboard input to the page.
+     Caret suppression is purely a Swing-side cosmetic
+     change.
+   - Caret restoration on `became == false` MUST happen
+     even if AWT focus has since moved to a different
+     `JTextComponent`. The handler restores the
+     previously-recorded caret (whichever was suppressed
+     on the prior `became == true`), not the current focus
+     owner's caret.
+   - `setFocusCallback(null)` clears the global ref and
+     deletes it cleanly. `EmbeddedWebView.dispose()` also
+     clears via `setFocusCallback(null)` BEFORE
+     `webview_embed_destroy` so the swizzled hooks don't
+     fire into a freed callback.
+
 ## N · Norms
 - All AWT/JAWT interaction must respect the rule that the
   native peer is only valid while the host AWT Component is
@@ -552,6 +1190,38 @@ inside the `if (e->debug)` branch).
   bounded wait; Linux dispatches to the GTK pump thread.
   Native bugs that would block must be diagnosed and fixed,
   not worked around with timeouts in Java.
+- The editing-shortcut `KeyEventDispatcher` MUST return
+  `true` for every event it forwards to
+  `EmbeddedWebView.executeEditingCommand`, so AWT does not
+  also deliver the same event to the focus owner. Returning
+  `false` after forwarding would let Swing's default
+  `Ctrl+C`/`Ctrl+V` action (e.g. on a focused `JTextField`
+  sibling — but the dispatcher only acts when the focus owner
+  is inside the WebView, so this is more about consuming
+  AWT's own native-shortcut consumption path) run a second
+  time.
+- The editing-shortcut dispatcher MUST detect the platform
+  shortcut modifier via
+  `Toolkit.getDefaultToolkit().getMenuShortcutKeyMask()` and
+  compare it against `KeyEvent.getModifiers()`. The Ex
+  variants (`getMenuShortcutKeyMaskEx` /
+  `getModifiersEx`) are Java 10+ only; the project's Maven
+  source/target is Java 8 (see `pom.xml` properties), so the
+  legacy modifier API is the correct choice. Hardcoding
+  `InputEvent.CTRL_MASK` or `InputEvent.META_MASK` is wrong
+  — it would break the other platform.
+- The editing-shortcut dispatcher MUST be registered in
+  `addNotify()` and unregistered in `removeNotify()`. A
+  dispatcher left registered across a removeNotify would
+  keep the WebViewHeavyweightComponent reachable from the
+  focus manager's strong reference and prevent both Java GC
+  and native peer release.
+- `WebViewNative.webview_embed_execute_editing_command` is
+  `void` and MUST NOT raise a JNI exception. All failure
+  paths (bad `cmdId`, null engine, native call failure) MUST
+  fall through silently or log via the existing
+  `WV_LOG`/`fprintf(stderr, ...)` pattern. Java callers must
+  not need to wrap the call in try/catch.
 
 ## S · Safeguards
 - `EmbeddedWebView.attach` validates `parent != null` AND
@@ -597,3 +1267,17 @@ inside the `if (e->debug)` branch).
 - The native `webview_embed_open_devtools` returns 0 (never
   raises a JNI exception) for every failure path so the Java
   side never has to wrap the call in a try/catch.
+- The editing-shortcut `KeyEventDispatcher` MUST short-circuit
+  to `false` when `embedded == null` so a key event that
+  arrives during teardown (between `dispose()` clearing the
+  field and `removeNotify` unregistering the dispatcher) does
+  not call JNI on a disposed peer. The dispatcher MUST also
+  short-circuit when the AWT focus owner is `null` or not a
+  descendant of the component — keystrokes typed into a
+  sibling `JTextField` or another window MUST continue to use
+  Swing's default handling untouched.
+- `EmbeddedWebView.executeEditingCommand` rejects a `null`
+  `EditingCommand` argument with `NullPointerException` BEFORE
+  calling `checkAlive`, so callers get a clear error rather
+  than the JNI layer mishandling an undefined `cmdId`. The
+  exception message MUST name the parameter (`"cmd"`).

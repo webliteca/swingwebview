@@ -105,11 +105,39 @@ struct Engine {
     ICoreWebView2Controller *controller = nullptr;
     ICoreWebView2 *webview = nullptr;
     EventRegistrationToken message_token{};
+    EventRegistrationToken got_focus_token{};
+    EventRegistrationToken lost_focus_token{};
     std::map<std::string, Binding *> bindings;
     JavaVM *jvm = nullptr;
     bool debug = false;
     std::mutex bindings_mutex;
+    // JNI global ref to the registered WebViewFocusCallback, or nullptr.
+    // Invoked from the WebView2 controller's GotFocus / LostFocus events.
+    jobject focus_callback = nullptr;
 };
+
+static void fire_focus_callback(Engine *e, bool became) {
+    if (!e || !e->focus_callback) return;
+    JavaVM *jvm = e->jvm;
+    if (!jvm) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        jvm->AttachCurrentThread((void **)&env, nullptr);
+        detach = true;
+    }
+    if (env) {
+        jclass cls = env->GetObjectClass(e->focus_callback);
+        if (cls) {
+            jmethodID m = env->GetMethodID(cls, "invoke", "(Z)V");
+            if (m) {
+                env->CallVoidMethod(e->focus_callback, m, (jboolean)became);
+            }
+            env->DeleteLocalRef(cls);
+        }
+    }
+    if (detach) jvm->DetachCurrentThread();
+}
 
 // IUnknown helper -- gives each WebView2 callback proper refcounting and
 // QueryInterface support.  The interfaces we implement are all single-
@@ -170,6 +198,20 @@ private:
 // Forward declarations.
 static void engine_on_message(Engine *e, LPCWSTR msg);
 static std::wstring utf8_to_wide(const char *s);
+
+class FocusHandler : public CallbackBase<
+    ICoreWebView2FocusChangedEventHandler> {
+public:
+    FocusHandler(Engine *e, bool became) : m_engine(e), m_became(became) {}
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2Controller *,
+                                     IUnknown *) override {
+        fire_focus_callback(m_engine, m_became);
+        return S_OK;
+    }
+private:
+    Engine *m_engine;
+    bool m_became;
+};
 
 class MsgHandler : public CallbackBase<
     ICoreWebView2WebMessageReceivedEventHandler> {
@@ -338,6 +380,19 @@ static void engine_thread(Engine *e, HWND /*parent*/, int width, int height,
                     e->webview->add_WebMessageReceived(mh, &e->message_token);
                     mh->Release();
 
+                    // Hook GotFocus / LostFocus on the controller so the
+                    // Java side can suppress and restore the previously-
+                    // focused JTextComponent's caret while WebView2 holds
+                    // Win32 keyboard focus.  Two separate handler
+                    // instances because the same callback signature has
+                    // no way to distinguish got vs lost from the args.
+                    auto *gh = new FocusHandler(e, true);
+                    ctrl->add_GotFocus(gh, &e->got_focus_token);
+                    gh->Release();
+                    auto *lh = new FocusHandler(e, false);
+                    ctrl->add_LostFocus(lh, &e->lost_focus_token);
+                    lh->Release();
+
                     init_done.clear();
                 });
             HRESULT r2 = env->CreateCoreWebView2Controller(
@@ -458,6 +513,22 @@ static void destroy_engine(Engine *e) {
     if (!e) return;
     if (e->thread_id) {
         PostThreadMessage(e->thread_id, WM_EMBED_QUIT, 0, 0);
+    }
+    // Release the focus callback global ref BEFORE the WebView2 worker
+    // thread tears down -- the GotFocus / LostFocus handlers can fire
+    // during teardown (LostFocus in particular fires when the controller
+    // is closed) and we don't want them invoking a callback into a freed
+    // Java global ref.
+    if (e->focus_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->focus_callback);
+        e->focus_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
     }
     {
         std::lock_guard<std::mutex> lk(e->bindings_mutex);
@@ -711,6 +782,9 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
 JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1open_1devtools
   (JNIEnv *, jclass, jlong) { return 0; }
 
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1execute_1editing_1command
+  (JNIEnv *, jclass, jlong, jint) {}
+
 JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1open_1devtools
   (JNIEnv *, jclass, jlong wv) {
     auto *e = (Engine *)wv;
@@ -745,6 +819,123 @@ JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1ope
         Sleep(1);
     }
     return (jint)result.load();
+}
+
+JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1is_1native_1first_1responder
+  (JNIEnv *, jclass, jlong) {
+    // Windows has no notion of "first responder"; the focus-cooperation
+    // dispatcher heuristic is macOS-only.  Returning 0 means the Java
+    // dispatcher falls back to its standard AWT-focus-owner gating.
+    return 0;
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1focus_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    // Store the Java callback (JNI global ref) on the Engine.  The
+    // ICoreWebView2 GotFocus / LostFocus handlers (registered during
+    // engine creation) read this field and invoke the callback so the
+    // Java side can mirror WebView2's focus state into Swing -- e.g.,
+    // suppress and restore the previously-focused JTextComponent's
+    // caret while WebView2 holds Win32 keyboard focus.
+    auto *e = (Engine *)wv;
+    if (!e) return;
+    if (e->focus_callback) {
+        env->DeleteGlobalRef(e->focus_callback);
+        e->focus_callback = nullptr;
+    }
+    if (cb) {
+        e->focus_callback = env->NewGlobalRef(cb);
+    }
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1release_1native_1focus
+  (JNIEnv *, jclass, jlong wv) {
+    // When AWT moves its Java-side focus owner to a Swing component, Win32
+    // keyboard focus does NOT automatically follow -- if the user had
+    // clicked into the WebView2 child HWND first, that HWND keeps focus
+    // and steals subsequent keystrokes from AWT.  Force focus back to
+    // the AWT-owned parent HWND so the new Swing focus owner actually
+    // receives keystrokes.
+    //
+    // Win32 focus is per-thread.  The WebView2 worker thread holds focus
+    // on its own HWND; the AWT-owned parent HWND lives on the EDT.  We
+    // need to share input state between the two before SetFocus can
+    // transfer focus across them.
+    //
+    // Done synchronously on the calling thread (the EDT, since this
+    // JNI is invoked from the global focus-owner PropertyChangeListener
+    // on the EDT) -- not via dispatch_to_thread, because the WebView2
+    // worker may be busy with rendering or JS and we want SetFocus to
+    // happen BEFORE the user's next keystroke.  AttachThreadInput merges
+    // the two threads' input queues, so SetFocus from the EDT will
+    // transfer focus from the WebView2 HWND in the worker thread's
+    // queue to the parent HWND in the EDT's queue.
+    auto *e = (Engine *)wv;
+    if (!e || !e->parent) return;
+    // The JAWT-provided HWND on Windows is the heavyweight Canvas peer,
+    // NOT the JFrame's HWND.  The URL JTextField is a lightweight Swing
+    // component drawn inside the JFrame's HWND area; for Win32 keystrokes
+    // to reach AWT and be routed to the JTextField, we need focus on the
+    // top-level window, not on the Canvas (which is a sibling of the
+    // toolbar containing the JTextField).
+    HWND target = GetAncestor(e->parent, GA_ROOT);
+    if (!target) target = e->parent;
+    DWORD edt_tid = GetCurrentThreadId();
+    DWORD wv2_tid = e->thread_id;
+    bool debug = getenv("WEBVIEW_DEBUG_SHORTCUT") != nullptr;
+    if (wv2_tid != 0 && wv2_tid != edt_tid) {
+        if (!AttachThreadInput(edt_tid, wv2_tid, TRUE)) {
+            if (debug) {
+                WV_LOG("[webview-focus] AttachThreadInput(edt=%lu,wv2=%lu) "
+                       "failed: %lu",
+                       (unsigned long)edt_tid, (unsigned long)wv2_tid,
+                       (unsigned long)GetLastError());
+            }
+            return;
+        }
+        HWND prev = GetFocus();
+        HWND now = SetFocus(target);
+        AttachThreadInput(edt_tid, wv2_tid, FALSE);
+        if (debug) {
+            WV_LOG("[webview-focus] SetFocus(target=%p canvas=%p) prev=%p "
+                   "after=%p now=%p edt=%lu wv2=%lu",
+                   (void *)target, (void *)e->parent,
+                   (void *)prev, (void *)now, (void *)GetFocus(),
+                   (unsigned long)edt_tid, (unsigned long)wv2_tid);
+        }
+    } else {
+        HWND prev = GetFocus();
+        HWND now = SetFocus(target);
+        if (debug) {
+            WV_LOG("[webview-focus] same-thread SetFocus(target=%p) "
+                   "prev=%p after=%p now=%p",
+                   (void *)target, (void *)prev, (void *)now,
+                   (void *)GetFocus());
+        }
+    }
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1execute_1editing_1command
+  (JNIEnv *, jclass, jlong wv, jint cmdId) {
+    auto *e = (Engine *)wv;
+    if (!e) return;
+    // WebView2 exposes no first-class editing-command IPC; route via
+    // document.execCommand on the WebView2 worker thread.  This reliably
+    // triggers the focused element's clipboard handlers and matches the
+    // semantics we get from the Cocoa / GTK sides.  Fire-and-forget --
+    // no callback, no result wait.
+    const wchar_t *js = nullptr;
+    switch (cmdId) {
+        case 1: js = L"document.execCommand('cut')";       break;
+        case 2: js = L"document.execCommand('copy')";      break;
+        case 3: js = L"document.execCommand('paste')";     break;
+        case 4: js = L"document.execCommand('selectAll')"; break;
+        default: return;
+    }
+    std::wstring wjs = js;
+    embed_win::dispatch_to_thread(e, [e, wjs] {
+        if (e->webview) e->webview->ExecuteScript(wjs.c_str(), nullptr);
+    });
 }
 
 } // extern "C"
