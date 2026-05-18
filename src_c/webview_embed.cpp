@@ -422,6 +422,402 @@ static void fire_click_callback(Engine *e) {
     if (detach) jvm->DetachCurrentThread();
 }
 
+// ---------------------------------------------------------------------------
+// JS-initiated UI dialog bridge for WebKitGTK.
+//
+// Connects to the `script-dialog` and `run-file-chooser` signals on each
+// WebKitWebView (both heavyweight gtk_create_engine and lightweight
+// gtk_off_create_engine).  Returning TRUE from each handler suppresses the
+// default GTK dialog; the application drives the response by invoking
+// WebViewDialogCallback methods on the per-engine dialog_callback global ref
+// and feeding the answer back via webkit_script_dialog_*_set_* /
+// webkit_file_chooser_request_select_files / _cancel.
+//
+// All four `fire_dialog_*` helpers mirror fire_click_callback's shape:
+// defensive AttachCurrentThread + detach-only-if-we-attached, resolve method
+// id per call (no caching), ExceptionCheck/Clear after every Call*Method.
+// Strings returned from fire_dialog_prompt are g_strdup'd (caller g_free's);
+// arrays returned from fire_dialog_file_picker are g_new0+g_strdup'd (caller
+// g_strfreev's).  WebKitGTK copies both internally per its docs.
+// ---------------------------------------------------------------------------
+
+static void fire_dialog_alert(JavaVM *jvm, jobject callback,
+                              const char *message,
+                              const char *pageUrl,
+                              const char *frameUrl) {
+    if (!jvm || !callback) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK
+                || !env) {
+            return;
+        }
+        detach = true;
+    }
+    if (!env) {
+        if (detach) jvm->DetachCurrentThread();
+        return;
+    }
+    jstring jmsg = env->NewStringUTF(message ? message : "");
+    jstring jpage = env->NewStringUTF(pageUrl ? pageUrl : "");
+    jstring jframe = env->NewStringUTF(frameUrl ? frameUrl : "");
+    jclass cls = env->GetObjectClass(callback);
+    if (cls) {
+        jmethodID m = env->GetMethodID(
+            cls, "onAlert",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+        if (m) {
+            env->CallVoidMethod(callback, m, jmsg, jpage, jframe);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (jmsg) env->DeleteLocalRef(jmsg);
+    if (jpage) env->DeleteLocalRef(jpage);
+    if (jframe) env->DeleteLocalRef(jframe);
+    if (detach) jvm->DetachCurrentThread();
+}
+
+static jboolean fire_dialog_confirm(JavaVM *jvm, jobject callback,
+                                    const char *message,
+                                    const char *pageUrl,
+                                    const char *frameUrl) {
+    if (!jvm || !callback) return JNI_FALSE;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK
+                || !env) {
+            return JNI_FALSE;
+        }
+        detach = true;
+    }
+    if (!env) {
+        if (detach) jvm->DetachCurrentThread();
+        return JNI_FALSE;
+    }
+    jboolean result = JNI_FALSE;
+    jstring jmsg = env->NewStringUTF(message ? message : "");
+    jstring jpage = env->NewStringUTF(pageUrl ? pageUrl : "");
+    jstring jframe = env->NewStringUTF(frameUrl ? frameUrl : "");
+    jclass cls = env->GetObjectClass(callback);
+    if (cls) {
+        jmethodID m = env->GetMethodID(
+            cls, "onConfirm",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z");
+        if (m) {
+            result = env->CallBooleanMethod(callback, m, jmsg, jpage, jframe);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+                result = JNI_FALSE;
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (jmsg) env->DeleteLocalRef(jmsg);
+    if (jpage) env->DeleteLocalRef(jpage);
+    if (jframe) env->DeleteLocalRef(jframe);
+    if (detach) jvm->DetachCurrentThread();
+    return result;
+}
+
+static char *fire_dialog_prompt(JavaVM *jvm, jobject callback,
+                                const char *message,
+                                const char *defaultValue,
+                                const char *pageUrl,
+                                const char *frameUrl) {
+    if (!jvm || !callback) return nullptr;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK
+                || !env) {
+            return nullptr;
+        }
+        detach = true;
+    }
+    if (!env) {
+        if (detach) jvm->DetachCurrentThread();
+        return nullptr;
+    }
+    char *result = nullptr;
+    jstring jmsg = env->NewStringUTF(message ? message : "");
+    jstring jdefault = env->NewStringUTF(defaultValue ? defaultValue : "");
+    jstring jpage = env->NewStringUTF(pageUrl ? pageUrl : "");
+    jstring jframe = env->NewStringUTF(frameUrl ? frameUrl : "");
+    jclass cls = env->GetObjectClass(callback);
+    if (cls) {
+        jmethodID m = env->GetMethodID(
+            cls, "onPrompt",
+            "(Ljava/lang/String;Ljava/lang/String;"
+            "Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
+        if (m) {
+            jstring jresult = (jstring)env->CallObjectMethod(
+                callback, m, jmsg, jdefault, jpage, jframe);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+                jresult = nullptr;
+            }
+            if (jresult) {
+                const char *cstr = env->GetStringUTFChars(jresult, nullptr);
+                if (cstr) {
+                    result = g_strdup(cstr);
+                    env->ReleaseStringUTFChars(jresult, cstr);
+                }
+                env->DeleteLocalRef(jresult);
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (jmsg) env->DeleteLocalRef(jmsg);
+    if (jdefault) env->DeleteLocalRef(jdefault);
+    if (jpage) env->DeleteLocalRef(jpage);
+    if (jframe) env->DeleteLocalRef(jframe);
+    if (detach) jvm->DetachCurrentThread();
+    return result;  // caller owns; free with g_free
+}
+
+// Build a jobjectArray of UTF-8 jstrings from a NULL-terminated
+// const gchar*const* (may be NULL).  Returns a freshly-allocated
+// local ref; the caller is responsible for DeleteLocalRef on the
+// outer array.  Element local refs are released inside this helper.
+static jobjectArray nullterm_array_to_jstring_array(
+        JNIEnv *env, jclass stringCls, const gchar *const *arr) {
+    jsize n = 0;
+    if (arr) {
+        while (arr[n] != nullptr) n++;
+    }
+    jobjectArray ja = env->NewObjectArray(n, stringCls, nullptr);
+    if (!ja) return nullptr;
+    for (jsize i = 0; i < n; i++) {
+        jstring js = env->NewStringUTF(arr[i]);
+        if (js) {
+            env->SetObjectArrayElement(ja, i, js);
+            env->DeleteLocalRef(js);
+        }
+    }
+    return ja;
+}
+
+static gchar **fire_dialog_file_picker(JavaVM *jvm, jobject callback,
+                                       gboolean multiple,
+                                       const gchar *const *mimeTypes,
+                                       const gchar *const *extensions,
+                                       const char *pageUrl,
+                                       const char *frameUrl) {
+    if (!jvm || !callback) return nullptr;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK
+                || !env) {
+            return nullptr;
+        }
+        detach = true;
+    }
+    if (!env) {
+        if (detach) jvm->DetachCurrentThread();
+        return nullptr;
+    }
+    gchar **result = nullptr;
+    jclass stringCls = env->FindClass("java/lang/String");
+    if (!stringCls) {
+        if (detach) jvm->DetachCurrentThread();
+        return nullptr;
+    }
+    jobjectArray jmimes = nullterm_array_to_jstring_array(
+        env, stringCls, mimeTypes);
+    jobjectArray jexts = nullterm_array_to_jstring_array(
+        env, stringCls, extensions);
+    jstring jpage = env->NewStringUTF(pageUrl ? pageUrl : "");
+    jstring jframe = env->NewStringUTF(frameUrl ? frameUrl : "");
+    jclass cls = env->GetObjectClass(callback);
+    if (cls) {
+        jmethodID m = env->GetMethodID(
+            cls, "onFilePicker",
+            "(Z[Ljava/lang/String;[Ljava/lang/String;"
+            "Ljava/lang/String;Ljava/lang/String;)[Ljava/lang/String;");
+        if (m) {
+            jobjectArray jresult = (jobjectArray)env->CallObjectMethod(
+                callback, m,
+                (jboolean)(multiple ? JNI_TRUE : JNI_FALSE),
+                jmimes, jexts, jpage, jframe);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+                jresult = nullptr;
+            }
+            if (jresult) {
+                jsize len = env->GetArrayLength(jresult);
+                if (len > 0) {
+                    result = g_new0(gchar *, (gsize)len + 1);
+                    gsize idx = 0;
+                    for (jsize i = 0; i < len; i++) {
+                        jstring js = (jstring)env->GetObjectArrayElement(
+                            jresult, i);
+                        if (!js) continue;
+                        const char *cstr = env->GetStringUTFChars(js, nullptr);
+                        if (cstr) {
+                            result[idx++] = g_strdup(cstr);
+                            env->ReleaseStringUTFChars(js, cstr);
+                        }
+                        env->DeleteLocalRef(js);
+                    }
+                    if (idx == 0) {
+                        // Defensive: every entry was null / unreadable.
+                        g_strfreev(result);
+                        result = nullptr;
+                    }
+                }
+                env->DeleteLocalRef(jresult);
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (jmimes) env->DeleteLocalRef(jmimes);
+    if (jexts) env->DeleteLocalRef(jexts);
+    if (jpage) env->DeleteLocalRef(jpage);
+    if (jframe) env->DeleteLocalRef(jframe);
+    env->DeleteLocalRef(stringCls);
+    if (detach) jvm->DetachCurrentThread();
+    return result;  // caller owns; free with g_strfreev
+}
+
+// Shared inner dispatcher for the `script-dialog` signal.  Engine-agnostic;
+// the per-engine wrappers (on_script_dialog_engine /
+// on_script_dialog_off_engine) pull jvm + dialog_callback + page URL out
+// of their respective Engine / OffEngine struct and call into this
+// function.  Always returns TRUE — the GTK default dialog is permanently
+// suppressed for any WebViewComponent-managed engine.  Even on the
+// null-callback / JNI-attach-failure path, every branch resolves the
+// dialog (via the engine-specific set_* APIs or by not calling them) so
+// the page's JS thread always resumes within bounded time.
+static gboolean handle_script_dialog(JavaVM *jvm, jobject dialog_callback,
+                                     const gchar *page_url,
+                                     WebKitScriptDialog *dialog) {
+    if (!dialog) return TRUE;
+    WebKitScriptDialogType type = webkit_script_dialog_get_dialog_type(dialog);
+    const gchar *message = webkit_script_dialog_get_message(dialog);
+    const char *frame_url = page_url ? page_url : "";
+    switch (type) {
+        case WEBKIT_SCRIPT_DIALOG_ALERT:
+            if (dialog_callback) {
+                fire_dialog_alert(jvm, dialog_callback,
+                                  message, page_url, frame_url);
+            }
+            // No set_* call needed for alert.
+            break;
+        case WEBKIT_SCRIPT_DIALOG_CONFIRM:
+        case WEBKIT_SCRIPT_DIALOG_BEFORE_UNLOAD_CONFIRM: {
+            jboolean ok = JNI_FALSE;
+            if (dialog_callback) {
+                ok = fire_dialog_confirm(jvm, dialog_callback,
+                                         message, page_url, frame_url);
+            }
+            webkit_script_dialog_confirm_set_confirmed(
+                dialog, ok == JNI_TRUE);
+            break;
+        }
+        case WEBKIT_SCRIPT_DIALOG_PROMPT: {
+            const gchar *def =
+                webkit_script_dialog_prompt_get_default_text(dialog);
+            char *answer = nullptr;
+            if (dialog_callback) {
+                answer = fire_dialog_prompt(jvm, dialog_callback,
+                                            message, def ? def : "",
+                                            page_url, frame_url);
+            }
+            if (answer) {
+                webkit_script_dialog_prompt_set_text(dialog, answer);
+                g_free(answer);
+            }
+            // If answer is null: do NOT call _set_text.  WebKitGTK treats
+            // the absence of a _set_text call as "user cancelled" and the
+            // page sees prompt() return null — exactly the JS-spec cancel
+            // semantic.
+            break;
+        }
+        default:
+            // Unknown dialog kind: suppress the GTK default but don't
+            // forward to Java.  Conservative — future WebKitGTK versions
+            // may add new dialog types we haven't taught the handler
+            // about yet.
+            break;
+    }
+    return TRUE;
+}
+
+// Shared inner dispatcher for the `run-file-chooser` signal.  Same
+// engine-agnostic shape as handle_script_dialog.  Always returns TRUE so
+// the GTK default file picker never fires; always resolves the request
+// via either _select_files (accept) or _cancel (cancel / null callback /
+// empty result) so the page's JS `change` event fires within bounded
+// time.
+static gboolean handle_run_file_chooser(JavaVM *jvm, jobject dialog_callback,
+                                        const gchar *page_url,
+                                        WebKitFileChooserRequest *request) {
+    if (!request) return TRUE;
+    if (!dialog_callback) {
+        webkit_file_chooser_request_cancel(request);
+        return TRUE;
+    }
+    gboolean multiple =
+        webkit_file_chooser_request_get_select_multiple(request);
+    const gchar *const *mime_types =
+        webkit_file_chooser_request_get_mime_types(request);
+    const char *frame_url = page_url ? page_url : "";
+
+    // WebKitGTK's file-chooser API does not expose the original `.ext`
+    // strings the page wrote (only the opaque GtkFileFilter via
+    // _get_mime_types_filter), so we pass an empty extensions array.
+    // The Java-side DialogDispatcher.normaliseExtensions handles the
+    // empty case correctly; the default JFileChooser falls through to
+    // "show all files".  Documented Linux limitation per the canvas.
+    gchar **paths = fire_dialog_file_picker(
+        jvm, dialog_callback, multiple, mime_types,
+        /* extensions */ nullptr, page_url, frame_url);
+
+    if (!paths) {
+        webkit_file_chooser_request_cancel(request);
+    } else {
+        webkit_file_chooser_request_select_files(
+            request, (const gchar *const *)paths);
+        // WebKitGTK copies the paths internally per its docs, so free
+        // our array immediately.
+        g_strfreev(paths);
+    }
+    return TRUE;
+}
+
+// Per-Engine wrapper for the `script-dialog` signal.  Reads page URL,
+// jvm, and dialog_callback from the heavyweight Engine struct and
+// delegates to handle_script_dialog.  The OffEngine counterpart is
+// defined alongside the OffEngine struct further down so its forward
+// dependency is satisfied.
+static gboolean on_script_dialog_engine(WebKitWebView *web,
+                                        WebKitScriptDialog *dialog,
+                                        gpointer user_data) {
+    Engine *e = static_cast<Engine *>(user_data);
+    if (!e) return TRUE;
+    const gchar *uri = webkit_web_view_get_uri(web);
+    return handle_script_dialog(e->jvm, e->dialog_callback, uri, dialog);
+}
+
+static gboolean on_run_file_chooser_engine(WebKitWebView *web,
+                                           WebKitFileChooserRequest *request,
+                                           gpointer user_data) {
+    Engine *e = static_cast<Engine *>(user_data);
+    if (!e) return TRUE;
+    const gchar *uri = webkit_web_view_get_uri(web);
+    return handle_run_file_chooser(e->jvm, e->dialog_callback, uri, request);
+}
+
 static void engine_on_message(Engine *e, const char *msg) {
     if (msg == nullptr) return;
     // The message is JSON: {name, seq, args}.  We mirror the bind format used
@@ -592,6 +988,21 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
                          (GCallback)on_load_changed, nullptr);
         g_signal_connect(WEBKIT_WEB_VIEW(e->web), "load-failed",
                          (GCallback)on_load_failed, nullptr);
+
+        // Wire JS-initiated dialogs (alert / confirm / prompt /
+        // <input type=file>) to the per-engine Java DialogDispatcher via
+        // the dialog_callback global ref.  Returning TRUE from each
+        // handler suppresses the default GTK dialog; the Java side
+        // decides what UI (if any) to show, with default behaviour being
+        // Swing dialogs anchored on the host JFrame.  See
+        // WebViewDialogHandler for the full contract.  Identical
+        // registration site in gtk_off_create_engine — both engines
+        // share the inner handle_script_dialog / handle_run_file_chooser
+        // logic via the per-engine wrappers.
+        g_signal_connect(WEBKIT_WEB_VIEW(e->web), "script-dialog",
+                         (GCallback)on_script_dialog_engine, e);
+        g_signal_connect(WEBKIT_WEB_VIEW(e->web), "run-file-chooser",
+                         (GCallback)on_run_file_chooser_engine, e);
 
         // Wire up the "external" message handler.
         g_signal_connect(
@@ -1017,11 +1428,37 @@ struct OffEngine {
     JavaVM *jvm = nullptr;
 
     // JNI global ref to the registered WebViewDialogCallback, or nullptr.
-    // Storage only in this canvas (STORY-004-001) -- STORY-004-002 wires
-    // the WebKitGTK script-dialog + run-file-chooser signal handlers
-    // that actually invoke this callback on the offscreen WebKitWebView.
+    // Set by gtk_off_set_dialog_callback; cleared in gtk_off_destroy_engine.
+    // Invoked by the script-dialog / run-file-chooser signal handlers
+    // installed in gtk_off_create_engine, which route through the shared
+    // handle_script_dialog / handle_run_file_chooser inner functions
+    // declared in the heavyweight engine block above.
     jobject dialog_callback = nullptr;
 };
+
+// Per-OffEngine wrapper for the `script-dialog` signal.  Reads page URL,
+// jvm, and dialog_callback from the lightweight OffEngine struct and
+// delegates to the shared handle_script_dialog.  Mirrors
+// on_script_dialog_engine — single divergence is the user_data cast type.
+// Per the canvas Safeguards: behaviour MUST be byte-identical to the
+// heavyweight variant, which is achieved by sharing handle_script_dialog.
+static gboolean on_script_dialog_off_engine(WebKitWebView *web,
+                                            WebKitScriptDialog *dialog,
+                                            gpointer user_data) {
+    OffEngine *e = static_cast<OffEngine *>(user_data);
+    if (!e) return TRUE;
+    const gchar *uri = webkit_web_view_get_uri(web);
+    return handle_script_dialog(e->jvm, e->dialog_callback, uri, dialog);
+}
+
+static gboolean on_run_file_chooser_off_engine(
+        WebKitWebView *web, WebKitFileChooserRequest *request,
+        gpointer user_data) {
+    OffEngine *e = static_cast<OffEngine *>(user_data);
+    if (!e) return TRUE;
+    const gchar *uri = webkit_web_view_get_uri(web);
+    return handle_run_file_chooser(e->jvm, e->dialog_callback, uri, request);
+}
 
 // Parallel of engine_on_message for OffEngine: parse the {name, seq, args}
 // envelope produced by window.external.invoke / the bind shim, look the
@@ -1102,6 +1539,17 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
             e);
         webkit_user_content_manager_register_script_message_handler(
             e->manager, "external");
+
+        // Wire JS-initiated dialogs to the per-engine Java DialogDispatcher.
+        // Same shape as gtk_create_engine; the offscreen variants of the
+        // signal handlers route through OffEngine instead of Engine but
+        // call the same inner handle_script_dialog /
+        // handle_run_file_chooser logic.
+        g_signal_connect(WEBKIT_WEB_VIEW(e->web), "script-dialog",
+                         (GCallback)on_script_dialog_off_engine, e);
+        g_signal_connect(WEBKIT_WEB_VIEW(e->web), "run-file-chooser",
+                         (GCallback)on_run_file_chooser_off_engine, e);
+
         webkit_user_content_manager_add_script(
             e->manager,
             webkit_user_script_new(
@@ -3809,6 +4257,17 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
 #endif
 }
 
+// The two dialog-callback JNI bridges below are wrapped in `extern "C"`
+// so the symbols emitted match the JVM's JNI lookup expectations
+// (`Java_<classpath>_<method>` with C linkage).  The existing focus /
+// click / release-native-focus / set-attach-callback bridges above get
+// this treatment from `ca_weblite_webview_WebViewNative.h`'s
+// `extern "C" { ... }` wrapper, but the dialog setters were added
+// without regenerating that header so they need the explicit linkage
+// spec.  Regenerating the header is a cosmetic follow-up; the explicit
+// `extern "C"` here keeps the symbols callable from the JVM today.
+extern "C" {
+
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1dialog_1callback
   (JNIEnv *env, jclass, jlong wv, jobject cb) {
     if (wv == 0) return;
@@ -3833,6 +4292,8 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
     (void)env; (void)cb;
 #endif
 }
+
+} // extern "C"
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1init
   (JNIEnv *env, jclass, jlong wv, jstring js) {

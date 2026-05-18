@@ -296,14 +296,23 @@ wv.setDialogHandler(new WebViewDialogHandler() {
   calls park on the EDT); use `.thenAccept(...)` instead, or
   pre-compute the value before the dialog opens.
 * **Platform coverage (current).**  macOS heavyweight (WKWebView)
-  routes all four dialog kinds through the handler in this release
-  (STORY-004-001).  On Linux and Windows, `setDialogHandler` stores
-  the handler reference but the embedded engine continues to use its
-  built-in dialogs until STORY-004-002 (WebKitGTK signal handlers)
-  and STORY-004-003 (WebView2 `ScriptDialogOpening` event) land.
-  On Windows, `<input type="file">` will continue to use the
-  OS-native dialog even after STORY-004-003 — WebView2 exposes no
-  public hook for it, so `filePickerOpened` never fires on Windows.
+  routes all four dialog kinds through the handler (STORY-004-001).
+  Linux WebKitGTK routes all four kinds through the handler in both
+  heavyweight and lightweight modes via the `script-dialog` and
+  `run-file-chooser` signals (STORY-004-002).  On Windows,
+  `setDialogHandler` stores the handler reference but the embedded
+  engine continues to use its built-in dialogs until STORY-004-003
+  (WebView2 `ScriptDialogOpening` event) lands.  On Windows,
+  `<input type="file">` will continue to use the OS-native dialog
+  even after STORY-004-003 — WebView2 exposes no public hook for it,
+  so `filePickerOpened` never fires on Windows.
+* **Linux file-picker `accept`-extension limitation.**  On Linux, the
+  `WebViewFilePickerEvent.acceptedExtensions` list is always empty
+  even when the page wrote `<input accept=".png,.jpg">` — WebKitGTK
+  exposes the extension filter as an opaque `GtkFileFilter` rather
+  than the original extension strings.  The page's MIME-type hints
+  (`accept="image/png"` etc.) are surfaced via `acceptedMimeTypes`;
+  the page's own client-side `accept` validation continues to work.
 
 See [`demos/WebViewDialogDemo/`](demos/WebViewDialogDemo/README.md)
 for a runnable example that exercises all four dialog kinds in each
