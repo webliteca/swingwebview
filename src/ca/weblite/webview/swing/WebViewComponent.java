@@ -359,11 +359,14 @@ public abstract class WebViewComponent extends JComponent {
     }
 
     /**
-     * @return the effective {@code defaultEnabled} setting (the value most
-     * recently passed to {@link #setDefaultContextMenuEnabled(boolean)},
-     * or {@code true} when never set).  Note: this is the explicit override
-     * value, not the effective <em>suppress</em> state &mdash; that depends
-     * on whether any listener is also registered.
+     * @return the effective default-context-menu-enabled state &mdash;
+     * "if a right-click happened right now, would the platform default
+     * menu appear?".  When the caller has used
+     * {@link #setDefaultContextMenuEnabled(boolean)}, that value is
+     * returned verbatim.  Otherwise the auto-suppress policy applies:
+     * returns {@code true} when no listener is registered (default menu
+     * would show) and {@code false} when at least one listener is
+     * registered (default menu would be suppressed).
      */
     public final boolean isDefaultContextMenuEnabled() {
         return mouseDispatcher.isDefaultEnabled();

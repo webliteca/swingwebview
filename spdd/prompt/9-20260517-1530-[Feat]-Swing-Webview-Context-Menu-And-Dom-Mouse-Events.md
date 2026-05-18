@@ -210,9 +210,15 @@ generated_at: 2026-05-17T15:30:00-07:00
     iteration captures a stable snapshot, so add/remove during
     fan-out only takes effect for the NEXT event (matches
     `ConsoleDispatcher.java:225-229`).
-  - `defaultEnabled: volatile boolean` — explicit override
-    state. Default `true`. Mutated only by
-    `setDefaultContextMenuEnabled(boolean)`.
+  - `defaultOverride: volatile Boolean` — explicit override state.
+    `null` means "no override has been set; follow the auto-suppress
+    policy" (the initial state).  Non-null means the caller has used
+    `setDefaultContextMenuEnabled(boolean)` and the dispatcher honors
+    that value verbatim regardless of listener count.  The field is
+    `Boolean` (not `boolean`) precisely so the dispatcher can tell
+    "auto" apart from "explicit `true`" — a plain boolean cannot
+    represent both an initial-default state AND an explicit `true`
+    override at the same time.
   - `source: final WebViewComponent` — non-null; supplied at
     construction. Used to populate `WebViewMouseEvent.source()`.
   - `flagSink: volatile FlagSink` — the path through which the
@@ -235,9 +241,14 @@ generated_at: 2026-05-17T15:30:00-07:00
       remove from `listeners`; if `flagSink != null`,
       re-evaluate the suppress flag.
     - `hasListeners(): boolean` — returns `!listeners.isEmpty()`.
-    - `isDefaultEnabled(): boolean` — returns `defaultEnabled`.
-    - `setDefaultEnabled(boolean): void` — mutate `defaultEnabled`;
-      re-evaluate the suppress flag.
+    - `isDefaultEnabled(): boolean` — returns the **effective**
+      default-menu-enabled state:
+      `(defaultOverride != null) ? defaultOverride : !hasListeners()`.
+      Callers asking "if a right-click happens now, will the
+      platform default menu appear?" get the answer.
+    - `setDefaultEnabled(boolean): void` — set
+      `defaultOverride = Boolean.valueOf(enabled)`; re-evaluate
+      the suppress flag.
     - `attachFlagSink(FlagSink): void` — set the sink; replay
       `pendingPreloads` into the sink (one `addOnBeforeLoad` per
       entry); then re-evaluate the suppress flag once. Called
@@ -266,8 +277,11 @@ generated_at: 2026-05-17T15:30:00-07:00
     - Implemented inline by `WebViewHeavyweightComponent` and
       `WebViewLightweightComponent` against their respective
       peers (`EmbeddedWebView` / `OffscreenWebView`).
-  - Suppress-flag computation:
-    `effectiveSuppress = (!defaultEnabled) && hasListeners()`.
+  - Suppress-flag computation (3-state, see Approach):
+    ```
+    enabled  = (defaultOverride != null) ? defaultOverride : !hasListeners();
+    suppress = !enabled;
+    ```
     Every time the dispatcher re-evaluates the flag, it MUST
     issue BOTH a synchronous `eval` (current document) AND a
     fresh `addOnBeforeLoad` (next navigation). The
@@ -416,26 +430,51 @@ generated_at: 2026-05-17T15:30:00-07:00
   registered. The shim's `contextmenu` handler always builds the
   payload and posts via the binding; whether or not it calls
   `preventDefault()` is gated by `window.__webview_dom_event_suppress`,
-  which the dispatcher initially leaves `false`. With zero
-  listeners and `defaultEnabled=true` the suppress flag stays
-  `false`, the shim does no preventDefault, and the platform
-  default menu fires as before — AC11 holds. Going through the
-  shim every right-click costs roughly one small JS function
-  invocation; the alternative (lazy install on first listener
-  add) would require coordinating shim-install with binding-bind
-  and re-evaluating the flag on every state change. Eager install
-  is simpler and matches the console-bridge pattern.
+  which the dispatcher initially leaves `false`.  With zero
+  listeners AND no override (`defaultOverride == null`), the
+  auto rule gives `enabled = !hasListeners() = true`, so
+  `suppress = false`, the shim does no preventDefault, and the
+  platform default menu fires as before — AC11 holds.  Going
+  through the shim every right-click costs roughly one small JS
+  function invocation; the alternative (lazy install on first
+  listener add) would require coordinating shim-install with
+  binding-bind and re-evaluating the flag on every state
+  change.  Eager install is simpler and matches the
+  console-bridge pattern.
 
-- **Effective suppression =
-  `!defaultEnabled && hasListeners()`.** The dispatcher computes
-  this on every listener add/remove and on every
-  `setDefaultContextMenuEnabled` call, then mirrors the result
-  into `window.__webview_dom_event_suppress` via BOTH `eval`
-  (apply to the current document) AND `addOnBeforeLoad` (apply
-  on every subsequent navigation). The eval-only alternative
-  would reset the flag every navigation; the
-  addOnBeforeLoad-only alternative would not take effect on the
-  current document. Both are required.
+- **Effective suppression follows an auto-vs-override rule.**
+  When the caller has NOT used `setDefaultContextMenuEnabled`
+  (i.e. the dispatcher's `defaultOverride` field is `null`), the
+  platform menu is suppressed iff at least one listener is
+  registered — the story's "auto-suppress when listener
+  registered" policy.  When the caller HAS used
+  `setDefaultContextMenuEnabled(b)`, the override wins verbatim:
+  `b == true` means platform menu shows (listener still fires),
+  `b == false` means platform menu is suppressed regardless of
+  listener count.  Concretely:
+  ```
+  enabled  = (override != null) ? override : !hasListeners();
+  suppress = !enabled;
+  ```
+  A plain `boolean defaultEnabled` (default `true`) does NOT
+  work: with a single field there is no way to distinguish "no
+  override has been set; auto policy applies" from "caller
+  explicitly set override = true".  The first listener add must
+  produce `suppress = true` (auto policy), but if `defaultEnabled`
+  reads as `true` because that is the initial value, the formula
+  `!defaultEnabled && hasListeners()` short-circuits and the
+  platform menu is never suppressed.  This was a real bug found
+  during macOS manual testing; the 3-state
+  `Boolean defaultOverride` (null / true / false) is the fix.
+  The dispatcher computes the effective suppression on every
+  listener add/remove and on every `setDefaultContextMenuEnabled`
+  call, then mirrors the result into
+  `window.__webview_dom_event_suppress` via BOTH `eval` (apply
+  to the current document) AND `addOnBeforeLoad` (apply on every
+  subsequent navigation).  The eval-only alternative would reset
+  the flag every navigation; the addOnBeforeLoad-only alternative
+  would not take effect on the current document.  Both are
+  required.
 
 - **Cross-navigation persistence via append-only init scripts.**
   Each engine's `addOnBeforeLoad` is append-only — there is no
@@ -679,7 +718,11 @@ File: `src/ca/weblite/webview/WebViewMouseDispatcher.java`
    - `private final WebViewComponent source;` — non-null;
      supplied at construction.
    - `private final CopyOnWriteArrayList<WebViewMouseListener> listeners = new CopyOnWriteArrayList<>();`
-   - `private volatile boolean defaultEnabled = true;`
+   - `private volatile Boolean defaultOverride;` — null initially.
+     Non-null after the caller has used
+     `setDefaultContextMenuEnabled(boolean)`.  See Approach for
+     why this is `Boolean` (3-state) rather than a plain
+     `boolean`.
    - `private volatile FlagSink flagSink;` — null until
      `attachFlagSink` runs.
    - `private final List<String> pendingPreloads = new java.util.ArrayList<>();`
@@ -698,9 +741,16 @@ File: `src/ca/weblite/webview/WebViewMouseDispatcher.java`
      - Logic: null-tolerant (return on null); `listeners.remove(l)`;
        call `reevaluateSuppression()`.
    - `boolean hasListeners()`: returns `!listeners.isEmpty()`.
-   - `boolean isDefaultEnabled()`: returns `defaultEnabled`.
+   - `boolean isDefaultEnabled()`: returns the **effective**
+     default-menu-enabled state — when `defaultOverride != null`,
+     returns `defaultOverride.booleanValue()`; otherwise returns
+     `!hasListeners()`.  That is, "what would happen on the next
+     right-click given current state": no listener and no
+     override → default menu shows → returns `true`; listener
+     registered and no override → default menu is suppressed →
+     returns `false`; explicit override always wins.
    - `void setDefaultEnabled(boolean enabled)`:
-     - Logic: `defaultEnabled = enabled`; call
+     - Logic: `defaultOverride = Boolean.valueOf(enabled);` call
        `reevaluateSuppression()`.
    - `void attachFlagSink(FlagSink sink)`:
      - Logic: null-check; assign to `flagSink`; under
@@ -709,9 +759,12 @@ File: `src/ca/weblite/webview/WebViewMouseDispatcher.java`
        `pendingPreloads.clear()`; finally call
        `reevaluateSuppression()` once.
    - `private void reevaluateSuppression()`:
-     - Logic: compute `boolean suppress = !defaultEnabled && hasListeners()`;
-       build `String stmt = "window.__webview_dom_event_suppress=" + suppress + ";"`;
-       capture `FlagSink sink = flagSink`; if `sink == null`,
+     - Logic: snapshot `Boolean o = defaultOverride;` then
+       compute
+       `boolean enabled = (o != null) ? o.booleanValue() : !hasListeners();`
+       and `boolean suppress = !enabled;`.  Build
+       `String stmt = "window.__webview_dom_event_suppress=" + suppress + ";"`.
+       Capture `FlagSink sink = flagSink`; if `sink == null`,
        under `synchronized(this)` append `stmt` to
        `pendingPreloads` and return; otherwise call
        `sink.eval(stmt)` (apply to current document) and
@@ -1274,7 +1327,7 @@ File: `README.md`
   in `setDefaultContextMenuEnabled` Javadoc as an honest
   limitation.
 - **Concurrent `setDefaultContextMenuEnabled` from non-EDT
-  threads.** `defaultEnabled` is `volatile`; the underlying
+  threads.** `defaultOverride` is `volatile`; the underlying
   `eval` / `addOnBeforeLoad` calls go through the engine's
   thread-safe message bridge. No additional synchronization
   is required.

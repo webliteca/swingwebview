@@ -180,7 +180,13 @@ public final class WebViewMouseDispatcher {
     private final WebViewComponent source;
     private final CopyOnWriteArrayList<WebViewMouseListener> listeners =
             new CopyOnWriteArrayList<WebViewMouseListener>();
-    private volatile boolean defaultEnabled = true;
+    // 3-state: null = no explicit override; follow the auto-suppress
+    // policy (suppressed iff at least one listener is registered).
+    // Non-null = caller has used setDefaultContextMenuEnabled and that
+    // value wins regardless of listener count.  A plain boolean default
+    // cannot express both "no override has been set" and "explicit true"
+    // in a single field, which is why this is Boolean and not boolean.
+    private volatile Boolean defaultOverride;
     private volatile FlagSink flagSink;
     // Guarded by `this`.  Populated only while flagSink == null; drained
     // verbatim into the sink on attachFlagSink.
@@ -207,12 +213,21 @@ public final class WebViewMouseDispatcher {
         return !listeners.isEmpty();
     }
 
+    /**
+     * @return the effective default-menu-enabled state — "if a right-click
+     * happened right now, would the platform default menu appear?".  When
+     * the caller has used {@link #setDefaultEnabled(boolean)}, returns
+     * that value verbatim.  Otherwise returns {@code !hasListeners()},
+     * which is the auto-suppress policy: default menu shows iff no
+     * listener is registered.
+     */
     public boolean isDefaultEnabled() {
-        return defaultEnabled;
+        Boolean o = defaultOverride;
+        return (o != null) ? o.booleanValue() : !hasListeners();
     }
 
     public void setDefaultEnabled(boolean enabled) {
-        defaultEnabled = enabled;
+        defaultOverride = Boolean.valueOf(enabled);
         reevaluateSuppression();
     }
 
@@ -238,7 +253,12 @@ public final class WebViewMouseDispatcher {
     }
 
     private void reevaluateSuppression() {
-        boolean suppress = !defaultEnabled && !listeners.isEmpty();
+        // Auto-suppress policy: with no explicit override, the platform
+        // default menu is suppressed iff at least one listener is
+        // registered.  With an override set, that wins verbatim.
+        Boolean o = defaultOverride;
+        boolean enabled = (o != null) ? o.booleanValue() : listeners.isEmpty();
+        boolean suppress = !enabled;
         String stmt = "window.__webview_dom_event_suppress=" + suppress + ";";
         FlagSink sink = flagSink;
         if (sink == null) {
