@@ -866,6 +866,56 @@ Files:
   verbatim by the offscreen path.  Do NOT fork the shim for
   the lightweight engine — page authors expect identical
   semantics across both modes, and the shim is the contract.
+- **macOS and Windows lightweight stay stubs by design.**
+  Do NOT pursue `ScreenCaptureKit`, `CARenderer` /
+  `cacheDisplayInRect:` / `CALayer.renderInContext:`, or
+  `WKWebView.takeSnapshot:withConfiguration:` as a future
+  rendering path on these platforms.  A spike conducted on
+  2026-05-18 (`experiments/mac-sck-spike/`) evaluated the
+  three technically-available options and rejected all three:
+  - `CARenderer` and the related `cacheDisplayInRect:` /
+    `CALayer.renderInContext:` APIs return blank/white pixels
+    for a WKWebView.  WKWebView composites out-of-process:
+    the host-process layer is a `CALayerHost` that references
+    a `CAContext` owned by the WebContent process, and a
+    host-process renderer cannot see those remote layers.
+    This is the architectural reason multiple Apple Developer
+    Forums threads from 2017 onward report blank output —
+    `CARenderer` worked on the legacy in-process `WebView`
+    but stopped working when WKWebView replaced it in
+    macOS 10.13 High Sierra.
+  - `WKWebView.takeSnapshot:withConfiguration:` works
+    correctly but delivers roughly 5–15 FPS via async IPC to
+    the WebContent process.  This is well below the 30+ FPS
+    the lightweight repaint loop targets
+    (`REPAINT_INTERVAL_MS = 33`) and would make the component
+    visibly laggy.
+  - `ScreenCaptureKit` (macOS 12.3+) hosting a WKWebView in
+    an offscreen `NSWindow` positioned at `(-32000, -32000)`
+    and captured via
+    `SCContentFilter.initWithDesktopIndependentWindow:`
+    technically works: the spike confirms `SCStream` sees
+    the window, delivers real (non-blank) pixels, and
+    sustains ≥60 FPS.  However SCK requires the system-wide
+    **Screen Recording** privacy permission.  For a library
+    this is user-hostile — the OS prompts on first run, the
+    grant is per-binary (so a Maven-launched JVM, a bundled
+    JRE, and any other Java app on the same machine each
+    need separate approvals), and the dialog itself is
+    alarming for end users of an app that just wants to
+    embed a web view.  Treated as a show-stopper.
+  The mode-selection contract in
+  [[swing-webview-component-mode-selection]] already routes
+  macOS and Windows callers to heavyweight by default, so
+  the practical user-facing impact of leaving the
+  lightweight stub in place is zero.  Future maintainers
+  MUST NOT re-attempt this path without a fundamentally
+  different approach that does not require the Screen
+  Recording entitlement.  The spike binary
+  (`experiments/mac-sck-spike/sck_spike.mm`,
+  `experiments/mac-sck-spike/build.sh`) is preserved in the
+  repository as a referenceable artifact and as a starting
+  point if Apple ever exposes a permission-free path.
 - The lightweight editing-shortcut `KeyEventDispatcher` MUST
   return `true` for every event it forwards to
   `OffscreenWebView.executeEditingCommand`. Returning `false`

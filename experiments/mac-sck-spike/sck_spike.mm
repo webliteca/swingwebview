@@ -1,6 +1,17 @@
 // sck_spike.mm — exploratory spike for ScreenCaptureKit-backed
 // offscreen WKWebView capture on macOS.
 //
+// VERDICT (2026-05-18): REJECTED. The spike works — SCStream sees the
+// offscreen NSWindow and delivers real WKWebView pixels at >=60 FPS —
+// but the very first run triggers the macOS Screen Recording privacy
+// prompt. Per-binary, alarming-looking, granted in System Settings;
+// unacceptable UX for a library that just wants to embed a web view.
+// See "macOS and Windows lightweight stay stubs by design" in
+// spdd/prompt/7-...-Lightweight-Webview-Embedding.md for the full
+// rationale and the two other rejected alternatives (CARenderer and
+// WKWebView.takeSnapshot:). This file is preserved as a referenceable
+// artifact in case Apple ever exposes a permission-free path.
+//
 // Goal: validate three things before investing in a full SPDD-driven
 // implementation of the macOS lightweight WebView path
 // (spdd/prompt/7-...-Lightweight-Webview-Embedding.md, currently a stub
