@@ -10,6 +10,7 @@ import ca.weblite.webview.EditingCommand;
 import ca.weblite.webview.GdkInput;
 import ca.weblite.webview.OffscreenWebView;
 import ca.weblite.webview.WebView;
+import ca.weblite.webview.WebViewMouseDispatcher;
 
 import java.awt.Color;
 import java.awt.Component;
@@ -214,6 +215,31 @@ public class WebViewLightweightComponent extends WebViewComponent {
                     consoleDispatcher.dispatch(arg);
                 }
             });
+        // Install the DOM mouse-event bridge: parallel to console capture,
+        // separate reserved channel.  Skipped implicitly when engine is
+        // null (non-Linux short-circuit above).
+        engine.addOnBeforeLoad(WebViewMouseDispatcher.SHIM_JS);
+        engine.addJavascriptCallback(WebViewMouseDispatcher.CHANNEL_NAME,
+            new WebView.JavascriptCallback() {
+                @Override
+                public void run(String arg) {
+                    mouseDispatcher.dispatch(arg);
+                }
+            });
+        mouseDispatcher.attachFlagSink(new WebViewMouseDispatcher.FlagSink() {
+            @Override
+            public void eval(String js) {
+                OffscreenWebView e = engine;
+                if (e == null) return;
+                try { e.eval(js); } catch (IllegalStateException ignored) {}
+            }
+            @Override
+            public void addOnBeforeLoad(String js) {
+                OffscreenWebView e = engine;
+                if (e == null) return;
+                try { e.addOnBeforeLoad(js); } catch (IllegalStateException ignored) {}
+            }
+        });
         for (String js : pendingInit) {
             engine.addOnBeforeLoad(js);
         }

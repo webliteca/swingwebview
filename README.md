@@ -205,6 +205,12 @@ modes side-by-side, plus interaction with surrounding Swing widgets
 (`run-mac-demo.sh`, `run-linux-demo.sh`, `run-windows-demo.bat`) live
 at the project root.
 
+Additional demos:
+
+* `demos/WebViewContextMenuDemo/` — exercises the right-click
+  context-menu API: target descriptor, link / image / editable /
+  selection cases, and the `setDefaultContextMenuEnabled` override.
+
 ## Building from source
 
 ```

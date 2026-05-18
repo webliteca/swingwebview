@@ -11,6 +11,7 @@ import ca.weblite.webview.EmbeddedWebView;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewClickCallback;
 import ca.weblite.webview.WebViewFocusCallback;
+import ca.weblite.webview.WebViewMouseDispatcher;
 import java.awt.AWTEvent;
 import java.awt.event.AWTEventListener;
 import java.beans.PropertyChangeEvent;
@@ -415,6 +416,33 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
                     consoleDispatcher.dispatch(arg);
                 }
             });
+        // Install the DOM mouse-event bridge alongside the console bridge:
+        // same pattern, separate channel.  The flag sink wraps eval and
+        // addOnBeforeLoad in try/catch so a late state-change call during
+        // teardown can't propagate IllegalStateException out of the
+        // dispatcher.
+        embedded.addOnBeforeLoad(WebViewMouseDispatcher.SHIM_JS);
+        embedded.addJavascriptCallback(WebViewMouseDispatcher.CHANNEL_NAME,
+            new WebView.JavascriptCallback() {
+                @Override
+                public void run(String arg) {
+                    mouseDispatcher.dispatch(arg);
+                }
+            });
+        mouseDispatcher.attachFlagSink(new WebViewMouseDispatcher.FlagSink() {
+            @Override
+            public void eval(String js) {
+                EmbeddedWebView e = embedded;
+                if (e == null) return;
+                try { e.eval(js); } catch (IllegalStateException ignored) {}
+            }
+            @Override
+            public void addOnBeforeLoad(String js) {
+                EmbeddedWebView e = embedded;
+                if (e == null) return;
+                try { e.addOnBeforeLoad(js); } catch (IllegalStateException ignored) {}
+            }
+        });
         for (String js : pendingInit) {
             embedded.addOnBeforeLoad(js);
         }
