@@ -43,6 +43,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Swing component that embeds a native WebView as a heavyweight child of a
@@ -145,6 +146,19 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
             embedded.eval(js);
         }
         return this;
+    }
+
+    @Override
+    public CompletableFuture<String> evalAsync(String js) {
+        if (js == null) throw new NullPointerException("js");
+        EmbeddedWebView e = embedded;
+        if (e == null) {
+            CompletableFuture<String> f = new CompletableFuture<String>();
+            f.completeExceptionally(
+                new IllegalStateException("WebViewComponent not displayed"));
+            return f;
+        }
+        return e.evalAsync(js);
     }
 
     @Override

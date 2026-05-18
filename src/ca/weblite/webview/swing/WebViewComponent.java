@@ -7,11 +7,13 @@ package ca.weblite.webview.swing;
 
 import ca.weblite.webview.ConsoleDispatcher;
 import ca.weblite.webview.ConsoleListener;
+import ca.weblite.webview.JavaScriptEvalException;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewMouseDispatcher;
 import ca.weblite.webview.WebViewMouseListener;
 
 import java.io.PrintStream;
+import java.util.concurrent.CompletableFuture;
 import javax.swing.JComponent;
 
 /**
@@ -162,6 +164,37 @@ public abstract class WebViewComponent extends JComponent {
      * the component is displayable.
      */
     public abstract WebViewComponent eval(String js);
+
+    /**
+     * Evaluate JavaScript on the currently loaded document and return a
+     * future that completes with the JSON-stringified result.  The user
+     * snippet must use {@code return} to yield a value (the wrapper
+     * wraps it in an IIFE; a bare expression on its own line is NOT
+     * the IIFE's return value).  {@code undefined} maps to
+     * {@code "null"}; returned {@code Promise}s are awaited.  JS-side
+     * failures (synchronous throw, Promise rejection, or
+     * {@code JSON.stringify} {@code TypeError}) complete the future
+     * exceptionally with a {@link JavaScriptEvalException} wrapping
+     * the JS-side message.
+     *
+     * <p>Returns an already-failed future carrying
+     * {@code IllegalStateException("WebViewComponent not displayed")}
+     * when called before the component is displayed (or, in the
+     * lightweight case, when running on a platform where the offscreen
+     * engine is a stub).  No native call is issued in that case.
+     *
+     * <p>Threading: future continuations
+     * ({@code .thenAccept}/{@code .thenApply}/{@code .exceptionally}/{@code .handle})
+     * complete on the Swing EDT, matching the existing
+     * {@code ConsoleListener} and {@code WebViewMouseListener}
+     * contracts.  Safe to call from any Java thread.  Cancellation
+     * ({@code future.cancel(true)}) marks the future cancelled but
+     * does NOT abort the in-page JS.
+     *
+     * @param js the JS snippet; must not be null.
+     * @return a future that resolves to the JSON-stringified result.
+     */
+    public abstract CompletableFuture<String> evalAsync(String js);
 
     /**
      * Bind a Java callback that will appear as a global javascript function

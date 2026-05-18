@@ -196,6 +196,69 @@ For debugging, set `-Dca.weblite.webview.debugShortcut=true` (Java
 side) and `WEBVIEW_DEBUG_SHORTCUT=1` (native side) to log the
 dispatcher decisions and Win32 `SetFocus` calls.
 
+## Talking to JavaScript
+
+Three methods on `WebViewComponent` (and on the standalone `WebView`)
+cover the JS-interop surface:
+
+* **`eval(String js)`** — fire-and-forget.  Runs the snippet in the
+  current document; the return value is discarded.  Use for side
+  effects (`scrollTo`, `document.title = "..."`, click a hidden
+  button).
+* **`evalAsync(String js): CompletableFuture<String>`** — round-trips
+  the snippet's result back to Java.  The future resolves with the
+  `JSON.stringify`'d return value (`undefined` becomes `"null"`;
+  returned `Promise`s are awaited).  JS-side failures
+  (synchronous `throw`, Promise rejection, `JSON.stringify` `TypeError`)
+  complete the future exceptionally with a
+  `JavaScriptEvalException`.  The snippet runs inside an IIFE, so
+  **use `return` to yield a value** — a bare expression is not the
+  IIFE's return.
+* **`addJavascriptCallback(String name, JavascriptCallback cb)`** —
+  exposes a Java callback at `window.<name>(arg)` for the page to
+  call.  Use when the page initiates the conversation, or when a
+  long-lived JS subscription needs to push events to Java.
+
+```java
+WebViewComponent wv = WebViewComponent.create();
+wv.setUrl("https://example.com");
+// ...add to JFrame and show...
+
+// Ask the page for its current scroll position once it loads.
+wv.evalAsync("return [window.scrollX, window.scrollY];")
+  .thenAccept(json -> System.out.println("scroll = " + json));
+// Prints e.g. "scroll = [0,240]"
+
+// Await a Promise: the future resolves with the fetched body length.
+wv.evalAsync(
+    "return fetch('/health').then(r => r.text()).then(t => t.length);"
+).thenAccept(json -> System.out.println("body length = " + json));
+
+// JS error → future completes exceptionally.
+wv.evalAsync("return missing.value;").exceptionally(t -> {
+    Throwable cause = t.getCause();          // CompletionException wraps it
+    if (cause instanceof JavaScriptEvalException) {
+        System.err.println("page said no: " + cause.getMessage());
+    }
+    return null;
+});
+```
+
+**Threading.**  On `WebViewComponent` (both heavyweight and lightweight)
+future continuations land on the Swing EDT, so a `.thenAccept(...)` can
+touch Swing state directly.  On the standalone `WebView` continuations
+run inline on the WebView's native UI thread — there's no Swing in the
+standalone path; wrap with
+`.thenAcceptAsync(continuation, SwingUtilities::invokeLater)` if you
+need EDT delivery there.
+
+**Lifecycle.**  Calling `evalAsync` before the component is displayed
+(or on the standalone `WebView` before `show()`, or after the window
+closes) returns an already-failed future whose cause is an
+`IllegalStateException` — no native call is made.  See
+[`demos/WebViewAsyncEvalDemo/`](demos/WebViewAsyncEvalDemo/README.md)
+for a runnable example.
+
 ## Demo
 
 See [`demos/WebViewHeavyweightDemo/`](demos/WebViewHeavyweightDemo/README.md)
@@ -210,6 +273,11 @@ Additional demos:
 * `demos/WebViewContextMenuDemo/` — exercises the right-click
   context-menu API: target descriptor, link / image / editable /
   selection cases, and the `setDefaultContextMenuEnabled` override.
+* `demos/WebViewAsyncEvalDemo/` — exercises `evalAsync(String)`:
+  primitive / object / Promise / `undefined` results, synchronous
+  throws and Promise rejections surfacing as
+  `JavaScriptEvalException`, concurrent in-flight calls, and EDT
+  delivery of continuations.
 
 ## Building from source
 
