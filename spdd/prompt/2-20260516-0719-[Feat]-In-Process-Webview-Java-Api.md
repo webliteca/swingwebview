@@ -22,6 +22,22 @@ generated_at: 2026-05-16T07:19:13-07:00
   after the window is shown (`WebView.java:201`) and dispatch
   arbitrary `Runnable`s onto the WebView's UI thread
   (`WebView.java:213`).
+- Callers must be able to run JavaScript with a future-returning
+  round-trip via `evalAsync(String js): CompletableFuture<String>`,
+  yielding the JSON-stringified result (with `undefined → null`,
+  Promise-awaiting, and JS-side errors surfaced as exceptional
+  completions carrying a `JavaScriptEvalException`). The dispatcher
+  implementation, JS shim contract, and exception type are owned by
+  [[webview-async-javascript-eval]]; this canvas owns only the
+  `WebView`-side surface (the public method, the per-instance
+  dispatcher field, and the eager registration of the shim and the
+  resolver binding inside `show()`). Threading: continuations
+  complete inline on the WebView's native UI thread (the same
+  thread that `dispatch(Runnable)` callbacks land on); callers
+  needing EDT delivery wrap with
+  `.thenAcceptAsync(continuation, SwingUtilities::invokeLater)`.
+  This is the `marshalToEdt = false` branch of the dispatcher
+  contract documented in [[webview-async-javascript-eval]].
 - `show()` is the terminal call: it creates the native peer, applies
   all queued configuration, navigates to the URL, then enters the
   WebView's event loop, blocking until the window closes
@@ -57,6 +73,20 @@ generated_at: 2026-05-16T07:19:13-07:00
   the native side still holds a function pointer. Anything passed
   across the JNI boundary that may be invoked later (JS callbacks,
   dispatch Runnables) must be added to `heap`.
+- **evalDispatcher: final EvalDispatcher** (new) — per-instance
+  fan-out hub for `evalAsync` round-tripping. Constructed in the
+  `WebView` constructor with `marshalToEdt = false` and
+  `disposeLabel = "WebView"`. Its `EvalSink` lambda is a two-line
+  closure over `this` that issues
+  `WebViewNative.webview_eval(peer, wrappedJs)` when `peer != 0`,
+  silently no-ops otherwise (the `peer == 0` case is handled
+  earlier by `evalAsync` itself, so the sink-level guard is
+  belt-and-suspenders). The dispatcher's full semantics — in-flight
+  `id → CompletableFuture<String>` map, JS wrapper template,
+  base64-decoded payload parsing, dispose drain — are owned by
+  [[webview-async-javascript-eval]]; this canvas owns only the
+  fact that `WebView` constructs one with these specific
+  parameters.
 
 ## A · Approach
 - **Two-phase configuration.** Setter methods buffer their values
@@ -74,6 +104,19 @@ generated_at: 2026-05-16T07:19:13-07:00
   `WebViewNative.webview_run(peer)` and never returns until the
   window closes (`WebView.java:245`). Concurrent Java work must be
   marshalled via `dispatch(Runnable)` (`WebView.java:213`).
+- **Future-returning eval delegates to EvalDispatcher.**
+  `evalAsync(String js)` short-circuits with an already-failed
+  future when `peer == 0` (covers the pre-`show()` and
+  post-window-close cases) and otherwise hands `js` straight to
+  `evalDispatcher.evalAsync(js)`. The dispatcher inserts a future
+  into its in-flight map, wraps the snippet, and invokes the
+  injected `EvalSink` lambda, which in turn issues
+  `WebViewNative.webview_eval(peer, wrappedJs)`. When the JS shim
+  posts the result back through the
+  `__webview_eval_result__` binding, the dispatcher's
+  registered callback (see Operation §5) routes it to the
+  matching future. See [[webview-async-javascript-eval]] for the
+  dispatcher contract.
 
 ## S · Structure
 - `src/ca/weblite/webview/WebView.java` — the public API class.
@@ -83,6 +126,14 @@ generated_at: 2026-05-16T07:19:13-07:00
 - `src/ca/weblite/webview/WebViewNativeCallback.java` — native
   callback interface invoked by the zserge engine for each bound
   JavaScript callback.
+- `src/ca/weblite/webview/EvalDispatcher.java` — owned by
+  [[webview-async-javascript-eval]]. `WebView` depends on it
+  for `evalAsync`, via constructor injection of an `EvalSink`
+  lambda.
+- `src/ca/weblite/webview/JavaScriptEvalException.java` — owned
+  by [[webview-async-javascript-eval]]. Surfaces in the
+  exceptional completion of `evalAsync` futures when the JS side
+  fails (sync throw, Promise rejection, serialization failure).
 
 ## O · Operations
 
@@ -173,23 +224,44 @@ File: `src/ca/weblite/webview/WebView.java`
 File: `src/ca/weblite/webview/WebView.java`
 
 1. Responsibility: create the native peer, apply buffered
-   configuration, navigate, and run the blocking event loop.
+   configuration, install the eval-shim and resolver binding for
+   `evalAsync`, navigate, run the blocking event loop, and drain
+   pending eval futures on return.
 2. Methods:
    - `show(): void`
      - Logic: assign
        `peer = WebViewNative.webview_create(0, 0)`
        (`WebView.java:228`); set bounds via
        `webview_set_bounds(peer, 0, 0, w, h, 0)`
-       (`WebView.java:229`); replay each init JS via
-       `webview_init(peer, js)` (`WebView.java:230`); set the title
-       via `webview_set_title(peer, title)` (`WebView.java:233`);
-       for every binding, create a `WebViewNativeCallback`
-       lambda, anchor it in `heap`, and call
+       (`WebView.java:229`); install the eval-shim FIRST via
+       `webview_init(peer, EvalDispatcher.SHIM_JS)` so the
+       installer always runs at document-start before any user
+       init script (idempotency is guarded inside the shim itself
+       by `window.__webview_eval_installed__`); then replay each
+       user init JS via `webview_init(peer, js)`
+       (`WebView.java:230`); set the title via
+       `webview_set_title(peer, title)` (`WebView.java:233`);
+       register the resolver binding by going directly through
+       `WebViewNative.webview_bind`: construct a
+       `WebViewNativeCallback` lambda whose `invoke(arg, wv)` calls
+       `evalDispatcher.dispatch(arg)`, anchor it in `heap` (to
+       prevent GC while the native side holds a function pointer),
+       and call
+       `webview_bind(peer, EvalDispatcher.CHANNEL_NAME, fn, peer)`;
+       then for every user binding, create a
+       `WebViewNativeCallback` lambda, anchor it in `heap`, and call
        `webview_bind(peer, key, fn, peer)`
        (`WebView.java:234`–`WebView.java:243`); navigate via
-       `webview_navigate(peer, url)` (`WebView.java:244`); finally
-       call `webview_run(peer)` (`WebView.java:245`), which blocks
-       until the window closes.
+       `webview_navigate(peer, url)` (`WebView.java:244`); call
+       `webview_run(peer)` (`WebView.java:245`), which blocks
+       until the window closes; AFTER `webview_run` returns,
+       set `peer = 0L` and call
+       `evalDispatcher.disposeAllPending()` so any still-pending
+       `evalAsync` futures complete exceptionally with
+       `IllegalStateException("WebView disposed")` and any
+       subsequent `evalAsync`, `eval`, or `addJavascriptCallback`
+       call observes `peer == 0` and behaves as if `show()` had
+       never been called.
 3. Constraints / Invariants:
    - On macOS, the calling JVM **must** have been started with
      `-XstartOnFirstThread` or this method will fail / misbehave;
@@ -198,7 +270,60 @@ File: `src/ca/weblite/webview/WebView.java`
    - `show()` is one-shot — after the event loop returns the native
      peer is invalid. There is no `close()` or `destroy()` exposed
      here; closing the window destroys the peer natively and the
-     `WebView` instance becomes effectively dead.
+     `WebView` instance becomes effectively dead. The
+     post-`webview_run` `peer = 0L` plus
+     `evalDispatcher.disposeAllPending()` makes this lifecycle
+     state observable to all entry points: post-close `eval` /
+     `evalAsync` / `addJavascriptCallback` calls become safe
+     no-ops or already-failed futures instead of crashing the JVM
+     with a SIGSEGV on a freed native handle. This is an
+     INCIDENTAL fix to the pre-existing `[INFERRED]` "calling
+     `eval` after `show()` returns is likely SIGSEGV" gap noted
+     under Operation §3.
+
+### 6. Evaluate Javascript Asynchronously — WebView.evalAsync
+File: `src/ca/weblite/webview/WebView.java`
+
+1. Responsibility: submit a JS snippet for evaluation and return
+   a `CompletableFuture<String>` that completes with the
+   JSON-stringified result, with `undefined → null`, Promise-awaiting,
+   and JS-side errors surfaced as exceptional completions. The
+   future's continuations run on the WebView's native UI thread.
+2. Methods:
+   - `evalAsync(String js): CompletableFuture<String>`
+     - Logic: `Objects.requireNonNull(js, "js");` — null is a
+       programming error, propagate synchronously per
+       [[webview-async-javascript-eval]] Norms.
+       If `peer == 0L`, allocate a fresh
+       `CompletableFuture<String>` and complete it exceptionally
+       with `IllegalStateException("WebView not shown")`; return
+       it without touching the dispatcher (this covers both
+       pre-`show()` and post-window-close states, the latter
+       guaranteed by Operation §5's
+       post-`webview_run` `peer = 0L`). Otherwise, delegate to
+       `evalDispatcher.evalAsync(js)` and return the dispatcher's
+       returned future verbatim.
+3. Constraints / Invariants:
+   - The returned future's continuations
+     (`.thenAccept` / `.thenApply` / `.exceptionally` / `.handle`)
+     run on whatever native thread the resolver binding fires on
+     — the same thread that `dispatch(Runnable)` callbacks land
+     on. This is the `marshalToEdt = false` branch of the
+     dispatcher contract documented in
+     [[webview-async-javascript-eval]]. Callers needing EDT
+     delivery must wrap with
+     `.thenAcceptAsync(continuation, SwingUtilities::invokeLater)`.
+   - `evalAsync` is safe to call from any Java thread; the
+     dispatcher's `pending` map is `ConcurrentHashMap`-backed and
+     the id sequencer is an `AtomicLong`.
+   - The user snippet must use `return` to yield a value (the
+     wrapper template wraps it in an IIFE); a bare expression on
+     its own line is NOT the IIFE's return value. See
+     [[webview-async-javascript-eval]] for the full JS contract.
+   - Cancellation: `future.cancel(true)` marks the future
+     cancelled but does NOT abort the in-page JS. The eventual
+     binding callback finds the cancelled future, removes it
+     from the in-flight map, and silently drops the result.
 
 ## N · Norms
 - Java 8 source/target (`pom.xml:41`). Anonymous-inner-class style
@@ -227,3 +352,39 @@ File: `src/ca/weblite/webview/WebView.java`
 - `addOnBeforeLoad` is the only safe way to inject "run on every
   page" JS; `eval` only affects the currently loaded document
   (`WebView.java:198`).
+- The `evalDispatcher` field is `final` and is held by `WebView` for
+  the instance's entire lifetime. Its resolver-binding callback
+  (constructed in Operation §5 and added to `heap`) remains
+  reachable as long as `heap` is — same anti-GC discipline as
+  every other native callback this class registers.
+  Forgetting the `heap.add(fn)` step on the resolver-binding
+  callback would let the JVM dereference a freed Java object on
+  the next eval result; the operation spec mandates it explicitly.
+- Post-`show()` lifecycle is now observable to every entry
+  point. After `webview_run` returns, Operation §5 zeroes
+  `peer` and calls `evalDispatcher.disposeAllPending()`. As a
+  result: `eval(js)` becomes a no-op
+  (`WebViewNative.webview_eval(0, js)` is not issued — Operation
+  §3 should be read in light of this, but for safety future
+  edits to `eval` SHOULD add an explicit `if (peer == 0L)
+  return this;` early-out); `evalAsync(js)` returns an
+  already-failed future; `addJavascriptCallback(name, cb)` falls
+  through the `peer == 0` branch and just buffers (a buffer that
+  will never be replayed since `show()` is one-shot). This is a
+  small `[DRIFT]` correction to the pre-existing
+  `[INFERRED] likely SIGSEGV` note under Operation §3 — the new
+  peer-zeroing makes the SIGSEGV case unreachable for callers
+  who interact with this class only via its public API.
+- The standalone `WebView` surface does NOT marshal
+  `evalAsync` future completions to the Swing EDT. There is no
+  Swing involved in the standalone path and the WebView owns the
+  main thread for its event loop. Callers wanting EDT delivery
+  arrange it themselves via
+  `.thenAcceptAsync(continuation, SwingUtilities::invokeLater)`.
+  This is the documented
+  [[webview-async-javascript-eval]] `marshalToEdt = false`
+  branch; the analogous embedded surfaces
+  ([[swing-heavyweight-webview-embedding]] and
+  [[swing-lightweight-webview-embedding]]) take the
+  `marshalToEdt = true` branch so callers there receive
+  continuations on the EDT directly.

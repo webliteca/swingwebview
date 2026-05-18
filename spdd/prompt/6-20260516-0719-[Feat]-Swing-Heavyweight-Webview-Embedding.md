@@ -54,6 +54,23 @@ generated_at: 2026-05-16T07:19:13-07:00
     install is per peer-attach, not per navigation — the
     underlying init-script + script-message-handler machinery
     re-fires automatically on every new document load.
+  - `evalAsync(String js): CompletableFuture<String>` — concrete
+    implementation of the abstract method declared on
+    [[swing-webview-component-mode-selection]]. The heavyweight
+    `WebViewHeavyweightComponent.evalAsync` short-circuits with
+    an already-failed future carrying
+    `IllegalStateException("WebViewComponent not displayed")`
+    when `embedded == null`; otherwise delegates to
+    `embedded.evalAsync(js)`. The backing `EmbeddedWebView` owns
+    a per-peer `EvalDispatcher` (constructed with
+    `marshalToEdt = true` and
+    `disposeLabel = "EmbeddedWebView"`) that holds the in-flight
+    futures, the JS wrapper template, and the dispose drain. The
+    dispatcher class, JS shim contract, and
+    `JavaScriptEvalException` type are owned by
+    [[webview-async-javascript-eval]]. Future continuations
+    complete on the Swing EDT, matching the existing
+    `ConsoleListener` and `WebViewMouseListener` contracts.
 - macOS-only: when `debug=true`, the native `cocoa_create_engine`
   block that already sets `developerExtrasEnabled=YES` MUST
   also call `setInspectable:YES` on the `WKWebView` instance,
@@ -178,6 +195,13 @@ generated_at: 2026-05-16T07:19:13-07:00
   - Overrides `openDevTools()` to delegate to
     `EmbeddedWebView.openDevTools()`; returns `false` when
     `embedded == null`.
+  - Overrides `evalAsync(String js)` to short-circuit with an
+    already-failed future
+    (`IllegalStateException("WebViewComponent not displayed")`)
+    when `embedded == null`, otherwise delegate to
+    `embedded.evalAsync(js)`. No state is held on the heavyweight
+    component itself — the per-peer `EvalDispatcher` lives on
+    `EmbeddedWebView` and is constructed during `attach`.
   - Overrides `addJavascriptCallback(name, cb)` to reject any
     name starting with `__webview_` (matches the canvas-5
     reserved-prefix norm).
@@ -218,8 +242,16 @@ generated_at: 2026-05-16T07:19:13-07:00
 - **EmbeddedWebView** (`EmbeddedWebView.java:30`) — Low-level
   wrapper around the native embedded peer. Holds `long peer`,
   a `heap: List<Object>` to anchor JNI callbacks
-  (`EmbeddedWebView.java:33`), and the bindings map
-  (`EmbeddedWebView.java:34`). Invariants:
+  (`EmbeddedWebView.java:33`), the bindings map
+  (`EmbeddedWebView.java:34`), and a `final evalDispatcher:
+  EvalDispatcher` field that owns the in-flight
+  `requestId → CompletableFuture<String>` map for `evalAsync`.
+  The dispatcher is constructed inside `attach` with
+  `marshalToEdt = true` and `disposeLabel = "EmbeddedWebView"`
+  and an `EvalSink` lambda that calls
+  `WebViewNative.webview_embed_eval(peer, wrappedJs)` when
+  `peer != 0L`. The dispatcher class is owned by
+  [[webview-async-javascript-eval]]. Invariants:
   - `peer == 0` means disposed; every public method calls
     `checkAlive()` first (`EmbeddedWebView.java:204`).
   - `attach(Component, debug)` REQUIRES the component to be
@@ -336,6 +368,38 @@ generated_at: 2026-05-16T07:19:13-07:00
   `AddScriptToExecuteOnDocumentCreated` machinery re-fires at
   document-start for every new document. No re-install on
   page change is required.
+- **Eval-bridge install is per peer-attach AND lives inside
+  `EmbeddedWebView.attach` rather than the heavyweight
+  component's `createPeer`.** Rationale: the per-peer
+  `EvalDispatcher` is owned by `EmbeddedWebView`, so co-locating
+  the dispatcher construction, the `addOnBeforeLoad(EvalDispatcher.SHIM_JS)`
+  call, and the
+  `addJavascriptCallback(EvalDispatcher.CHANNEL_NAME, fn)`
+  registration inside `attach` keeps engine concerns inside the
+  engine wrapper and avoids leaking a dispatcher accessor onto
+  the public API. The heavyweight component's `createPeer`
+  therefore needs no new eval-specific steps — the eval bridge
+  is wired automatically by the act of constructing the
+  `EmbeddedWebView`. The resolver-callback closure references
+  the dispatcher directly (it was constructed two lines above)
+  and is anchored in the same `heap` list as every other
+  native callback.
+- **Heavyweight `evalAsync` flow end-to-end.**
+  `WebViewHeavyweightComponent.evalAsync(js)` → null-check
+  `embedded` → delegate to `embedded.evalAsync(js)` →
+  `EvalDispatcher.evalAsync(js)` allocates a request id and a
+  `CompletableFuture`, inserts into the pending map, wraps the
+  user snippet via the SHIM_JS wrapper template, and invokes
+  the `EvalSink` lambda → the sink issues
+  `WebViewNative.webview_embed_eval(peer, wrappedJs)` (when
+  `peer != 0L`). When the JS shim posts the result back, the
+  native engine fires the resolver binding callback (registered
+  inside `attach`) which calls `evalDispatcher.dispatch(arg)` →
+  the dispatcher parses the envelope, extracts the request id,
+  removes the future from the pending map, hops to the EDT via
+  `SwingUtilities.invokeLater`, and completes the future. See
+  [[webview-async-javascript-eval]] for the full dispatcher
+  contract.
 - **Editing-command shortcuts driven from Java, not from
   AppKit / X11.** The standard platform Cut/Copy/Paste/Select-All
   shortcuts (`Cmd+C/V/X/A` on macOS, `Ctrl+C/V/X/A` elsewhere)
@@ -468,6 +532,17 @@ generated_at: 2026-05-16T07:19:13-07:00
   component; receives raw payloads from the internal
   `__webview_console__` binding callback registered in
   `createPeer`.
+- `src/ca/weblite/webview/EvalDispatcher.java` (owned by
+  [[webview-async-javascript-eval]]) — owned per-engine by
+  `EmbeddedWebView`; receives raw payloads from the internal
+  `__webview_eval_result__` binding callback registered in
+  `EmbeddedWebView.attach`. Provides `SHIM_JS`, `CHANNEL_NAME`,
+  `evalAsync`, `dispatch`, and `disposeAllPending`.
+- `src/ca/weblite/webview/JavaScriptEvalException.java` (owned
+  by [[webview-async-javascript-eval]]) — surfaces in the
+  exceptional completion of `evalAsync` futures when the JS
+  side fails (sync throw, Promise rejection, serialization
+  failure).
 - `src_c/webview_embed.cpp`, `windows/webview_embed.cc` — native
   implementations (Linux+macOS and Windows respectively). New
   implementations: the Linux+macOS file gains a function
@@ -515,6 +590,18 @@ File: `src/ca/weblite/webview/EmbeddedWebView.java`
      (`EmbeddedWebView.java:33`).
    - `bindings: Map<String, JavascriptCallback>` — current
      bound JS callbacks (`EmbeddedWebView.java:34`).
+   - `evalDispatcher: final EvalDispatcher` (new) — per-engine
+     fan-out hub for `evalAsync` round-tripping. Constructed
+     inside `attach` after the peer is created, with
+     `marshalToEdt = true`, `disposeLabel = "EmbeddedWebView"`,
+     and an `EvalSink` lambda that issues
+     `WebViewNative.webview_embed_eval(peer, wrappedJs)` when
+     `peer != 0L` (no-op otherwise — the dispatcher's own
+     `disposed` flag and `EmbeddedWebView.evalAsync`'s
+     pre-check already handle the dead-peer case; the sink's
+     `peer != 0L` guard is belt-and-suspenders against a
+     destroy that races a dispatch). The dispatcher class
+     itself is owned by [[webview-async-javascript-eval]].
 3. Methods:
    - `attach(Component parent, boolean debug): EmbeddedWebView`
      - Logic: null-check `parent`
@@ -524,6 +611,28 @@ File: `src/ca/weblite/webview/EmbeddedWebView.java`
        (`EmbeddedWebView.java:57`); throw if zero
        (`EmbeddedWebView.java:58`); wrap the peer in a new
        instance.
+       **Install the eval bridge BEFORE returning** so it is
+       in place before the heavyweight component's `createPeer`
+       starts replaying user config: construct the
+       `EvalDispatcher` (storing it in the `evalDispatcher`
+       field) with the `EvalSink` lambda described in Fields;
+       call `webview_embed_init(peer, EvalDispatcher.SHIM_JS)`
+       to register the wrapper-installer at document-start
+       (idempotency is guarded inside the shim itself by
+       `window.__webview_eval_installed__`); register the
+       resolver binding by constructing a
+       `WebViewNativeCallback` whose `invoke(arg, wv)` calls
+       `evalDispatcher.dispatch(arg)`, anchoring it in `heap`
+       (anti-GC), and calling
+       `WebViewNative.webview_embed_bind(peer,
+       EvalDispatcher.CHANNEL_NAME, fn, peer)`. The
+       reserved-name guard on the higher-level
+       `WebViewHeavyweightComponent.addJavascriptCallback` is
+       bypassed because this registration goes directly through
+       the `WebViewNative` JNI call rather than through any
+       component-level method — same pattern as the existing
+       console / mouse bridges register from
+       `WebViewHeavyweightComponent.createPeer`.
    - `setBounds(int x, int y, int w, int h): EmbeddedWebView` —
      `checkAlive`, call `webview_embed_set_bounds`
      (`EmbeddedWebView.java:77`).
@@ -540,6 +649,22 @@ File: `src/ca/weblite/webview/EmbeddedWebView.java`
      `webview_embed_init(peer, js)` (`EmbeddedWebView.java:121`).
    - `eval(String js): EmbeddedWebView` —
      `webview_embed_eval(peer, js)` (`EmbeddedWebView.java:130`).
+   - `evalAsync(String js): CompletableFuture<String>` (new) —
+     `Objects.requireNonNull(js, "js");` — null is a programming
+     error, propagate synchronously per
+     [[webview-async-javascript-eval]] Norms. If `peer == 0L`,
+     allocate a fresh `CompletableFuture<String>` and complete
+     it exceptionally with
+     `IllegalStateException("EmbeddedWebView has been disposed.")`
+     (matching the message string the existing `checkAlive`
+     produces) and return it without touching the dispatcher.
+     Otherwise delegate to `evalDispatcher.evalAsync(js)` and
+     return the dispatcher's future verbatim. Does NOT call
+     `checkAlive` because `checkAlive` throws and the
+     `evalAsync` contract is that lifecycle failures arrive as
+     exceptional futures, not as thrown exceptions. The
+     dispatcher handles the full JS contract, error mapping,
+     in-flight map, and EDT marshaling.
    - `addJavascriptCallback(String name, JavascriptCallback cb)`
      — store `name → cb` in `bindings`; build a
      `WebViewNativeCallback` that looks up the binding by name;
@@ -553,9 +678,22 @@ File: `src/ca/weblite/webview/EmbeddedWebView.java`
      `webview_embed_pump`; only non-trivial on Linux/GTK where
      the GTK loop is independent of AWT's X11 loop
      (`EmbeddedWebView.java:186`).
-   - `dispose(): void` — if `peer != 0`, zero it, call
+   - `dispose(): void` — if `peer != 0`, FIRST call
+     `evalDispatcher.disposeAllPending()` so every pending
+     `evalAsync` future completes exceptionally with
+     `IllegalStateException("EmbeddedWebView disposed")` (and
+     the dispatcher's `disposed` flag flips so subsequent
+     `evalAsync` calls return an already-failed future without
+     touching the engine); then zero `peer`, call
      `webview_embed_destroy`, clear `heap` and `bindings`
-     (`EmbeddedWebView.java:194`).
+     (`EmbeddedWebView.java:194`). The order matters: drain
+     pending futures BEFORE clearing `heap`, because the
+     resolver-binding callback (anchored in `heap`) could
+     otherwise be GC'd between the drain and the native
+     destroy — the dispatcher's drain marks the futures
+     `cancelled`-by-exception in a single atomic snapshot, so
+     any callback that fires after the drain finds an empty
+     pending map and silently drops.
    - `executeEditingCommand(EditingCommand cmd): EmbeddedWebView` (new)
      - Logic: null-check `cmd` (throw `NullPointerException`
        with a message naming the parameter); `checkAlive`;
@@ -617,6 +755,19 @@ File: `src/ca/weblite/webview/swing/WebViewHeavyweightComponent.java`
      (`WebViewHeavyweightComponent.java:98`).
    - `eval(String js)` — no-op until live, then
      `embedded.eval(js)` (`WebViewHeavyweightComponent.java:107`).
+   - `evalAsync(String js): CompletableFuture<String>` — if
+     `embedded == null`, allocate a fresh
+     `CompletableFuture<String>` and complete it exceptionally
+     with `IllegalStateException("WebViewComponent not displayed")`,
+     return it. Otherwise delegate to `embedded.evalAsync(js)`
+     and return its future verbatim. No buffering: pre-display
+     calls fail rather than queue, because a future demands a
+     definite resolution and there is no defined moment to
+     resolve a buffered pre-display call. The dispatcher inside
+     `embedded` handles the in-flight map, the JS contract, the
+     `JavaScriptEvalException` mapping, and the EDT marshaling
+     (per the `marshalToEdt = true` branch of
+     [[webview-async-javascript-eval]]).
    - `addJavascriptCallback(String name, JavascriptCallback cb)`
      — reject reserved-prefix names (any `name.startsWith("__webview_")`)
      with `IllegalArgumentException` BEFORE mutating any
@@ -1623,3 +1774,31 @@ Files:
   focus tangles documented in Operations 11 and 12, and the
   handler runs on every WebView click so any extra work pays
   per-click cost.
+- The `__webview_eval_result__` resolver binding callback
+  constructed in `EmbeddedWebView.attach` MUST be anchored in
+  the same `heap` list as every other native callback this
+  canvas registers. Forgetting `heap.add(fn)` lets the JVM
+  dereference a freed Java ref on the next eval result —
+  exactly the same failure mode as for console-channel and
+  mouse-channel callbacks, with the same fix.
+- The per-peer `EvalDispatcher` lifecycle is tied to
+  `EmbeddedWebView`: constructed in `attach`, drained on
+  `dispose`. The dispatcher's `disposed` flag flips inside
+  `disposeAllPending()` BEFORE `EmbeddedWebView.dispose` zeroes
+  `peer` and clears `heap`, so any pending JS callback firing
+  during destroy finds either an empty `pending` map (drained)
+  or a still-alive resolver callback that silently drops —
+  never a SIGSEGV. Inverting the order (clearing heap before
+  draining) would let a late callback run on a dead future
+  reference; the existing dispose contract enforces drain-first.
+- The heavyweight `evalAsync` completes futures on the EDT (per
+  [[webview-async-javascript-eval]] `marshalToEdt = true`).
+  Callers may continue with Swing-touching code directly from
+  `.thenAccept(...)` / `.thenApply(...)` / `.exceptionally(...)`
+  / `.handle(...)` without an additional
+  `SwingUtilities.invokeLater`. This is the symmetric
+  counterpart of the standalone `WebView` surface's
+  `marshalToEdt = false` branch documented in
+  [[in-process-webview-java-api]]; the asymmetry is
+  intentional because the standalone surface has no Swing in
+  the picture.

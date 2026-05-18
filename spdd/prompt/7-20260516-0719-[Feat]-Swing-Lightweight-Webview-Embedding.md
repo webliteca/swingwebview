@@ -61,6 +61,28 @@ generated_at: 2026-05-16T07:19:13-07:00
     that routes the raw payload into
     `ConsoleDispatcher.dispatch`.  Both happen inside
     `addNotify()` immediately after engine creation.
+  - `evalAsync(String js): CompletableFuture<String>` —
+    concrete implementation of the abstract method declared on
+    [[swing-webview-component-mode-selection]]. The lightweight
+    `WebViewLightweightComponent.evalAsync` short-circuits with
+    an already-failed future carrying
+    `IllegalStateException("WebViewComponent not displayed")`
+    when `engine == null` (covers both pre-display Linux and
+    the macOS / Windows graceful-degrade case where
+    `OffscreenWebView.create` returned `null`); otherwise
+    delegates to `engine.evalAsync(js)`. The backing
+    `OffscreenWebView` owns a per-peer `EvalDispatcher`
+    (constructed with `marshalToEdt = true` and
+    `disposeLabel = "OffscreenWebView"`) that holds the
+    in-flight futures, the JS wrapper template, and the
+    dispose drain. The dispatcher class, JS shim contract, and
+    `JavaScriptEvalException` type are owned by
+    [[webview-async-javascript-eval]]. Future continuations
+    complete on the Swing EDT, symmetric with the heavyweight
+    implementation in
+    [[swing-heavyweight-webview-embedding]] and matching the
+    existing `ConsoleListener` / `WebViewMouseListener`
+    contracts.
 - Clipboard & editing-command shortcuts (Linux only — the
   lightweight engine is a stub on macOS / Windows): pressing
   `Ctrl + C` / `V` / `X` / `A` while the AWT focus owner is
@@ -125,6 +147,16 @@ generated_at: 2026-05-16T07:19:13-07:00
   - Overrides `openDevTools()` to delegate to
     `OffscreenWebView.openDevTools()`; returns `false` when
     `engine == null`.
+  - Overrides `evalAsync(String js)` to short-circuit with an
+    already-failed future
+    (`IllegalStateException("WebViewComponent not displayed")`)
+    when `engine == null`, otherwise delegate to
+    `engine.evalAsync(js)`. No state is held on the lightweight
+    component itself — the per-peer `EvalDispatcher` lives on
+    `OffscreenWebView` and is constructed during `create`.
+    Returns an already-failed future on macOS / Windows where
+    the offscreen engine never created — the dispatcher cannot
+    deliver a future continuation without a live JS engine.
   - Overrides `addJavascriptCallback(name, cb)` to reject any
     name starting with `__webview_` (matches the canvas-5
     reserved-prefix norm).
@@ -167,6 +199,20 @@ generated_at: 2026-05-16T07:19:13-07:00
     → Java callback for every bound `window.<name>` shim.
     Mirrors `EmbeddedWebView.bindings`
     (`EmbeddedWebView.java:34`).
+  - `evalDispatcher: final EvalDispatcher` (new) — per-engine
+    fan-out hub for `evalAsync` round-tripping. Constructed
+    inside `create` after the peer is created, with
+    `marshalToEdt = true`, `disposeLabel = "OffscreenWebView"`,
+    and an `EvalSink` lambda that issues
+    `WebViewNative.webview_offscreen_eval(peer, wrappedJs)`
+    when `peer != 0L` (no-op otherwise — belt-and-suspenders
+    against a destroy that races a dispatch; the dispatcher's
+    own `disposed` flag and
+    `OffscreenWebView.evalAsync`'s pre-check already handle
+    the dead-peer case). The dispatcher class itself is owned
+    by [[webview-async-javascript-eval]]. Symmetric with the
+    `EmbeddedWebView.evalDispatcher` field declared in
+    [[swing-heavyweight-webview-embedding]].
   Invariants:
   - New method `executeEditingCommand(EditingCommand cmd): OffscreenWebView`
     — rejects null `cmd` with `NullPointerException("cmd")`
@@ -254,6 +300,46 @@ generated_at: 2026-05-16T07:19:13-07:00
   underlying `webkit_user_script_new` /
   `register_script_message_handler` machinery re-fires for
   every new document at document-start.
+- **Eval-bridge install is per engine-creation AND lives
+  inside `OffscreenWebView.create` rather than the lightweight
+  component's `addNotify`.** Rationale: the per-peer
+  `EvalDispatcher` is owned by `OffscreenWebView`, so
+  co-locating the dispatcher construction, the
+  `addOnBeforeLoad(EvalDispatcher.SHIM_JS)` call, and the
+  `addJavascriptCallback(EvalDispatcher.CHANNEL_NAME, fn)`
+  registration inside `create` keeps engine concerns inside
+  the engine wrapper and avoids leaking a dispatcher accessor
+  onto the public API. The lightweight component's
+  `addNotify` (which already installs the console + mouse
+  bridges after creating the engine) therefore needs no new
+  eval-specific steps — the eval bridge is wired automatically
+  by the act of `OffscreenWebView.create` returning non-null.
+  Symmetric with the heavyweight install in
+  `EmbeddedWebView.attach` documented in
+  [[swing-heavyweight-webview-embedding]]. The
+  resolver-callback closure references the dispatcher directly
+  (it was constructed two lines above) and is anchored in the
+  same `heap` list as every other native callback.
+- **Lightweight `evalAsync` flow end-to-end.**
+  `WebViewLightweightComponent.evalAsync(js)` → null-check
+  `engine` → delegate to `engine.evalAsync(js)` →
+  `EvalDispatcher.evalAsync(js)` allocates a request id and a
+  `CompletableFuture`, inserts into the pending map, wraps the
+  user snippet via the SHIM_JS wrapper template, and invokes
+  the `EvalSink` lambda → the sink issues
+  `WebViewNative.webview_offscreen_eval(peer, wrappedJs)` (when
+  `peer != 0L`). When the JS shim posts the result back, the
+  native engine fires the resolver binding callback (registered
+  inside `create`) which calls `evalDispatcher.dispatch(arg)`
+  on the GTK pump thread → the dispatcher parses the envelope,
+  extracts the request id, removes the future from the pending
+  map, hops to the EDT via `SwingUtilities.invokeLater`, and
+  completes the future. The GTK-pump → EDT hop normalizes the
+  completion thread so caller `.thenAccept(...)` continuations
+  can touch Swing state directly without an extra
+  `SwingUtilities.invokeLater`. See
+  [[webview-async-javascript-eval]] for the full dispatcher
+  contract.
 - **Editing-command shortcuts bypass synthetic key dispatch.**
   The existing AWT-`KeyListener` → `GdkInput.translateKeyCode`
   → `engine.keyEvent` forwarding cannot deliver Ctrl+C/V/X/A
@@ -316,6 +402,18 @@ generated_at: 2026-05-16T07:19:13-07:00
   component; receives raw payloads from the internal
   `__webview_console__` binding callback registered in
   `addNotify`.
+- `src/ca/weblite/webview/EvalDispatcher.java` (owned by
+  [[webview-async-javascript-eval]]) — owned per-engine by
+  `OffscreenWebView`; receives raw payloads from the internal
+  `__webview_eval_result__` binding callback registered in
+  `OffscreenWebView.create`. Provides `SHIM_JS`,
+  `CHANNEL_NAME`, `evalAsync`, `dispatch`, and
+  `disposeAllPending`.
+- `src/ca/weblite/webview/JavaScriptEvalException.java` (owned
+  by [[webview-async-javascript-eval]]) — surfaces in the
+  exceptional completion of `evalAsync` futures when the JS
+  side fails (sync throw, Promise rejection, serialization
+  failure).
 - `src_c/webview_embed.cpp` — native implementation (shared
   with embed path on Linux).  Stubs on macOS/Windows.  New
   implementations of the five offscreen JNI methods listed
@@ -388,12 +486,44 @@ File: `src/ca/weblite/webview/OffscreenWebView.java`
    - `bindings: Map<String, WebView.JavascriptCallback>` —
      name-keyed Java callbacks for every bound JS function;
      same shape as `EmbeddedWebView.bindings`.
+   - `evalDispatcher: final EvalDispatcher` (new) — per-engine
+     fan-out hub for `evalAsync` round-tripping. Constructed
+     inside `create` after the peer is created, with
+     `marshalToEdt = true`, `disposeLabel = "OffscreenWebView"`,
+     and an `EvalSink` lambda that issues
+     `WebViewNative.webview_offscreen_eval(peer, wrappedJs)`
+     when `peer != 0L` (no-op otherwise). The dispatcher class
+     itself is owned by [[webview-async-javascript-eval]].
+     Symmetric with `EmbeddedWebView.evalDispatcher` from
+     [[swing-heavyweight-webview-embedding]].
 3. Methods:
    - `create(int width, int height, boolean debug): OffscreenWebView`
      - Logic: call
        `webview_offscreen_create(max(1,w), max(1,h), debug?1:0)`;
        return `null` if the native side returns 0 (unsupported
        platform).
+       **Install the eval bridge BEFORE returning** so it is
+       in place before the lightweight component's `addNotify`
+       starts replaying user config: construct the
+       `EvalDispatcher` (storing it in the `evalDispatcher`
+       field) with the `EvalSink` lambda described in Fields;
+       call `webview_offscreen_init(peer, EvalDispatcher.SHIM_JS)`
+       to register the wrapper-installer at document-start
+       (idempotency is guarded inside the shim itself by
+       `window.__webview_eval_installed__`); register the
+       resolver binding by constructing a
+       `WebViewNativeCallback` whose `invoke(arg, wv)` calls
+       `evalDispatcher.dispatch(arg)`, anchoring it in `heap`
+       (anti-GC), and calling
+       `WebViewNative.webview_offscreen_bind(peer,
+       EvalDispatcher.CHANNEL_NAME, fn, peer)`. The
+       reserved-name guard on the higher-level
+       `WebViewLightweightComponent.addJavascriptCallback` is
+       bypassed because this registration goes directly through
+       the `WebViewNative` JNI call rather than through any
+       component-level method — same pattern as the existing
+       console / mouse bridges register from
+       `WebViewLightweightComponent.addNotify`.
    - `setSize(int w, int h): OffscreenWebView` —
      `checkAlive`, call
      `webview_offscreen_resize(peer, max(1,w), max(1,h))`.
@@ -414,6 +544,24 @@ File: `src/ca/weblite/webview/OffscreenWebView.java`
    - `eval(String js): OffscreenWebView` — `checkAlive`, then
      `WebViewNative.webview_offscreen_eval(peer, js)`. Mirrors
      `EmbeddedWebView.eval`.
+   - `evalAsync(String js): CompletableFuture<String>` (new) —
+     `Objects.requireNonNull(js, "js");` — null is a programming
+     error, propagate synchronously per
+     [[webview-async-javascript-eval]] Norms. If `peer == 0L`,
+     allocate a fresh `CompletableFuture<String>` and complete
+     it exceptionally with
+     `IllegalStateException("OffscreenWebView has been disposed.")`
+     (matching the message string the existing `checkAlive`
+     produces) and return it without touching the dispatcher.
+     Otherwise delegate to `evalDispatcher.evalAsync(js)` and
+     return the dispatcher's future verbatim. Does NOT call
+     `checkAlive` because `checkAlive` throws and the
+     `evalAsync` contract is that lifecycle failures arrive as
+     exceptional futures, not as thrown exceptions. The
+     dispatcher handles the full JS contract, error mapping,
+     in-flight map, and EDT marshaling. Symmetric with
+     `EmbeddedWebView.evalAsync` from
+     [[swing-heavyweight-webview-embedding]].
    - `addJavascriptCallback(String name, WebView.JavascriptCallback cb): OffscreenWebView`
      — `checkAlive`; put `name → cb` into `bindings`;
      construct a `WebViewNativeCallback` whose `invoke(arg, wv)`
@@ -433,9 +581,23 @@ File: `src/ca/weblite/webview/OffscreenWebView.java`
    - `openDevTools(): boolean` — `checkAlive`; call
      `WebViewNative.webview_offscreen_open_devtools(peer)`;
      return `(result == 1)`.
-   - `dispose(): void` — zero `peer` then call
-     `webview_offscreen_destroy` if non-zero; clear `heap` and
-     `bindings`.
+   - `dispose(): void` — if `peer != 0`, FIRST call
+     `evalDispatcher.disposeAllPending()` so every pending
+     `evalAsync` future completes exceptionally with
+     `IllegalStateException("OffscreenWebView disposed")` (and
+     the dispatcher's `disposed` flag flips so subsequent
+     `evalAsync` calls return an already-failed future without
+     touching the engine); then zero `peer`, call
+     `webview_offscreen_destroy`, clear `heap` and `bindings`.
+     The order matters: drain pending futures BEFORE clearing
+     `heap`, because the resolver-binding callback (anchored in
+     `heap`) could otherwise be GC'd between the drain and the
+     native destroy — the dispatcher's drain marks the futures
+     `cancelled`-by-exception in a single atomic snapshot, so
+     any callback that fires after the drain finds an empty
+     pending map and silently drops. Symmetric with
+     `EmbeddedWebView.dispose` from
+     [[swing-heavyweight-webview-embedding]].
 4. Constraints / Invariants:
    - All operations except `create` and `dispose` go through
      `checkAlive` which throws after dispose.
@@ -609,6 +771,29 @@ File: `src/ca/weblite/webview/swing/WebViewLightweightComponent.java`
        abstract contract's "no-op until displayable" — same
        as heavyweight `WebViewHeavyweightComponent.eval`).
        Otherwise call `engine.eval(js)`.  Return `this`.
+   - `evalAsync(String js): CompletableFuture<String>`
+     - Logic: if `engine == null`, allocate a fresh
+       `CompletableFuture<String>` and complete it
+       exceptionally with
+       `IllegalStateException("WebViewComponent not displayed")`,
+       return it. Otherwise delegate to
+       `engine.evalAsync(js)` and return its future verbatim.
+       No buffering: pre-display calls fail rather than queue,
+       because a future demands a definite resolution and there
+       is no defined moment to resolve a buffered pre-display
+       call. On macOS / Windows where the offscreen engine
+       never creates, the failed-future path is the permanent
+       result — the dispatcher cannot deliver continuations
+       without a live engine. This is the lightweight-specific
+       graceful-degradation shape: callers receive a clear
+       exceptional completion (`IllegalStateException`) rather
+       than a future that hangs forever. The dispatcher inside
+       `engine` handles the in-flight map, the JS contract, the
+       `JavaScriptEvalException` mapping, and the EDT
+       marshaling (per the `marshalToEdt = true` branch of
+       [[webview-async-javascript-eval]]). Symmetric with
+       `WebViewHeavyweightComponent.evalAsync` from
+       [[swing-heavyweight-webview-embedding]].
    - `addJavascriptCallback(String name, WebView.JavascriptCallback cb): WebViewComponent`
      - Logic: reject reserved-prefix names (any
        `name.startsWith("__webview_")`) with
@@ -1043,3 +1228,39 @@ Files:
   `EmbeddedWebView.executeEditingCommand` safeguard from
   [[swing-heavyweight-webview-embedding]]. The exception
   message MUST name the parameter (`"cmd"`).
+- The `__webview_eval_result__` resolver binding callback
+  constructed in `OffscreenWebView.create` MUST be anchored
+  in the same `heap` list as every other native callback this
+  canvas registers. Forgetting `heap.add(fn)` lets the JVM
+  dereference a freed Java ref on the next eval result —
+  exactly the same failure mode as for console-channel and
+  mouse-channel callbacks, with the same fix. Symmetric with
+  the heavyweight safeguard in
+  [[swing-heavyweight-webview-embedding]].
+- The per-peer `EvalDispatcher` lifecycle is tied to
+  `OffscreenWebView`: constructed in `create`, drained on
+  `dispose`. The dispatcher's `disposed` flag flips inside
+  `disposeAllPending()` BEFORE `OffscreenWebView.dispose`
+  zeroes `peer` and clears `heap`, so any pending JS callback
+  firing during destroy finds either an empty `pending` map
+  (drained) or a still-alive resolver callback that silently
+  drops — never a SIGSEGV. Inverting the order (clearing heap
+  before draining) would let a late callback run on a dead
+  future reference; the existing dispose contract enforces
+  drain-first. Symmetric with the heavyweight safeguard in
+  [[swing-heavyweight-webview-embedding]].
+- The lightweight `evalAsync` completes futures on the EDT
+  (per [[webview-async-javascript-eval]] `marshalToEdt = true`).
+  The lightweight component already runs a Swing-aware paint
+  cycle (the `repaintTimer` runs on the EDT), but the JS
+  binding callback that resolves the future fires on the GTK
+  pump thread — the dispatcher's `SwingUtilities.invokeLater`
+  hop normalizes the completion thread so caller
+  `.thenAccept(...)` / `.thenApply(...)` / `.exceptionally(...)`
+  / `.handle(...)` continuations land on the EDT and can touch
+  Swing state directly. Symmetric with the heavyweight
+  EDT-marshaling contract in
+  [[swing-heavyweight-webview-embedding]], and consistent with
+  the standalone `WebView` surface's opposite
+  `marshalToEdt = false` branch documented in
+  [[in-process-webview-java-api]].

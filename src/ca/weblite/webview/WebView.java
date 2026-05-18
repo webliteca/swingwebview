@@ -29,6 +29,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Encapsulates a WebBrowser window.  This class interfaces directly with the
@@ -91,10 +92,31 @@ public class WebView {
     
     
     /**
+     * Per-instance fan-out hub for {@link #evalAsync(String)}.  Holds
+     * the in-flight {@code requestId -> CompletableFuture<String>} map,
+     * the JS wrapper template, and the dispose drain.  Constructed with
+     * {@code marshalToEdt = false} because the standalone {@code WebView}
+     * owns its own main-thread event loop and has no Swing in the
+     * picture — future continuations complete on the WebView's native
+     * UI thread (the same thread that {@link #dispatch(Runnable)}
+     * callbacks land on).  Callers needing EDT delivery wrap with
+     * {@code .thenAcceptAsync(continuation, SwingUtilities::invokeLater)}.
+     */
+    private final EvalDispatcher evalDispatcher;
+
+    /**
      * Creates a new webview.
      */
     public WebView() {
-        
+        this.evalDispatcher = new EvalDispatcher(new EvalDispatcher.EvalSink() {
+            @Override
+            public void eval(String js) {
+                long p = peer;
+                if (p != 0L) {
+                    WebViewNative.webview_eval(p, js);
+                }
+            }
+        }, false, "WebView");
     }
     
     /**
@@ -196,15 +218,49 @@ public class WebView {
     /**
      * Execute javascript.
      * @param js Javscript to run
-     * @return 
+     * @return
      */
     public WebView eval(String js) {
         WebViewNative.webview_eval(peer, js);
         return this;
     }
-    
-    
-   
+
+    /**
+     * Evaluate JavaScript and return a future that completes with the
+     * JSON-stringified result.  See
+     * {@link EvalDispatcher#evalAsync(String)} for the full contract
+     * (snippet must use {@code return} to yield a value, {@code undefined}
+     * maps to {@code "null"}, returned {@code Promise}s are awaited,
+     * JS-side errors surface as a {@link JavaScriptEvalException}).
+     *
+     * <p>Returns an already-failed future carrying
+     * {@code IllegalStateException("WebView not shown")} when called
+     * before {@link #show()} or after the window has closed (the
+     * post-{@code webview_run} cleanup in {@link #show()} zeroes
+     * {@code peer}).
+     *
+     * <p>Threading: future continuations
+     * ({@code .thenAccept}/{@code .thenApply}/{@code .exceptionally}/{@code .handle})
+     * run inline on the WebView's native UI thread — the same thread
+     * that {@link #dispatch(Runnable)} callbacks land on.  Callers
+     * needing EDT delivery wrap with
+     * {@code .thenAcceptAsync(continuation, SwingUtilities::invokeLater)}.
+     *
+     * @param js the JS snippet; must not be null.
+     * @return a future that resolves to the JSON-stringified result.
+     * @throws NullPointerException if {@code js} is null.
+     */
+    public CompletableFuture<String> evalAsync(String js) {
+        if (js == null) throw new NullPointerException("js");
+        if (peer == 0L) {
+            CompletableFuture<String> f = new CompletableFuture<String>();
+            f.completeExceptionally(new IllegalStateException("WebView not shown"));
+            return f;
+        }
+        return evalDispatcher.evalAsync(js);
+    }
+
+
     /**
      * Dispatch on the WebView event thread.
      * @param r 
@@ -227,10 +283,24 @@ public class WebView {
     public void show() {
         peer = WebViewNative.webview_create(0, 0);
         WebViewNative.webview_set_bounds(peer, 0, 0, w, h, 0);
+        // Install the evalAsync shim FIRST so it runs at document-start
+        // before any user init script.  Idempotency-guarded inside the
+        // shim itself by window.__webview_eval_installed__.
+        WebViewNative.webview_init(peer, EvalDispatcher.SHIM_JS);
         for (String js : onBeforeLoad) {
             WebViewNative.webview_init(peer, js);
         }
         WebViewNative.webview_set_title(peer, title);
+        // Register the eval resolver binding via direct JNI (the
+        // __webview_ reserved prefix is unenforced on the standalone
+        // WebView surface, but going directly through webview_bind
+        // matches the pattern used by the embedded engines and keeps
+        // the resolver invisible to addJavascriptCallback callers).
+        WebViewNativeCallback evalCb = (String arg, long wv) -> {
+            evalDispatcher.dispatch(arg);
+        };
+        heap.add(evalCb);
+        WebViewNative.webview_bind(peer, EvalDispatcher.CHANNEL_NAME, evalCb, peer);
         for (final String key : bindings.keySet()) {
             WebViewNativeCallback fn = (String arg2, long wv) -> {
                 JavascriptCallback cb = bindings.get(key);
@@ -243,6 +313,12 @@ public class WebView {
         }
         WebViewNative.webview_navigate(peer, url);
         WebViewNative.webview_run(peer);
+        // Window closed and native peer destroyed.  Zero peer so
+        // subsequent entry points observe the dead state, and drain
+        // pending evalAsync futures so callers waiting on .get() do
+        // not hang.
+        peer = 0L;
+        evalDispatcher.disposeAllPending();
     }
 
 }

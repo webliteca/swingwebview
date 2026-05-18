@@ -9,6 +9,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 
 /**
  * Low-level wrapper around an offscreen (lightweight) WebView native peer.
@@ -41,8 +42,30 @@ public class OffscreenWebView {
     private final Map<String, WebView.JavascriptCallback> bindings =
             new LinkedHashMap<String, WebView.JavascriptCallback>();
 
+    /**
+     * Per-engine fan-out hub for {@link #evalAsync(String)}.  Holds the
+     * in-flight {@code requestId -> CompletableFuture<String>} map and
+     * the dispose drain.  Constructed with {@code marshalToEdt = true}
+     * so future continuations land on the Swing EDT, matching the
+     * existing {@code ConsoleListener} / {@code WebViewMouseListener}
+     * contracts on {@code WebViewComponent}.  Its {@code EvalSink}
+     * issues {@code webview_offscreen_eval} when {@code peer != 0}; the
+     * sink-level guard is belt-and-suspenders against a destroy that
+     * races a dispatch.
+     */
+    private final EvalDispatcher evalDispatcher;
+
     private OffscreenWebView(long peer) {
         this.peer = peer;
+        this.evalDispatcher = new EvalDispatcher(new EvalDispatcher.EvalSink() {
+            @Override
+            public void eval(String js) {
+                long p = OffscreenWebView.this.peer;
+                if (p != 0L) {
+                    WebViewNative.webview_offscreen_eval(p, js);
+                }
+            }
+        }, true, "OffscreenWebView");
     }
 
     /**
@@ -53,7 +76,25 @@ public class OffscreenWebView {
         long p = WebViewNative.webview_offscreen_create(
             Math.max(1, width), Math.max(1, height), debug ? 1 : 0);
         if (p == 0L) return null;
-        return new OffscreenWebView(p);
+        final OffscreenWebView ow = new OffscreenWebView(p);
+        // Install the evalAsync bridge BEFORE returning so the SHIM_JS is
+        // in place at document-start for every subsequent navigation, and
+        // the __webview_eval_result__ resolver binding is ready before
+        // the lightweight component's addNotify starts replaying user
+        // config.  Goes directly through WebViewNative (not through
+        // OffscreenWebView.addJavascriptCallback) so callers can't reroute
+        // the binding by registering a colliding name through the
+        // public API.
+        WebViewNative.webview_offscreen_init(p, EvalDispatcher.SHIM_JS);
+        WebViewNativeCallback evalCb = new WebViewNativeCallback() {
+            @Override
+            public void invoke(String arg, long wv) {
+                ow.evalDispatcher.dispatch(arg);
+            }
+        };
+        ow.heap.add(evalCb);
+        WebViewNative.webview_offscreen_bind(p, EvalDispatcher.CHANNEL_NAME, evalCb, p);
+        return ow;
     }
 
     /** @return the native peer pointer, or 0 if disposed. */
@@ -139,6 +180,38 @@ public class OffscreenWebView {
     }
 
     /**
+     * Evaluate JavaScript in the current document and return a future
+     * that completes with the JSON-stringified result.  See
+     * {@link EvalDispatcher#evalAsync(String)} for the full contract.
+     *
+     * <p>Unlike {@link #eval(String)} this method does NOT call
+     * {@code checkAlive} and does NOT throw on dispose — lifecycle
+     * failures surface as exceptional future completions instead, so
+     * callers never have to wrap {@code evalAsync} in try/catch.  When
+     * {@code peer == 0L} (disposed) returns an already-failed future
+     * carrying
+     * {@code IllegalStateException("OffscreenWebView has been disposed.")}
+     * without touching the dispatcher; otherwise delegates to
+     * {@link EvalDispatcher#evalAsync(String)}.
+     *
+     * <p>Future continuations complete on the Swing EDT.
+     *
+     * @param js the JS snippet; must not be null.
+     * @return a future that resolves to the JSON-stringified result.
+     * @throws NullPointerException if {@code js} is null.
+     */
+    public CompletableFuture<String> evalAsync(String js) {
+        if (js == null) throw new NullPointerException("js");
+        if (peer == 0L) {
+            CompletableFuture<String> f = new CompletableFuture<String>();
+            f.completeExceptionally(
+                new IllegalStateException("OffscreenWebView has been disposed."));
+            return f;
+        }
+        return evalDispatcher.evalAsync(js);
+    }
+
+    /**
      * Bind a Java callback under {@code window.<name>} in the offscreen
      * page.  Structurally identical to
      * {@link EmbeddedWebView#addJavascriptCallback}: the native side
@@ -216,6 +289,17 @@ public class OffscreenWebView {
     public void dispose() {
         if (peer != 0L) {
             long p = peer;
+            // Drain pending evalAsync futures FIRST so callers waiting
+            // on .get() wake up with IllegalStateException rather than
+            // hanging forever, and the dispatcher's disposed flag flips
+            // so subsequent evalAsync calls return an already-failed
+            // future without touching the engine.  Runs before the
+            // heap clear / native destroy so the resolver-binding
+            // callback (anchored in heap) is still reachable if a late
+            // JS-side callback fires during the destroy sequence — but
+            // the drain ensures such a late callback finds an empty
+            // pending map and silently drops.
+            evalDispatcher.disposeAllPending();
             peer = 0L;
             WebViewNative.webview_offscreen_destroy(p);
             heap.clear();

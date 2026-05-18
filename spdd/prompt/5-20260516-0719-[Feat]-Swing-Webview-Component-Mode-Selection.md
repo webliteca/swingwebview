@@ -12,9 +12,27 @@ generated_at: 2026-05-16T07:19:13-07:00
   heavyweight peer or an offscreen-rendered lightweight component
   (`WebViewComponent.java:42`).
 - Public abstract API: `setUrl`/`getUrl`, `setDebug`,
-  `addOnBeforeLoad`, `eval`, `addJavascriptCallback`,
-  `dispatch`, `dispose`, `isHeavyweight`
+  `addOnBeforeLoad`, `eval`, `evalAsync`,
+  `addJavascriptCallback`, `dispatch`, `dispose`,
+  `isHeavyweight`
   (`WebViewComponent.java:122`–`WebViewComponent.java:170`).
+  The `evalAsync(String js): CompletableFuture<String>` method
+  is the embedded counterpart of `WebView.evalAsync` (see
+  [[in-process-webview-java-api]]) and MUST be implemented by
+  every subclass (currently `WebViewHeavyweightComponent` per
+  [[swing-heavyweight-webview-embedding]] and
+  `WebViewLightweightComponent` per
+  [[swing-lightweight-webview-embedding]]). Future continuations
+  on the returned future complete on the Swing Event Dispatch
+  Thread, matching the existing `ConsoleListener` and
+  `WebViewMouseListener` contracts — this is the
+  `marshalToEdt = true` branch of the dispatcher contract
+  documented in [[webview-async-javascript-eval]]. The standalone
+  in-process `WebView` surface
+  ([[in-process-webview-java-api]]) takes the opposite
+  `marshalToEdt = false` branch since it has no Swing in
+  the picture; the asymmetry is intentional and documented in
+  both canvases.
 - Public non-abstract API (defaulted on the base class so any
   future subclass inherits without rework):
   - `openDevTools(): boolean` — opens the platform's native
@@ -178,6 +196,22 @@ generated_at: 2026-05-16T07:19:13-07:00
   receives `onMessage` on the EDT regardless of which
   subclass produced the message — matches Swing convention
   and lets listeners touch Swing state directly.
+- **`evalAsync` is part of the embedding API surface and
+  delegates per-subclass to the engine wrapper's `evalAsync`.**
+  Heavyweight calls into the backing `EmbeddedWebView.evalAsync`
+  (see [[swing-heavyweight-webview-embedding]]); lightweight
+  calls into the backing `OffscreenWebView.evalAsync` (see
+  [[swing-lightweight-webview-embedding]]). The per-engine
+  `EvalDispatcher` instance owned by the backing wrapper is
+  constructed with `marshalToEdt = true` and the appropriate
+  `disposeLabel`, so future-continuation callbacks
+  (`.thenAccept`, `.thenApply`, `.exceptionally`, `.handle`)
+  land on the EDT. This matches the existing `ConsoleListener`
+  and `WebViewMouseListener` EDT contracts on this canvas, so
+  callers can touch Swing state directly from continuations
+  without an additional thread hop. The dispatcher class, JS
+  shim contract, and `JavaScriptEvalException` type are owned
+  by [[webview-async-javascript-eval]].
 
 ## S · Structure
 - `src/ca/weblite/webview/swing/WebViewComponent.java` — abstract
@@ -200,6 +234,15 @@ generated_at: 2026-05-16T07:19:13-07:00
   same shim by referencing one location.
 - `README.md ("Choosing a mode" section)` — user-facing platform/mode matrix and override
   documentation.
+- `src/ca/weblite/webview/EvalDispatcher.java` — owned by
+  [[webview-async-javascript-eval]]. Both subclasses depend on
+  it for `evalAsync`; this canvas only declares the abstract
+  method signature.
+- `src/ca/weblite/webview/JavaScriptEvalException.java` — owned
+  by [[webview-async-javascript-eval]]. Surfaces in the
+  exceptional completion of `evalAsync` futures returned by
+  either subclass when the JS side fails (sync throw, Promise
+  rejection, serialization failure).
 
 ## O · Operations
 
@@ -277,6 +320,30 @@ File: `src/ca/weblite/webview/swing/WebViewComponent.java`
      and replayed on attach (`WebViewComponent.java:135`).
    - `eval(String js): WebViewComponent` — no-op until
      displayable (`WebViewComponent.java:141`).
+   - `evalAsync(String js): CompletableFuture<String>` — run
+     `js` and yield a future that completes with the
+     JSON-stringified result (`undefined → null`, Promise-
+     awaiting). When called before the component is displayed
+     (engine not yet alive), the returned future is already
+     completed exceptionally with `IllegalStateException`; no
+     native call is issued. When the JS side throws or returns a
+     rejecting Promise, the future completes exceptionally with
+     `JavaScriptEvalException` carrying the JS-side message.
+     Future continuations complete on the Swing EDT
+     (`marshalToEdt = true` branch of
+     [[webview-async-javascript-eval]]), matching the existing
+     `ConsoleListener` and `WebViewMouseListener` contracts.
+     The exact dispatcher wiring, JS shim, exception type, and
+     lifecycle of pending futures on dispose are all owned by
+     [[webview-async-javascript-eval]]; the concrete subclass
+     implementations are owned by
+     [[swing-heavyweight-webview-embedding]] and
+     [[swing-lightweight-webview-embedding]] respectively.
+     `evalAsync` is safe to call from any Java thread. The user
+     snippet must use `return` to yield a value — the wrapper
+     wraps it in an IIFE; a bare expression is not the IIFE's
+     return value. See [[webview-async-javascript-eval]] for the
+     full JS contract.
    - `addJavascriptCallback(String name, WebView.JavascriptCallback cb): WebViewComponent`
      — buffered and replayed on attach
      (`WebViewComponent.java:148`).
@@ -451,3 +518,35 @@ File: `src/ca/weblite/webview/swing/WebViewComponent.java`
   so a future subclass that doesn't override the method still
   behaves consistently with the macOS "enabled but not
   programmatically openable" semantics.
+- The abstract `evalAsync(String): CompletableFuture<String>`
+  signature on `WebViewComponent` is part of the binary
+  contract. Future extensions (variants, options, typed
+  result wrappers) MUST be added as new methods or overloads —
+  modifying the existing signature is a
+  binary-compatibility-breaking change for every host
+  application compiled against today's library and is forbidden.
+  The same rule applied to `addConsoleListener` /
+  `addWebViewMouseListener` (added as new methods, never by
+  altering an existing one) is the precedent.
+- The embedded surface marshals `evalAsync` future completions
+  to the EDT (the `marshalToEdt = true` branch of
+  [[webview-async-javascript-eval]]). The standalone
+  in-process `WebView` surface ([[in-process-webview-java-api]])
+  does NOT — that's the `marshalToEdt = false` branch. Both
+  are correct in context; the asymmetry is documented in both
+  canvases. Callers wanting EDT delivery from the standalone
+  surface arrange it themselves via
+  `.thenAcceptAsync(continuation, SwingUtilities::invokeLater)`.
+- Calling `evalAsync` before the component is displayed MUST
+  return an already-failed future whose cause is an
+  `IllegalStateException` and MUST NOT issue a native call.
+  Concrete subclasses implement this per their own
+  peer-creation lifecycle: heavyweight checks the `embedded`
+  field
+  ([[swing-heavyweight-webview-embedding]]); lightweight
+  checks the `engine` field
+  ([[swing-lightweight-webview-embedding]]).
+  Symmetric with the existing pre-display contract for `eval`
+  ("no-op until displayable") except that `evalAsync` cannot
+  silently no-op — callers expect a future to complete one way
+  or another.

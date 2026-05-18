@@ -34,6 +34,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.CompletableFuture;
 import javax.swing.SwingUtilities;
 import javax.swing.Timer;
 
@@ -408,6 +409,19 @@ public class WebViewLightweightComponent extends WebViewComponent {
             engine.eval(js);
         }
         return this;
+    }
+
+    @Override
+    public CompletableFuture<String> evalAsync(String js) {
+        if (js == null) throw new NullPointerException("js");
+        OffscreenWebView e = engine;
+        if (e == null) {
+            CompletableFuture<String> f = new CompletableFuture<String>();
+            f.completeExceptionally(
+                new IllegalStateException("WebViewComponent not displayed"));
+            return f;
+        }
+        return e.evalAsync(js);
     }
 
     @Override
