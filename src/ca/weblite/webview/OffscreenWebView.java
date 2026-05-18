@@ -285,6 +285,37 @@ public class OffscreenWebView {
         return this;
     }
 
+    /**
+     * Register (or clear, by passing {@code null}) a callback invoked for
+     * each JS-initiated UI dialog ({@code alert} / {@code confirm} /
+     * {@code prompt}) or {@code <input type="file">} click inside the
+     * offscreen WebView.  Unlike {@code setFocusCallback} /
+     * {@code setClickCallback} on {@link EmbeddedWebView}, dialog
+     * callbacks RETURN VALUES to the engine synchronously: the native
+     * UI thread is suspended while waiting for the answer.
+     * Implementations MUST marshal to the EDT (the library-provided
+     * implementation routes through {@link DialogDispatcher} which uses
+     * {@code SwingUtilities.invokeAndWait}).
+     *
+     * <p>Anchoring the callback in {@code heap} is required so the JVM
+     * does not garbage-collect the lambda while the native side holds
+     * a global ref.
+     *
+     * <p>On macOS / Windows, where the offscreen engine itself is a
+     * stub, this method has no effect — the native stub is a no-op.
+     * Linux is the only platform where the offscreen path actually
+     * dispatches dialog requests, and STORY-004-002 implements the GTK
+     * signal-handler side.
+     */
+    public OffscreenWebView setDialogCallback(WebViewDialogCallback cb) {
+        checkAlive();
+        if (cb != null) {
+            heap.add(cb);
+        }
+        WebViewNative.webview_offscreen_set_dialog_callback(peer, cb);
+        return this;
+    }
+
     /** Release native resources. */
     public void dispose() {
         if (peer != 0L) {

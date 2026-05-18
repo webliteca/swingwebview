@@ -411,6 +411,44 @@ public class EmbeddedWebView {
     }
 
     /**
+     * Register (or clear, by passing {@code null}) a callback invoked
+     * for each JS-initiated UI dialog ({@code alert} / {@code confirm}
+     * / {@code prompt}) or {@code <input type="file">} click inside the
+     * embedded WebView.  Unlike {@link #setFocusCallback} /
+     * {@link #setClickCallback}, dialog callbacks RETURN VALUES to the
+     * engine synchronously: the native UI thread is suspended while
+     * waiting for the answer.  Implementations MUST marshal to the
+     * EDT (the library-provided implementation routes through
+     * {@link DialogDispatcher} which uses
+     * {@code SwingUtilities.invokeAndWait}).
+     *
+     * <p>Anchoring the callback in {@code heap} is required so the JVM
+     * does not garbage-collect the lambda while the native side holds
+     * a global ref.
+     *
+     * <p>Per-platform delivery:
+     * <ul>
+     *   <li><b>macOS</b>: {@code WKUIDelegate} selectors on the
+     *       {@code WKWebView} — wired in STORY-004-001 (this story).</li>
+     *   <li><b>Linux heavyweight</b>: {@code script-dialog} and
+     *       {@code run-file-chooser} signals on {@code WebKitWebView} —
+     *       wired in STORY-004-002.</li>
+     *   <li><b>Windows</b>: {@code ICoreWebView2::add_ScriptDialogOpening}
+     *       event handler — wired in STORY-004-003 (file picker remains
+     *       OS-native; {@code <input type="file">} is not interceptable
+     *       in WebView2).</li>
+     * </ul>
+     */
+    public EmbeddedWebView setDialogCallback(WebViewDialogCallback cb) {
+        checkAlive();
+        if (cb != null) {
+            heap.add(cb);
+        }
+        WebViewNative.webview_embed_set_dialog_callback(peer, cb);
+        return this;
+    }
+
+    /**
      * Windows-only: force Win32 keyboard focus back to the AWT-owned parent
      * HWND, so subsequent keystrokes route to AWT instead of the WebView2
      * child HWND.  Used by the Java-side global focus-owner listener when

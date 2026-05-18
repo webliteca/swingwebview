@@ -122,6 +122,14 @@ struct Engine {
     // into the WebView (AWT's MouseGrabber AWTEventListener never sees
     // those clicks because they reach the WebView2 HWND directly).
     jobject click_callback = nullptr;
+    // JNI global ref to the registered WebViewDialogCallback, or nullptr.
+    // Storage only in this canvas (STORY-004-001) -- STORY-004-003 wires
+    // ICoreWebView2::add_ScriptDialogOpening + AreDefaultScriptDialogsEnabled(FALSE)
+    // to actually invoke this callback for JS alert / confirm / prompt.
+    // The Windows file picker remains OS-native (WebView2 exposes no
+    // public hook for <input type=file>), so this callback is never
+    // invoked for the file-picker event kind on Windows.
+    jobject dialog_callback = nullptr;
 };
 
 static void fire_focus_callback(Engine *e, bool became) {
@@ -605,6 +613,22 @@ static void destroy_engine(Engine *e) {
         e->click_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
+    // Symmetric cleanup for the dialog callback global ref.  Storage
+    // only in this canvas; STORY-004-003 will fire the ScriptDialogOpening
+    // event handler off this field, so the symmetric cleanup is required
+    // even though STORY-004-001 itself never invokes the callback on
+    // Windows.
+    if (e->dialog_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->dialog_callback);
+        e->dialog_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     {
         std::lock_guard<std::mutex> lk(e->bindings_mutex);
         for (auto &kv : e->bindings) {
@@ -941,6 +965,33 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
     if (cb) {
         e->click_callback = env->NewGlobalRef(cb);
     }
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1dialog_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    // Store the Java callback (JNI global ref) on the Engine.
+    // STORY-004-001 only ships storage on Windows -- STORY-004-003
+    // wires the ICoreWebView2::add_ScriptDialogOpening event handler
+    // off this field plus put_AreDefaultScriptDialogsEnabled(FALSE) so
+    // built-in WebView2 dialogs are suppressed and JS alert / confirm /
+    // prompt route through Java instead.  <input type=file> remains
+    // OS-native on Windows -- WebView2 exposes no public hook for it.
+    auto *e = (Engine *)wv;
+    if (!e) return;
+    if (e->dialog_callback) {
+        env->DeleteGlobalRef(e->dialog_callback);
+        e->dialog_callback = nullptr;
+    }
+    if (cb) {
+        e->dialog_callback = env->NewGlobalRef(cb);
+    }
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1dialog_1callback
+  (JNIEnv *, jclass, jlong, jobject) {
+    // Windows has no offscreen engine; OffscreenWebView.create returns
+    // null on Windows so this JNI bridge should never be reached.
+    // Stub it for link-symmetry across all three native binaries.
 }
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1release_1native_1focus

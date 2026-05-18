@@ -259,6 +259,56 @@ closes) returns an already-failed future whose cause is an
 [`demos/WebViewAsyncEvalDemo/`](demos/WebViewAsyncEvalDemo/README.md)
 for a runnable example.
 
+## Browser-initiated dialogs
+
+Pages can call `window.alert`, `window.confirm`, `window.prompt`, and
+they can include `<input type="file">` elements whose click opens a
+file picker.  `WebViewComponent.setDialogHandler` lets the host
+application customise — or fully suppress — what shows up:
+
+```java
+wv.setDialogHandler(new WebViewDialogHandler() {
+    @Override public boolean confirmOpened(WebViewConfirmEvent e) {
+        return JOptionPane.showConfirmDialog(
+            frame, e.message(), "Confirm",
+            JOptionPane.OK_CANCEL_OPTION) == JOptionPane.OK_OPTION;
+    }
+});
+```
+
+* **Default behaviour.**  When no handler is installed (the initial
+  state), every dialog kind shows a Swing dialog — `JOptionPane` for
+  alert / confirm / prompt, `JFileChooser` for file picker — modal to
+  the host `JFrame` resolved via
+  `SwingUtilities.getWindowAncestor(component)`.  Override individual
+  methods to customise specific kinds; un-overridden methods fall
+  through to the Swing defaults.
+* **Drop mode for headless tests.**  Pass `null`:
+  `wv.setDialogHandler(null)` installs an internal drop handler that
+  returns the JS-spec cancel values synchronously without UI
+  (`alert` no-op, `confirm` → `false`, `prompt` → `null`, file
+  picker → empty list).  Required for unit tests in headless
+  environments.  To reset to the framework default, pass
+  `WebViewDialogHandler.DEFAULT` explicitly — `null` is NOT a reset.
+* **Threading.**  Handler methods run on the Swing EDT, marshaled
+  from whatever native thread fired the dialog.  Calling
+  `wv.evalAsync(js).get()` from inside a handler **deadlocks** (both
+  calls park on the EDT); use `.thenAccept(...)` instead, or
+  pre-compute the value before the dialog opens.
+* **Platform coverage (current).**  macOS heavyweight (WKWebView)
+  routes all four dialog kinds through the handler in this release
+  (STORY-004-001).  On Linux and Windows, `setDialogHandler` stores
+  the handler reference but the embedded engine continues to use its
+  built-in dialogs until STORY-004-002 (WebKitGTK signal handlers)
+  and STORY-004-003 (WebView2 `ScriptDialogOpening` event) land.
+  On Windows, `<input type="file">` will continue to use the
+  OS-native dialog even after STORY-004-003 — WebView2 exposes no
+  public hook for it, so `filePickerOpened` never fires on Windows.
+
+See [`demos/WebViewDialogDemo/`](demos/WebViewDialogDemo/README.md)
+for a runnable example that exercises all four dialog kinds in each
+of the three handler modes (default, custom, drop).
+
 ## Demo
 
 See [`demos/WebViewHeavyweightDemo/`](demos/WebViewHeavyweightDemo/README.md)
@@ -278,6 +328,11 @@ Additional demos:
   throws and Promise rejections surfacing as
   `JavaScriptEvalException`, concurrent in-flight calls, and EDT
   delivery of continuations.
+* `demos/WebViewDialogDemo/` — exercises the new
+  `WebViewDialogHandler` API: default Swing dialogs
+  (`alert` / `confirm` / `prompt` / file picker), a custom handler
+  returning programmatic answers, and the
+  `setDialogHandler(null)` drop mode for headless tests.
 
 ## Building from source
 

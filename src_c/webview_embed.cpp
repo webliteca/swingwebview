@@ -382,6 +382,14 @@ struct Engine {
     // destroyed so a late press cannot fire into a freed ref.
     jobject click_callback = nullptr;
 
+    // JNI global ref to the registered WebViewDialogCallback, or nullptr.
+    // Storage only in this canvas (STORY-004-001) -- the signal handler
+    // wiring that actually invokes the callback lands in STORY-004-002
+    // (script-dialog + run-file-chooser on WebKitWebView).  The field
+    // is declared here so the JNI bridge function can store / clear
+    // the global ref without dropping the canvas-004-002 changes.
+    jobject dialog_callback = nullptr;
+
     Engine() {}
     ~Engine() {}
 };
@@ -814,6 +822,21 @@ static void gtk_destroy_engine(Engine *e) {
         e->click_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
+    // Same treatment for the dialog-callback global ref.  Stored only
+    // in this canvas; STORY-004-002 will fire signal handlers off
+    // this field, so symmetric cleanup is required even though
+    // STORY-004-001 itself never invokes the callback on Linux.
+    if (e->dialog_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm && e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->dialog_callback);
+        e->dialog_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     GtkPump::instance().run_sync([&] {
         if (e->redraw_timer_id) {
             g_source_remove(e->redraw_timer_id);
@@ -955,6 +978,24 @@ static void gtk_set_click_callback(Engine *e, JNIEnv *env, jobject cb) {
     }
 }
 
+// Register (or clear, when cb is null) the Java WebViewDialogCallback
+// for this engine.  STORY-004-001 stores the global ref but does NOT
+// install the WebKitWebView script-dialog / run-file-chooser signal
+// handlers that actually invoke it -- those land in STORY-004-002.
+// Implementing the storage lifecycle here keeps the JNI bridge linkable
+// across all three platforms and lets STORY-004-002 ship by only
+// touching the signal-handler wiring.
+static void gtk_set_dialog_callback(Engine *e, JNIEnv *env, jobject cb) {
+    if (!e) return;
+    if (e->dialog_callback) {
+        env->DeleteGlobalRef(e->dialog_callback);
+        e->dialog_callback = nullptr;
+    }
+    if (cb) {
+        e->dialog_callback = env->NewGlobalRef(cb);
+    }
+}
+
 // ===========================================================================
 // Linux / GTK lightweight (offscreen) engine
 //
@@ -974,6 +1015,12 @@ struct OffEngine {
     bool debug = false;
     std::map<std::string, Binding *> bindings;
     JavaVM *jvm = nullptr;
+
+    // JNI global ref to the registered WebViewDialogCallback, or nullptr.
+    // Storage only in this canvas (STORY-004-001) -- STORY-004-002 wires
+    // the WebKitGTK script-dialog + run-file-chooser signal handlers
+    // that actually invoke this callback on the offscreen WebKitWebView.
+    jobject dialog_callback = nullptr;
 };
 
 // Parallel of engine_on_message for OffEngine: parse the {name, seq, args}
@@ -1154,6 +1201,17 @@ static void gtk_off_destroy_engine(OffEngine *e) {
             e->web = nullptr;
         }
     });
+    if (e->dialog_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->dialog_callback);
+        e->dialog_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     for (auto &kv : e->bindings) {
         Binding *b = kv.second;
         JNIEnv *env = nullptr;
@@ -1171,6 +1229,23 @@ static void gtk_off_destroy_engine(OffEngine *e) {
     }
     e->bindings.clear();
     delete e;
+}
+
+// Register (or clear, when cb is null) the Java WebViewDialogCallback
+// for this offscreen engine.  STORY-004-001 stores the global ref but
+// does NOT install the WebKitGTK signal handlers; STORY-004-002 wires
+// the script-dialog + run-file-chooser handlers on the offscreen
+// WebKitWebView.
+static void gtk_off_set_dialog_callback(OffEngine *e, JNIEnv *env,
+                                        jobject cb) {
+    if (!e) return;
+    if (e->dialog_callback) {
+        env->DeleteGlobalRef(e->dialog_callback);
+        e->dialog_callback = nullptr;
+    }
+    if (cb) {
+        e->dialog_callback = env->NewGlobalRef(cb);
+    }
 }
 
 static void gtk_off_init_script(OffEngine *e, std::string js) {
@@ -1631,6 +1706,23 @@ struct Engine {
     std::string attach_failure_message;
     jobject attach_callback = nullptr;
     jclass attach_callback_cls = nullptr;
+
+    // JNI global ref to the registered WebViewDialogCallback, or
+    // nullptr.  Invoked by the WKUIDelegate selectors below for each
+    // JS-initiated alert / confirm / prompt and for <input type=file>
+    // clicks.  The selector waits for the Java side's return value
+    // (via DialogDispatcher's invokeAndWait EDT hop) before invoking
+    // the platform's completion handler, which is what releases the
+    // page's JS thread.  Cleared in cocoa_destroy_engine BEFORE the
+    // ui_delegate is released so any in-flight selector reads a null
+    // field instead of a freed ref.
+    jobject dialog_callback = nullptr;
+
+    // Per-engine WKUIDelegate instance assigned to e->webview via
+    // setUIDelegate:.  Retained by us (we hold the only strong ref);
+    // released in cocoa_destroy_engine after we clear the WKWebView's
+    // uiDelegate property.
+    id ui_delegate = nullptr;
 };
 
 // Process-global map from WKWebView (id) to its owning Engine*.  Populated
@@ -1814,6 +1906,428 @@ static Class get_webview_embed_delegate_cls() {
         g_webview_embed_delegate_cls = c;
     });
     return g_webview_embed_delegate_cls;
+}
+
+// ---------------------------------------------------------------------------
+// WKUIDelegate hook for JS-initiated dialogs.
+//
+// WKWebView consults its uiDelegate to know what to do for
+// runJavaScriptAlertPanelWithMessage: / runJavaScriptConfirmPanel: /
+// runJavaScriptTextInputPanel: / runOpenPanelWithParameters:.  If the
+// uiDelegate is nil -- which is the default -- WKWebView SILENTLY DROPS
+// these requests: alert() returns immediately, confirm() returns false,
+// prompt() returns null, and <input type=file> clicks open no picker.
+// Installing a uiDelegate that implements these selectors restores the
+// expected JS behaviour and lets the host customise it via
+// WebViewDialogHandler.
+//
+// Selectors are invoked on the AppKit main thread.  Each selector takes
+// a completionHandler block that MUST be invoked exactly once to release
+// the page's JavaScript thread; the dispatcher's invokeAndWait hop to
+// the Swing EDT happens between selector entry and completion-handler
+// invocation, so AppKit main is parked during the modal Swing dialog.
+// That is the correct JS-contract behaviour: the page is frozen while
+// the dialog is open.
+//
+// Class registration mirrors get_webview_embed_delegate_cls above
+// (once-per-JVM call_once + objc_allocateClassPair + class_addMethod +
+// objc_registerClassPair).
+// ---------------------------------------------------------------------------
+static std::once_flag g_webview_embed_ui_delegate_once;
+static Class g_webview_embed_ui_delegate_cls = nil;
+
+// Helper: convert an NSString (or nil) to a fresh jstring via UTF-8.
+// Returns nullptr for nil input.  Caller is responsible for releasing
+// the local ref via DeleteLocalRef when done.
+static jstring ns_to_jstring(JNIEnv *env, id ns) {
+    if (!ns) return nullptr;
+    const char *cstr = msg<const char *>(ns, sel("UTF8String"));
+    if (!cstr) return nullptr;
+    return env->NewStringUTF(cstr);
+}
+
+// Helper: read the top-level page URL from the WKWebView.
+static jstring page_url_jstring(JNIEnv *env, id webView) {
+    if (!webView) return nullptr;
+    id url = msg(webView, sel("URL"));
+    if (!url) return nullptr;
+    id abs = msg(url, sel("absoluteString"));
+    return ns_to_jstring(env, abs);
+}
+
+// Helper: read the URL of the frame that initiated the dialog.  When
+// frame is nil or its request has no URL, fall back to the page URL.
+static jstring frame_url_jstring(JNIEnv *env, id frame, id webView) {
+    if (frame) {
+        id req = msg(frame, sel("request"));
+        if (req) {
+            id url = msg(req, sel("URL"));
+            if (url) {
+                id abs = msg(url, sel("absoluteString"));
+                jstring js = ns_to_jstring(env, abs);
+                if (js) return js;
+            }
+        }
+    }
+    return page_url_jstring(env, webView);
+}
+
+// Helper: convert an NSArray<NSString*> (or nil) to a fresh
+// jobjectArray of UTF-8 jstrings.  Returns an empty array for nil
+// input -- never returns nullptr -- so the Java side can assume
+// non-null arrays.  Caller is responsible for releasing the local ref.
+static jobjectArray ns_array_to_jstring_array(JNIEnv *env, id nsArray) {
+    jclass strCls = env->FindClass("java/lang/String");
+    if (!strCls) return nullptr;
+    if (!nsArray) {
+        jobjectArray empty = env->NewObjectArray(0, strCls, nullptr);
+        env->DeleteLocalRef(strCls);
+        return empty;
+    }
+    long count = msg<long>(nsArray, sel("count"));
+    jobjectArray arr = env->NewObjectArray(
+        (jsize)count, strCls, nullptr);
+    for (long i = 0; i < count; i++) {
+        id ns = msg<id, long>(nsArray, sel("objectAtIndex:"), i);
+        jstring js = ns_to_jstring(env, ns);
+        if (js) {
+            env->SetObjectArrayElement(arr, (jsize)i, js);
+            env->DeleteLocalRef(js);
+        }
+    }
+    env->DeleteLocalRef(strCls);
+    return arr;
+}
+
+// Ensure the current AppKit thread is attached to the JVM and return
+// the JNIEnv.  Sets *attached to true when this call attached (the
+// caller must detach before returning to AppKit).  Returns nullptr on
+// failure -- caller must invoke the platform completion handler with
+// the safe default.
+static JNIEnv *ensure_jni_env(JavaVM *jvm, bool *attached) {
+    *attached = false;
+    if (!jvm) return nullptr;
+    JNIEnv *env = nullptr;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK) {
+            return nullptr;
+        }
+        *attached = true;
+    }
+    return env;
+}
+
+// IMP: -[WebviewEmbedUIDelegate webView:runJavaScriptAlertPanelWithMessage:
+//                               initiatedByFrame:completionHandler:]
+static void impl_run_alert(id self, SEL, id webView, id message,
+                           id frame, id completionHandler) {
+    Engine *e = (Engine *)objc_getAssociatedObject(self, "eng");
+    auto run_completion = [&] {
+        // void(^)(void)
+        ((void (^)(void))completionHandler)();
+    };
+    if (!e || !e->dialog_callback) {
+        run_completion();
+        return;
+    }
+    bool attached = false;
+    JNIEnv *env = ensure_jni_env(e->jvm, &attached);
+    if (!env) {
+        run_completion();
+        return;
+    }
+    jstring jmsg = ns_to_jstring(env, message);
+    jstring jpage = page_url_jstring(env, webView);
+    jstring jframe = frame_url_jstring(env, frame, webView);
+    jclass cls = env->GetObjectClass(e->dialog_callback);
+    if (cls) {
+        jmethodID mid = env->GetMethodID(
+            cls, "onAlert",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+        if (mid) {
+            env->CallVoidMethod(e->dialog_callback, mid,
+                                jmsg, jpage, jframe);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (jmsg) env->DeleteLocalRef(jmsg);
+    if (jpage) env->DeleteLocalRef(jpage);
+    if (jframe) env->DeleteLocalRef(jframe);
+    if (attached) e->jvm->DetachCurrentThread();
+    run_completion();
+}
+
+// IMP: -[WebviewEmbedUIDelegate webView:runJavaScriptConfirmPanelWithMessage:
+//                               initiatedByFrame:completionHandler:]
+static void impl_run_confirm(id self, SEL, id webView, id message,
+                             id frame, id completionHandler) {
+    Engine *e = (Engine *)objc_getAssociatedObject(self, "eng");
+    auto run_completion = [&](BOOL result) {
+        ((void (^)(BOOL))completionHandler)(result);
+    };
+    if (!e || !e->dialog_callback) {
+        run_completion(NO);
+        return;
+    }
+    bool attached = false;
+    JNIEnv *env = ensure_jni_env(e->jvm, &attached);
+    if (!env) {
+        run_completion(NO);
+        return;
+    }
+    jboolean result = JNI_FALSE;
+    jstring jmsg = ns_to_jstring(env, message);
+    jstring jpage = page_url_jstring(env, webView);
+    jstring jframe = frame_url_jstring(env, frame, webView);
+    jclass cls = env->GetObjectClass(e->dialog_callback);
+    if (cls) {
+        jmethodID mid = env->GetMethodID(
+            cls, "onConfirm",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z");
+        if (mid) {
+            result = env->CallBooleanMethod(
+                e->dialog_callback, mid, jmsg, jpage, jframe);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+                result = JNI_FALSE;
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (jmsg) env->DeleteLocalRef(jmsg);
+    if (jpage) env->DeleteLocalRef(jpage);
+    if (jframe) env->DeleteLocalRef(jframe);
+    if (attached) e->jvm->DetachCurrentThread();
+    run_completion(result == JNI_TRUE ? YES : NO);
+}
+
+// IMP: -[WebviewEmbedUIDelegate webView:runJavaScriptTextInputPanelWithPrompt:
+//                               defaultText:initiatedByFrame:completionHandler:]
+static void impl_run_prompt(id self, SEL, id webView, id prompt,
+                            id defaultText, id frame,
+                            id completionHandler) {
+    Engine *e = (Engine *)objc_getAssociatedObject(self, "eng");
+    auto run_completion = [&](id text) {
+        // void(^)(NSString *)
+        ((void (^)(id))completionHandler)(text);
+    };
+    if (!e || !e->dialog_callback) {
+        run_completion(nil);
+        return;
+    }
+    bool attached = false;
+    JNIEnv *env = ensure_jni_env(e->jvm, &attached);
+    if (!env) {
+        run_completion(nil);
+        return;
+    }
+    id result_ns = nil;
+    jstring jmsg = ns_to_jstring(env, prompt);
+    jstring jdefault = ns_to_jstring(env, defaultText);
+    jstring jpage = page_url_jstring(env, webView);
+    jstring jframe = frame_url_jstring(env, frame, webView);
+    jclass cls = env->GetObjectClass(e->dialog_callback);
+    if (cls) {
+        jmethodID mid = env->GetMethodID(
+            cls, "onPrompt",
+            "(Ljava/lang/String;Ljava/lang/String;"
+            "Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
+        if (mid) {
+            jstring jresult = (jstring)env->CallObjectMethod(
+                e->dialog_callback, mid,
+                jmsg, jdefault, jpage, jframe);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+                jresult = nullptr;
+            }
+            if (jresult) {
+                const char *cstr = env->GetStringUTFChars(jresult, nullptr);
+                if (cstr) {
+                    result_ns = ns_str(cstr);
+                    env->ReleaseStringUTFChars(jresult, cstr);
+                }
+                env->DeleteLocalRef(jresult);
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (jmsg) env->DeleteLocalRef(jmsg);
+    if (jdefault) env->DeleteLocalRef(jdefault);
+    if (jpage) env->DeleteLocalRef(jpage);
+    if (jframe) env->DeleteLocalRef(jframe);
+    if (attached) e->jvm->DetachCurrentThread();
+    // result_ns is nil → cancel (page sees prompt() return null per
+    // the JS contract); non-nil NSString → page sees the entered text.
+    run_completion(result_ns);
+}
+
+// IMP: -[WebviewEmbedUIDelegate webView:runOpenPanelWithParameters:
+//                               initiatedByFrame:completionHandler:]
+//
+// _acceptedMIMETypes and _acceptedFileExtensions are documented in
+// WebKit source and have been stable across macOS releases since
+// 10.12, but they are NOT part of the public WKWebKit headers.  Read
+// via KVC and wrap in @try/@catch; a hypothetical future macOS that
+// hides them yields empty arrays here and the default JFileChooser
+// shows all files unfiltered (the page's own client-side accept
+// validation continues to work).
+static void impl_run_open_panel(id self, SEL, id webView, id parameters,
+                                id frame, id completionHandler) {
+    Engine *e = (Engine *)objc_getAssociatedObject(self, "eng");
+    auto run_completion = [&](id urls) {
+        // void(^)(NSArray<NSURL *> *)
+        ((void (^)(id))completionHandler)(urls);
+    };
+    if (!e || !e->dialog_callback) {
+        run_completion(nil);
+        return;
+    }
+    bool attached = false;
+    JNIEnv *env = ensure_jni_env(e->jvm, &attached);
+    if (!env) {
+        run_completion(nil);
+        return;
+    }
+
+    BOOL multiple = NO;
+    if (parameters) {
+        multiple = msg<BOOL>(parameters, sel("allowsMultipleSelection"));
+    }
+
+    id mime_types = nil;
+    id ext_types = nil;
+    @try {
+        if (parameters) {
+            mime_types = msg<id, id>(
+                parameters, sel("valueForKey:"),
+                ns_str("_acceptedMIMETypes"));
+        }
+    } @catch (id ex) { mime_types = nil; }
+    @try {
+        if (parameters) {
+            ext_types = msg<id, id>(
+                parameters, sel("valueForKey:"),
+                ns_str("_acceptedFileExtensions"));
+        }
+    } @catch (id ex) { ext_types = nil; }
+
+    jobjectArray jmimes = ns_array_to_jstring_array(env, mime_types);
+    jobjectArray jexts = ns_array_to_jstring_array(env, ext_types);
+    jstring jpage = page_url_jstring(env, webView);
+    jstring jframe = frame_url_jstring(env, frame, webView);
+
+    jobjectArray jresult = nullptr;
+    jclass cls = env->GetObjectClass(e->dialog_callback);
+    if (cls) {
+        jmethodID mid = env->GetMethodID(
+            cls, "onFilePicker",
+            "(Z[Ljava/lang/String;[Ljava/lang/String;"
+            "Ljava/lang/String;Ljava/lang/String;)[Ljava/lang/String;");
+        if (mid) {
+            jresult = (jobjectArray)env->CallObjectMethod(
+                e->dialog_callback, mid,
+                (jboolean)(multiple == YES ? JNI_TRUE : JNI_FALSE),
+                jmimes, jexts, jpage, jframe);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+                jresult = nullptr;
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+
+    id urls = nil;
+    if (jresult) {
+        jsize n = env->GetArrayLength(jresult);
+        if (n > 0) {
+            id NSURLcls = objc_cls("NSURL");
+            id arr = msg(objc_cls("NSMutableArray"),
+                         sel("arrayWithCapacity:"), (long)n);
+            for (jsize i = 0; i < n; i++) {
+                jstring js = (jstring)env->GetObjectArrayElement(
+                    jresult, i);
+                if (!js) continue;
+                const char *cstr = env->GetStringUTFChars(js, nullptr);
+                if (cstr) {
+                    id path_ns = ns_str(cstr);
+                    id url = msg<id, id>(
+                        NSURLcls, sel("fileURLWithPath:"), path_ns);
+                    if (url) {
+                        msg<void, id>(arr, sel("addObject:"), url);
+                    }
+                    env->ReleaseStringUTFChars(js, cstr);
+                }
+                env->DeleteLocalRef(js);
+            }
+            long arr_count = msg<long>(arr, sel("count"));
+            if (arr_count > 0) urls = arr;
+        }
+        env->DeleteLocalRef(jresult);
+    }
+
+    if (jmimes) env->DeleteLocalRef(jmimes);
+    if (jexts) env->DeleteLocalRef(jexts);
+    if (jpage) env->DeleteLocalRef(jpage);
+    if (jframe) env->DeleteLocalRef(jframe);
+    if (attached) e->jvm->DetachCurrentThread();
+    // urls nil → user cancelled (page receives an empty FileList);
+    // non-nil NSArray<NSURL*> → page receives the chosen files.
+    run_completion(urls);
+}
+
+static Class get_webview_embed_ui_delegate_cls() {
+    std::call_once(g_webview_embed_ui_delegate_once, [] {
+        Class c = objc_allocateClassPair((Class)objc_cls("NSObject"),
+                                         "WebviewEmbedUIDelegate", 0);
+        class_addProtocol(c, objc_getProtocol("WKUIDelegate"));
+        class_addMethod(
+            c,
+            sel("webView:runJavaScriptAlertPanelWithMessage:"
+                "initiatedByFrame:completionHandler:"),
+            (IMP)impl_run_alert, "v@:@@@@");
+        class_addMethod(
+            c,
+            sel("webView:runJavaScriptConfirmPanelWithMessage:"
+                "initiatedByFrame:completionHandler:"),
+            (IMP)impl_run_confirm, "v@:@@@@");
+        class_addMethod(
+            c,
+            sel("webView:runJavaScriptTextInputPanelWithPrompt:"
+                "defaultText:initiatedByFrame:completionHandler:"),
+            (IMP)impl_run_prompt, "v@:@@@@@");
+        class_addMethod(
+            c,
+            sel("webView:runOpenPanelWithParameters:"
+                "initiatedByFrame:completionHandler:"),
+            (IMP)impl_run_open_panel, "v@:@@@@");
+        objc_registerClassPair(c);
+        g_webview_embed_ui_delegate_cls = c;
+    });
+    return g_webview_embed_ui_delegate_cls;
+}
+
+// Register (or clear, when cb is null) the Java WebViewDialogCallback
+// for this engine.  Mirrors cocoa_set_focus_callback /
+// cocoa_set_click_callback.  The WKUIDelegate IMPs above read
+// e->dialog_callback on every dispatch, so installing the global ref
+// here is the single place that wires Java handler into the selector
+// hot path.
+static void cocoa_set_dialog_callback(Engine *e, JNIEnv *env, jobject cb) {
+    if (!e) return;
+    if (e->dialog_callback) {
+        env->DeleteGlobalRef(e->dialog_callback);
+        e->dialog_callback = nullptr;
+    }
+    if (cb) {
+        e->dialog_callback = env->NewGlobalRef(cb);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2463,6 +2977,24 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
         msg<void, id, id>(e->manager,
                           sel("addScriptMessageHandler:name:"), delegate,
                           ns_str("external"));
+
+        // Browser-dialog bridge: install a WKUIDelegate so JS-initiated
+        // alert / confirm / prompt and <input type=file> requests flow
+        // through Java (DialogDispatcher → WebViewDialogHandler) instead
+        // of being silently dropped (default behaviour when uiDelegate
+        // is nil).  Each engine constructs a fresh delegate object from
+        // the cached Class so the per-engine Engine pointer can be
+        // stashed via objc_setAssociatedObject for the selector IMPs to
+        // recover.
+        Class ui_delegate_cls = get_webview_embed_ui_delegate_cls();
+        id ui_delegate = msg((id)ui_delegate_cls, sel("new"));
+        objc_setAssociatedObject(
+            ui_delegate, "eng", (id)e, OBJC_ASSOCIATION_ASSIGN);
+        msg<void, id>(e->webview, sel("setUIDelegate:"), ui_delegate);
+        // We hold the only strong ref to the delegate (the WKWebView's
+        // uiDelegate is a weak reference per WebKit convention).  Stash
+        // it on the engine so cocoa_destroy_engine can release it.
+        e->ui_delegate = ui_delegate;
         // Install the external.invoke shim.
         id script = msg(objc_cls("WKUserScript"), sel("alloc"));
         script = msg<id, id, long, BOOL>(
@@ -2581,6 +3113,24 @@ static void cocoa_destroy_engine(Engine *e) {
         e->click_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
+    // Drop the dialog-callback global ref BEFORE the async teardown
+    // lambda runs, so any in-flight WKUIDelegate selector observes a
+    // null callback field and invokes its completion handler with the
+    // safe default (returning the WebKit JS thread cleanly).  Released
+    // here -- outside the async lambda -- because the lambda runs on
+    // the AppKit main thread later and we still have the EDT JNIEnv
+    // available right now (matches the click_callback cleanup above).
+    if (e->dialog_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->dialog_callback);
+        e->dialog_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     cocoa_run_on_main_async([e] {
         // Mark destroyed FIRST.  Any LATER-firing lambdas that read this
         // flag short-circuit; FIFO ordering on the main queue makes
@@ -2593,10 +3143,20 @@ static void cocoa_destroy_engine(Engine *e) {
         // is released with observers still attached.
         cocoa_kvo_teardown(e);
 
+
         if (e->webview) {
+            // Clear the WKWebView's uiDelegate BEFORE releasing the
+            // WKWebView so any in-flight delegate selector observes
+            // the cleared field (WKWebView holds a weak reference to
+            // uiDelegate per Apple's convention).
+            msg<void, id>(e->webview, sel("setUIDelegate:"), (id)nullptr);
             // If we added the WKWebView as a subview, remove it before
             // releasing so AppKit unwinds the view hierarchy cleanly.
             msg<void>(e->webview, sel("removeFromSuperview"));
+        }
+        if (e->ui_delegate) {
+            msg<void>(e->ui_delegate, sel("release"));
+            e->ui_delegate = nullptr;
         }
         if (e->host_view) {
             msg<void>(e->host_view, sel("release"));
@@ -3246,6 +3806,31 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
         env->CallVoidMethod(cb, m, (jboolean)JNI_TRUE, (jstring)nullptr);
     }
     env->DeleteLocalRef(cls);
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1dialog_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    if (wv == 0) return;
+#ifdef WEBVIEW_GTK
+    embed::gtk_set_dialog_callback((embed::Engine *)wv, env, cb);
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_set_dialog_callback((embed::Engine *)wv, env, cb);
+#else
+    (void)env; (void)cb;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1dialog_1callback
+  (JNIEnv *env, jclass, jlong peer, jobject cb) {
+    if (peer == 0) return;
+#ifdef WEBVIEW_GTK
+    embed::gtk_off_set_dialog_callback((embed::OffEngine *)peer, env, cb);
+#else
+    // macOS / Windows have no offscreen engine; the Java
+    // OffscreenWebView.setDialogCallback never gets here because
+    // OffscreenWebView.create returns null on those platforms.
+    (void)env; (void)cb;
 #endif
 }
 

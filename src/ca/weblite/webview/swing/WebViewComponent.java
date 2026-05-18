@@ -7,8 +7,10 @@ package ca.weblite.webview.swing;
 
 import ca.weblite.webview.ConsoleDispatcher;
 import ca.weblite.webview.ConsoleListener;
+import ca.weblite.webview.DialogDispatcher;
 import ca.weblite.webview.JavaScriptEvalException;
 import ca.weblite.webview.WebView;
+import ca.weblite.webview.WebViewDialogHandler;
 import ca.weblite.webview.WebViewMouseDispatcher;
 import ca.weblite.webview.WebViewMouseListener;
 
@@ -65,6 +67,14 @@ public abstract class WebViewComponent extends JComponent {
      *  registered before display are remembered and start receiving events
      *  once the native peer attaches and the JS shim is installed. */
     protected final WebViewMouseDispatcher mouseDispatcher = new WebViewMouseDispatcher(this);
+
+    /** Per-component browser-dialog fan-out hub.  Holds the active
+     *  {@link WebViewDialogHandler} and marshals each native-side
+     *  alert / confirm / prompt / file-picker request onto the Swing
+     *  EDT.  Subclasses install a {@link ca.weblite.webview.WebViewDialogCallback}
+     *  on their native peer at peer-attach time that delegates to this
+     *  dispatcher's {@code dispatch*} methods. */
+    protected final DialogDispatcher dialogDispatcher = new DialogDispatcher(this);
 
     /** Implementation mode for {@link #create(Mode)}. */
     public enum Mode {
@@ -403,5 +413,64 @@ public abstract class WebViewComponent extends JComponent {
      */
     public final boolean isDefaultContextMenuEnabled() {
         return mouseDispatcher.isDefaultEnabled();
+    }
+
+    // ---------------------------------------------------------------------
+    // Browser-initiated UI dialog handler API.
+    //
+    // The handler covers `window.alert`, `window.confirm`,
+    // `window.prompt`, and `<input type="file">` clicks.  Default
+    // behaviour shows Swing dialogs anchored on the host JFrame.
+    // Callers replace it wholesale via setDialogHandler; passing null
+    // installs an internal drop handler that suppresses all dialogs
+    // without UI (useful for headless tests).  See WebViewDialogHandler
+    // for the full contract.
+    //
+    // Concrete (not abstract) on the base class — the dispatcher does
+    // not depend on subclass state.  Subclasses install a
+    // WebViewDialogCallback adapter on their native peer at
+    // peer-attach time that bridges native dialog events into this
+    // dispatcher's dispatch* methods.
+    //
+    // Platform coverage (this iteration):
+    //   - macOS heavyweight (WKWebView): wired in this story.
+    //   - Linux WebKitGTK and Windows WebView2: handler reference is
+    //     stored but the native callback is not yet bridged; the
+    //     embedded engine continues to use its built-in dialogs.
+    //     STORY-004-002 and STORY-004-003 complete the coverage.
+    // ---------------------------------------------------------------------
+
+    /**
+     * Install (or replace) the {@link WebViewDialogHandler} that
+     * receives JS-initiated alert / confirm / prompt / file-picker
+     * events.  Passing {@code null} does NOT reset to the framework
+     * default — it installs an internal drop handler that returns the
+     * JS-spec cancel values without UI ({@code alert} no-op,
+     * {@code confirm} false, {@code prompt} null, file picker empty
+     * list).  To reset to the stock Swing-dialog default, pass
+     * {@link WebViewDialogHandler#DEFAULT} explicitly.
+     *
+     * <p>Safe to call before the component is displayed.  Safe to
+     * call from any thread.  Replacement is atomic; the next
+     * dispatch picks up the new handler.
+     *
+     * <p>See {@link WebViewDialogHandler} for the full contract,
+     * including the Swing EDT threading rules and the
+     * {@code evalAsync(...).get()} self-deadlock hazard.
+     */
+    public final WebViewComponent setDialogHandler(WebViewDialogHandler handler) {
+        dialogDispatcher.setHandler(handler);
+        return this;
+    }
+
+    /**
+     * @return the active {@link WebViewDialogHandler}.  Never returns
+     * {@code null} — returns {@link WebViewDialogHandler#DEFAULT} when
+     * no caller has installed one, and returns the internal drop
+     * singleton when caller passed {@code null} to
+     * {@link #setDialogHandler}.
+     */
+    public final WebViewDialogHandler getDialogHandler() {
+        return dialogDispatcher.getHandler();
     }
 }

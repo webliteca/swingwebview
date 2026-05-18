@@ -10,6 +10,7 @@ import ca.weblite.webview.EditingCommand;
 import ca.weblite.webview.GdkInput;
 import ca.weblite.webview.OffscreenWebView;
 import ca.weblite.webview.WebView;
+import ca.weblite.webview.WebViewDialogCallback;
 import ca.weblite.webview.WebViewMouseDispatcher;
 
 import java.awt.Color;
@@ -241,6 +242,36 @@ public class WebViewLightweightComponent extends WebViewComponent {
                 try { e.addOnBeforeLoad(js); } catch (IllegalStateException ignored) {}
             }
         });
+        // Install the dialog bridge so JS alert/confirm/prompt and
+        // <input type=file> route to the per-component
+        // WebViewDialogHandler.  Anchored in OffscreenWebView.heap by
+        // setDialogCallback.  STORY-004-002 wires the native
+        // WebKitGTK signal handlers on Linux; on macOS / Windows the
+        // offscreen engine is a stub and this setDialogCallback call
+        // is a native-side no-op.
+        engine.setDialogCallback(new WebViewDialogCallback() {
+            @Override
+            public void onAlert(String message, String pageUrl, String frameUrl) {
+                dialogDispatcher.dispatchAlert(message, pageUrl, frameUrl);
+            }
+            @Override
+            public boolean onConfirm(String message, String pageUrl, String frameUrl) {
+                return dialogDispatcher.dispatchConfirm(message, pageUrl, frameUrl);
+            }
+            @Override
+            public String onPrompt(String message, String defaultValue,
+                                   String pageUrl, String frameUrl) {
+                return dialogDispatcher.dispatchPrompt(
+                    message, defaultValue, pageUrl, frameUrl);
+            }
+            @Override
+            public String[] onFilePicker(boolean multiple, String[] mimeTypes,
+                                         String[] extensions, String pageUrl,
+                                         String frameUrl) {
+                return dialogDispatcher.dispatchFilePicker(
+                    multiple, mimeTypes, extensions, pageUrl, frameUrl);
+            }
+        });
         for (String js : pendingInit) {
             engine.addOnBeforeLoad(js);
         }
@@ -267,6 +298,11 @@ public class WebViewLightweightComponent extends WebViewComponent {
             repaintTimer.stop();
             repaintTimer = null;
         }
+        // Flip the dispatcher's disposed flag BEFORE tearing down the
+        // native peer so any in-flight dialog event arriving from the
+        // native side mid-teardown returns the safe fallback without
+        // invoking the handler against a half-disposed component.
+        dialogDispatcher.disposeAll();
         if (engine != null) {
             OffscreenWebView ow = engine;
             engine = null;

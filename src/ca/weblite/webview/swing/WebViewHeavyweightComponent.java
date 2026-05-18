@@ -10,6 +10,7 @@ import ca.weblite.webview.EditingCommand;
 import ca.weblite.webview.EmbeddedWebView;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewClickCallback;
+import ca.weblite.webview.WebViewDialogCallback;
 import ca.weblite.webview.WebViewFocusCallback;
 import ca.weblite.webview.WebViewMouseDispatcher;
 import java.awt.AWTEvent;
@@ -193,6 +194,12 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
 
     @Override
     public void dispose() {
+        // Flip the dispatcher's disposed flag BEFORE tearing down the
+        // native peer so any in-flight dialog event arriving from the
+        // native side mid-teardown returns the safe fallback (void /
+        // false / null / empty) without invoking the handler against
+        // a half-disposed component.
+        dialogDispatcher.disposeAll();
         if (embedded != null) {
             EmbeddedWebView e = embedded;
             embedded = null;
@@ -497,6 +504,37 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
                         handleNativeClick();
                     }
                 });
+            }
+        });
+        // Install the dialog bridge so JS alert/confirm/prompt and
+        // <input type=file> route to the per-component
+        // WebViewDialogHandler.  Anchored in EmbeddedWebView.heap by
+        // setDialogCallback so the JVM does not collect the lambda
+        // while the native side holds a global ref.  Each method
+        // delegates to dialogDispatcher.dispatch*, which does the
+        // EDT hop via SwingUtilities.invokeAndWait and returns the
+        // handler's answer to the native completion handler.
+        embedded.setDialogCallback(new WebViewDialogCallback() {
+            @Override
+            public void onAlert(String message, String pageUrl, String frameUrl) {
+                dialogDispatcher.dispatchAlert(message, pageUrl, frameUrl);
+            }
+            @Override
+            public boolean onConfirm(String message, String pageUrl, String frameUrl) {
+                return dialogDispatcher.dispatchConfirm(message, pageUrl, frameUrl);
+            }
+            @Override
+            public String onPrompt(String message, String defaultValue,
+                                   String pageUrl, String frameUrl) {
+                return dialogDispatcher.dispatchPrompt(
+                    message, defaultValue, pageUrl, frameUrl);
+            }
+            @Override
+            public String[] onFilePicker(boolean multiple, String[] mimeTypes,
+                                         String[] extensions, String pageUrl,
+                                         String frameUrl) {
+                return dialogDispatcher.dispatchFilePicker(
+                    multiple, mimeTypes, extensions, pageUrl, frameUrl);
             }
         });
     }
