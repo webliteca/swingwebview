@@ -240,9 +240,18 @@ jobs:
         shell: bash
         # source/target 1.8 in pom.xml keeps the assembled jar runnable on
         # JRE 8 even though we build it with JDK 11.
+        #
+        # `mvn package` (no -DskipTests) runs the unit-test phase
+        # first: DialogDispatcherTest, EvalDispatcherTest, and
+        # JavaScriptEvalExceptionTest.  All three are headless-safe --
+        # they exercise dispatcher Java contracts without spinning up a
+        # native peer or constructing a Window -- so they run cleanly on
+        # the CI runner with no display server.  GUI integration
+        # (WebViewDialogDemo, the heavyweight / context-menu demos)
+        # remains a manual verification step on a real desktop host.
         run: |
           set -euo pipefail
-          mvn -B -DskipTests package
+          mvn -B package
           echo "--- jar contents ---"
           jar tf target/webview-*.jar | sort | head -80
           ls -la target/
