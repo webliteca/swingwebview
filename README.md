@@ -299,13 +299,16 @@ wv.setDialogHandler(new WebViewDialogHandler() {
   routes all four dialog kinds through the handler (STORY-004-001).
   Linux WebKitGTK routes all four kinds through the handler in both
   heavyweight and lightweight modes via the `script-dialog` and
-  `run-file-chooser` signals (STORY-004-002).  On Windows,
-  `setDialogHandler` stores the handler reference but the embedded
-  engine continues to use its built-in dialogs until STORY-004-003
-  (WebView2 `ScriptDialogOpening` event) lands.  On Windows,
-  `<input type="file">` will continue to use the OS-native dialog
-  even after STORY-004-003 — WebView2 exposes no public hook for it,
-  so `filePickerOpened` never fires on Windows.
+  `run-file-chooser` signals (STORY-004-002).  Windows WebView2
+  routes alert / confirm / prompt (and before-unload) through the
+  handler via the `ScriptDialogOpening` event combined with
+  `put_AreDefaultScriptDialogsEnabled(FALSE)` (STORY-004-003).  On
+  Windows, `<input type="file">` continues to use the OS-native
+  Common Item Dialog — WebView2 exposes no public hook for the file
+  picker, so `filePickerOpened` never fires on Windows.  On Windows,
+  `frameUrl()` equals `pageUrl()` for now (top-level only) because
+  the `ScriptDialogOpening` event args do not expose a separate
+  frame URL.
 * **Linux file-picker `accept`-extension limitation.**  On Linux, the
   `WebViewFilePickerEvent.acceptedExtensions` list is always empty
   even when the page wrote `<input accept=".png,.jpg">` — WebKitGTK
