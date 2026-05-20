@@ -2620,11 +2620,13 @@ static void impl_run_prompt(id self, SEL, id webView, id prompt,
 //
 // _acceptedMIMETypes and _acceptedFileExtensions are documented in
 // WebKit source and have been stable across macOS releases since
-// 10.12, but they are NOT part of the public WKWebKit headers.  Read
-// via KVC and wrap in @try/@catch; a hypothetical future macOS that
-// hides them yields empty arrays here and the default JFileChooser
-// shows all files unfiltered (the page's own client-side accept
-// validation continues to work).
+// 10.12, but they are NOT part of the public WKWebKit headers.  Probe
+// them via the ObjC runtime's respondsToSelector: (see below) rather
+// than blind invocation so a hypothetical future macOS that hides them
+// yields empty arrays here and the default JFileChooser shows all
+// files unfiltered (the page's own client-side accept validation
+// continues to work).  We avoid @try/@catch because this file is
+// compiled as plain C++, not Objective-C++.
 static void impl_run_open_panel(id self, SEL, id webView, id parameters,
                                 id frame, id completionHandler) {
     Engine *e = (Engine *)objc_getAssociatedObject(self, "eng");
@@ -2650,20 +2652,30 @@ static void impl_run_open_panel(id self, SEL, id webView, id parameters,
 
     id mime_types = nil;
     id ext_types = nil;
-    @try {
-        if (parameters) {
-            mime_types = msg<id, id>(
-                parameters, sel("valueForKey:"),
-                ns_str("_acceptedMIMETypes"));
+    // _acceptedMIMETypes / _acceptedFileExtensions are private
+    // (underscore-prefixed) accessors on WKOpenPanelParameters that have
+    // been stable since macOS 10.12.  Probe respondsToSelector: rather
+    // than blindly invoking them so a hypothetical future macOS that
+    // removes or renames the selectors degrades gracefully (we pass an
+    // empty array to Java and the default JFileChooser shows all files;
+    // the page's own client-side `accept` validation still works).
+    //
+    // Probing via the ObjC runtime keeps this file as plain C++ -- the
+    // Objective-C++ @try/@catch syntax can't be used because
+    // src_c/webview_embed.cpp is compiled with `c++` not `clang++ -x
+    // objective-c++` (see build-mac.sh and .github/workflows/build.yml).
+    if (parameters) {
+        SEL mime_sel = sel("_acceptedMIMETypes");
+        if (msg<BOOL, SEL>(parameters, sel("respondsToSelector:"),
+                           mime_sel)) {
+            mime_types = msg<id>(parameters, mime_sel);
         }
-    } @catch (id ex) { mime_types = nil; }
-    @try {
-        if (parameters) {
-            ext_types = msg<id, id>(
-                parameters, sel("valueForKey:"),
-                ns_str("_acceptedFileExtensions"));
+        SEL ext_sel = sel("_acceptedFileExtensions");
+        if (msg<BOOL, SEL>(parameters, sel("respondsToSelector:"),
+                           ext_sel)) {
+            ext_types = msg<id>(parameters, ext_sel);
         }
-    } @catch (id ex) { ext_types = nil; }
+    }
 
     jobjectArray jmimes = ns_array_to_jstring_array(env, mime_types);
     jobjectArray jexts = ns_array_to_jstring_array(env, ext_types);
