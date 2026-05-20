@@ -1700,6 +1700,39 @@ Files:
   than adding new native hooks per use case. Keep the Java
   handler narrowly scoped so the call cost is bounded for
   every WebView click.
+- macOS sync main-thread dispatch (`embed::cocoa_run_on_main` in
+  `src_c/webview_embed.cpp`) MUST NOT use
+  `dispatch_sync(dispatch_get_main_queue(), …)` from the EDT.
+  AppKit's main thread routinely parks inside
+  `-[LWCToolkit doAWTRunLoopImpl]`'s private CFRunLoop while it
+  waits for the EDT to answer a JNI callback (the AX
+  `accessibilityFocusedUIElement` query during a VoiceOver
+  focus-changed event is the canonical trigger, but any
+  AppKit→Java upcall through `doAWTRunLoopImpl` qualifies —
+  IME callbacks, AWT-EDT round-trips). That private runloop
+  runs only in `@"AWTRunLoopMode"` and does NOT drain the main
+  dispatch queue; combined with the EDT blocking on
+  `dispatch_sync` waiting for the main thread, this is an
+  unconditional EDT-↔-main deadlock. The fix — required for
+  every sync main-thread bridge in this codebase — is to use
+  `-[NSObject performSelectorOnMainThread:withObject:
+  waitUntilDone:YES modes:]` with a mode array that includes
+  `@"AWTRunLoopMode"` alongside the normal AppKit modes
+  (`kCFRunLoopDefaultMode`, `NSEventTrackingRunLoopMode`,
+  `NSModalPanelRunLoopMode`). This matches the JDK's own
+  `sun.lwawt.macosx.ThreadUtilities.javaModes` set and is the
+  canonical "talk to AppKit from a JNI call on the EDT"
+  pattern. The wrapper class
+  (`WebViewAwtMainBridge` / `performWork:`) is registered once
+  per JVM via `std::call_once`, symmetric with the existing
+  swizzle / `WebviewEmbedDelegate` once-only registrations.
+  See the bug report "WebViewHeavyweightComponent deadlocks the
+  EDT when the WebView peer is created during macOS
+  accessibility focus events" for the original trace. The
+  async helper `cocoa_run_on_main_async` is unaffected — it
+  uses `dispatch_async_f` and never blocks the EDT, so a queued
+  block sitting in the main queue while
+  `doAWTRunLoopImpl` runs is latency, not deadlock.
 
 ## S · Safeguards
 - `EmbeddedWebView.attach` validates `parent != null` AND

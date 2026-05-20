@@ -1593,29 +1593,130 @@ struct Engine {
 static std::mutex g_webview_map_mutex;
 static std::map<id, Engine *> g_webview_map;
 
+// Heap-allocated work item passed across the EDT → AppKit main bridge.
+// Lives until the main-thread method runs and deletes it.
+struct AwtBridgeWork {
+    std::function<void()> fn;
+};
+
+// Implementation of -[WebViewAwtMainBridge performWork:].  Runs on the
+// AppKit main thread; receives an NSValue wrapping an AwtBridgeWork *,
+// extracts the function, runs it, and deletes the work item.  The class
+// itself is allocated lazily in ensure_awt_main_bridge.
+static void awt_main_bridge_perform_impl(id /*self*/, SEL /*_cmd*/, id arg) {
+    if (!arg) return;
+    void *p = msg<void *>(arg, sel("pointerValue"));
+    if (!p) return;
+    auto *work = static_cast<AwtBridgeWork *>(p);
+    work->fn();
+    delete work;
+}
+
+// Process-global state for the AWT main-thread bridge.  We allocate one
+// Objective-C class (WebViewAwtMainBridge), one shared instance of it
+// (the target of every performSelectorOnMainThread: call), and one
+// NSArray of run-loop modes.  Initialised exactly once per JVM via
+// std::call_once -- objc_allocateClassPair returns Nil on second call
+// for the same name.
+static Class g_awt_main_bridge_cls = nil;
+static id g_awt_main_bridge_target = nil;
+static id g_awt_main_bridge_modes = nil;
+static std::once_flag g_awt_main_bridge_once;
+
+static void ensure_awt_main_bridge() {
+    std::call_once(g_awt_main_bridge_once, [] {
+        Class c = objc_allocateClassPair((Class)objc_cls("NSObject"),
+                                         "WebViewAwtMainBridge", 0);
+        class_addMethod(c, sel("performWork:"),
+                        (IMP)awt_main_bridge_perform_impl, "v@:@");
+        objc_registerClassPair(c);
+        g_awt_main_bridge_cls = c;
+        // [new] returns a +1-retained instance; keep it forever.
+        g_awt_main_bridge_target = msg((id)c, sel("new"));
+
+        // Build the modes list under which the main thread will service
+        // our performSelector dispatch.  The critical entry here is
+        // "AWTRunLoopMode" -- the private CFRunLoop mode the JDK enters
+        // from -[LWCToolkit doAWTRunLoopImpl] when AppKit calls into
+        // Java from the main thread (accessibility role queries during a
+        // VoiceOver / AX focus-changed event, IME callbacks, etc) and
+        // pumps a nested runloop waiting for the EDT to respond.  In
+        // that mode the main dispatch queue is NOT drained, so the
+        // previous dispatch_sync(main_queue, ...)-based implementation
+        // deadlocked: the EDT was already blocked in
+        // webview_embed_create, so the AX query the main thread was
+        // waiting on never got serviced, and our queued block on the
+        // main queue never got drained either.  Adding AWTRunLoopMode
+        // here lets the main thread service the perform from inside
+        // doAWTRunLoopImpl's nested CFRunLoop, breaking the cycle.
+        //
+        // The other modes mirror what the JDK's own ThreadUtilities
+        // installs (kCFRunLoopDefaultMode, NSEventTrackingRunLoopMode
+        // for live resize / drag, NSModalPanelRunLoopMode for modal
+        // panels) so we keep being serviced through every CFRunLoop
+        // mode AppKit normally runs in.
+        id arr = msg(objc_cls("NSMutableArray"), sel("alloc"));
+        arr = msg(arr, sel("init"));
+        msg<void, id>(arr, sel("addObject:"),
+                      ns_str("kCFRunLoopDefaultMode"));
+        msg<void, id>(arr, sel("addObject:"), ns_str("AWTRunLoopMode"));
+        msg<void, id>(arr, sel("addObject:"),
+                      ns_str("NSEventTrackingRunLoopMode"));
+        msg<void, id>(arr, sel("addObject:"),
+                      ns_str("NSModalPanelRunLoopMode"));
+        g_awt_main_bridge_modes = arr;
+    });
+}
+
+// Wrap `work` in an NSValue (no autorelease -- we hand-manage the +1).
+// Caller owns one ref; release after the perform call returns.
+static id awt_bridge_box(AwtBridgeWork *work) {
+    void *ptr_val = work;
+    id arg = msg(objc_cls("NSValue"), sel("alloc"));
+    arg = msg<id, const void *, const char *>(
+        arg, sel("initWithBytes:objCType:"), &ptr_val, "^v");
+    return arg;
+}
+
 static void cocoa_run_on_main(std::function<void()> f) {
-    // If we're already on the AppKit main thread, just run f inline; otherwise
-    // dispatch_sync to the main queue.  Synchronously dispatching onto your
-    // own queue deadlocks, which is easy to hit when a script-message handler
-    // (which runs on the main thread) ends up calling back into the embed API.
+    // If we're already on the AppKit main thread, just run f inline.
+    // Otherwise route through -[NSObject performSelectorOnMainThread:
+    // withObject:waitUntilDone:modes:] with a mode set that includes
+    // "AWTRunLoopMode", so the call is serviced even when the main
+    // thread is parked inside the JDK's LWCToolkit.doAWTRunLoopImpl
+    // (accessibility-focus callbacks, IME callbacks, AWT-EDT round
+    // trips, etc).
     //
-    // This MUST NOT be called from the EDT during a live AppKit operation
-    // (window resize / drag etc.) -- main's run loop is in
-    // NSEventTrackingRunLoopMode during those and the main dispatch queue is
-    // not reliably drained from sync waiters on other threads, causing the
-    // EDT to block forever.  Use cocoa_run_on_main_async for fire-and-forget
-    // calls (setBounds, navigate, eval, ...).  Reserve the sync version for
-    // attach/detach where we genuinely need to wait for the result.
+    // The previous implementation used dispatch_sync_f to the main
+    // dispatch queue, which deadlocks in that scenario: AppKit's main
+    // thread was inside doAWTRunLoopImpl's nested CFRunLoop in
+    // AWTRunLoopMode (which does NOT drain the main dispatch queue),
+    // waiting for the EDT to answer an accessibility role query; the
+    // EDT meanwhile was here in webview_embed_create waiting for the
+    // main thread to dequeue our sync block.  See the bug report
+    // "WebViewHeavyweightComponent deadlocks the EDT when the WebView
+    // peer is created during macOS accessibility focus events".
+    //
+    // performSelectorOnMainThread:waitUntilDone:YES is the canonical
+    // AWT-on-macOS bridge for "talk to AppKit from a JNI call" and is
+    // the same mechanism the JDK itself uses internally
+    // (sun.lwawt.macosx.ThreadUtilities / JNFRunLoop).
     BOOL is_main = msg<BOOL>(objc_cls("NSThread"), sel("isMainThread"));
     if (is_main) {
         f();
         return;
     }
-    struct Holder { std::function<void()> f; };
-    Holder h{std::move(f)};
-    dispatch_sync_f(dispatch_get_main_queue(), &h, +[](void *p) {
-        static_cast<Holder *>(p)->f();
-    });
+    ensure_awt_main_bridge();
+    auto *work = new AwtBridgeWork{std::move(f)};
+    id arg = awt_bridge_box(work);
+    msg<void, SEL, id, BOOL, id>(
+        g_awt_main_bridge_target,
+        sel("performSelectorOnMainThread:withObject:waitUntilDone:modes:"),
+        sel("performWork:"), arg, YES, g_awt_main_bridge_modes);
+    // performSelectorOnMainThread retains arg for the duration of the
+    // call; releasing our +1 here brings the refcount to 1 (held by
+    // perform) and then 0 after the selector finishes.
+    msg<void>(arg, sel("release"));
 }
 
 static void cocoa_run_on_main_async(std::function<void()> f) {
