@@ -33,6 +33,7 @@ call "%vc_dir%\Common7\Tools\vsdevcmd.bat" -arch=x86 -host_arch=x64
 echo Building webview.dll (x86)
 mkdir "%src_dir%\dll\x86"
 cl /D "WEBVIEW_API=__declspec(dllexport)" ^
+	/D "_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS" ^
 	/I "%JAVA_HOME%\include" /I "%JAVA_HOME%\include\win32" ^
 	/I "%src_dir%\script\Microsoft.Web.WebView2.0.8.355\build\native\include" ^
 	"%src_dir%\script\Microsoft.Web.WebView2.0.8.355\build\native\x86\WebView2Loader.dll.lib" ^
@@ -47,6 +48,7 @@ call "%vc_dir%\Common7\Tools\vsdevcmd.bat" -arch=x64 -host_arch=x64
 echo Building webview.dll (x64)
 mkdir "%src_dir%\dll\x64"
 cl /D "WEBVIEW_API=__declspec(dllexport)" ^
+    /D "_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS" ^
     /I "%JAVA_HOME%\include" /I "%JAVA_HOME%\include\win32" ^
 	/I "%src_dir%\script\Microsoft.Web.WebView2.0.8.355\build\native\include" ^
 	"%src_dir%\script\Microsoft.Web.WebView2.0.8.355\build\native\x64\WebView2Loader.dll.lib" ^

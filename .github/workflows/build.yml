@@ -159,6 +159,7 @@ jobs:
 
           cl /nologo ^
               /D "WEBVIEW_API=__declspec(dllexport)" ^
+              /D "_SILENCE_EXPERIMENTAL_COROUTINE_DEPRECATION_WARNINGS" ^
               /I "%JAVA_HOME%\include" ^
               /I "%JAVA_HOME%\include\win32" ^
               /I "%REPO_DIR%\windows" ^
