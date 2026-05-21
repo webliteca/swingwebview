@@ -168,10 +168,91 @@ generated_at: 2026-05-16T07:19:13-07:00
   component (`WebViewLightweightComponent`) is unaffected
   because its mouse events flow through AWT and `MouseGrabber`
   sees them naturally.
+- **No sync EDT↔AppKit-main bridge.** `src_c/webview_embed.cpp`
+  MUST NOT contain any synchronous EDT→AppKit-main-thread
+  dispatch primitive. Every per-engine native operation runs
+  via `cocoa_run_on_main_async` (or inlines when already on
+  main); any AppKit-thread state that the EDT needs to read
+  is mirrored into an atomic on the `Engine` struct, updated
+  from the main thread, and read lock-free. Mutual-wait
+  deadlocks of the form "EDT parks waiting for AppKit-main
+  while AppKit-main is parked in `invokeAndWait` waiting for
+  EDT" — including the path through accessibility, IME,
+  focus-change, or any other AppKit→Java upcall via
+  `LWCToolkit.doAWTRunLoopImpl` — are structurally impossible
+  in this codebase as a consequence.
+- **Async engine attach with deferred completion**
+  (macOS-specific behaviour, cross-platform API).
+  `EmbeddedWebView.attach(parent, debug)` is a synchronous
+  factory on every platform — it returns immediately with a
+  non-null `EmbeddedWebView` and MUST return within 50 ms on
+  macOS regardless of AppKit-side activity (accessibility,
+  IME, focus tracking, etc.). On macOS the WKWebView creation,
+  host-NSView discovery, `addSubview:`, and configuration run
+  asynchronously on the AppKit main thread after the C++
+  `Engine` struct is allocated. On Windows and Linux the
+  attach completes synchronously inside the JNI call as
+  today. A new `WebViewAttachListener` API
+  (`addOnAttachComplete`) reports the deferred outcome on the
+  EDT — `onAttached` on success, `onAttachFailed(cause)` on
+  AppKit-side failure. The listener API exists on all
+  platforms; on Windows / Linux the listener fires on the
+  next EDT tick because the engine is already in `ATTACHED`
+  state when the constructor returns. Pre-attach operations
+  (`setUrl`, `addOnBeforeLoad`, `addJavascriptCallback`,
+  `eval`, `setBounds`, `setVisible`, `requestFocus`,
+  `executeEditingCommand`) MUST NOT throw on a `PENDING`
+  engine — they queue and replay automatically. The
+  `EmbeddedWebView.attach(...)` Java signature does not
+  change; existing callers (including
+  `WebViewHeavyweightComponent.createPeer`) MUST continue to
+  work without modification.
+- **Async engine destroy with safe queued-op handling**
+  (macOS-specific behaviour). `EmbeddedWebView.dispose()`
+  MUST return within 50 ms on macOS regardless of AppKit-side
+  activity. On macOS the `removeFromSuperview`, AppKit
+  object releases, and `delete e` move into a
+  `cocoa_run_on_main_async` block. A `destroyed: std::atomic<bool>`
+  flag on the `Engine` lets any queued async op that fires
+  after destroy short-circuit cleanly. `EmbeddedWebView.dispose()`
+  remains idempotent. Late `evalAsync` calls on a disposed
+  engine continue to return an already-failed future carrying
+  `IllegalStateException("EmbeddedWebView has been disposed.")`,
+  as today; the future-completion path does not regress.
+- **Cached first-responder probe via KVO.**
+  `EmbeddedWebView.isNativeFirstResponder()` MUST NOT make a
+  synchronous main-thread hop on any call. On macOS the
+  responder state is mirrored into an
+  `std::atomic<bool> is_first_responder` field on the
+  `Engine`, maintained by a KVO observer on the host
+  `NSWindow`'s `firstResponder` key path; each observation
+  fires on the AppKit main thread, walks the responder chain
+  exactly as the previous synchronous probe did, and writes
+  the atomic. The cache MUST correctly reflect focus on inner
+  WebKit content views (e.g. an `<input>` inside the page) —
+  the existing `WKWebView` `becomeFirstResponder` /
+  `resignFirstResponder` swizzle is insufficient for this
+  alone because those methods do not fire for focus
+  transitions to the private content view. Behaviour visible
+  through the editing-shortcut dispatcher and any other
+  caller of `isNativeFirstResponder` MUST be indistinguishable
+  from the previous synchronous implementation outside of
+  deadlock conditions.
+- **Deadlock-repro demo runs indefinitely.**
+  `demos/WebViewDeadlockRepro` (the reproducer for the v1.0.5
+  sync-bridge deadlock) MUST run for at least 60 seconds with
+  its synthetic `Cmd-C` loop without the EDT watchdog firing.
+  An extended attach → focus → `Cmd-C` → dispose stress loop
+  MUST run for at least 5 minutes without watchdog firing,
+  native crash, or Address-Sanitizer-reported use-after-free
+  attributable to the destroy path.
 - Definition of Done: documented by `README.md ("Heavyweight platform notes" section)` ("Heavyweight
   platform notes") and exercised by the `WebViewHeavyweightDemo`
   (`demos/WebViewHeavyweightDemo/...`). No automated tests cover
-  this — it is GUI integration code.
+  this — it is GUI integration code. The sync-deadlock
+  elimination work additionally MUST keep the
+  `demos/WebViewDeadlockRepro` long-run loop passing on macOS;
+  see Operation 14 below for the test plan.
 
 ## E · Entities
 - **WebViewHeavyweightComponent** (extends `WebViewComponent`,
@@ -300,6 +381,102 @@ generated_at: 2026-05-16T07:19:13-07:00
     avoided. New commands (e.g. `UNDO`, `REDO`) MUST be
     appended with new IDs rather than reusing or shifting
     existing ones.
+- **WebViewAttachListener** (new public functional interface,
+  `src/ca/weblite/webview/WebViewAttachListener.java`). Two
+  methods: `void onAttached(EmbeddedWebView webView)` and
+  `void onAttachFailed(EmbeddedWebView webView, Throwable cause)`.
+  Documented to fire on the Swing EDT. Invariants:
+  - Listeners MAY be registered before or after attach
+    resolves. Registration after resolution fires the
+    corresponding callback on the next EDT tick (via
+    `SwingUtilities.invokeLater`), never inline on the
+    calling thread.
+  - Multiple listeners are supported; they fire in
+    registration order.
+  - The `cause` argument on `onAttachFailed` carries an
+    actionable message identifying the failure step (e.g.
+    "WKWebView allocation failed", "host NSView not found").
+    Implementations MAY downcast to a more specific
+    exception type if a richer contract is exposed in a
+    future revision.
+  - Listener-thrown exceptions propagate to AWT's
+    uncaught-exception handler (same convention as every
+    other EDT-marshalled callback in this canvas);
+    implementations SHOULD catch their own exceptions if
+    they do not want default AWT behaviour.
+- **AttachState** (new public enum,
+  `src/ca/weblite/webview/AttachState.java`). Values:
+  `PENDING`, `ATTACHED`, `FAILED`. Exposed via
+  `EmbeddedWebView.getAttachState(): AttachState`.
+  Invariants:
+  - State transitions occur only on the EDT.
+  - `PENDING → ATTACHED` and `PENDING → FAILED` are the only
+    legal transitions; `ATTACHED` and `FAILED` are terminal.
+  - On Windows and Linux, the engine enters `ATTACHED`
+    synchronously during the `EmbeddedWebView` constructor.
+  - On macOS, the engine enters `ATTACHED` or `FAILED`
+    asynchronously after `cocoa_create_engine`'s async
+    epilogue completes — driven by a JNI callback that
+    marshals onto the EDT before flipping the state.
+- **EmbeddedWebView additions for async attach / destroy and
+  responder cache** (extends the existing entity above).
+  Invariants:
+  - `attachState: AttachState` — initialised based on the
+    platform-specific return shape of `webview_embed_create`
+    (see Operation 1 and Operation 14).
+  - `attachFailure: Throwable` — null until `FAILED`
+    transition.
+  - `attachListeners: List<WebViewAttachListener>` —
+    registered listeners. Cleared after the resolve dispatch
+    fires (no further callbacks once the engine resolves);
+    a fresh list is rebuilt only if a caller registers
+    additional listeners post-resolution (each of which
+    fires immediately on the next EDT tick).
+  - New method `addOnAttachComplete(WebViewAttachListener listener)`:
+    appends to `attachListeners` (when `PENDING`) or
+    schedules an immediate `invokeLater` dispatch (when
+    `ATTACHED` / `FAILED`). MUST be safe to call before or
+    after resolution. Returns `this` for chaining.
+  - New method `getAttachState(): AttachState`: read the
+    current state. Useful for tests and for callers that
+    prefer polling over listeners.
+  - The pre-existing `peer` field is non-zero from the moment
+    `EmbeddedWebView` is constructed (the C++ `Engine` struct
+    allocation is still synchronous on every platform); only
+    the AppKit-side state inside the struct is deferred on
+    macOS. `checkAlive()` keeps its existing
+    `peer == 0L` semantics — it is NOT used to gate
+    pre-attach calls on `PENDING`. Methods that today call
+    `checkAlive()` continue to call it; they remain safe
+    because the native lambdas they enqueue null-check
+    `e->webview` / `e->manager` at fire time.
+- **C++ Engine struct additions for async lifecycle and
+  responder cache** (`src_c/webview_embed.cpp`). Invariants:
+  - `is_first_responder: std::atomic<bool>` — mirrored
+    AppKit-main-thread state. Written by the KVO observer
+    callback only; read by `cocoa_is_first_responder` from
+    any thread. Default-initialised to `false`.
+  - `destroyed: std::atomic<bool>` — set to `true` inside
+    the destroy async lambda before any AppKit teardown
+    runs. Read by every other async-on-main lambda at fire
+    time as a belt-and-suspenders short-circuit; the
+    primary correctness guarantee is dispatch-queue FIFO
+    ordering plus EDT-only enqueueing, but the flag closes
+    any hypothetical non-EDT-enqueue race and provides a
+    clean signal for the `cocoa_eval` late-failure path
+    (see Operation 14).
+  - `kvo_observer: id` — strong reference to the KVO observer
+    target (an `NSObject` subclass owned by this engine).
+    Registered against the host `NSWindow`'s `firstResponder`
+    key path when the WKWebView gains a non-nil window;
+    unregistered before the engine struct is freed. May be
+    re-registered against a new window if the WKWebView's
+    `window` property changes at runtime.
+  - `observed_window: id` — weak/unretained back-reference
+    to the NSWindow the observer is currently registered
+    against. Used by destroy / window-change to call
+    `removeObserver:forKeyPath:` against the right target;
+    never `release`d (it's an unowned back-pointer).
 
 ## A · Approach
 - **Heavyweight peer hosts the native view.** AWT/JAWT exposes a
@@ -505,6 +682,188 @@ generated_at: 2026-05-16T07:19:13-07:00
   The hook is the canonical mechanism for surfacing in-WebView
   user input back to Swing for purposes AWT's event queue would
   normally handle.
+- **No sync EDT→AppKit-main bridge in the macOS path.** The
+  previous design (v1.0.5, PR #30) routed every EDT→main hop
+  through `-[NSObject performSelectorOnMainThread:withObject:
+  waitUntilDone:YES modes:]` with `AWTRunLoopMode` in the
+  modes array, expecting that to break the
+  EDT-parked-while-main-parked-in-AWT-doAWTRunLoopImpl cycle.
+  It does break that one specific ordering, but it does NOT
+  close the inverse cycle: if our `cocoa_run_on_main` block
+  has already begun executing on the main thread and the
+  block's body drives an AppKit primitive (e.g. `addSubview:`)
+  that synchronously rendezvous with the EDT through
+  AppKit accessibility / IME / `LWCToolkit.invokeAndWait`,
+  the EDT is still parked on the original `performSelector`'s
+  semaphore and the cycle closes. The fix is to eliminate
+  the sync EDT→main bridge entirely. Three sync sites
+  (`cocoa_is_first_responder`, `cocoa_create_engine`,
+  `cocoa_destroy_engine`) are converted to async-or-cached
+  equivalents; once all three are gone, the
+  `cocoa_run_on_main` helper, the `WebViewAwtMainBridge`
+  Objective-C class, and the `performWork:` selector are
+  removed. The three conversion strategies are documented
+  in the three following Approach entries.
+- **Cached first-responder via KVO on
+  `NSWindow.firstResponder`.** The previous sync probe
+  walked the responder chain on the AppKit main thread on
+  every call; each call was a deadlock surface for the
+  editing-shortcut dispatcher's hot path. The replacement
+  mirrors the responder state into an `std::atomic<bool>`
+  field on the `Engine`. A KVO observer on the host
+  `NSWindow`'s `firstResponder` key path fires on the main
+  thread for every focus transition anywhere in the
+  window's responder hierarchy; the observer callback walks
+  the responder chain using the same logic the previous
+  sync probe used (which correctly handles inner WebKit
+  content views by walking upward) and writes the atomic.
+  The atomic read in `cocoa_is_first_responder` is now
+  lock-free with no thread hop. Trade-off accepted:
+  swizzling `WKWebView`'s own `becomeFirstResponder` /
+  `resignFirstResponder` (already done elsewhere in this
+  canvas for the focus-callback path) was considered as the
+  sole cache-update mechanism but rejected — focus on
+  inner content views (`<input>`, contentEditable) does not
+  pass through `WKWebView`'s own responder methods, so the
+  cache would be wrong. KVO on the window's firstResponder
+  observes every transition. The KVO observer's lifecycle
+  is tied to the engine and the WKWebView's current window:
+  registered lazily on the first non-nil window (the
+  WKWebView's `window` property is observed in case it is
+  initially nil, which is the AppKit policy during view
+  hierarchy construction), unregistered on destroy, and
+  re-registered against any new window if the WKWebView
+  ever moves between windows at runtime.
+- **Async engine attach with FIFO-queue-ordered pre-attach
+  ops.** The previous design ran all of WKWebView creation,
+  host-view discovery, `addSubview:`, and configuration
+  synchronously on the AppKit main thread with the EDT
+  parked on a semaphore. `addSubview:` triggers AppKit
+  accessibility metadata queries against the AWT host view,
+  which the JDK answers via `LWCToolkit.invokeAndWait` —
+  and the EDT is parked above, so the cycle closes. The
+  fix splits `cocoa_create_engine` into a synchronous
+  prologue (allocate the C++ `Engine` struct, take the JAWT
+  lock long enough to retain `surface_layers`, install the
+  `EvalDispatcher` and the eval-bridge JNI globals on the
+  Java side) and an async epilogue (`cocoa_run_on_main_async`)
+  that does the AppKit-side setup. The JNI entry point
+  returns immediately after the prologue with a valid C++
+  `Engine` pointer; the AppKit-side success/failure resolves
+  later and is posted back to the EDT via a JNI callback
+  that flips `EmbeddedWebView.attachState` and fires any
+  registered `WebViewAttachListener`s. **Pre-attach op
+  ordering is solved by the macOS main dispatch queue
+  itself.** `dispatch_get_main_queue()` is a documented
+  serial FIFO queue — blocks fire one at a time in enqueue
+  order. The attach epilogue is the first block enqueued;
+  every subsequent `cocoa_navigate` / `cocoa_eval` /
+  `cocoa_init_script` / `cocoa_set_bounds` /
+  `cocoa_request_focus` / `cocoa_set_visible` /
+  `cocoa_execute_editing_command` call enqueues its own
+  async block and they fire in registration order, AFTER
+  the attach block, with `e->webview` and `e->manager`
+  populated. Each per-op block already null-checks the
+  field at fire time and silently no-ops if cleared (for
+  the destroy-side race), so the implementation pattern
+  already handles the pre-attach case at zero additional
+  cost. No Java-level pre-attach buffer is introduced in
+  `EmbeddedWebView`; the pre-paint buffer in
+  `WebViewHeavyweightComponent` (its `pendingUrl` /
+  `pendingInit` / `pendingBindings` fields) keeps working
+  exactly as today, layered above this lower-level mechanism.
+  The one operation that previously ran synchronously on the
+  calling thread — `cocoa_bind` (mutates `e->bindings`) —
+  MUST be converted to an async-on-main lambda so it
+  enqueues after the attach block (FIFO) and serialises
+  against the script-message-handler delegate's reads
+  (which also run on main). Alternatives considered:
+  - Java-level pre-attach buffer in `EmbeddedWebView`
+    (mirroring the heavyweight component's pattern).
+    Rejected as the primary mechanism — duplicates the
+    FIFO-queue ordering invariant that the macOS main queue
+    already provides. Kept available as a fallback if
+    testing reveals a queue-ordering edge case.
+  - Keep `cocoa_bind` sync with a `std::mutex` around
+    `e->bindings`. Rejected — converting to async keeps
+    the "every per-engine native op is async" invariant
+    uniform and trivially serialises against the
+    script-message-handler's reads.
+  - Move to a `CompletableFuture<EmbeddedWebView>` attach
+    factory. Rejected — every existing caller would have
+    to be rewritten; the listener API serves the same
+    purpose with no break.
+- **`EmbeddedWebView.attach(...)` stays a synchronous Java
+  factory.** The Java signature is unchanged across all
+  platforms. On Windows / Linux, attach completes
+  synchronously inside the JNI call as today and the
+  returned `EmbeddedWebView` is in `ATTACHED` state by the
+  time it is observable. On macOS, attach returns in
+  `PENDING` state and resolves asynchronously. Pre-attach
+  method calls on a `PENDING` engine MUST NOT throw — they
+  enqueue native async blocks that fire after the attach
+  epilogue, exactly as post-attach calls do. The contract
+  the caller sees is: "after `attach(...)` returns, the
+  `EmbeddedWebView` is fully usable; setUrl / addBinding /
+  eval / etc. all work; if you want a definite signal that
+  the native view is on-screen, register a
+  `WebViewAttachListener`."
+- **Synchronous failure path preserved for C++ allocation
+  failure.** If the C++ `Engine` struct allocation itself
+  fails (out-of-memory, JAWT lock failure, missing JAWT on
+  the platform), `webview_embed_create` returns `0` and
+  `EmbeddedWebView.attach(...)` throws
+  `IllegalStateException` synchronously, exactly as today.
+  Only the AppKit-side phase is moved async. The new
+  listener-driven failure path covers the AppKit-side
+  failures (WKWebView allocation returns nil, no hostable
+  NSView discovered) that did not previously exist as a
+  distinct failure mode.
+- **Async engine destroy with `destroyed` flag belt-and-
+  suspenders.** The previous design ran `removeFromSuperview`
+  and view-hierarchy teardown synchronously on the AppKit
+  main thread with the EDT parked. `removeFromSuperview`
+  triggers the same AppKit accessibility metadata path as
+  `addSubview:`, so the destroy side has the same deadlock
+  surface. The fix moves the entire AppKit teardown
+  (`removeFromSuperview`, host-view release, surface-layers
+  release, webview release, config release, KVO observer
+  unregistration) and the C++ `delete e` call into a
+  `cocoa_run_on_main_async` lambda. The JNI entry returns
+  immediately. The Java-side teardown sequence (drain
+  `evalDispatcher`, clear focus / click callbacks via
+  `setFocusCallback(null)` / `setClickCallback(null)`, set
+  `peer = 0L`, then `webview_embed_destroy`) is preserved
+  unchanged — those steps run on the calling thread (EDT)
+  BEFORE the async destroy lambda is enqueued, exactly as
+  today. **Use-after-free safety**: a `destroyed:
+  std::atomic<bool>` flag on the `Engine` is set to `true`
+  at the top of the destroy lambda before any AppKit
+  teardown runs. Every other async-on-main lambda
+  (navigate / eval / init / setBounds / setVisible /
+  requestFocus / executeEditingCommand) reads the flag at
+  fire time and short-circuits cleanly if `true`. **The
+  primary correctness guarantee is FIFO dispatch-queue
+  ordering plus EDT-only enqueueing** — no async lambda is
+  ever enqueued after destroy is, so no lambda fires after
+  destroy fires. The flag is belt-and-suspenders against
+  (a) destroy being called from a non-EDT thread
+  (hypothetical), (b) future code changes that violate the
+  EDT-only-enqueue invariant, and (c) the `cocoa_eval`
+  late-completion path that needs to report "WebView
+  disposed" back to a `CompletableFuture`. Trade-off:
+  callers who relied on "after `dispose()` returns, the
+  WKWebView is fully detached from the view hierarchy"
+  will see the detachment happen up to one main-loop tick
+  later. No current caller depends on this — the demos
+  and `WebViewHeavyweightComponent` do not observe AppKit
+  state from Java after dispose — but is documented for
+  future readers. Alternative considered: a generation
+  counter (`std::atomic<uint64_t>`) instead of a flag.
+  Rejected as over-engineering — engines in this library
+  are never reused, and the flag is sufficient for the
+  current contract. The counter design can be reintroduced
+  later if an engine-reset operation is ever needed.
 
 ## S · Structure
 - `src/ca/weblite/webview/swing/WebViewHeavyweightComponent.java`
@@ -527,6 +886,19 @@ generated_at: 2026-05-16T07:19:13-07:00
   per-platform native click hook once per mouse-button press
   inside the heavyweight WebView's native surface. Mirrors the
   shape of the existing `WebViewFocusCallback`.
+- `src/ca/weblite/webview/WebViewAttachListener.java` (new) —
+  public functional interface with two methods:
+  `void onAttached(EmbeddedWebView)` and
+  `void onAttachFailed(EmbeddedWebView, Throwable)`. Registered
+  on `EmbeddedWebView` via the new `addOnAttachComplete`
+  method; the callbacks fire on the Swing EDT. On Windows /
+  Linux the listener fires synchronously on the next EDT tick
+  because attach completes inside the constructor; on macOS it
+  fires asynchronously once the AppKit-side setup resolves.
+- `src/ca/weblite/webview/AttachState.java` (new) — public
+  enum with values `PENDING`, `ATTACHED`, `FAILED`. Returned
+  by `EmbeddedWebView.getAttachState()`. State transitions
+  are EDT-only.
 - `src/ca/weblite/webview/ConsoleDispatcher.java` (from
   [[swing-webview-component-mode-selection]]) — owned by the
   component; receives raw payloads from the internal
@@ -566,6 +938,31 @@ generated_at: 2026-05-16T07:19:13-07:00
   `mouseDown:`/`rightMouseDown:`/`otherMouseDown:` swizzle on
   macOS, `WM_PARENTNOTIFY` on Windows) reads that ref and
   invokes the Java callback's `invoke()` method.
+  macOS-specific structural changes for the sync-deadlock
+  elimination work (see Operation 14): the
+  `cocoa_run_on_main` synchronous helper, the
+  `WebViewAwtMainBridge` Objective-C class, the
+  `performWork:` selector, and the `ensure_awt_main_bridge`
+  / `awt_bridge_box` / `awt_main_bridge_perform_impl`
+  scaffolding are removed; the `g_awt_main_bridge_cls` /
+  `g_awt_main_bridge_target` / `g_awt_main_bridge_modes` /
+  `g_awt_main_bridge_once` file-scope statics are removed.
+  `cocoa_create_engine` is split into a synchronous prologue
+  + `cocoa_run_on_main_async` epilogue; `cocoa_destroy_engine`
+  becomes fully async; `cocoa_is_first_responder` reads an
+  atomic on the `Engine` struct. The `Engine` struct gains
+  `is_first_responder: std::atomic<bool>`, `destroyed:
+  std::atomic<bool>`, `kvo_observer: id`, and
+  `observed_window: id` fields. `cocoa_bind` becomes async
+  on main (FIFO-ordered after the attach epilogue) instead
+  of mutating `e->bindings` synchronously on the calling
+  thread. The JNI export for `webview_embed_create` keeps
+  its `jlong`-returning signature on every platform; the
+  macOS side returns the freshly-allocated `Engine*` after
+  the synchronous prologue. A new JNI callback channel
+  (declared on `WebViewNative`) carries the AppKit-side
+  attach success / failure outcome from the async epilogue
+  back to the EDT.
 - `demos/WebViewHeavyweightDemo/...` — interactive demo that
   exercises the trickier scenarios (combo-box popups over the
   WebView, `JTabbedPane` tab visibility, and on-demand
@@ -709,6 +1106,29 @@ File: `src/ca/weblite/webview/EmbeddedWebView.java`
        `WebViewNative.webview_embed_open_devtools(peer)`;
        return `(result == 1)`. Does NOT touch `heap` or
        `bindings` — pure side-effect call.
+   - `addOnAttachComplete(WebViewAttachListener listener): EmbeddedWebView` (new)
+     - Null-check `listener` (throw `NullPointerException`
+       with a message naming the parameter).
+     - If `attachState == PENDING`, append the listener to
+       `attachListeners`.
+     - If `attachState == ATTACHED`, schedule
+       `SwingUtilities.invokeLater` that calls
+       `listener.onAttached(this)`. MUST NOT fire inline on
+       the calling thread.
+     - If `attachState == FAILED`, schedule
+       `SwingUtilities.invokeLater` that calls
+       `listener.onAttachFailed(this, attachFailure)`. MUST
+       NOT fire inline.
+     - Returns `this` for chaining. Pure side-effect; does
+       NOT touch `heap` or `bindings`. Safe to call before
+       or after attach resolves and from the EDT only — the
+       method MAY assume EDT thread (document this) so the
+       state read and the list append do not need explicit
+       synchronisation.
+   - `getAttachState(): AttachState` (new)
+     - Read and return `attachState`. EDT-only. Useful for
+       tests and for callers that prefer polling over
+       listeners.
 4. Constraints / Invariants:
    - `checkAlive` throws `IllegalStateException` after dispose
      (`EmbeddedWebView.java:204`).
@@ -1061,7 +1481,17 @@ Files:
        that the user is interacting with the WebView,
        because AWT's focus owner stays on whichever Swing
        component last had focus while the WKWebView holds
-       native first-responder status.
+       native first-responder status. The macOS native body
+       MUST NOT perform a synchronous main-thread hop on
+       this call — it MUST read the cached
+       `is_first_responder` atomic on the `Engine` struct,
+       maintained by the KVO observer on
+       `NSWindow.firstResponder` (see Operation 14). The
+       dispatcher's hot path on every editing keystroke is
+       therefore a lock-free atomic load with no thread
+       hop; the previous synchronous probe (which is the
+       sync site the `WebViewDeadlockRepro` demo wedges on)
+       is gone.
    - **Default to deferring to Swing.** If both signals are
      false, return `false` so AWT delivers the event to its
      focus owner via the normal dispatch path. This is the
@@ -1627,6 +2057,289 @@ Files:
      currently selected, so the callback can fire on every
      click without worrying about the current popup state.
 
+### 14. Eliminate Sync EDT↔AppKit Bridge (macOS)
+Files:
+- `src/ca/weblite/webview/WebViewAttachListener.java` (new
+  public functional interface)
+- `src/ca/weblite/webview/AttachState.java` (new public
+  enum)
+- `src/ca/weblite/webview/EmbeddedWebView.java` (new
+  `attachState` / `attachFailure` / `attachListeners`
+  fields, `addOnAttachComplete`, `getAttachState`, and the
+  internal JNI callback that resolves the attach state on
+  the EDT; no signature change to the existing `attach`
+  factory)
+- `src/ca/weblite/webview/WebViewNative.java` (one new
+  JNI entry point for the attach-completion callback
+  registration; signature is platform-uniform, native
+  bodies on Windows / Linux fire the callback immediately)
+- `src_c/webview_embed.cpp` (the three sync-site removals
+  plus the helper teardown)
+- `windows/webview_embed.cc` (immediate-fire attach
+  callback)
+- `demos/WebViewDeadlockRepro/...` (extension to drive the
+  long-run attach → focus → Cmd-C → dispose stress loop
+  for the 5-minute test)
+
+1. Responsibility: structurally eliminate the class of
+   EDT↔AppKit-main mutual-wait deadlock from the macOS
+   heavyweight WebView implementation by removing every
+   synchronous EDT→AppKit-main dispatch primitive in
+   `src_c/webview_embed.cpp`. Three concrete sync sites
+   are converted; the synchronous helper plumbing is then
+   removed. The Java-visible API surface is augmented with
+   a deferred-completion listener (`WebViewAttachListener`)
+   that fires on the EDT, but `EmbeddedWebView.attach(...)`
+   remains a synchronous factory so existing callers are
+   unaffected. Cross-platform: the new Java API exists on
+   every platform; on Windows / Linux the listener fires
+   immediately because attach is already synchronous.
+
+2. Cached first-responder via KVO on
+   `NSWindow.firstResponder` (closes
+   `cocoa_is_first_responder` sync site):
+   - Add `is_first_responder: std::atomic<bool>` to the
+     `Engine` struct, default-initialised `false`.
+   - Define a small Objective-C class
+     (`WebViewKvoObserver` or similar) whose
+     `observeValueForKeyPath:ofObject:change:context:`
+     method recomputes the responder state by walking the
+     responder chain from `[window firstResponder]` upward
+     through `superview` looking for `e->webview` (same
+     walk the previous synchronous probe used,
+     `webview_embed.cpp:2004-2019`). The observer holds a
+     back-pointer to its owning `Engine` via
+     `objc_setAssociatedObject` or a direct field; it
+     writes the result into `e->is_first_responder` with
+     `store(value)`.
+   - Observer lifecycle: register lazily on the first
+     non-nil window. Because the WKWebView's `window`
+     property may be transiently nil at the moment of
+     `addSubview:` (AppKit policy during view-hierarchy
+     construction), observe the WKWebView's own `window`
+     key path with a one-shot KVO; on the first non-nil
+     window, register the firstResponder observer on that
+     window and recompute the atomic immediately, then
+     either leave the window observer in place (to handle
+     subsequent window changes — see below) or
+     short-circuit further triggers as appropriate.
+   - Window-change handling: if the WKWebView ever moves
+     between windows (e.g. user drags the JFrame across
+     screens, or a re-parenting operation), the
+     `window`-keypath observer fires again; the
+     implementation unregisters the firstResponder
+     observer from the previous window's
+     `observed_window` (if any) and registers it on the
+     new window, then recomputes the atomic.
+   - Refactor `cocoa_is_first_responder` to a single line:
+     `return e ? e->is_first_responder.load() : 0;`. No
+     thread hop, no responder-chain walk on the EDT side.
+   - Observer registration runs inside the attach epilogue
+     (which is `cocoa_run_on_main_async` after the changes
+     in step 3); observer unregistration runs inside the
+     destroy lambda (step 4) BEFORE any view release. On
+     window-change the unregister/register happens on the
+     main thread within the observer callback itself.
+   - The existing swizzled `becomeFirstResponder` /
+     `resignFirstResponder` hooks on `WKWebView` are NOT
+     repurposed for the cache; they stay scoped to the
+     existing focus-callback delivery (Operation 11).
+     Rationale per Approach: those swizzles do not fire
+     for focus on inner WebKit content views.
+
+3. Async engine attach (closes `cocoa_create_engine` sync
+   site):
+   - Split `cocoa_create_engine` into:
+     - Synchronous prologue (runs on the calling thread,
+       typically EDT): allocate the C++ `Engine` struct
+       with `new Engine()`; record `e->jvm`,
+       `e->debug`. Acquire the JAWT lock long enough to
+       retain `surface_layers` (existing
+       `JawtLock` pattern); on JAWT lock failure return
+       0 (matches today's `delete e; return nullptr;`
+       synchronous-failure path). After the prologue
+       succeeds, `webview_embed_create` returns the
+       `Engine*` cast to `jlong` immediately.
+     - Async epilogue (`cocoa_run_on_main_async`, runs
+       on the AppKit main thread later): install the
+       focus / click / first-responder swizzles
+       (existing `std::call_once` guards apply); alloc
+       and init the WKWebView; register in
+       `g_webview_map`; find the host NSView; call
+       `[host setWantsLayer:YES]`; call
+       `[host addSubview:e->webview]`; install the
+       script-message-handler delegate and the
+       `external.invoke` shim; if `debug`, set
+       `developerExtrasEnabled` / `setInspectable:`;
+       register the KVO observer per step 2; finally
+       post the success outcome back to the EDT (see
+       step 6).
+   - On any AppKit-side failure inside the async
+     epilogue (WKWebView alloc returned nil, no
+     hostable NSView discovered), post a failure
+     outcome to the EDT carrying an actionable message
+     identifying the failure step, then proceed to
+     release whatever AppKit objects were allocated so
+     far, drop the entry from `g_webview_map` (if it
+     was inserted), and `delete e`. The C++ `Engine`
+     struct MUST NOT leak on the async-failure path.
+   - The synchronous return of a non-zero `Engine*`
+     before the async epilogue runs is the macOS
+     behavioural change. Windows and Linux retain their
+     existing synchronous-create semantics inside their
+     own JNI bodies.
+
+4. Async engine destroy (closes `cocoa_destroy_engine`
+   sync site):
+   - Add `destroyed: std::atomic<bool>` to the `Engine`
+     struct, default `false`.
+   - Pre-destroy work on the calling thread (EDT)
+     remains as today and runs BEFORE the async lambda
+     is enqueued: drop `e->webview` from
+     `g_webview_map` under `g_webview_map_mutex`;
+     release the `focus_callback` JNI global ref;
+     release the `click_callback` JNI global ref.
+     Rationale: these refs must be cleared before the
+     swizzled responder / mouse hooks could fire into a
+     freed Java ref.
+   - The remaining teardown moves into a
+     `cocoa_run_on_main_async` lambda:
+     `e->destroyed.store(true)` first; unregister the
+     KVO firstResponder observer from
+     `e->observed_window` (if any) and the
+     `window`-keypath observer from `e->webview`; clear
+     `e->kvo_observer` / `e->observed_window`; call
+     `[e->webview removeFromSuperview]`; release
+     `e->host_view` / `e->surface_layers` /
+     `e->webview` / `e->config`; walk `e->bindings`
+     releasing each Java global ref (the JNI attach /
+     detach pattern existing destroy uses); `delete e`.
+     The JNI entry returns immediately after enqueueing
+     the lambda.
+   - Every other async-on-main lambda
+     (`cocoa_navigate` / `cocoa_eval` /
+     `cocoa_init_script` / `cocoa_set_bounds` /
+     `cocoa_set_visible` / `cocoa_request_focus` /
+     `cocoa_execute_editing_command` / `cocoa_bind`)
+     reads `e->destroyed.load()` at the top of the
+     lambda and short-circuits cleanly if `true`. For
+     `cocoa_eval` specifically, the late-fire short-
+     circuit MUST NOT raise an exception or write to a
+     freed pointer; the corresponding
+     `CompletableFuture<String>` is already drained
+     exceptionally by `EmbeddedWebView.dispose()` via
+     `evalDispatcher.disposeAllPending()` before the
+     JNI destroy call, so the native-side short-circuit
+     is belt-and-suspenders.
+
+5. `cocoa_bind` async conversion (required by step 3):
+   - The existing `cocoa_bind(Engine *e, Binding *b) {
+     e->bindings[b->name] = b; }` mutates `e->bindings`
+     synchronously on the calling thread (EDT). Under
+     async attach the script-message-handler delegate
+     might read `e->bindings` on the main thread before
+     the EDT's write is visible. Wrap the body in
+     `cocoa_run_on_main_async([=] { … })` so the map
+     write runs on main and serialises against the
+     delegate's reads. Pre-attach `addJavascriptCallback`
+     calls thus enqueue after the attach epilogue (FIFO),
+     are picked up by the delegate at JS-call time, and
+     the existing
+     `WebViewHeavyweightComponent.createPeer` replay
+     order (bindings before navigate) is preserved.
+
+6. Attach-completion JNI bridge:
+   - Declare a JNI entry point on `WebViewNative` for
+     registering an attach-completion callback against a
+     peer, with a Java-side signature shaped like
+     `webview_embed_set_attach_callback(long peer, Object
+     callback)`. The Java callback object is a small
+     internal type owned by `EmbeddedWebView`; its
+     `onResolved(boolean ok, String failureMessage)`
+     method is invoked from the native side via JNI.
+   - macOS native body: store a JNI global ref to the
+     callback on the `Engine`. The async attach epilogue,
+     on success, calls the global ref's `onResolved(true,
+     null)`; on failure, calls `onResolved(false,
+     failureMessage)`. The native call attaches the
+     current thread to the JVM if needed (same pattern as
+     `fire_focus_callback`) and detaches after. The
+     callback in turn marshals to the EDT via
+     `SwingUtilities.invokeLater` — either inside the JNI
+     callback's Java body, or by having the C++ side
+     enqueue an `invokeLater` directly. Either is valid;
+     the listener firing rule (Norms) is that
+     `WebViewAttachListener` callbacks fire on the EDT.
+   - Windows / Linux native bodies: fire `onResolved(true,
+     null)` immediately during `webview_embed_create`
+     (the synchronous path), so the Java side observes
+     `ATTACHED` as soon as the constructor returns.
+   - Java side: `EmbeddedWebView` constructor registers
+     the callback BEFORE returning from `attach(...)`.
+     The callback flips `attachState` from `PENDING` to
+     `ATTACHED` or `FAILED`, captures `attachFailure` on
+     failure, and fires every registered listener via
+     `SwingUtilities.invokeLater` in registration order.
+
+7. Helper removal (after steps 2–6 land):
+   - Remove the `cocoa_run_on_main` synchronous helper
+     and the entire `WebViewAwtMainBridge` /
+     `performWork:` / `ensure_awt_main_bridge` /
+     `awt_bridge_box` / `awt_main_bridge_perform_impl`
+     scaffolding from `src_c/webview_embed.cpp`. Remove
+     the file-scope statics
+     `g_awt_main_bridge_cls`,
+     `g_awt_main_bridge_target`, `g_awt_main_bridge_modes`,
+     `g_awt_main_bridge_once`. Grep `src/`, `src_c/`,
+     `windows/`, and `demos/` for `cocoa_run_on_main`
+     (without `_async`) and `WebViewAwtMainBridge` /
+     `performWork:` — there MUST be zero matches in
+     production code after this step.
+
+8. Deadlock-repro long-run test
+   (`demos/WebViewDeadlockRepro/...`):
+   - Extend the demo with a stress mode that runs an
+     attach → wait for `onAttached` → request focus →
+     simulate Cmd-C → dispose loop for at least 5
+     minutes. The existing 5-second EDT watchdog stays
+     in place; the demo MUST exit cleanly with a zero
+     status code after the configured duration without
+     the watchdog firing.
+   - Run locally under Address Sanitizer (`ASAN_OPTIONS`
+     compatible with the existing Mac demo runner); any
+     UAF attributable to the destroy path MUST surface
+     during this test.
+
+9. Constraints / Invariants:
+   - Every per-engine native operation on macOS MUST run
+     via `cocoa_run_on_main_async` (or inline when
+     already on main). No new synchronous EDT→main
+     dispatch primitive may be introduced in
+     `src_c/webview_embed.cpp`.
+   - State that the EDT needs to read about the AppKit
+     main thread MUST be cached in an `std::atomic` on
+     the `Engine` struct, written from the main thread.
+     Direct synchronous reads of AppKit-thread state
+     from the EDT are forbidden.
+   - `dispatch_get_main_queue()` ordering (serial FIFO)
+     is load-bearing for pre-attach op replay. Any change
+     that uses a different queue, multiple queues, or
+     introduces concurrent dispatch breaks the
+     no-Java-buffer invariant and must be redesigned.
+   - The KVO observer MUST be unregistered before any
+     view release in the destroy lambda. AppKit logs a
+     warning (and may crash in some configurations) if
+     an observed object is released while observers are
+     still registered.
+   - The synchronous return shape of `webview_embed_create`
+     is preserved: it returns the C++ `Engine*` as
+     `jlong`, or 0 on synchronous prologue failure. Java
+     callers continue to throw `IllegalStateException`
+     on a zero return.
+   - The Windows and Linux native paths are NOT modified
+     by this Operation, except for the immediate-fire
+     attach-completion callback in step 6.
+
 ## N · Norms
 - All AWT/JAWT interaction must respect the rule that the
   native peer is only valid while the host AWT Component is
@@ -1700,39 +2413,68 @@ Files:
   than adding new native hooks per use case. Keep the Java
   handler narrowly scoped so the call cost is bounded for
   every WebView click.
-- macOS sync main-thread dispatch (`embed::cocoa_run_on_main` in
-  `src_c/webview_embed.cpp`) MUST NOT use
-  `dispatch_sync(dispatch_get_main_queue(), …)` from the EDT.
-  AppKit's main thread routinely parks inside
-  `-[LWCToolkit doAWTRunLoopImpl]`'s private CFRunLoop while it
-  waits for the EDT to answer a JNI callback (the AX
-  `accessibilityFocusedUIElement` query during a VoiceOver
-  focus-changed event is the canonical trigger, but any
-  AppKit→Java upcall through `doAWTRunLoopImpl` qualifies —
-  IME callbacks, AWT-EDT round-trips). That private runloop
-  runs only in `@"AWTRunLoopMode"` and does NOT drain the main
-  dispatch queue; combined with the EDT blocking on
-  `dispatch_sync` waiting for the main thread, this is an
-  unconditional EDT-↔-main deadlock. The fix — required for
-  every sync main-thread bridge in this codebase — is to use
+- macOS sync EDT→AppKit-main bridge in
+  `src_c/webview_embed.cpp` is PROHIBITED. No code path
+  in the macOS portion of `webview_embed.cpp` may block the
+  EDT waiting for the AppKit main thread — not via
+  `dispatch_sync(dispatch_get_main_queue(), …)`, not via
   `-[NSObject performSelectorOnMainThread:withObject:
-  waitUntilDone:YES modes:]` with a mode array that includes
-  `@"AWTRunLoopMode"` alongside the normal AppKit modes
-  (`kCFRunLoopDefaultMode`, `NSEventTrackingRunLoopMode`,
-  `NSModalPanelRunLoopMode`). This matches the JDK's own
-  `sun.lwawt.macosx.ThreadUtilities.javaModes` set and is the
-  canonical "talk to AppKit from a JNI call on the EDT"
-  pattern. The wrapper class
-  (`WebViewAwtMainBridge` / `performWork:`) is registered once
-  per JVM via `std::call_once`, symmetric with the existing
-  swizzle / `WebviewEmbedDelegate` once-only registrations.
-  See the bug report "WebViewHeavyweightComponent deadlocks the
-  EDT when the WebView peer is created during macOS
-  accessibility focus events" for the original trace. The
-  async helper `cocoa_run_on_main_async` is unaffected — it
-  uses `dispatch_async_f` and never blocks the EDT, so a queued
-  block sitting in the main queue while
-  `doAWTRunLoopImpl` runs is latency, not deadlock.
+  waitUntilDone:YES modes:]`, not via any custom semaphore /
+  condition-variable rendezvous, and not via any new
+  helper that has those semantics. The previous Norm (which
+  mandated `performSelectorOnMainThread:modes:` with
+  `AWTRunLoopMode`) is retired by Operation 14 because it
+  only closes one ordering of the deadlock cycle: it does
+  NOT prevent the case where our own main-thread block has
+  already begun executing and its body (e.g.
+  `[host addSubview:e->webview]`) synchronously rendezvous
+  with the EDT through AppKit accessibility / IME /
+  `LWCToolkit.invokeAndWait`, with the EDT still parked on
+  the original `performSelector` semaphore. The structural
+  fix is to eliminate every sync EDT→main hop. Specifically:
+  - Every per-engine native operation MUST run via
+    `cocoa_run_on_main_async` (or inline when already on
+    main), and `cocoa_run_on_main_async` MUST remain
+    asynchronous (`dispatch_async_f` to
+    `dispatch_get_main_queue()`); queued blocks sitting in
+    the main queue while `doAWTRunLoopImpl` runs are
+    latency, not deadlock.
+  - Any AppKit-main-thread state that the EDT needs to
+    read MUST be mirrored into an `std::atomic` on the
+    `Engine` struct, written from the main thread (e.g. by
+    a KVO observer callback, a swizzled responder hook,
+    or the destroy lambda) and read lock-free from the
+    EDT. The cached first-responder flag
+    (`is_first_responder`) is the canonical example.
+  - Pre-attach op ordering is provided by
+    `dispatch_get_main_queue()`'s documented FIFO serial
+    semantics. Any change that uses a different queue,
+    introduces a concurrent dispatch queue, or otherwise
+    breaks the FIFO-after-attach invariant is forbidden
+    by this Norm because it would force the
+    re-introduction of an explicit pre-attach buffer (or
+    worse, a sync bridge).
+  - The synchronous helper `cocoa_run_on_main` and the
+    `WebViewAwtMainBridge` / `performWork:` /
+    `ensure_awt_main_bridge` scaffolding MUST NOT be
+    reintroduced. They were removed by Operation 14 step
+    7; any code-review observation that they are
+    "missing" should be redirected to the documented
+    async pattern.
+  Rationale and history: the v1.0.5 fix from PR #30
+  (commit `dcda4cf`) introduced the
+  `performSelectorOnMainThread:modes:` mechanism to close
+  one specific ordering. The demo at
+  `demos/WebViewDeadlockRepro` reproduces the inverse
+  ordering it does NOT close, where the EDT enters
+  `cocoa_run_on_main` for `cocoa_is_first_responder` while
+  the AppKit main thread is parked in `invokeAndWait`
+  waiting for the EDT to drain a JS callback. The
+  user-story decomposition in
+  `requirements/[User-story-4]eliminate-edt-appkit-sync-deadlock-on-macos.md`
+  and the analysis in
+  `spdd/analysis/GGQPA-XXX-202605201900-[Analysis]-edt-appkit-sync-deadlock-elimination.md`
+  document the full reasoning.
 
 ## S · Safeguards
 - `EmbeddedWebView.attach` validates `parent != null` AND
@@ -1835,3 +2577,107 @@ Files:
   [[in-process-webview-java-api]]; the asymmetry is
   intentional because the standalone surface has no Swing in
   the picture.
+- `WebViewAttachListener` callbacks MUST fire on the Swing
+  EDT and MUST NOT fire inline on the registering thread,
+  even when attach has already resolved at registration time.
+  `addOnAttachComplete` on a `PENDING` engine appends to
+  `attachListeners` and returns; the resolve dispatch fires
+  every listener via `SwingUtilities.invokeLater` in
+  registration order. `addOnAttachComplete` on an `ATTACHED`
+  or `FAILED` engine schedules `SwingUtilities.invokeLater`
+  with the appropriate callback; inline firing on the
+  calling thread would let listener bodies that register
+  further listeners re-enter the dispatch code path with
+  half-initialised state and is a source of subtle bugs.
+- `EmbeddedWebView` state transitions (`PENDING → ATTACHED`,
+  `PENDING → FAILED`) are EDT-only. The macOS native
+  attach-completion callback marshals to the EDT before
+  flipping `attachState`, capturing `attachFailure` (on
+  failure), and firing listeners. State reads
+  (`getAttachState`) are also documented EDT-only; this
+  removes the need to volatile-qualify `attachState` and
+  matches the existing Swing-thread-confinement convention
+  used throughout this canvas.
+- Pre-attach method calls on a `PENDING` engine MUST NOT
+  throw. `setUrl`, `addOnBeforeLoad`, `addJavascriptCallback`,
+  `eval`, `setBounds`, `setVisible`, `requestFocus`,
+  `executeEditingCommand` all enqueue native async-on-main
+  blocks; each block null-checks `e->webview` / `e->manager`
+  at fire time and silently no-ops if cleared (the existing
+  destroy-side race pattern). The `EmbeddedWebView.checkAlive()`
+  guard continues to check `peer == 0L`, which is non-zero
+  during `PENDING` (the C++ struct allocation is synchronous);
+  callers therefore see no behavioural difference from the
+  pre-async-attach contract.
+- The KVO observer for `NSWindow.firstResponder` MUST be
+  registered lazily on the first non-nil window (the
+  WKWebView's `window` property may be transiently nil at
+  `addSubview:` time per AppKit policy) and MUST be
+  unregistered from its current `observed_window` before any
+  view release in the destroy lambda. AppKit logs a warning
+  (and may crash in some configurations) if an observed
+  object is released while observers are still registered.
+  The observer MUST also be moved (unregistered from the old
+  window, registered against the new window) if the
+  WKWebView's `window` property changes at runtime; the atomic
+  cache MUST be recomputed immediately after the move.
+- The `Engine.destroyed: std::atomic<bool>` MUST be set to
+  `true` as the FIRST action inside the destroy lambda,
+  before any AppKit teardown runs. Every other
+  `cocoa_run_on_main_async` lambda (navigate / eval /
+  init_script / set_bounds / set_visible / request_focus /
+  execute_editing_command / bind) MUST read `destroyed` at
+  the top of its body and short-circuit cleanly (no JNI
+  exception, no callback into Java, no AppKit call) if `true`.
+  The primary correctness guarantee is dispatch-queue FIFO
+  ordering plus EDT-only enqueueing; the flag is
+  belt-and-suspenders against (a) destroy-from-non-EDT,
+  (b) future code changes that violate the
+  EDT-only-enqueue invariant, and (c) the `cocoa_eval`
+  late-completion path that needs a clean signalling channel.
+- `EmbeddedWebView.dispose()` ordering (Java-side) MUST be
+  preserved under async destroy: drain the `EvalDispatcher`
+  first, clear focus / click callbacks (try/catch),
+  set `peer = 0L`, then call `webview_embed_destroy`. The
+  drain runs on the EDT and completes every pending
+  `evalAsync` future exceptionally before the native destroy
+  enqueues its lambda; the `peer = 0L` flip ensures
+  subsequent `EmbeddedWebView.evalAsync` calls return an
+  already-failed future without touching the dispatcher.
+  Native-side late `cocoa_eval` short-circuits are therefore
+  exercised only in pathological orderings; they remain
+  the correct defensive design.
+- `EmbeddedWebView.attach(...)` synchronous-throw contract is
+  preserved for C++ allocation failure. If the C++ `Engine`
+  struct allocation itself fails (out-of-memory, JAWT lock
+  failure, or any synchronous-prologue error),
+  `webview_embed_create` returns `0` and the Java factory
+  throws `IllegalStateException` exactly as today — no
+  partial `EmbeddedWebView` instance is observable. Only
+  AppKit-side failures (which by definition only occur on
+  macOS in the async epilogue) route through the
+  `WebViewAttachListener.onAttachFailed` callback. Callers
+  who use `attach(...)` without registering a listener
+  MUST be able to discover async failure via
+  `getAttachState() == FAILED`; documenting this avoids
+  the trap where AppKit-side failures are silently swallowed.
+- The C++ `Engine` struct MUST NOT leak on async-attach
+  failure. If the async epilogue fails after `new Engine()`
+  succeeded (e.g. WKWebView allocation returned nil, no
+  hostable NSView discovered), the failure path MUST
+  release any AppKit objects already allocated, drop the
+  entry from `g_webview_map` if it was inserted, post the
+  failure outcome to the EDT, and finally `delete e`. This
+  is symmetric with the synchronous `!ok → delete e` path
+  the previous design used; the new path just runs in the
+  async lambda instead of inline.
+- `cocoa_bind`'s async conversion MUST preserve the
+  registration-order semantics relied upon by
+  `WebViewHeavyweightComponent.createPeer` (which iterates
+  `pendingBindings` BEFORE calling `navigate(pendingUrl)`).
+  The main dispatch queue's FIFO serial ordering provides
+  this automatically; any change that breaks FIFO order
+  (e.g. routing bind through a different queue) would
+  re-introduce a race between binding registration and
+  page-load JS calls that the existing canvas code already
+  documents around.

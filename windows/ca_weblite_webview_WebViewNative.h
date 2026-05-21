@@ -321,6 +321,14 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1rel
 
 /*
  * Class:     ca_weblite_webview_WebViewNative
+ * Method:    webview_embed_set_attach_callback
+ * Signature: (JLjava/lang/Object;)V
+ */
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1attach_1callback
+  (JNIEnv *, jclass, jlong, jobject);
+
+/*
+ * Class:     ca_weblite_webview_WebViewNative
  * Method:    webview_offscreen_init
  * Signature: (JLjava/lang/String;)V
  */

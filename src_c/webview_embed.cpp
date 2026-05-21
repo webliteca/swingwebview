@@ -1583,6 +1583,54 @@ struct Engine {
     // those clicks because the heavyweight peer receives them through
     // the AppKit responder chain rather than AWT's event queue.
     jobject click_callback = nullptr;
+
+    // Mirrored first-responder state.  Written on the AppKit main thread
+    // by the KVO observer callback on NSWindow.firstResponder (see
+    // WebviewEmbedKvoObserver below); read lock-free from any thread by
+    // cocoa_is_first_responder.  A stale read by at most one event-loop
+    // tick is acceptable; a single bool admits no torn reads.
+    std::atomic<bool> is_first_responder{false};
+
+    // Destroyed flag.  Set true as the FIRST action inside the destroy
+    // lambda (cocoa_destroy_engine), before any AppKit teardown runs.
+    // Every other async-on-main lambda (navigate / eval / init_script /
+    // set_bounds / set_visible / request_focus / execute_editing_command
+    // / bind) reads this at fire time and short-circuits cleanly if true.
+    // The primary correctness guarantee is dispatch-queue FIFO ordering +
+    // EDT-only enqueueing; this flag is belt-and-suspenders against
+    // (a) destroy-from-non-EDT, (b) future code changes that violate the
+    // EDT-only-enqueue invariant, and (c) the cocoa_eval late-fire path
+    // that needs to short-circuit if the engine is gone.
+    std::atomic<bool> destroyed{false};
+
+    // KVO observer wired against the host window's firstResponder key
+    // path; lazily registered on the first non-nil window the WKWebView
+    // sees, and re-registered if the WKWebView moves between windows at
+    // runtime.  Owned by the engine (retained); released in the destroy
+    // lambda before the WKWebView itself is released.
+    id kvo_observer = nullptr;
+
+    // Last NSWindow the KVO observer was registered against.  Used to
+    // unregister cleanly during destroy or on window change.  Weak
+    // (unretained) back-reference; AppKit owns the window's lifecycle.
+    id observed_window = nullptr;
+
+    // Attach-completion resolution state.  Coordinated between
+    // (a) the AppKit-main-thread epilogue inside cocoa_create_engine,
+    // which sets attach_resolved+attach_ok+attach_failure_message and
+    // fires the callback if one is registered; and (b) the EDT-thread
+    // cocoa_set_attach_callback, which stores the callback and fires
+    // it immediately if attach is already resolved.  Guarded by
+    // attach_callback_mutex.  The callback is fired exactly once: the
+    // mutex serialises the "store callback + fire if resolved" and
+    // "set resolved + fire if callback present" windows, and the
+    // callback fields are cleared after firing.
+    std::mutex attach_callback_mutex;
+    bool attach_resolved = false;
+    bool attach_ok = false;
+    std::string attach_failure_message;
+    jobject attach_callback = nullptr;
+    jclass attach_callback_cls = nullptr;
 };
 
 // Process-global map from WKWebView (id) to its owning Engine*.  Populated
@@ -1593,131 +1641,19 @@ struct Engine {
 static std::mutex g_webview_map_mutex;
 static std::map<id, Engine *> g_webview_map;
 
-// Heap-allocated work item passed across the EDT → AppKit main bridge.
-// Lives until the main-thread method runs and deletes it.
-struct AwtBridgeWork {
-    std::function<void()> fn;
-};
-
-// Implementation of -[WebViewAwtMainBridge performWork:].  Runs on the
-// AppKit main thread; receives an NSValue wrapping an AwtBridgeWork *,
-// extracts the function, runs it, and deletes the work item.  The class
-// itself is allocated lazily in ensure_awt_main_bridge.
-static void awt_main_bridge_perform_impl(id /*self*/, SEL /*_cmd*/, id arg) {
-    if (!arg) return;
-    void *p = msg<void *>(arg, sel("pointerValue"));
-    if (!p) return;
-    auto *work = static_cast<AwtBridgeWork *>(p);
-    work->fn();
-    delete work;
-}
-
-// Process-global state for the AWT main-thread bridge.  We allocate one
-// Objective-C class (WebViewAwtMainBridge), one shared instance of it
-// (the target of every performSelectorOnMainThread: call), and one
-// NSArray of run-loop modes.  Initialised exactly once per JVM via
-// std::call_once -- objc_allocateClassPair returns Nil on second call
-// for the same name.
-static Class g_awt_main_bridge_cls = nil;
-static id g_awt_main_bridge_target = nil;
-static id g_awt_main_bridge_modes = nil;
-static std::once_flag g_awt_main_bridge_once;
-
-static void ensure_awt_main_bridge() {
-    std::call_once(g_awt_main_bridge_once, [] {
-        Class c = objc_allocateClassPair((Class)objc_cls("NSObject"),
-                                         "WebViewAwtMainBridge", 0);
-        class_addMethod(c, sel("performWork:"),
-                        (IMP)awt_main_bridge_perform_impl, "v@:@");
-        objc_registerClassPair(c);
-        g_awt_main_bridge_cls = c;
-        // [new] returns a +1-retained instance; keep it forever.
-        g_awt_main_bridge_target = msg((id)c, sel("new"));
-
-        // Build the modes list under which the main thread will service
-        // our performSelector dispatch.  The critical entry here is
-        // "AWTRunLoopMode" -- the private CFRunLoop mode the JDK enters
-        // from -[LWCToolkit doAWTRunLoopImpl] when AppKit calls into
-        // Java from the main thread (accessibility role queries during a
-        // VoiceOver / AX focus-changed event, IME callbacks, etc) and
-        // pumps a nested runloop waiting for the EDT to respond.  In
-        // that mode the main dispatch queue is NOT drained, so the
-        // previous dispatch_sync(main_queue, ...)-based implementation
-        // deadlocked: the EDT was already blocked in
-        // webview_embed_create, so the AX query the main thread was
-        // waiting on never got serviced, and our queued block on the
-        // main queue never got drained either.  Adding AWTRunLoopMode
-        // here lets the main thread service the perform from inside
-        // doAWTRunLoopImpl's nested CFRunLoop, breaking the cycle.
-        //
-        // The other modes mirror what the JDK's own ThreadUtilities
-        // installs (kCFRunLoopDefaultMode, NSEventTrackingRunLoopMode
-        // for live resize / drag, NSModalPanelRunLoopMode for modal
-        // panels) so we keep being serviced through every CFRunLoop
-        // mode AppKit normally runs in.
-        id arr = msg(objc_cls("NSMutableArray"), sel("alloc"));
-        arr = msg(arr, sel("init"));
-        msg<void, id>(arr, sel("addObject:"),
-                      ns_str("kCFRunLoopDefaultMode"));
-        msg<void, id>(arr, sel("addObject:"), ns_str("AWTRunLoopMode"));
-        msg<void, id>(arr, sel("addObject:"),
-                      ns_str("NSEventTrackingRunLoopMode"));
-        msg<void, id>(arr, sel("addObject:"),
-                      ns_str("NSModalPanelRunLoopMode"));
-        g_awt_main_bridge_modes = arr;
-    });
-}
-
-// Wrap `work` in an NSValue (no autorelease -- we hand-manage the +1).
-// Caller owns one ref; release after the perform call returns.
-static id awt_bridge_box(AwtBridgeWork *work) {
-    void *ptr_val = work;
-    id arg = msg(objc_cls("NSValue"), sel("alloc"));
-    arg = msg<id, const void *, const char *>(
-        arg, sel("initWithBytes:objCType:"), &ptr_val, "^v");
-    return arg;
-}
-
-static void cocoa_run_on_main(std::function<void()> f) {
-    // If we're already on the AppKit main thread, just run f inline.
-    // Otherwise route through -[NSObject performSelectorOnMainThread:
-    // withObject:waitUntilDone:modes:] with a mode set that includes
-    // "AWTRunLoopMode", so the call is serviced even when the main
-    // thread is parked inside the JDK's LWCToolkit.doAWTRunLoopImpl
-    // (accessibility-focus callbacks, IME callbacks, AWT-EDT round
-    // trips, etc).
-    //
-    // The previous implementation used dispatch_sync_f to the main
-    // dispatch queue, which deadlocks in that scenario: AppKit's main
-    // thread was inside doAWTRunLoopImpl's nested CFRunLoop in
-    // AWTRunLoopMode (which does NOT drain the main dispatch queue),
-    // waiting for the EDT to answer an accessibility role query; the
-    // EDT meanwhile was here in webview_embed_create waiting for the
-    // main thread to dequeue our sync block.  See the bug report
-    // "WebViewHeavyweightComponent deadlocks the EDT when the WebView
-    // peer is created during macOS accessibility focus events".
-    //
-    // performSelectorOnMainThread:waitUntilDone:YES is the canonical
-    // AWT-on-macOS bridge for "talk to AppKit from a JNI call" and is
-    // the same mechanism the JDK itself uses internally
-    // (sun.lwawt.macosx.ThreadUtilities / JNFRunLoop).
-    BOOL is_main = msg<BOOL>(objc_cls("NSThread"), sel("isMainThread"));
-    if (is_main) {
-        f();
-        return;
-    }
-    ensure_awt_main_bridge();
-    auto *work = new AwtBridgeWork{std::move(f)};
-    id arg = awt_bridge_box(work);
-    msg<void, SEL, id, BOOL, id>(
-        g_awt_main_bridge_target,
-        sel("performSelectorOnMainThread:withObject:waitUntilDone:modes:"),
-        sel("performWork:"), arg, YES, g_awt_main_bridge_modes);
-    // performSelectorOnMainThread retains arg for the duration of the
-    // call; releasing our +1 here brings the refcount to 1 (held by
-    // perform) and then 0 after the selector finishes.
-    msg<void>(arg, sel("release"));
-}
+// The EDT↔AppKit-main synchronous bridge has been eliminated.  Per
+// Canvas 6 Norms (the macOS sync EDT→AppKit-main bridge prohibition),
+// every per-engine native operation runs via cocoa_run_on_main_async
+// (FIFO dispatch_get_main_queue) or inlines when already on main; any
+// AppKit-thread state the EDT needs to read is mirrored into an
+// std::atomic on the Engine (see Engine::is_first_responder, fed by
+// the KVO observer on NSWindow.firstResponder, walked below).  The
+// historical scaffolding -- cocoa_run_on_main, WebViewAwtMainBridge,
+// performWork:, ensure_awt_main_bridge, awt_bridge_box,
+// awt_main_bridge_perform_impl, the g_awt_main_bridge_* statics, and
+// the AwtBridgeWork heap-allocated work item -- has been removed.  Do
+// NOT reintroduce any of them; the structural reason is documented in
+// the canvas's "Eliminate Sync EDT↔AppKit Bridge" approach entry.
 
 static void cocoa_run_on_main_async(std::function<void()> f) {
     BOOL is_main = msg<BOOL>(objc_cls("NSThread"), sel("isMainThread"));
@@ -1986,39 +1922,327 @@ static void install_click_swizzle() {
     });
 }
 
-// Returns 1 if the engine's WKWebView (or a descendant view in its
-// subview hierarchy -- WebKit content view, etc.) is currently the
-// first responder of its NSWindow.  Synchronous query against AppKit
-// main thread state; safe to call from EDT during a key press
-// (NOT during NSEventTrackingRunLoopMode, but Cmd+C isn't a tracking
-// event).
-static int cocoa_is_first_responder(Engine *e) {
-    if (!e || !e->webview) return 0;
-    int result = 0;
-    cocoa_run_on_main([&] {
-        if (!e->webview) return;
-        id window = msg(e->webview, sel("window"));
-        if (!window) return;
-        id fr = msg(window, sel("firstResponder"));
-        if (!fr) return;
-        // Walk the responder's view-hierarchy chain looking for the
-        // WKWebView.  The actual first responder is often an inner
-        // WebKit content view, not the WKWebView itself.
-        SEL is_kind_of_view = sel("isKindOfClass:");
-        id view_cls = objc_cls("NSView");
-        if (!msg<BOOL, id>(fr, is_kind_of_view, view_cls)) {
-            // First responder isn't an NSView (e.g. NSWindow itself) --
-            // not us.
+// Walk the responder chain from [window firstResponder] upward through
+// superview looking for e->webview.  Runs on the AppKit main thread
+// (invoked from the KVO observer below and from the post-window-attach
+// recompute path).  Identical logic to the previous synchronous
+// cocoa_is_first_responder probe -- correctly handles inner WebKit
+// content views (NSResponder subclasses inside WKWebView) by walking
+// up the view hierarchy until it either reaches e->webview (match) or
+// runs out of superviews (no match).  Stores the result into
+// e->is_first_responder so cocoa_is_first_responder can read it
+// lock-free with no thread hop.
+static void cocoa_recompute_first_responder_on_main(Engine *e) {
+    if (!e || !e->webview) {
+        if (e) e->is_first_responder.store(false);
+        return;
+    }
+    id window = msg(e->webview, sel("window"));
+    if (!window) {
+        e->is_first_responder.store(false);
+        return;
+    }
+    id fr = msg(window, sel("firstResponder"));
+    if (!fr) {
+        e->is_first_responder.store(false);
+        return;
+    }
+    SEL is_kind_of_view = sel("isKindOfClass:");
+    id view_cls = objc_cls("NSView");
+    if (!msg<BOOL, id>(fr, is_kind_of_view, view_cls)) {
+        // First responder isn't an NSView (e.g. NSWindow itself) -- not us.
+        e->is_first_responder.store(false);
+        return;
+    }
+    for (id v = fr; v; v = msg(v, sel("superview"))) {
+        if (v == e->webview) {
+            e->is_first_responder.store(true);
             return;
         }
-        for (id v = fr; v; v = msg(v, sel("superview"))) {
-            if (v == e->webview) {
-                result = 1;
-                return;
+    }
+    e->is_first_responder.store(false);
+}
+
+// Returns 1 if the engine's WKWebView (or a descendant view in its
+// subview hierarchy -- WebKit content view, etc.) is currently the
+// first responder of its NSWindow.  Lock-free read of the mirrored
+// state maintained by the KVO observer registered on
+// NSWindow.firstResponder; no AppKit-main-thread hop, no deadlock
+// surface.  Safe to call from any thread, but in practice fired only
+// from the EDT (the editing-shortcut dispatcher in
+// WebViewHeavyweightComponent).
+static int cocoa_is_first_responder(Engine *e) {
+    if (!e) return 0;
+    return e->is_first_responder.load() ? 1 : 0;
+}
+
+// ---------------------------------------------------------------------------
+// KVO observer for NSWindow.firstResponder + WKWebView.window.
+//
+// The Engine struct holds an std::atomic<bool> is_first_responder that
+// mirrors AppKit-main-thread state for lock-free EDT reads.  Two key paths
+// drive updates:
+//   1. NSWindow.firstResponder fires for every focus transition anywhere
+//      in the host window's responder hierarchy.  Each firing walks the
+//      responder chain via cocoa_recompute_first_responder_on_main and
+//      stores the result in the atomic.
+//   2. WKWebView.window fires when the WKWebView is added to / removed
+//      from / moved between NSWindows.  When the property goes non-nil,
+//      we register the firstResponder observer on the new window and
+//      recompute immediately.  When it changes to a different window we
+//      unregister from the previous window and register on the new one.
+//      When it goes nil (e.g. just before removeFromSuperview during
+//      destroy) we unregister and clear the cache.
+//
+// The Objective-C class is registered exactly once per JVM via
+// std::call_once -- same pattern as the existing WKWebView swizzles and
+// the WebviewEmbedDelegate class registration.  Each engine creates one
+// instance of the class and stores the back-pointer to its owning Engine*
+// via objc_setAssociatedObject (OBJC_ASSOCIATION_ASSIGN -- Engine is not
+// an Obj-C object, so the runtime won't try to retain/release it).
+// ---------------------------------------------------------------------------
+
+static std::once_flag g_kvo_observer_once;
+static Class g_kvo_observer_cls = nil;
+
+static const char KVO_ENGINE_KEY[] = "eng";
+// Distinct context pointers let observeValueForKeyPath: tell the two
+// key paths apart without string-comparing the keypath every fire.
+static int kvo_ctx_first_responder = 0;
+static int kvo_ctx_window = 0;
+
+// Forward declaration: defined after cocoa_destroy_engine so the
+// KVO observer can reference engine teardown helpers.
+static void cocoa_kvo_register_on_window(Engine *e, id window);
+static void cocoa_kvo_unregister_from_window(Engine *e);
+
+static void kvo_observe_impl(id self, SEL /*_cmd*/, id /*keyPath*/,
+                             id /*object*/, id /*change*/, void *context) {
+    auto *e = (Engine *)objc_getAssociatedObject(self, KVO_ENGINE_KEY);
+    if (!e) return;
+    if (e->destroyed.load()) return;
+    if (context == &kvo_ctx_first_responder) {
+        cocoa_recompute_first_responder_on_main(e);
+    } else if (context == &kvo_ctx_window) {
+        // WKWebView's window keypath changed.  Re-aim the firstResponder
+        // observer at the new window (or unregister if nil) and
+        // recompute.
+        id new_window = e->webview ? msg(e->webview, sel("window"))
+                                   : (id)nullptr;
+        if (new_window != e->observed_window) {
+            cocoa_kvo_unregister_from_window(e);
+            if (new_window) {
+                cocoa_kvo_register_on_window(e, new_window);
             }
         }
+        cocoa_recompute_first_responder_on_main(e);
+    }
+}
+
+static void ensure_kvo_observer_class() {
+    std::call_once(g_kvo_observer_once, [] {
+        Class c = objc_allocateClassPair((Class)objc_cls("NSObject"),
+                                         "WebviewEmbedKvoObserver", 0);
+        // observeValueForKeyPath:ofObject:change:context: --
+        // signature "v@:@@@^v"
+        //   v   void
+        //   @   id self
+        //   :   SEL _cmd
+        //   @   id keyPath  (NSString)
+        //   @   id object
+        //   @   id change   (NSDictionary)
+        //   ^v  void *context
+        class_addMethod(
+            c,
+            sel("observeValueForKeyPath:ofObject:change:context:"),
+            (IMP)kvo_observe_impl,
+            "v@:@@@^v");
+        objc_registerClassPair(c);
+        g_kvo_observer_cls = c;
     });
-    return result;
+}
+
+// Register the engine's KVO observer against `window`'s firstResponder
+// key path.  Caller MUST hold the AppKit main thread.  Idempotent
+// against repeated registration on the same window (the second call
+// is a no-op).
+static void cocoa_kvo_register_on_window(Engine *e, id window) {
+    if (!e || !window) return;
+    if (e->observed_window == window) return;
+    if (!e->kvo_observer) return;
+    msg<void, id, id, unsigned long, void *>(
+        window,
+        sel("addObserver:forKeyPath:options:context:"),
+        e->kvo_observer,
+        ns_str("firstResponder"),
+        (unsigned long)0,           // no NSKeyValueObservingOptions flags
+        &kvo_ctx_first_responder);
+    e->observed_window = window;
+}
+
+// Unregister the engine's KVO observer from its currently-observed
+// window (if any).  Caller MUST hold the AppKit main thread.
+static void cocoa_kvo_unregister_from_window(Engine *e) {
+    if (!e || !e->observed_window || !e->kvo_observer) return;
+    msg<void, id, id, void *>(
+        e->observed_window,
+        sel("removeObserver:forKeyPath:context:"),
+        e->kvo_observer,
+        ns_str("firstResponder"),  // forKeyPath:
+        &kvo_ctx_first_responder); // context:
+    // Template params: (Ret=void, Args = id observer, id keyPath, void* context)
+    e->observed_window = nullptr;
+}
+
+// Install the engine's KVO observer.  Allocates the observer object,
+// associates it with the Engine pointer, attaches the WKWebView.window
+// observer (so we react to window changes), and -- if the WKWebView
+// already has a window -- registers the firstResponder observer on
+// that window and seeds the atomic.  Caller MUST hold the AppKit main
+// thread.
+static void cocoa_kvo_install(Engine *e) {
+    if (!e || !e->webview) return;
+    ensure_kvo_observer_class();
+    id observer = msg((id)g_kvo_observer_cls, sel("new"));
+    if (!observer) return;
+    objc_setAssociatedObject(observer, KVO_ENGINE_KEY, (id)e,
+                             OBJC_ASSOCIATION_ASSIGN);
+    e->kvo_observer = observer;
+    msg<void, id, id, unsigned long, void *>(
+        e->webview,
+        sel("addObserver:forKeyPath:options:context:"),
+        observer,
+        ns_str("window"),
+        (unsigned long)0,
+        &kvo_ctx_window);
+    id w = msg(e->webview, sel("window"));
+    if (w) {
+        cocoa_kvo_register_on_window(e, w);
+        cocoa_recompute_first_responder_on_main(e);
+    }
+}
+
+// Tear down the engine's KVO observer.  Reverses cocoa_kvo_install;
+// caller MUST hold the AppKit main thread, and MUST call this BEFORE
+// any view release in the destroy lambda (AppKit logs a warning and
+// may crash if an observed object is released while observers are
+// still registered).
+static void cocoa_kvo_teardown(Engine *e) {
+    if (!e || !e->kvo_observer) return;
+    cocoa_kvo_unregister_from_window(e);
+    if (e->webview) {
+        msg<void, id, id, void *>(
+            e->webview,
+            sel("removeObserver:forKeyPath:context:"),
+            e->kvo_observer,
+            ns_str("window"),         // forKeyPath:
+            &kvo_ctx_window);         // context:
+    }
+    objc_setAssociatedObject(e->kvo_observer, KVO_ENGINE_KEY, (id)nullptr,
+                             OBJC_ASSOCIATION_ASSIGN);
+    msg<void>(e->kvo_observer, sel("release"));
+    e->kvo_observer = nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// Attach-completion callback.
+//
+// The Java side registers an AttachCallback bridge object via
+// cocoa_set_attach_callback before the EmbeddedWebView factory returns.
+// The macOS async attach epilogue inside cocoa_create_engine, on
+// success or failure, calls cocoa_attach_signal_complete to publish the
+// outcome.  Two ordering cases:
+//   (a) Java registers the callback BEFORE the async epilogue fires
+//       (typical case): cocoa_set_attach_callback stores the global ref;
+//       cocoa_attach_signal_complete sees the stored callback and fires
+//       it from the main thread.
+//   (b) Java registers the callback AFTER the async epilogue fires
+//       (race window narrow but possible): the async epilogue stores the
+//       resolution state without anyone to call; cocoa_set_attach_callback
+//       sees attach_resolved==true and fires the callback from the EDT.
+// Both paths are guarded by attach_callback_mutex.  The callback fires
+// exactly once -- both paths null out the callback fields after firing.
+// ---------------------------------------------------------------------------
+
+// Caller MUST hold e->attach_callback_mutex.  Invokes the registered
+// Java callback's onResolved(boolean, String) method and clears the
+// stored callback fields.  Attaches the current thread to the JVM if
+// needed (mirrors the fire_focus_callback pattern).
+static void cocoa_attach_invoke_callback_locked(Engine *e) {
+    if (!e || !e->attach_callback || !e->attach_callback_cls) return;
+    bool ok = e->attach_ok;
+    std::string msg_text = e->attach_failure_message;
+    JavaVM *jvm = e->jvm;
+    if (!jvm) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        jvm->AttachCurrentThread((void **)&env, nullptr);
+        detach = true;
+    }
+    if (env) {
+        jmethodID m = env->GetMethodID(
+            e->attach_callback_cls, "onResolved",
+            "(ZLjava/lang/String;)V");
+        if (m) {
+            jstring js = (!ok && !msg_text.empty())
+                ? env->NewStringUTF(msg_text.c_str()) : nullptr;
+            env->CallVoidMethod(e->attach_callback, m,
+                                (jboolean)(ok ? JNI_TRUE : JNI_FALSE), js);
+            if (js) env->DeleteLocalRef(js);
+        }
+        env->DeleteGlobalRef(e->attach_callback);
+        env->DeleteGlobalRef(e->attach_callback_cls);
+    }
+    e->attach_callback = nullptr;
+    e->attach_callback_cls = nullptr;
+    if (detach) jvm->DetachCurrentThread();
+}
+
+// Called from the async attach epilogue inside cocoa_create_engine
+// (on the AppKit main thread).  Records the outcome and fires the
+// callback if one is already registered.
+static void cocoa_attach_signal_complete(Engine *e, bool ok,
+                                         std::string failure_message) {
+    if (!e) return;
+    std::lock_guard<std::mutex> lk(e->attach_callback_mutex);
+    if (e->attach_resolved) return;  // idempotent
+    e->attach_resolved = true;
+    e->attach_ok = ok;
+    e->attach_failure_message = std::move(failure_message);
+    if (e->attach_callback) {
+        cocoa_attach_invoke_callback_locked(e);
+    }
+}
+
+// Java entry point: register the AttachCallback bridge object.  Called
+// from EmbeddedWebView.attach on the EDT immediately after
+// webview_embed_create returns.  Stores a JNI global ref; if the
+// async attach epilogue has already completed (case (b) above), fires
+// the callback immediately.
+static void cocoa_set_attach_callback(Engine *e, JNIEnv *env, jobject cb) {
+    if (!e || !env) return;
+    std::lock_guard<std::mutex> lk(e->attach_callback_mutex);
+    // If we already have a callback registered, drop the old one
+    // (defensive -- the Java factory wires this exactly once, but make
+    // the contract robust).
+    if (e->attach_callback) {
+        env->DeleteGlobalRef(e->attach_callback);
+        e->attach_callback = nullptr;
+    }
+    if (e->attach_callback_cls) {
+        env->DeleteGlobalRef(e->attach_callback_cls);
+        e->attach_callback_cls = nullptr;
+    }
+    if (cb) {
+        e->attach_callback = env->NewGlobalRef(cb);
+        jclass cls = env->GetObjectClass(cb);
+        e->attach_callback_cls = (jclass)env->NewGlobalRef(cls);
+        env->DeleteLocalRef(cls);
+    }
+    if (e->attach_resolved && e->attach_callback) {
+        cocoa_attach_invoke_callback_locked(e);
+    }
 }
 
 static void cocoa_set_focus_callback(Engine *e, JNIEnv *env, jobject cb) {
@@ -2049,6 +2273,26 @@ static void cocoa_set_click_callback(Engine *e, JNIEnv *env, jobject cb) {
     }
 }
 
+// Synchronous prologue + async epilogue.  Returns the freshly-allocated
+// Engine* (cast to jlong by the JNI export) immediately after the JAWT
+// surface-layers handoff; the WKWebView creation, host-NSView discovery,
+// addSubview:, configuration, and KVO observer install run later on the
+// AppKit main thread.  The async epilogue calls cocoa_attach_signal_
+// complete on completion to drive the Java-side AttachState transition.
+//
+// Only synchronous failure (JAWT lock failure) returns nullptr; every
+// other failure surfaces via the attach-completion callback's onResolved
+// (false, "<message>") path so the Java side can observe it through a
+// registered WebViewAttachListener.
+//
+// The C++ Engine struct itself is NOT deleted on async-attach failure --
+// the contract is that the Java side owns the EmbeddedWebView wrapper
+// and will eventually call dispose() (typically via removeNotify in the
+// heavyweight component), which triggers cocoa_destroy_engine to free
+// the Engine.  The async failure path therefore leaves the Engine in a
+// partially-initialised state but with destroyed==false, so the user
+// can still call dispose() to clean up.  destroyed is set to true only
+// inside cocoa_destroy_engine.
 static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
                                    jlong /*display*/, jint debug) {
     auto *e = new Engine();
@@ -2056,8 +2300,10 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
     e->debug = debug != 0;
 
     // Resolve the JAWT surface layers object up front, then release the
-    // surface lock immediately -- holding it across a dispatch_sync to the
-    // AppKit main thread can deadlock with AppKit's redraw loop.
+    // surface lock immediately -- holding it across a hop to the AppKit
+    // main thread (the async epilogue below) could deadlock with
+    // AppKit's redraw loop.  This is the only step that requires the
+    // calling thread's JNIEnv, so it stays in the synchronous prologue.
     {
         JawtLock lock(env, parentComponent);
         if (!lock.ok) {
@@ -2073,8 +2319,25 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
         }
     }
 
-    bool ok = false;
-    cocoa_run_on_main([&] {
+    // Async epilogue: AppKit-side setup on the main thread.  Captures e
+    // by value (pointer); never blocks the EDT.  dispatch_get_main_queue
+    // is serial FIFO, so subsequent cocoa_navigate / cocoa_eval / etc.
+    // blocks enqueued by the EDT before the user's first listener call
+    // are guaranteed to fire AFTER this block on the main thread.  Each
+    // of those blocks already null-checks e->webview / e->manager and
+    // silently no-ops if cleared -- so an op enqueued before the
+    // epilogue creates the WKWebView simply finds it ready by the time
+    // it fires.
+    cocoa_run_on_main_async([e] {
+        if (e->destroyed.load()) {
+            // The user called dispose() between the prologue returning
+            // and this block firing.  The destroy lambda is enqueued
+            // AFTER this block; bail without doing AppKit-side work so
+            // the destroy lambda has nothing to tear down.
+            cocoa_attach_signal_complete(e, false,
+                "EmbeddedWebView disposed before attach completed");
+            return;
+        }
         // Install the WKWebView first-responder swizzle once per JVM
         // BEFORE creating the WKWebView, so any becomeFirstResponder
         // calls during init are routed through our hook from the start.
@@ -2087,10 +2350,25 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
 
         e->config = msg(objc_cls("WKWebViewConfiguration"), sel("new"));
         e->manager = msg(e->config, sel("userContentController"));
-        e->webview = msg(objc_cls("WKWebView"), sel("alloc"));
-        e->webview = msg<id, CGRect, id>(
-            e->webview, sel("initWithFrame:configuration:"),
+        id wv = msg(objc_cls("WKWebView"), sel("alloc"));
+        wv = msg<id, CGRect, id>(
+            wv, sel("initWithFrame:configuration:"),
             CGRectMake(0, 0, 800, 600), e->config);
+        if (!wv) {
+            // Release the partial AppKit allocations so they don't leak
+            // before reporting the failure.  e->manager is an
+            // autoreleased getter from config so does not need explicit
+            // release; e->config does.
+            e->manager = nullptr;
+            if (e->config) {
+                msg<void>(e->config, sel("release"));
+                e->config = nullptr;
+            }
+            cocoa_attach_signal_complete(e, false,
+                "WKWebView allocation failed");
+            return;
+        }
+        e->webview = wv;
 
         // Register the WKWebView in the engine map so the swizzled
         // responder hooks can find their Engine pointer.
@@ -2214,15 +2492,57 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
                 msg<void, BOOL>(e->webview, sel("setInspectable:"), YES);
             }
         }
-        ok = true;
+
+        // Install the KVO observer on the WKWebView's window keypath --
+        // when the WKWebView lands in an NSWindow, the observer
+        // registers a firstResponder observer on that window and seeds
+        // the cached atomic so cocoa_is_first_responder can read it
+        // lock-free.  See cocoa_kvo_install above.
+        cocoa_kvo_install(e);
+
+        // Signal attach completion.  cocoa_attach_signal_complete fires
+        // the Java AttachCallback immediately if one is already
+        // registered (typical case -- the Java factory installs the
+        // callback synchronously before any wider event-loop time slice
+        // elapses); otherwise it just stores the resolution, and
+        // cocoa_set_attach_callback fires it when the registration
+        // arrives.
+        cocoa_attach_signal_complete(e, true, "");
     });
-    if (!ok) {
-        delete e;
-        return nullptr;
-    }
     return e;
 }
 
+// Asynchronous engine destroy.  Returns immediately on the calling
+// thread (typically the EDT) after a small Java-side cleanup; the
+// AppKit teardown, view-hierarchy removal, KVO observer unregister,
+// binding global-ref release, and finally `delete e` run on the
+// AppKit main thread in a single async-on-main lambda.
+//
+// Pre-async cleanup (calling thread):
+//   1. Erase from g_webview_map so the swizzled responder / mouse hooks
+//      cannot find the engine again.  This window MUST be as small as
+//      possible -- the calling thread runs this synchronously before
+//      any subsequent async ops can be enqueued.
+//   2. DeleteGlobalRef on focus_callback and click_callback so the
+//      hooks (which had read the fields up to this point) cannot fire
+//      Java callbacks against freed refs.  Uses the calling thread's
+//      JNIEnv via attach/detach.
+//
+// Async cleanup (AppKit main thread, FIFO after any previously-enqueued
+// per-engine op):
+//   1. Set destroyed=true as the FIRST action so any LATER fires of
+//      previously-enqueued lambdas (defence-in-depth -- FIFO ordering
+//      makes this impossible in normal operation) see the flag.
+//   2. Tear down the KVO observer BEFORE any view release (AppKit logs
+//      a warning if an observed object is released while observers are
+//      still registered).
+//   3. removeFromSuperview, release retained AppKit objects.
+//   4. Drain e->bindings (releasing the per-binding Java global refs).
+//   5. Release any still-pending attach callback global ref (the
+//      typical case is that it was already cleared inside attach
+//      resolution, but a never-resolved attach + dispose pattern would
+//      land here).
+//   6. delete e.
 static void cocoa_destroy_engine(Engine *e) {
     if (!e) return;
     // Drop the webview from the engine map BEFORE any teardown work --
@@ -2261,7 +2581,18 @@ static void cocoa_destroy_engine(Engine *e) {
         e->click_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
-    cocoa_run_on_main([&] {
+    cocoa_run_on_main_async([e] {
+        // Mark destroyed FIRST.  Any LATER-firing lambdas that read this
+        // flag short-circuit; FIFO ordering on the main queue makes
+        // "later" impossible in normal operation but the flag is the
+        // canvas-mandated belt-and-suspenders.
+        e->destroyed.store(true);
+
+        // KVO observer unregistration MUST happen BEFORE any view
+        // release -- AppKit warns (and may crash) if an observed object
+        // is released with observers still attached.
+        cocoa_kvo_teardown(e);
+
         if (e->webview) {
             // If we added the WKWebView as a subview, remove it before
             // releasing so AppKit unwinds the view hierarchy cleanly.
@@ -2284,24 +2615,52 @@ static void cocoa_destroy_engine(Engine *e) {
             msg<void>(e->config, sel("release"));
             e->config = nullptr;
         }
+
+        // Drain e->bindings on the main thread.  Each binding holds
+        // two Java global refs (the callback and its class); attach to
+        // the JVM via the engine's stored JavaVM* to release them.
+        for (auto &kv : e->bindings) {
+            Binding *b = kv.second;
+            JNIEnv *env2 = nullptr;
+            bool detach = false;
+            if (e->jvm && e->jvm->GetEnv((void **)&env2, JNI_VERSION_1_6) != JNI_OK) {
+                e->jvm->AttachCurrentThread((void **)&env2, nullptr);
+                detach = true;
+            }
+            if (env2) {
+                env2->DeleteGlobalRef(b->fn);
+                env2->DeleteGlobalRef(b->cls);
+            }
+            if (detach && e->jvm) e->jvm->DetachCurrentThread();
+            delete b;
+        }
+        e->bindings.clear();
+
+        // Release any still-pending attach-callback global ref.  Under
+        // normal flow cocoa_attach_signal_complete cleared this when
+        // the callback fired, but a never-resolved-then-disposed
+        // engine (rare: user disposes while the async epilogue's
+        // destroyed-check above bailed) would leave it set.
+        {
+            std::lock_guard<std::mutex> lk(e->attach_callback_mutex);
+            if (e->attach_callback || e->attach_callback_cls) {
+                JNIEnv *env2 = nullptr;
+                bool detach = false;
+                if (e->jvm && e->jvm->GetEnv((void **)&env2, JNI_VERSION_1_6) != JNI_OK) {
+                    e->jvm->AttachCurrentThread((void **)&env2, nullptr);
+                    detach = true;
+                }
+                if (env2) {
+                    if (e->attach_callback) env2->DeleteGlobalRef(e->attach_callback);
+                    if (e->attach_callback_cls) env2->DeleteGlobalRef(e->attach_callback_cls);
+                }
+                e->attach_callback = nullptr;
+                e->attach_callback_cls = nullptr;
+                if (detach && e->jvm) e->jvm->DetachCurrentThread();
+            }
+        }
+        delete e;
     });
-    for (auto &kv : e->bindings) {
-        Binding *b = kv.second;
-        JNIEnv *env = nullptr;
-        bool detach = false;
-        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
-            e->jvm->AttachCurrentThread((void **)&env, nullptr);
-            detach = true;
-        }
-        if (env) {
-            env->DeleteGlobalRef(b->fn);
-            env->DeleteGlobalRef(b->cls);
-        }
-        if (detach) e->jvm->DetachCurrentThread();
-        delete b;
-    }
-    e->bindings.clear();
-    delete e;
 }
 
 // Update the WKWebView's frame so it overlays exactly the AWT canvas
@@ -2312,7 +2671,8 @@ static void cocoa_destroy_engine(Engine *e) {
 // is translated into Cocoa's bottom-left coords.
 static void cocoa_set_bounds(Engine *e, int x, int y, int w, int h) {
     cocoa_run_on_main_async([=] {
-        if (!e || !e->webview || !e->host_view) return;
+        if (!e || e->destroyed.load()) return;
+        if (!e->webview || !e->host_view) return;
         CGFloat fx = (CGFloat)x;
         CGFloat fy = (CGFloat)y;
         CGFloat fw = (CGFloat)w;
@@ -2334,6 +2694,7 @@ static void cocoa_set_bounds(Engine *e, int x, int y, int w, int h) {
 
 static void cocoa_navigate(Engine *e, std::string url) {
     cocoa_run_on_main_async([=] {
+        if (!e || e->destroyed.load()) return;
         if (!e->webview) return;
         id nsurl = msg<id, id>(objc_cls("NSURL"), sel("URLWithString:"),
                                ns_str(url.c_str()));
@@ -2345,6 +2706,7 @@ static void cocoa_navigate(Engine *e, std::string url) {
 
 static void cocoa_init_script(Engine *e, std::string js) {
     cocoa_run_on_main_async([=] {
+        if (!e || e->destroyed.load()) return;
         if (!e->manager) return;
         id script = msg(objc_cls("WKUserScript"), sel("alloc"));
         script = msg<id, id, long, BOOL>(
@@ -2356,6 +2718,7 @@ static void cocoa_init_script(Engine *e, std::string js) {
 
 static void cocoa_eval(Engine *e, std::string js) {
     cocoa_run_on_main_async([=] {
+        if (!e || e->destroyed.load()) return;
         if (!e->webview) return;
         msg<void, id, id>(e->webview,
                           sel("evaluateJavaScript:completionHandler:"),
@@ -2365,6 +2728,7 @@ static void cocoa_eval(Engine *e, std::string js) {
 
 static void cocoa_set_visible(Engine *e, bool visible) {
     cocoa_run_on_main_async([=] {
+        if (!e || e->destroyed.load()) return;
         if (!e->webview) return;
         msg<void, BOOL>(e->webview, sel("setHidden:"), visible ? NO : YES);
     });
@@ -2372,6 +2736,7 @@ static void cocoa_set_visible(Engine *e, bool visible) {
 
 static void cocoa_request_focus(Engine *e) {
     cocoa_run_on_main_async([=] {
+        if (!e || e->destroyed.load()) return;
         if (!e->webview) return;
         id win = msg(e->webview, sel("window"));
         if (win) {
@@ -2380,7 +2745,41 @@ static void cocoa_request_focus(Engine *e) {
     });
 }
 
-static void cocoa_bind(Engine *e, Binding *b) { e->bindings[b->name] = b; }
+// Convert the per-engine binding registration to async-on-main so it
+// serialises against the script-message-handler delegate's reads of
+// e->bindings (which also run on main).  FIFO main-queue ordering
+// guarantees the bind block fires AFTER the attach epilogue (which
+// creates the WKWebView and sets up the script-message-handler) and
+// BEFORE any cocoa_navigate enqueued by the caller after the bind --
+// so the binding is registered in e->bindings before the page can call
+// it from JS.
+static void cocoa_bind(Engine *e, Binding *b) {
+    if (!e || !b) {
+        if (b) delete b;
+        return;
+    }
+    cocoa_run_on_main_async([e, b] {
+        if (e->destroyed.load()) {
+            // Engine destroyed before this bind could fire.  Release
+            // the Binding's Java global refs and delete it; no engine
+            // to attach it to.
+            JNIEnv *env = nullptr;
+            bool detach = false;
+            if (e->jvm && e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+                e->jvm->AttachCurrentThread((void **)&env, nullptr);
+                detach = true;
+            }
+            if (env) {
+                if (b->fn) env->DeleteGlobalRef(b->fn);
+                if (b->cls) env->DeleteGlobalRef(b->cls);
+            }
+            if (detach && e->jvm) e->jvm->DetachCurrentThread();
+            delete b;
+            return;
+        }
+        e->bindings[b->name] = b;
+    });
+}
 
 // macOS has no public API to programmatically open the Web Inspector; the
 // only public entry points are right-click -> Inspect Element (gated by
@@ -2412,7 +2811,11 @@ static int cocoa_open_devtools(Engine *e) {
 // cmdId values are the EditingCommand contract: 1=CUT, 2=COPY, 3=PASTE,
 // 4=SELECT_ALL.  Unknown cmdIds are silently dropped.
 static void cocoa_execute_editing_command(Engine *e, int cmdId) {
-    if (!e || !e->webview) return;
+    if (!e) return;
+    // No early bail on e->webview: the engine may still be in async
+    // attach (e->webview not yet set) -- FIFO ordering on the main
+    // queue means the lambda below sees a populated e->webview by the
+    // time it fires.
     SEL action = nullptr;
     const char *name = nullptr;
     switch (cmdId) {
@@ -2423,6 +2826,7 @@ static void cocoa_execute_editing_command(Engine *e, int cmdId) {
         default: return;
     }
     cocoa_run_on_main_async([=] {
+        if (!e || e->destroyed.load()) return;
         if (!e->webview) return;
         if (!msg<BOOL, SEL>(e->webview, sel("respondsToSelector:"),
                             action)) {
@@ -2813,6 +3217,36 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1rel
     // adequate.  Windows has its own implementation in
     // windows/webview_embed.cc that performs the cross-thread SetFocus.
     (void)wv;
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1attach_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    auto *e = (Engine *)wv;
+    if (!e) return;
+#if defined(WEBVIEW_COCOA)
+    // macOS attach is asynchronous; the callback connects the Java
+    // EmbeddedWebView's AttachState machine to the async epilogue's
+    // resolution.  cocoa_set_attach_callback handles both orderings
+    // (callback registered before vs. after the async epilogue
+    // completes) under attach_callback_mutex.
+    embed::cocoa_set_attach_callback(e, env, cb);
+#else
+    // GTK / unsupported: attach is synchronous (the engine is fully
+    // ready by the time webview_embed_create returns), so signal
+    // completion immediately.  Fire onResolved(true, null) from the
+    // calling thread (typically the EDT); the Java handler marshals
+    // via SwingUtilities.invokeLater so the listener actually fires on
+    // the next EDT tick regardless of which thread we are on here.
+    if (!cb) return;
+    jclass cls = env->GetObjectClass(cb);
+    if (!cls) return;
+    jmethodID m = env->GetMethodID(cls, "onResolved",
+                                   "(ZLjava/lang/String;)V");
+    if (m) {
+        env->CallVoidMethod(cb, m, (jboolean)JNI_TRUE, (jstring)nullptr);
+    }
+    env->DeleteLocalRef(cls);
+#endif
 }
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1init

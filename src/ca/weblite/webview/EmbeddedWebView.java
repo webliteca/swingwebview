@@ -15,6 +15,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CompletableFuture;
+import javax.swing.SwingUtilities;
 
 /**
  * Low-level wrapper around an embedded WebView native peer.
@@ -27,6 +28,23 @@ import java.util.concurrent.CompletableFuture;
  *
  * <p>Most callers should not use this class directly; use the Swing components
  * in the {@code ca.weblite.webview.swing} package instead.
+ *
+ * <p><b>Attach lifecycle.</b> The Java factory {@link #attach(Component,
+ * boolean)} is synchronous on every platform — it returns a non-null
+ * {@code EmbeddedWebView} immediately. On macOS the underlying AppKit-side
+ * setup (WKWebView allocation, host-NSView discovery, {@code addSubview:},
+ * configuration) runs asynchronously on the AppKit main thread; the
+ * returned instance is briefly in {@link AttachState#PENDING} state and
+ * transitions to {@link AttachState#ATTACHED} or {@link AttachState#FAILED}
+ * once the AppKit-side phase resolves. Callers that need an explicit
+ * signal may register a {@link WebViewAttachListener} via
+ * {@link #addOnAttachComplete}; pre-attach method calls
+ * ({@link #setBounds}, {@link #setVisible}, {@link #navigate},
+ * {@link #addOnBeforeLoad}, {@link #eval}, {@link #addJavascriptCallback},
+ * etc.) are safe on a {@code PENDING} engine — the macOS dispatch queue
+ * preserves FIFO order, so they replay in registration order after the
+ * AppKit-side setup completes. On Windows and Linux the engine is in
+ * {@link AttachState#ATTACHED} state by the time the factory returns.
  */
 public class EmbeddedWebView {
 
@@ -48,6 +66,39 @@ public class EmbeddedWebView {
      */
     private final EvalDispatcher evalDispatcher;
 
+    /**
+     * Attach lifecycle state.  Reads and writes are confined to the
+     * Swing EDT.  Initialised to {@link AttachState#PENDING}; the
+     * native attach-completion callback drives the transition to
+     * {@link AttachState#ATTACHED} or {@link AttachState#FAILED} via
+     * {@link AttachCallback#onResolved}, which marshals onto the EDT
+     * before flipping the field.
+     */
+    private AttachState attachState = AttachState.PENDING;
+
+    /**
+     * Failure cause set on the {@code PENDING → FAILED} transition.
+     * EDT-only; null in {@code PENDING} and {@code ATTACHED} states.
+     */
+    private Throwable attachFailure;
+
+    /**
+     * Listeners registered via {@link #addOnAttachComplete} while the
+     * engine is in {@link AttachState#PENDING}.  Fired in registration
+     * order on the EDT once the attach resolves and then cleared.
+     * EDT-only.
+     */
+    private final List<WebViewAttachListener> attachListeners =
+            new ArrayList<WebViewAttachListener>();
+
+    /**
+     * Native-callable bridge object that receives the attach-completion
+     * notification from the native side.  Held in {@link #heap} so the
+     * JNI global ref the native side stores stays reachable from Java
+     * until the engine is destroyed.
+     */
+    private final AttachCallback attachCallback = new AttachCallback();
+
     private EmbeddedWebView(long peer) {
         this.peer = peer;
         this.evalDispatcher = new EvalDispatcher(new EvalDispatcher.EvalSink() {
@@ -59,12 +110,28 @@ public class EmbeddedWebView {
                 }
             }
         }, true, "EmbeddedWebView");
+        // Anchor the attach callback against GC for as long as the engine
+        // is alive; the native side holds a JNI global ref but releasing
+        // it via the destroy lambda is the only mechanism that drops the
+        // anchor on the native side.  Java-side anchor matches every other
+        // callback registered through this class.
+        heap.add(attachCallback);
     }
 
     /**
      * Attach a WebView to the displayable parent Component.  The Component
      * must be heavyweight and already displayable (i.e. {@code addNotify()}
      * has been called).
+     *
+     * <p>On macOS the returned {@code EmbeddedWebView} is briefly in
+     * {@link AttachState#PENDING} state while the AppKit-side setup runs
+     * asynchronously on the AppKit main thread; on Windows and Linux it
+     * is in {@link AttachState#ATTACHED} state by the time the call
+     * returns.  In both cases the engine is safe to operate on
+     * immediately — pre-attach calls buffer through the platform's
+     * native dispatch queue and replay in registration order.  Callers
+     * that need an explicit signal may register a
+     * {@link WebViewAttachListener} via {@link #addOnAttachComplete}.
      *
      * @param parent a heavyweight, displayable AWT Component to attach to.
      * @param debug enables developer tools on supported platforms.
@@ -84,6 +151,13 @@ public class EmbeddedWebView {
                 "native window handle or initialize the embedded WebView.");
         }
         final EmbeddedWebView ewv = new EmbeddedWebView(p);
+        // Register the attach-completion callback BEFORE installing the
+        // eval bridge or returning.  The native side either fires the
+        // callback immediately (Windows/Linux, where attach is
+        // synchronous) or stores it for later (macOS, where the AppKit-
+        // side epilogue is still in flight).  Both paths marshal the
+        // ATTACHED / FAILED transition onto the Swing EDT.
+        WebViewNative.webview_embed_set_attach_callback(p, ewv.attachCallback);
         // Install the evalAsync bridge BEFORE returning so the SHIM_JS is
         // in place at document-start for every subsequent navigation, and
         // the __webview_eval_result__ resolver binding is ready before
@@ -347,6 +421,132 @@ public class EmbeddedWebView {
         checkAlive();
         WebViewNative.webview_embed_release_native_focus(peer);
         return this;
+    }
+
+    /**
+     * Read the current attach lifecycle state.  EDT-only.
+     *
+     * @return one of {@link AttachState#PENDING}, {@link AttachState#ATTACHED},
+     *         or {@link AttachState#FAILED}.
+     */
+    public AttachState getAttachState() {
+        return attachState;
+    }
+
+    /**
+     * Register a {@link WebViewAttachListener} to be notified when the
+     * native peer's attach resolves.  May be called at any point during
+     * the engine's lifetime — including after attach has already
+     * resolved, in which case the appropriate callback fires on the
+     * next EDT tick.  Callbacks never fire inline on the calling
+     * thread, even when attach is already resolved.
+     *
+     * <p>Multiple listeners are supported; they fire in registration
+     * order on the EDT.  Listener-thrown exceptions propagate to AWT's
+     * uncaught-exception handler.
+     *
+     * @param listener the listener to register; must not be null.
+     * @return {@code this} for chaining.
+     */
+    public EmbeddedWebView addOnAttachComplete(WebViewAttachListener listener) {
+        if (listener == null) {
+            throw new NullPointerException("listener");
+        }
+        if (attachState == AttachState.PENDING) {
+            attachListeners.add(listener);
+        } else {
+            // Already resolved — schedule the callback on the next EDT
+            // tick so the call does not fire inline on the registering
+            // thread.  Capture state at registration time in case a
+            // subsequent transition somehow occurred (defence in depth;
+            // ATTACHED and FAILED are terminal in normal operation).
+            final WebViewAttachListener captured = listener;
+            final boolean attachedNow = (attachState == AttachState.ATTACHED);
+            final Throwable cause = attachFailure;
+            SwingUtilities.invokeLater(new Runnable() {
+                @Override
+                public void run() {
+                    if (attachedNow) {
+                        captured.onAttached(EmbeddedWebView.this);
+                    } else {
+                        captured.onAttachFailed(EmbeddedWebView.this, cause);
+                    }
+                }
+            });
+        }
+        return this;
+    }
+
+    /**
+     * EDT-only.  Flip the attach state and fire every registered
+     * listener.  Called from {@link AttachCallback#onResolved} after
+     * the native side has notified Java that the AppKit-side setup
+     * has resolved.
+     */
+    private void resolveAttachOnEdt(boolean ok, String failureMessage) {
+        if (attachState != AttachState.PENDING) {
+            // Idempotent: native side should only fire once, but be
+            // defensive against a stray re-fire.
+            return;
+        }
+        if (ok) {
+            attachState = AttachState.ATTACHED;
+            attachFailure = null;
+        } else {
+            attachState = AttachState.FAILED;
+            attachFailure = new IllegalStateException(
+                failureMessage != null ? failureMessage
+                    : "EmbeddedWebView attach failed");
+        }
+        // Snapshot then clear so any callback that itself calls
+        // addOnAttachComplete (which would now hit the resolved
+        // branch) sees a clean PENDING-listener list.
+        List<WebViewAttachListener> snapshot =
+                new ArrayList<WebViewAttachListener>(attachListeners);
+        attachListeners.clear();
+        Throwable cause = attachFailure;
+        boolean attachedNow = ok;
+        for (WebViewAttachListener l : snapshot) {
+            try {
+                if (attachedNow) {
+                    l.onAttached(this);
+                } else {
+                    l.onAttachFailed(this, cause);
+                }
+            } catch (RuntimeException ex) {
+                // Let AWT's uncaught-exception handler observe it;
+                // do not let one listener's throw stop the others
+                // from firing.
+                Thread t = Thread.currentThread();
+                t.getUncaughtExceptionHandler().uncaughtException(t, ex);
+            }
+        }
+    }
+
+    /**
+     * Bridge object the native side calls to signal attach completion.
+     * Held in {@link #heap} (anti-GC) and registered with the native
+     * engine via {@link WebViewNative#webview_embed_set_attach_callback}
+     * inside {@link #attach}.  The native side invokes
+     * {@link #onResolved} from whatever thread completed the AppKit-side
+     * setup; this implementation marshals the work onto the Swing EDT
+     * before mutating any state.
+     */
+    final class AttachCallback {
+        /**
+         * Invoked by the native side; safe to call from any thread.
+         * @param ok true on success, false on failure.
+         * @param failureMessage human-readable failure description;
+         *                       only meaningful when {@code ok} is false.
+         */
+        public void onResolved(final boolean ok, final String failureMessage) {
+            SwingUtilities.invokeLater(new Runnable() {
+                @Override
+                public void run() {
+                    resolveAttachOnEdt(ok, failureMessage);
+                }
+            });
+        }
     }
 
     /**

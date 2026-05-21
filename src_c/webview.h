@@ -537,7 +537,32 @@ protected:
 
 #define OBJC_OLD_DISPATCH_PROTOTYPES 1
 #include <CoreGraphics/CoreGraphics.h>
+#include <cstddef>
 #include <objc/objc-runtime.h>
+
+// Typed objc_msgSend shim.
+//
+// Modern macOS SDKs (Xcode 15+) declare objc_msgSend with no parameters
+// even when OBJC_OLD_DISPATCH_PROTOTYPES is defined, and the ARM64
+// calling convention does not match the variadic ABI used by old
+// prototypes anyway.  Every call therefore has to go through a typed
+// function-pointer cast that matches the call site's actual argument
+// types.  msg<>() centralises that cast; the `#define objc_msgSend
+// webview::msg` redirection below makes every objc_msgSend(...) call in
+// this header route through it without touching individual call sites.
+//
+// Identical in shape to the helper of the same name in
+// src_c/webview_embed.cpp; replicated here because webview.h is a
+// header-only single-file include of upstream Serge Zaitsev webview
+// and cannot rely on the embed file's helper.
+namespace webview {
+template <typename Ret = id, typename... Args>
+static inline Ret msg(id receiver, SEL selector, Args... args) {
+  using Fn = Ret (*)(id, SEL, Args...);
+  return reinterpret_cast<Fn>(objc_msgSend)(receiver, selector, args...);
+}
+} // namespace webview
+#define objc_msgSend webview::msg
 
 #define NSBackingStoreBuffered 2
 
