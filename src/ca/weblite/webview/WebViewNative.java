@@ -250,6 +250,22 @@ native static void webview_embed_set_click_callback(long w, WebViewClickCallback
 // adequate on those platforms).  Never throws via JNI.
 native static void webview_embed_release_native_focus(long w);
 
+// Register a one-shot attach-completion callback for the engine.
+// The callback object MUST have a method
+// {@code void onResolved(boolean ok, String failureMessage)} that the
+// native side invokes once the engine's attach resolves — with
+// (true, null) on success, or (false, "<step description>") on
+// failure. macOS attach is asynchronous: the callback fires later,
+// from the AppKit main thread, when the WKWebView setup completes.
+// Windows and Linux attach is synchronous: the callback fires
+// immediately inside this call (still routed through the EDT via
+// SwingUtilities.invokeLater in the Java handler).  Never throws via
+// JNI; null callback clears any prior registration.  Used by
+// {@link EmbeddedWebView} to drive the {@link AttachState} state
+// machine and fire {@link WebViewAttachListener} callbacks on the
+// Swing EDT.
+native static void webview_embed_set_attach_callback(long w, Object cb);
+
 
 // ---------------------------------------------------------------------------
 // Lightweight / offscreen API (currently Linux-only).

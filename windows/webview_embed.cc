@@ -1010,6 +1010,28 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1rel
     }
 }
 
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1attach_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    auto *e = (Engine *)wv;
+    if (!e || !cb) return;
+    // Windows attach is synchronous: by the time the Java factory calls
+    // this entry, embed_win::create_engine has already returned a
+    // populated Engine pointer, so the engine is fully in ATTACHED
+    // state.  Fire onResolved(true, null) immediately; the Java handler
+    // (EmbeddedWebView.AttachCallback.onResolved) marshals via
+    // SwingUtilities.invokeLater so the WebViewAttachListener actually
+    // fires on the next EDT tick regardless of which thread invoked
+    // this JNI entry.
+    jclass cls = env->GetObjectClass(cb);
+    if (!cls) return;
+    jmethodID m = env->GetMethodID(cls, "onResolved",
+                                   "(ZLjava/lang/String;)V");
+    if (m) {
+        env->CallVoidMethod(cb, m, (jboolean)JNI_TRUE, (jstring)nullptr);
+    }
+    env->DeleteLocalRef(cls);
+}
+
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1execute_1editing_1command
   (JNIEnv *, jclass, jlong wv, jint cmdId) {
     auto *e = (Engine *)wv;
