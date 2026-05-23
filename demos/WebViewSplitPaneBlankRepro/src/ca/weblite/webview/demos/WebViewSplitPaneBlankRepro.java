@@ -426,51 +426,56 @@ public class WebViewSplitPaneBlankRepro {
             canvas.repaint();
         });
 
-        JCheckBox glassPaneCutoutToggle = new JCheckBox("Cutout overlays");
+        JCheckBox glassPaneCutoutToggle = new JCheckBox("Cutout glass pane");
         glassPaneCutoutToggle.setToolTipText(
-            "Apply (checked) or clear (unchecked) an empty "
-          + "setMixingCutoutShape on whichever overlays were "
-          + "installed at startup (glass pane and/or PALETTE-layer "
-          + "overlay).  The litecode-confirmed fix: excluding these "
-          + "lightweights from AWT's mixing-region calculation "
-          + "restores rendering on Windows without reattaching "
-          + "anything.  No-op if no overlay flags were passed.");
+            "Apply (checked) or clear an empty setMixingCutoutShape on "
+          + "the JFrame's glass pane.  No-op if --glass-pane / "
+          + "--glass-pane-visible wasn't passed at startup.");
         glassPaneCutoutToggle.addActionListener(e -> {
-            int count = 0;
-            java.awt.Shape shape = glassPaneCutoutToggle.isSelected()
-                ? new Rectangle() : null;
-            if (glassPane != null) {
-                applyMixingCutout(glassPane, shape);
-                glassPane.invalidate();
-                glassPane.revalidate();
-                glassPane.repaint();
-                count++;
-            }
-            if (paletteOverlay != null) {
-                applyMixingCutout(paletteOverlay, shape);
-                paletteOverlay.invalidate();
-                paletteOverlay.revalidate();
-                paletteOverlay.repaint();
-                count++;
-            }
-            if (count == 0) {
-                System.err.println(
-                    "[repro] no overlays installed -- pass --glass-pane, "
-                  + "--glass-pane-visible, or --palette-overlay at "
-                  + "startup to test the litecode trigger.");
+            if (glassPane == null) {
+                System.err.println("[repro] no glass pane installed");
                 glassPaneCutoutToggle.setSelected(false);
                 return;
             }
-            System.err.println("[repro] overlay mixing-cutout "
-                + (glassPaneCutoutToggle.isSelected() ? "applied" : "cleared")
-                + " on " + count + " overlay(s)");
-            // Kick the WebView's ancestor chain too so any cached
-            // clip state gets re-evaluated.
+            java.awt.Shape shape = glassPaneCutoutToggle.isSelected()
+                ? new Rectangle() : null;
+            applyMixingCutout(glassPane, shape);
+            glassPane.invalidate();
+            glassPane.revalidate();
+            glassPane.repaint();
             if (CURRENT_WV[0] != null) {
                 CURRENT_WV[0].invalidate();
                 CURRENT_WV[0].revalidate();
                 CURRENT_WV[0].repaint();
             }
+            System.err.println("[repro] glass-pane cutout "
+                + (glassPaneCutoutToggle.isSelected() ? "applied" : "cleared"));
+        });
+
+        JCheckBox paletteCutoutToggle = new JCheckBox("Cutout palette overlay");
+        paletteCutoutToggle.setToolTipText(
+            "Apply (checked) or clear an empty setMixingCutoutShape on "
+          + "the PALETTE-layer overlay.  No-op if --palette-overlay "
+          + "wasn't passed at startup.");
+        paletteCutoutToggle.addActionListener(e -> {
+            if (paletteOverlay == null) {
+                System.err.println("[repro] no palette overlay installed");
+                paletteCutoutToggle.setSelected(false);
+                return;
+            }
+            java.awt.Shape shape = paletteCutoutToggle.isSelected()
+                ? new Rectangle() : null;
+            applyMixingCutout(paletteOverlay, shape);
+            paletteOverlay.invalidate();
+            paletteOverlay.revalidate();
+            paletteOverlay.repaint();
+            if (CURRENT_WV[0] != null) {
+                CURRENT_WV[0].invalidate();
+                CURRENT_WV[0].revalidate();
+                CURRENT_WV[0].repaint();
+            }
+            System.err.println("[repro] palette-overlay cutout "
+                + (paletteCutoutToggle.isSelected() ? "applied" : "cleared"));
         });
 
         JButton revalidateBtn = new JButton("Force revalidate");
@@ -548,6 +553,7 @@ public class WebViewSplitPaneBlankRepro {
         toolbar.add(panelWrapToggle);
         toolbar.add(cutoutToggle);
         toolbar.add(glassPaneCutoutToggle);
+        toolbar.add(paletteCutoutToggle);
         toolbar.add(revalidateBtn);
         toolbar.add(cycleTabBtn);
         toolbar.add(hint);
@@ -593,17 +599,24 @@ public class WebViewSplitPaneBlankRepro {
                 + "(opaque=false, visible=TRUE, one child)");
         }
 
+        frame.setVisible(true);
+        System.err.println("[repro] frame shown.  defer="
+            + DEFER_BUILD + " webviewFirst=" + WEBVIEW_FIRST);
+
         if (PALETTE_OVERLAY) {
-            // Frame-spanning lightweight at PALETTE_LAYER (above the
-            // contentPane in the layered pane), sized to the layered
-            // pane on every resize.  Mirrors litecode's stageOverlay.
-            paletteOverlay = new JPanel();
-            paletteOverlay.setOpaque(false);
-            paletteOverlay.setVisible(true);
+            // Litecode's stageOverlay extends JLayeredPane (NOT JPanel)
+            // and is installed AFTER setVisible.  The agent's
+            // hypothesis: JLayeredPane interacts with the mixing pass
+            // differently than a bare JPanel, and installing after
+            // the frame is realized triggers a fresh mixing-pass
+            // computation that picks up the overlay's bounds.
             JLayeredPane lp = frame.getLayeredPane();
-            lp.add(paletteOverlay, JLayeredPane.PALETTE_LAYER);
-            paletteOverlay.setBounds(0, 0,
-                lp.getWidth(), lp.getHeight());
+            JLayeredPane overlay = new JLayeredPane();
+            overlay.setOpaque(false);
+            overlay.setVisible(true);
+            overlay.setBounds(0, 0, lp.getWidth(), lp.getHeight());
+            lp.add(overlay, JLayeredPane.PALETTE_LAYER);
+            paletteOverlay = overlay;
             lp.addComponentListener(new ComponentAdapter() {
                 @Override
                 public void componentResized(ComponentEvent e) {
@@ -613,14 +626,10 @@ public class WebViewSplitPaneBlankRepro {
                     }
                 }
             });
-            System.err.println("[repro] installed --palette-overlay at "
-                + "PALETTE_LAYER, sized to layered-pane (opaque=false, "
-                + "visible=true)");
+            System.err.println("[repro] installed --palette-overlay "
+                + "(JLayeredPane at PALETTE_LAYER, post-setVisible, "
+                + "bounds=" + paletteOverlay.getBounds() + ")");
         }
-
-        frame.setVisible(true);
-        System.err.println("[repro] frame shown.  defer="
-            + DEFER_BUILD + " webviewFirst=" + WEBVIEW_FIRST);
 
         // ---- THE KEY RECIPE STEP ----
         // Build the WebView's container chain AFTER frame is visible.
@@ -655,6 +664,13 @@ public class WebViewSplitPaneBlankRepro {
                                              CardLayout cardLayout1,
                                              String url) {
         System.err.println("[repro] deferred build starting");
+        // Diagnostic per the agent's note: if either overlay reports
+        // 0x0 or null bounds at this point, the mixing pass is
+        // correctly skipping it and the trigger isn't firing.
+        System.err.println("[repro] at deferred build: glass="
+            + (glassPane == null ? "null" : glassPane.getBounds())
+            + " palette="
+            + (paletteOverlay == null ? "null" : paletteOverlay.getBounds()));
 
         // ---- Top of branchSplit: a placeholder JTable of "branches" ----
         Object[][] branchRows = new Object[][] {
