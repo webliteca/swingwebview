@@ -610,8 +610,20 @@ public class WebViewSplitPaneBlankRepro {
             // differently than a bare JPanel, and installing after
             // the frame is realized triggers a fresh mixing-pass
             // computation that picks up the overlay's bounds.
+            //
+            // Override contains() to return false so the overlay is
+            // click-transparent -- otherwise it intercepts mouse
+            // events across the entire frame and breaks JSplitPane
+            // divider drag, JTabbedPane tab selection, etc.  The
+            // mixing pass uses getBounds(), not contains(), so this
+            // does NOT change the mixing-region calculation.
             JLayeredPane lp = frame.getLayeredPane();
-            JLayeredPane overlay = new JLayeredPane();
+            JLayeredPane overlay = new JLayeredPane() {
+                @Override
+                public boolean contains(int x, int y) {
+                    return false;
+                }
+            };
             overlay.setOpaque(false);
             overlay.setVisible(true);
             overlay.setBounds(0, 0, lp.getWidth(), lp.getHeight());
