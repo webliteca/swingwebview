@@ -1,0 +1,60 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project name="WebViewSplitPaneBlankRepro" default="run" basedir=".">
+    <description>
+        Reproducer for the Windows-only "WebView renders blank inside
+        deeply nested JSplitPane" bug.  See the demo source header for
+        what the toolbar toggles do.
+    </description>
+
+    <property name="src.dir" value="src"/>
+    <property name="build.dir" value="build"/>
+    <property name="classes.dir" value="${build.dir}/classes"/>
+    <property name="webview.jar" value="../../dist/WebView.jar"/>
+    <property name="main.class"
+              value="ca.weblite.webview.demos.WebViewSplitPaneBlankRepro"/>
+
+    <target name="check-webview-jar">
+        <available file="${webview.jar}" property="webview.jar.exists"/>
+        <fail unless="webview.jar.exists">
+WebView.jar not found at ${webview.jar}.
+Build it first from the project root:  ant jar
+        </fail>
+    </target>
+
+    <target name="compile" depends="check-webview-jar">
+        <mkdir dir="${classes.dir}"/>
+        <javac srcdir="${src.dir}" destdir="${classes.dir}"
+               includeantruntime="false" source="1.8" target="1.8">
+            <classpath>
+                <pathelement location="${webview.jar}"/>
+            </classpath>
+        </javac>
+    </target>
+
+    <target name="run" depends="compile">
+        <java classname="${main.class}" fork="true">
+            <classpath>
+                <pathelement location="${classes.dir}"/>
+                <pathelement location="${webview.jar}"/>
+            </classpath>
+        </java>
+    </target>
+
+    <!-- Same as 'run', but with -Dsun.awt.disableMixing=true so the user
+         can compare side-by-side with the default run without re-typing
+         the flag.  If this fixes the blank render, the AWT-mixing clip
+         hypothesis is confirmed. -->
+    <target name="run-no-mixing" depends="compile">
+        <java classname="${main.class}" fork="true">
+            <jvmarg value="-Dsun.awt.disableMixing=true"/>
+            <classpath>
+                <pathelement location="${classes.dir}"/>
+                <pathelement location="${webview.jar}"/>
+            </classpath>
+        </java>
+    </target>
+
+    <target name="clean">
+        <delete dir="${build.dir}"/>
+    </target>
+</project>
