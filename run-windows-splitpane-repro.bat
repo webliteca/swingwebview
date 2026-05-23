@@ -284,6 +284,12 @@ if /I "%~1"=="--no-mixing" (
 ) else if /I "%~1"=="--flatlaf" (
     set "REPRO_APP_ARGS=%REPRO_APP_ARGS% --flatlaf"
     echo Launching with --flatlaf
+) else if /I "%~1"=="--no-defer" (
+    set "REPRO_APP_ARGS=%REPRO_APP_ARGS% --no-defer"
+    echo Launching with --no-defer (baseline -- skips the deferred build)
+) else if /I "%~1"=="--webview-first" (
+    set "REPRO_APP_ARGS=%REPRO_APP_ARGS% --webview-first"
+    echo Launching with --webview-first (WebView is initially selected)
 ) else (
     echo WARNING: unknown arg "%~1" -- ignoring.
 )

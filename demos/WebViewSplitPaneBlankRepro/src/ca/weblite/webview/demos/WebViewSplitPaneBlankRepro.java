@@ -4,77 +4,100 @@
  * Reproducer for the Windows-only "WebView renders blank inside deeply
  * nested JSplitPane" bug.
  *
- * Layout mirrors the real app where this reproduces:
- *   - Horizontal top-level JSplitPane: sidebar on the left, content on
- *     the right.
- *   - Right side: a vertical (north/south) JSplitPane.
- *   - South pane: a JTabbedPane.  The WebView lives in one of the tabs
- *     (tab[0] "WebView") alongside two pure-Swing siblings.
+ * Mirrors the litecode-app structure that reliably triggers the bug.
+ * Five things appear to combine; the recipe was provided by the agent
+ * working on the affected app:
  *
- * The tabbed-pane wrapping matters: each tab change triggers an
- * addNotify/removeNotify pair on the heavyweight Canvas via the
- * HierarchyListener inside WebViewHeavyweightComponent, so the bug can
- * manifest after a tab switch even if the initial display looked fine.
+ *   1. Two CardLayouts in the WebView's ancestor chain, each .show()n
+ *      AFTER the JFrame is already on screen.
+ *   2. The WebView's container is built and attached deferred -- via
+ *      SwingUtilities.invokeLater + Timer(500) -- not at frame setup
+ *      time.  So the WebView's hierarchy comes into existence after
+ *      frame.setVisible(true) has already settled.
+ *   3. Three nested JSplitPanes (HORIZONTAL outer / HORIZONTAL inner /
+ *      VERTICAL inside the inner's left card).
+ *   4. The WebView is the LAST tab in a JTabbedPane (10+ tabs), and
+ *      that tab is NOT initially selected.  Its first paint() is
+ *      deferred until the user clicks the tab.
+ *   5. At least one other heavyweight peer somewhere in the frame
+ *      (litecode has JediTerm terminals).  This demo plants a
+ *      stand-in java.awt.Canvas in a sibling tab to approximate it.
  *
- * Optional command-line flag: --flatlaf uses FlatLaf (if on classpath)
- * instead of the system L&F.  The real app uses FlatLaf, and the L&F
- * change swaps SplitPaneUI / divider painting -- which is exactly the
- * surface where the AWT mixing clip code does its lightweight-overlap
- * analysis -- so it may matter for triggering the bug.
+ * Component tree once the deferred build has run:
+ *
+ *   JFrame (FlatLaf via --flatlaf)
+ *     └─ ContentPane (BorderLayout)
+ *         ├─ toolbar (NORTH)
+ *         └─ mainSplit   (JSplitPane HORIZONTAL #1)            CENTER
+ *             ├─ leftNavPanel  (JList of "branches")
+ *             └─ contentSplit  (JSplitPane HORIZONTAL #2)
+ *                 ├─ centerPanel (JPanel + CardLayout #1)
+ *                 │   ├─ "empty"     (initial card)
+ *                 │   └─ "repoCard"  (added later, then shown)
+ *                 │       └─ branchSplit (JSplitPane VERTICAL #3)
+ *                 │           ├─ TOP: branchListPanel (JTable)
+ *                 │           └─ BOT: detailPanel (BorderLayout)
+ *                 │               └─ cardPanel2 (CardLayout #2)
+ *                 │                   ├─ "empty"
+ *                 │                   └─ "branchCard" (added later)
+ *                 │                       └─ wrapper (BorderLayout)
+ *                 │                           └─ innerTabs (JTabbedPane)
+ *                 │                               ├─ Placeholder 0..9
+ *                 │                               └─ "WebView" tab  ← bug target
+ *                 │                                   └─ webviewHost (BorderLayout)
+ *                 │                                       └─ WebViewComponent
+ *                 └─ eastTabs (JTabbedPane)
+ *                     ├─ Notes (placeholder)
+ *                     └─ Heavy (stand-in java.awt.Canvas to add a
+ *                               second heavyweight to the frame)
  *
  * What to look for on Windows:
- *   - The WebView2 page is fully loaded -- right-click -> Inspect Element
- *     in DevTools confirms the page rendered and reports the correct
- *     viewport size -- but the on-screen Canvas region is white/blank.
- *   - Dragging any divider often "wakes it up" momentarily then it goes
- *     blank again, or stays blank entirely.
- *   - Try clicking "Cycle tab" to switch away and back; some variants
- *     of this bug only manifest after the hide-then-show transition.
+ *   - Click the "WebView" tab (last in innerTabs).  Its first paint()
+ *     happens at that moment; this is the bug-trigger step.  DevTools
+ *     (right-click -> Inspect Element) should confirm the page is
+ *     fully rendered at the correct viewport size while the on-screen
+ *     Canvas region is blank.
  *
- * Diagnostic toggles in the toolbar:
+ * Diagnostic toggles in the toolbar (active once the WebView has been
+ * built; click "Select WebView tab" first):
  *
  *   "Wrap in java.awt.Panel"
- *       Tears down the current WebView and reinstalls a fresh one
- *       with a java.awt.Panel (heavyweight) between it and the
- *       Swing host.  Tests the agent-suggested workaround of
- *       inserting an extra heavyweight ancestor above the WebView's
- *       own Canvas HWND -- if that's enough to break the bad
- *       lightweight-overlap clip computation in nested JSplitPanes,
- *       the rendering should come back immediately on toggle.
- *       The page reloads from the URL field on each toggle.
+ *       Tears down the current WebView and reinstalls a fresh one with
+ *       a java.awt.Panel (heavyweight) between it and the Swing host.
  *
  *   "Mixing cutout (this Canvas)"
- *       Calls com.sun.awt.AWTUtilities.setComponentMixingCutoutShape
- *       (JDK 8) or Component.setMixingCutoutShape (JDK 9+) on the
- *       Canvas that hosts the WebView2 child HWND, with an empty
- *       Rectangle.  That tells AWT "never clip me to make room for
- *       lightweight overlap."  If the diagnosis (AWT mixing applies a
- *       bogus SetWindowRgn on the Canvas inside nested JSplitPanes) is
- *       right, flipping this on should restore the rendering without
- *       touching anything else.
- *
- *   "-Dsun.awt.disableMixing=true"
- *       Not a runtime toggle (the flag is read at JVM startup).
- *       Mentioned in the toolbar tooltip so users can re-launch with
- *       it set to compare.  If THIS fixes the blank render, the
- *       mixing-clip hypothesis is confirmed.
+ *       Applies an empty mixing-cutout shape to the WebView's Canvas
+ *       (setComponentMixingCutoutShape on JDK 8, setMixingCutoutShape
+ *       on JDK 9+).  If the bug is AWT's lightweight-overlap clip
+ *       region, this should restore the WebView immediately.
  *
  *   "Force revalidate"
- *       Calls revalidate() + repaint() on the WebView's ancestor
- *       chain.  Useful for confirming this is not just a stale-layout
- *       problem (if revalidate fixes it, the bug is layout-side; if
- *       it doesn't, it's the mixing region or DComp clip).
+ *       Calls revalidate() + repaint() up the ancestor chain.
  *
- * Diagnostic logging is written to stderr on attach and on every
- * Canvas resize, including the Canvas peer's window region via
- * GetWindowRgnBox-equivalent reflection where available.  Look for
- * lines prefixed [repro] in the launcher output.
+ *   "Select WebView tab" / "Cycle tabs"
+ *       Programmatic equivalents of the user-click bug-trigger and the
+ *       hide-then-show cycle.
+ *
+ * Command-line:
+ *   --flatlaf       use FlatLaf (if on classpath) instead of system L&F
+ *   --no-defer      build the WebView eagerly during run() instead of
+ *                   deferring -- baseline for confirming that the
+ *                   deferred-attach pattern is what triggers the bug
+ *   --webview-first make the WebView tab initially-selected in innerTabs
+ *                   instead of the last one -- another baseline for
+ *                   confirming that deferred first-paint is the trigger
+ *
+ * Re-launch with -Dsun.awt.disableMixing=true to test the AWT-mixing
+ * hypothesis at JVM startup (or pass --no-mixing to the .bat launcher).
  */
 package ca.weblite.webview.demos;
 
 import ca.weblite.webview.swing.WebViewComponent;
 
 import java.awt.BorderLayout;
+import java.awt.Canvas;
+import java.awt.CardLayout;
+import java.awt.Color;
 import java.awt.Component;
 import java.awt.Container;
 import java.awt.Dimension;
@@ -85,6 +108,7 @@ import java.awt.Rectangle;
 import java.awt.event.ComponentAdapter;
 import java.awt.event.ComponentEvent;
 import java.lang.reflect.Method;
+import javax.swing.BorderFactory;
 import javax.swing.DefaultListModel;
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
@@ -96,9 +120,12 @@ import javax.swing.JPopupMenu;
 import javax.swing.JScrollPane;
 import javax.swing.JSplitPane;
 import javax.swing.JTabbedPane;
+import javax.swing.JTable;
 import javax.swing.JTextArea;
 import javax.swing.JTextField;
+import javax.swing.SwingConstants;
 import javax.swing.SwingUtilities;
+import javax.swing.Timer;
 import javax.swing.ToolTipManager;
 
 public class WebViewSplitPaneBlankRepro {
@@ -109,14 +136,12 @@ public class WebViewSplitPaneBlankRepro {
         JPopupMenu.setDefaultLightWeightPopupEnabled(false);
         ToolTipManager.sharedInstance().setLightWeightPopupEnabled(false);
 
-        // L&F selection.  Default = system L&F (Windows L&F on Windows,
-        // which matches a typical app baseline).  Pass --flatlaf to
-        // switch to FlatLaf if it's on the classpath -- one of the real
-        // app's confounders was that it used FlatLaf, and we want to
-        // exercise the same SplitPaneUI / divider painting path.  Both
-        // paths fail fast if the requested L&F can't be installed so the
-        // user knows up front.
-        boolean useFlatLaf = java.util.Arrays.asList(args).contains("--flatlaf");
+        boolean useFlatLaf = false;
+        for (String a : args) {
+            if ("--flatlaf".equals(a)) useFlatLaf = true;
+            else if ("--no-defer".equals(a)) DEFER_BUILD = false;
+            else if ("--webview-first".equals(a)) WEBVIEW_FIRST = true;
+        }
         try {
             if (useFlatLaf) {
                 Class<?> laf = Class.forName("com.formdev.flatlaf.FlatLightLaf");
@@ -133,129 +158,164 @@ public class WebViewSplitPaneBlankRepro {
                 + "cross-platform default. cause=" + t);
         }
 
+        System.err.println("[repro] flags: --flatlaf=" + useFlatLaf
+            + " --no-defer=" + (!DEFER_BUILD)
+            + " --webview-first=" + WEBVIEW_FIRST);
         EventQueue.invokeLater(WebViewSplitPaneBlankRepro::run);
     }
 
-    // Mutable single-element holder so the toolbar's action listeners can
-    // address the *current* WebViewComponent across panel-wrap toggle
-    // recreations.  installWebView() rewrites slot [0]; everything else
-    // reads through it.
+    // ---- Runtime flag state (set in main, read in run/buildDeferred) ----
+
+    /**
+     * True (default): build the WebView's parent chain via Timer(500)
+     * AFTER frame.setVisible(true).  False: build everything before
+     * setVisible -- baseline for confirming that the deferred pattern
+     * is what triggers the bug.
+     */
+    private static boolean DEFER_BUILD = true;
+
+    /**
+     * False (default): the WebView is the LAST tab in innerTabs (10
+     * placeholder tabs + WebView), and innerTabs starts on Placeholder 0
+     * so the WebView's first paint waits for the user to click its tab.
+     * True: WebView is tab[0] and initially selected.
+     */
+    private static boolean WEBVIEW_FIRST = false;
+
+    // ---- Cross-handler state ----
+
+    /**
+     * Mutable single-element holder so the toolbar's action listeners can
+     * address the *current* WebViewComponent across panel-wrap toggle
+     * recreations.  installWebView() rewrites slot [0]; everything else
+     * reads through it.
+     */
     private static final WebViewComponent[] CURRENT_WV = new WebViewComponent[1];
+
+    /**
+     * Populated by buildDeferredContent().  Null until the deferred Timer
+     * fires; toolbar handlers null-guard on it.
+     */
+    private static JTabbedPane innerTabs;
+    private static JPanel currentWebviewHost;
 
     private static void run() {
         JFrame frame = new JFrame(
-            "WebView blank-render repro (nested JSplitPane, Windows)");
+            "WebView blank-render repro (litecode-pattern, Windows)");
         frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
 
         System.err.println("[repro] WebView mode: "
             + WebViewComponent.resolveDefaultMode());
 
-        // ----- Layout: matches the real app where this reproduces.
-        //
-        //   JFrame
-        //     └─ JSplitPane (HORIZONTAL, top-level)
-        //         ├─ left sidebar (JList)
-        //         └─ JSplitPane (VERTICAL)
-        //             ├─ north: pretend "editor" area
-        //             └─ south: JTabbedPane
-        //                 ├─ tab[0] "WebView": WebView (initial)
-        //                 ├─ tab[1] "Console": text area
-        //                 └─ tab[2] "Problems": list
-        //
-        // WebView ancestor chain:
-        //   topSplit (horizontal)
-        //     └─ rightSplit (vertical)
-        //         └─ southTabs (JTabbedPane)
-        //             └─ webviewHost (JPanel)
-        //                 └─ WebViewHeavyweightComponent
-        //                     └─ Canvas  <-- the HWND that goes blank
+        // ---- Left nav: "branches" list ----
+        DefaultListModel<String> branchModel = new DefaultListModel<>();
+        for (int i = 1; i <= 8; i++) branchModel.addElement("branch-" + i);
+        JList<String> branchList = new JList<>(branchModel);
+        branchList.setSelectedIndex(0);
+        JPanel leftNavPanel = new JPanel(new BorderLayout());
+        leftNavPanel.add(new JLabel(" Branches"), BorderLayout.NORTH);
+        leftNavPanel.add(new JScrollPane(branchList), BorderLayout.CENTER);
+        leftNavPanel.setPreferredSize(new Dimension(180, 0));
 
-        // ----- Left sidebar -----
-        DefaultListModel<String> sidebarItems = new DefaultListModel<>();
-        for (int i = 1; i <= 20; i++) {
-            sidebarItems.addElement("Sidebar item " + i);
-        }
-        JList<String> sidebar = new JList<>(sidebarItems);
-        JScrollPane sidebarScroll = new JScrollPane(sidebar);
-        sidebarScroll.setPreferredSize(new Dimension(180, 0));
+        // ---- Center: outer CardLayout (#1).  Starts empty -- the
+        // "repoCard" is added later by buildDeferredContent and then
+        // shown.  Replicates "user clicks a repo" in litecode.
+        CardLayout cardLayout1 = new CardLayout();
+        JPanel centerPanel = new JPanel(cardLayout1);
+        JLabel emptyOuter = new JLabel(
+            "Select a repo (deferred build will replace this card)",
+            SwingConstants.CENTER);
+        centerPanel.add(emptyOuter, "empty");
+        cardLayout1.show(centerPanel, "empty");
 
-        // ----- North pane of the vertical split (pretend editor) -----
-        JTextArea editorArea = new JTextArea(
-            "(pretend this is the editor / main content area)\n\n"
-          + "The WebView lives in a tab in the south pane below.\n"
-          + "Drag the vertical divider to give the south pane more / less\n"
-          + "height; click between tabs to test addNotify/removeNotify\n"
-          + "cycles on the heavyweight Canvas.\n");
-        editorArea.setEditable(false);
+        // ---- East: tabbed pane with a stand-in heavyweight Canvas in
+        // one tab, to approximate the JediTerm heavyweight peer the
+        // litecode app has elsewhere in its frame.
+        JTabbedPane eastTabs = new JTabbedPane();
+        JTextArea notes = new JTextArea(
+            "(placeholder Notes tab)\n\n"
+          + "The Heavy tab contains a bare java.awt.Canvas as a "
+          + "stand-in for the JediTerm heavyweight peer the real "
+          + "app has elsewhere in the frame.  Removing it should "
+          + "show whether 'multiple heavyweights in the same frame' "
+          + "is part of the trigger.");
+        notes.setEditable(false);
+        notes.setLineWrap(true);
+        notes.setWrapStyleWord(true);
+        eastTabs.addTab("Notes", new JScrollPane(notes));
 
-        // ----- South pane: JTabbedPane with WebView in tab[0] -----
-        JPanel webviewHost = new JPanel(new BorderLayout());
-        installWebView(webviewHost, false, "https://example.com");
+        JPanel heavyHost = new JPanel(new BorderLayout());
+        heavyHost.add(new JLabel(
+            " Stand-in heavyweight Canvas (simulates JediTerm)"),
+            BorderLayout.NORTH);
+        Canvas heavyStandIn = new Canvas();
+        heavyStandIn.setBackground(new Color(0xE0, 0xE0, 0xE0));
+        heavyHost.add(heavyStandIn, BorderLayout.CENTER);
+        eastTabs.addTab("Heavy", heavyHost);
 
-        JTabbedPane southTabs = new JTabbedPane();
-        southTabs.addTab("WebView", webviewHost);
-        JTextArea consoleArea = new JTextArea(
-            "(pretend this is a build console)\n");
-        consoleArea.setEditable(false);
-        southTabs.addTab("Console", new JScrollPane(consoleArea));
-        DefaultListModel<String> problemsItems = new DefaultListModel<>();
-        for (int i = 1; i <= 6; i++) {
-            problemsItems.addElement("warning: pretend problem " + i);
-        }
-        southTabs.addTab("Problems",
-            new JScrollPane(new JList<>(problemsItems)));
+        // ---- Inner content split (#2): centerPanel | eastTabs.
+        JSplitPane contentSplit = new JSplitPane(
+            JSplitPane.HORIZONTAL_SPLIT, centerPanel, eastTabs);
+        contentSplit.setResizeWeight(0.75);
+        contentSplit.setContinuousLayout(true);
 
-        // ----- Vertical split: editor (north) / tabbed pane (south) -----
-        JSplitPane rightSplit = new JSplitPane(
-            JSplitPane.VERTICAL_SPLIT, new JScrollPane(editorArea), southTabs);
-        rightSplit.setResizeWeight(0.55);
-        rightSplit.setContinuousLayout(true);
+        // ---- Main split (#1): leftNav | contentSplit.
+        JSplitPane mainSplit = new JSplitPane(
+            JSplitPane.HORIZONTAL_SPLIT, leftNavPanel, contentSplit);
+        mainSplit.setResizeWeight(0.15);
+        mainSplit.setContinuousLayout(true);
 
-        // ----- Top-level horizontal split: sidebar | rightSplit -----
-        JSplitPane topSplit = new JSplitPane(
-            JSplitPane.HORIZONTAL_SPLIT, sidebarScroll, rightSplit);
-        topSplit.setResizeWeight(0.15);
-        topSplit.setContinuousLayout(true);
-
-        // ----- Toolbar with the diagnostic toggles -----
+        // ---- Toolbar (mostly the same as before, but with null guards
+        // since the WebView doesn't exist until the deferred build).
         JTextField urlField = new JTextField("https://example.com", 40);
         JButton go = new JButton("Go");
-        go.addActionListener(e -> CURRENT_WV[0].setUrl(urlField.getText().trim()));
-        urlField.addActionListener(e -> CURRENT_WV[0].setUrl(urlField.getText().trim()));
+        go.addActionListener(e -> {
+            if (CURRENT_WV[0] != null) {
+                CURRENT_WV[0].setUrl(urlField.getText().trim());
+            } else {
+                System.err.println(
+                    "[repro] no WebView yet -- click 'Select WebView tab' "
+                  + "after the deferred build runs.");
+            }
+        });
+        urlField.addActionListener(e -> go.doClick());
 
         JCheckBox panelWrapToggle = new JCheckBox("Wrap in java.awt.Panel");
         panelWrapToggle.setToolTipText(
             "Recreate the WebView with a java.awt.Panel (heavyweight) "
-          + "between it and the lightweight Swing webviewHost.  Tests "
-          + "the suggestion that adding a heavyweight ancestor above "
-          + "the WebView's own Canvas changes how AWT computes the "
-          + "lightweight-overlap clip region inside nested JSplitPanes.  "
-          + "Toggling tears down the current WebView (dispose() runs via "
-          + "removeNotify) and reinstalls a fresh one -- the page "
-          + "reloads from the URL field.");
+          + "between it and the Swing host.  Inserts an extra "
+          + "heavyweight ancestor above the WebView's own Canvas.");
         panelWrapToggle.addActionListener(e -> {
-            String currentUrl = urlField.getText().trim();
-            installWebView(webviewHost, panelWrapToggle.isSelected(), currentUrl);
+            if (currentWebviewHost == null) {
+                System.err.println("[repro] no WebView host yet");
+                panelWrapToggle.setSelected(!panelWrapToggle.isSelected());
+                return;
+            }
+            installWebView(currentWebviewHost,
+                panelWrapToggle.isSelected(), urlField.getText().trim());
             System.err.println("[repro] reinstalled WebView "
                 + (panelWrapToggle.isSelected()
                     ? "WRAPPED in java.awt.Panel"
-                    : "UNWRAPPED (direct child of webviewHost)"));
+                    : "UNWRAPPED"));
         });
 
         JCheckBox cutoutToggle = new JCheckBox("Mixing cutout (this Canvas)");
         cutoutToggle.setToolTipText(
             "Apply an empty mixing-cutout shape to the WebView's Canvas "
-          + "(setComponentMixingCutoutShape on JDK 8 / "
-          + "setMixingCutoutShape on JDK 9+).  If the bug is AWT's "
-          + "lightweight-overlap clip region, this should restore the "
-          + "WebView immediately.");
+          + "(JDK 8 sun.awt API, JDK 9+ public API).  If the bug is "
+          + "AWT's lightweight-overlap clip region, this should restore "
+          + "the WebView immediately.");
         cutoutToggle.addActionListener(e -> {
             WebViewComponent wv = CURRENT_WV[0];
+            if (wv == null) {
+                System.err.println("[repro] no WebView yet");
+                return;
+            }
             Component canvas = findHostCanvas(wv);
             if (canvas == null) {
                 System.err.println(
-                    "[repro] No Canvas descendant found under WebViewComponent; "
-                  + "is the WebView in lightweight mode?");
+                    "[repro] No Canvas descendant found under "
+                  + "WebViewComponent; is it lightweight mode?");
                 return;
             }
             boolean applied = applyMixingCutout(canvas,
@@ -263,8 +323,7 @@ public class WebViewSplitPaneBlankRepro {
             System.err.println("[repro] mixing-cutout "
                 + (cutoutToggle.isSelected() ? "applied" : "cleared")
                 + " on " + canvas.getClass().getName() + " -> "
-                + (applied ? "ok" : "FAILED (see stack trace above)"));
-            // Force a relayout so the new clip takes effect immediately.
+                + (applied ? "ok" : "FAILED"));
             canvas.invalidate();
             canvas.revalidate();
             canvas.repaint();
@@ -273,11 +332,13 @@ public class WebViewSplitPaneBlankRepro {
         JButton revalidateBtn = new JButton("Force revalidate");
         revalidateBtn.setToolTipText(
             "Walk the WebView's ancestor chain calling revalidate() + "
-          + "repaint().  If this 'fixes' the blank render, the bug is a "
-          + "stale-layout problem.  If not, it's likely the mixing clip "
-          + "region or DComp.");
+          + "repaint().");
         revalidateBtn.addActionListener(e -> {
             Component c = CURRENT_WV[0];
+            if (c == null) {
+                System.err.println("[repro] no WebView yet");
+                return;
+            }
             while (c != null) {
                 c.invalidate();
                 if (c instanceof javax.swing.JComponent) {
@@ -289,38 +350,65 @@ public class WebViewSplitPaneBlankRepro {
             System.err.println("[repro] forced revalidate/repaint up the chain");
         });
 
-        JButton cycleTabBtn = new JButton("Cycle tab");
+        JButton selectWebViewTabBtn = new JButton("Select WebView tab");
+        selectWebViewTabBtn.setToolTipText(
+            "Programmatically select the WebView tab in innerTabs.  "
+          + "This is the bug-trigger step from the recipe -- the "
+          + "WebView's first paint() happens at this moment.");
+        selectWebViewTabBtn.addActionListener(e -> {
+            if (innerTabs == null) {
+                System.err.println("[repro] innerTabs not built yet");
+                return;
+            }
+            int idx = -1;
+            for (int i = 0; i < innerTabs.getTabCount(); i++) {
+                if ("WebView".equals(innerTabs.getTitleAt(i))) {
+                    idx = i;
+                    break;
+                }
+            }
+            if (idx < 0) {
+                System.err.println("[repro] no WebView tab found");
+                return;
+            }
+            innerTabs.setSelectedIndex(idx);
+            System.err.println("[repro] selected WebView tab at index " + idx);
+        });
+
+        JButton cycleTabBtn = new JButton("Cycle tabs");
         cycleTabBtn.setToolTipText(
-            "Advance the south JTabbedPane to the next tab and back.  "
-          + "Each tab change triggers the heavyweight Canvas's "
-          + "HierarchyListener to hide/show the native peer.  If the "
-          + "blank render only manifests after a tab switch (vs. on "
-          + "initial display), the bug correlates with the "
-          + "setVisible(false) -> setVisible(true) path rather than the "
-          + "initial attach.");
+            "Switch to Placeholder 0 and back to WebView after 300ms.  "
+          + "Tests the addNotify/removeNotify cycle on the Canvas via "
+          + "the HierarchyListener.");
         cycleTabBtn.addActionListener(e -> {
-            int n = southTabs.getTabCount();
-            if (n <= 1) return;
-            int next = (southTabs.getSelectedIndex() + 1) % n;
-            southTabs.setSelectedIndex(next);
-            // Bounce back after a short delay so the user can quickly
-            // exercise the away-and-back sequence without two clicks.
-            javax.swing.Timer t = new javax.swing.Timer(300, ev -> {
-                southTabs.setSelectedIndex(0);
-            });
+            if (innerTabs == null) return;
+            int wvIdx = -1;
+            for (int i = 0; i < innerTabs.getTabCount(); i++) {
+                if ("WebView".equals(innerTabs.getTitleAt(i))) {
+                    wvIdx = i;
+                    break;
+                }
+            }
+            if (wvIdx < 0) return;
+            innerTabs.setSelectedIndex(0);
+            final int finalWvIdx = wvIdx;
+            Timer t = new Timer(300, ev ->
+                innerTabs.setSelectedIndex(finalWvIdx));
             t.setRepeats(false);
             t.start();
         });
 
         JLabel hint = new JLabel(
-            "Re-launch with -Dsun.awt.disableMixing=true or --flatlaf "
-          + "to test at JVM startup.");
-        hint.setBorder(javax.swing.BorderFactory.createEmptyBorder(0, 12, 0, 0));
+            "Click 'Select WebView tab' to trigger first paint.  "
+          + "Re-launch with --flatlaf / --no-defer / --webview-first "
+          + "to vary the recipe.");
+        hint.setBorder(BorderFactory.createEmptyBorder(0, 12, 0, 0));
 
         JPanel toolbar = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 4));
         toolbar.add(new JLabel("URL:"));
         toolbar.add(urlField);
         toolbar.add(go);
+        toolbar.add(selectWebViewTabBtn);
         toolbar.add(panelWrapToggle);
         toolbar.add(cutoutToggle);
         toolbar.add(revalidateBtn);
@@ -329,21 +417,134 @@ public class WebViewSplitPaneBlankRepro {
 
         frame.getContentPane().setLayout(new BorderLayout());
         frame.getContentPane().add(toolbar, BorderLayout.NORTH);
-        frame.getContentPane().add(topSplit, BorderLayout.CENTER);
-        frame.setSize(1200, 800);
+        frame.getContentPane().add(mainSplit, BorderLayout.CENTER);
+        frame.setSize(1400, 900);
         frame.setLocationRelativeTo(null);
         frame.setVisible(true);
+        System.err.println("[repro] frame shown.  defer="
+            + DEFER_BUILD + " webviewFirst=" + WEBVIEW_FIRST);
+
+        // ---- THE KEY RECIPE STEP ----
+        // Build the WebView's container chain AFTER frame is visible.
+        // The 500ms Timer simulates the user-click delay in the real
+        // app where this triggers.
+        Runnable build = () -> buildDeferredContent(
+            centerPanel, cardLayout1, urlField.getText().trim());
+        if (DEFER_BUILD) {
+            SwingUtilities.invokeLater(() -> {
+                Timer t = new Timer(500, e -> build.run());
+                t.setRepeats(false);
+                t.start();
+            });
+        } else {
+            // Baseline: build everything synchronously before any user
+            // interaction, to confirm the deferred pattern is what
+            // matters.  Still runs through buildDeferredContent so the
+            // layout is identical.
+            build.run();
+        }
     }
 
-    // (Re)install a WebViewComponent into webviewHost, optionally with a
-    // java.awt.Panel between it and the Swing host.  Replaces whatever
-    // is currently there -- removing the previous WebView triggers
-    // removeNotify on its Canvas, which disposes the native peer, so it
-    // is safe to drop the reference.
-    //
-    // Updates CURRENT_WV[0] to the new WebView so the toolbar listeners
-    // see it, and re-hooks the canvas-resize log on the fresh Canvas
-    // (the old listener went with the old peer).
+    /**
+     * Builds branchSplit + cardPanel2 + branchCard + innerTabs + WebView
+     * and attaches them via two CardLayout.show() calls (one per
+     * card-layout level).  Populates innerTabs and currentWebviewHost
+     * so the toolbar handlers can address them.
+     *
+     * Must run on the EDT.
+     */
+    private static void buildDeferredContent(JPanel centerPanel,
+                                             CardLayout cardLayout1,
+                                             String url) {
+        System.err.println("[repro] deferred build starting");
+
+        // ---- Top of branchSplit: a placeholder JTable of "branches" ----
+        Object[][] branchRows = new Object[][] {
+            {"main",    "abc12345"},
+            {"develop", "bcd23456"},
+            {"feature/x", "cde34567"},
+            {"feature/y", "def45678"},
+            {"hotfix/z", "efa56789"},
+        };
+        JTable branchTable = new JTable(branchRows,
+            new Object[] {"Branch", "Sha"});
+
+        // ---- Inner CardLayout (#2) inside detailPanel ----
+        CardLayout cardLayout2 = new CardLayout();
+        JPanel cardPanel2 = new JPanel(cardLayout2);
+        cardPanel2.add(
+            new JLabel("Select a branch", SwingConstants.CENTER), "empty");
+        cardLayout2.show(cardPanel2, "empty");
+
+        JPanel detailPanel = new JPanel(new BorderLayout());
+        detailPanel.add(cardPanel2, BorderLayout.CENTER);
+
+        // ---- branchSplit (JSplitPane VERTICAL #3): branches / detail ----
+        JSplitPane branchSplit = new JSplitPane(
+            JSplitPane.VERTICAL_SPLIT,
+            new JScrollPane(branchTable), detailPanel);
+        branchSplit.setResizeWeight(0.4);
+        branchSplit.setContinuousLayout(true);
+
+        // ---- "repoCard": container for branchSplit, attached to outer
+        // CardLayout #1 and then shown.  This is the first .show() in
+        // the recipe.
+        JPanel repoCard = new JPanel(new BorderLayout());
+        repoCard.add(branchSplit, BorderLayout.CENTER);
+        centerPanel.add(repoCard, "repoCard");
+        cardLayout1.show(centerPanel, "repoCard");
+        System.err.println("[repro] cardLayout1.show(repoCard)");
+
+        // ---- innerTabs: 10 placeholder tabs + WebView, NOT initially
+        // selected on the WebView (unless --webview-first).  The
+        // WebView's webviewHost goes into the WebView tab.
+        JTabbedPane tabs = new JTabbedPane();
+        JPanel webviewHost = new JPanel(new BorderLayout());
+        installWebView(webviewHost, false, url);
+        if (WEBVIEW_FIRST) {
+            tabs.addTab("WebView", webviewHost);
+            for (int i = 0; i < 10; i++) {
+                tabs.addTab("Placeholder " + i,
+                    new JLabel("Placeholder tab " + i, SwingConstants.CENTER));
+            }
+        } else {
+            for (int i = 0; i < 10; i++) {
+                tabs.addTab("Placeholder " + i,
+                    new JLabel("Placeholder tab " + i, SwingConstants.CENTER));
+            }
+            tabs.addTab("WebView", webviewHost);
+            tabs.setSelectedIndex(0);
+        }
+
+        JPanel wrapper = new JPanel(new BorderLayout());
+        wrapper.add(tabs, BorderLayout.CENTER);
+        JPanel branchCard = new JPanel(new BorderLayout());
+        branchCard.add(wrapper, BorderLayout.CENTER);
+
+        // ---- "branchCard": attached to inner CardLayout #2 and shown.
+        // This is the second .show() in the recipe.
+        cardPanel2.add(branchCard, "branchCard");
+        cardLayout2.show(cardPanel2, "branchCard");
+        System.err.println("[repro] cardLayout2.show(branchCard)");
+
+        innerTabs = tabs;
+        currentWebviewHost = webviewHost;
+
+        System.err.println("[repro] deferred build complete.  WebView is "
+            + "tab " + (WEBVIEW_FIRST ? 0 : tabs.getTabCount() - 1)
+            + (WEBVIEW_FIRST ? " (initially selected)"
+                             : " (NOT initially selected; click it to trigger first paint)"));
+    }
+
+    /**
+     * (Re)install a WebViewComponent into webviewHost, optionally with a
+     * java.awt.Panel between it and the Swing host.  Replaces whatever
+     * is currently there -- removing the previous WebView triggers
+     * removeNotify on its Canvas, which disposes the native peer.
+     *
+     * Updates CURRENT_WV[0] to the new WebView so the toolbar listeners
+     * see it, and re-hooks the canvas-resize log on the fresh Canvas.
+     */
     private static void installWebView(JPanel webviewHost,
                                        boolean wrapInPanel,
                                        String url) {
@@ -360,11 +561,9 @@ public class WebViewSplitPaneBlankRepro {
 
         if (wrapInPanel) {
             // java.awt.Panel is heavyweight -- it gets a WPanelPeer HWND
-            // on Windows.  Wrapping the WebViewComponent in one inserts
-            // an extra heavyweight ancestor between the WebView's own
-            // Canvas HWND and the lightweight Swing parents (JPanel,
-            // JSplitPanes, ...).  This is the "wrap in a heavyweight
-            // panel" workaround the user's other agent suggested.
+            // on Windows.  Inserts an extra heavyweight ancestor between
+            // the WebView's Canvas HWND and the lightweight Swing
+            // parents.
             Panel panel = new Panel(new BorderLayout());
             panel.add(wv, BorderLayout.CENTER);
             webviewHost.add(panel, BorderLayout.CENTER);
@@ -374,8 +573,6 @@ public class WebViewSplitPaneBlankRepro {
         webviewHost.revalidate();
         webviewHost.repaint();
 
-        // Hook the canvas-resize log on the next EDT tick so addNotify
-        // has had a chance to run and the Canvas exists.
         EventQueue.invokeLater(() -> {
             Component canvas = findHostCanvas(wv);
             if (canvas != null) {
@@ -398,15 +595,16 @@ public class WebViewSplitPaneBlankRepro {
                 System.err.println(
                     "[repro] WARNING: could not find a Canvas under the "
                   + "WebViewComponent.  This demo targets the heavyweight "
-                  + "build; on Linux it runs but the blank-render bug "
-                  + "being investigated does not apply.");
+                  + "build.");
             }
         });
     }
 
-    // Walks the WebViewComponent looking for the first heavyweight AWT
-    // Canvas descendant; on the heavyweight build that's the surface the
-    // native WebView2 child HWND is parented under.
+    /**
+     * Walks the WebViewComponent looking for the first heavyweight AWT
+     * Canvas descendant; on the heavyweight build that's the surface the
+     * native WebView2 child HWND is parented under.
+     */
     private static Component findHostCanvas(Container root) {
         for (Component c : root.getComponents()) {
             if (c instanceof java.awt.Canvas) return c;
@@ -418,15 +616,12 @@ public class WebViewSplitPaneBlankRepro {
         return null;
     }
 
-    // Apply (or clear, with null) a mixing-cutout shape on a Component
-    // across both JDK 8 (com.sun.awt.AWTUtilities) and JDK 9+
-    // (Component.setMixingCutoutShape).  Returns true on success.
-    //
-    // Reflection-only so the demo compiles on JDK 8 without
-    // --add-exports and runs on JDK 9+ without depending on
-    // com.sun.awt.AWTUtilities at compile time.
+    /**
+     * Apply (or clear, with null) a mixing-cutout shape on a Component
+     * across both JDK 8 (com.sun.awt.AWTUtilities) and JDK 9+
+     * (Component.setMixingCutoutShape).  Returns true on success.
+     */
     private static boolean applyMixingCutout(Component c, java.awt.Shape shape) {
-        // JDK 9+ public API first.
         try {
             Method m = Component.class.getMethod(
                 "setMixingCutoutShape", java.awt.Shape.class);
@@ -438,7 +633,6 @@ public class WebViewSplitPaneBlankRepro {
             t.printStackTrace();
             return false;
         }
-        // JDK 8 sun-internal API.
         try {
             Class<?> util = Class.forName("com.sun.awt.AWTUtilities");
             Method m = util.getMethod(
