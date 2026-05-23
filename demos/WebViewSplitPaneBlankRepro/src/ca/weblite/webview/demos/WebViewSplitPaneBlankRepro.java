@@ -1,8 +1,31 @@
 /*
  * MIT License
  *
- * Reproducer for the Windows-only "WebView renders blank inside deeply
- * nested JSplitPane" bug.
+ * Reproducer for the Windows-only blank-WebView bug.  Originally
+ * blamed on deep JSplitPane nesting; the actual trigger was found
+ * by the litecode agent to be a frame-spanning lightweight component
+ * (typically a JFrame glass pane or a PALETTE-layer JLayeredPane
+ * overlay) installed above the contentPane.  Such an overlay -- even
+ * setOpaque(false) + setVisible(false) -- causes AWT's
+ * lightweight/heavyweight mixing pass to apply SetWindowRgn on every
+ * heavyweight Canvas in the frame, clipping the WebView2 HWND's pixels
+ * to (effectively) nothing.  The WebView2 controller renders correctly;
+ * the OS just hides the result.  Mac doesn't hit this because Cocoa
+ * composites in one CALayer tree.
+ *
+ * The minimum trigger in a standalone repro is one extra line before
+ * frame.setVisible(true):
+ *
+ *     JPanel glass = new JPanel();
+ *     glass.setOpaque(false);
+ *     glass.setVisible(false);
+ *     frame.setGlassPane(glass);
+ *
+ * Pass --glass-pane to enable that here, and use the "Cutout glass pane"
+ * toolbar checkbox to apply / clear an empty setMixingCutoutShape on
+ * the glass pane at runtime -- toggling it should flip the bug-target
+ * WebView between blank and rendered without reattaching anything.
+ * That's the diagnosis-confirmation cycle.
  *
  * Mirrors the litecode-app structure that reliably triggers the bug.
  * The recipe combines several factors, each contributed by the agent
@@ -163,6 +186,7 @@ public class WebViewSplitPaneBlankRepro {
             if ("--flatlaf".equals(a)) useFlatLaf = true;
             else if ("--no-defer".equals(a)) DEFER_BUILD = false;
             else if ("--webview-first".equals(a)) WEBVIEW_FIRST = true;
+            else if ("--glass-pane".equals(a)) GLASS_PANE = true;
         }
         try {
             if (useFlatLaf) {
@@ -182,7 +206,8 @@ public class WebViewSplitPaneBlankRepro {
 
         System.err.println("[repro] flags: --flatlaf=" + useFlatLaf
             + " --no-defer=" + (!DEFER_BUILD)
-            + " --webview-first=" + WEBVIEW_FIRST);
+            + " --webview-first=" + WEBVIEW_FIRST
+            + " --glass-pane=" + GLASS_PANE);
         EventQueue.invokeLater(WebViewSplitPaneBlankRepro::run);
     }
 
@@ -203,6 +228,25 @@ public class WebViewSplitPaneBlankRepro {
      * True: WebView is tab[0] and initially selected.
      */
     private static boolean WEBVIEW_FIRST = false;
+
+    /**
+     * True: install a setOpaque(false), setVisible(false) JPanel as the
+     * JFrame's glass pane before setVisible.  This is the
+     * litecode-confirmed trigger -- a frame-spanning lightweight above
+     * the contentPane causes the AWT mixing pass to compute a
+     * frame-wide SetWindowRgn cutout on every heavyweight Canvas in the
+     * frame, which clips the WebView2 HWND's pixels even though the
+     * WebView2 controller is rendering correctly.  False (default)
+     * matches the previous repro behaviour (no glass pane).
+     */
+    private static boolean GLASS_PANE = false;
+
+    /**
+     * Reference to the glass pane installed when --glass-pane is set,
+     * so the toolbar's mixing-cutout-on-glass-pane toggle can target
+     * it at runtime.  Null when --glass-pane is not set.
+     */
+    private static JPanel glassPane;
 
     // ---- Cross-handler state ----
 
@@ -357,6 +401,40 @@ public class WebViewSplitPaneBlankRepro {
             canvas.repaint();
         });
 
+        JCheckBox glassPaneCutoutToggle = new JCheckBox("Cutout glass pane");
+        glassPaneCutoutToggle.setToolTipText(
+            "Apply (checked) or clear (unchecked) an empty "
+          + "setMixingCutoutShape on the JFrame's glass pane.  The "
+          + "litecode-confirmed fix: with --glass-pane the WebView "
+          + "renders blank by default; toggling this on excludes the "
+          + "glass pane from AWT's mixing-region calculation and "
+          + "restores rendering without reattaching anything.  No-op "
+          + "if --glass-pane wasn't passed at startup.");
+        glassPaneCutoutToggle.addActionListener(e -> {
+            if (glassPane == null) {
+                System.err.println(
+                    "[repro] no glass pane installed -- pass --glass-pane "
+                  + "at startup to test the litecode trigger.");
+                glassPaneCutoutToggle.setSelected(false);
+                return;
+            }
+            boolean applied = applyMixingCutout(glassPane,
+                glassPaneCutoutToggle.isSelected() ? new Rectangle() : null);
+            System.err.println("[repro] glass-pane mixing-cutout "
+                + (glassPaneCutoutToggle.isSelected() ? "applied" : "cleared")
+                + " -> " + (applied ? "ok" : "FAILED"));
+            // Force a relayout so the new clip takes effect immediately.
+            glassPane.invalidate();
+            glassPane.revalidate();
+            glassPane.repaint();
+            // And kick the WebView's ancestor chain too.
+            if (CURRENT_WV[0] != null) {
+                CURRENT_WV[0].invalidate();
+                CURRENT_WV[0].revalidate();
+                CURRENT_WV[0].repaint();
+            }
+        });
+
         JButton revalidateBtn = new JButton("Force revalidate");
         revalidateBtn.setToolTipText(
             "Walk the WebView's ancestor chain calling revalidate() + "
@@ -431,6 +509,7 @@ public class WebViewSplitPaneBlankRepro {
         toolbar.add(selectWebViewTabBtn);
         toolbar.add(panelWrapToggle);
         toolbar.add(cutoutToggle);
+        toolbar.add(glassPaneCutoutToggle);
         toolbar.add(revalidateBtn);
         toolbar.add(cycleTabBtn);
         toolbar.add(hint);
@@ -440,6 +519,26 @@ public class WebViewSplitPaneBlankRepro {
         frame.getContentPane().add(mainSplit, BorderLayout.CENTER);
         frame.setSize(1400, 900);
         frame.setLocationRelativeTo(null);
+
+        // Install the glass pane BEFORE setVisible, matching the
+        // litecode pattern.  setOpaque(false) + setVisible(false) --
+        // the litecode agent confirmed that even an invisible, fully
+        // transparent, frame-spanning lightweight is enough to make
+        // the AWT mixing pass compute a SetWindowRgn cutout on every
+        // heavyweight Canvas in the frame.  The "Cutout glass pane"
+        // toolbar toggle flips setMixingCutoutShape on this same
+        // glass pane at runtime so the user can verify the fix
+        // restores rendering in-place.
+        if (GLASS_PANE) {
+            glassPane = new JPanel();
+            glassPane.setOpaque(false);
+            glassPane.setVisible(false);
+            frame.setGlassPane(glassPane);
+            System.err.println("[repro] installed frame-spanning glass pane "
+                + "(opaque=false, visible=false) -- expected to trigger "
+                + "the blank-render bug on Windows.");
+        }
+
         frame.setVisible(true);
         System.err.println("[repro] frame shown.  defer="
             + DEFER_BUILD + " webviewFirst=" + WEBVIEW_FIRST);

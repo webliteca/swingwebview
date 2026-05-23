@@ -290,6 +290,9 @@ if /I "%~1"=="--no-mixing" (
 ) else if /I "%~1"=="--webview-first" (
     set "REPRO_APP_ARGS=%REPRO_APP_ARGS% --webview-first"
     echo Launching with --webview-first (WebView is initially selected)
+) else if /I "%~1"=="--glass-pane" (
+    set "REPRO_APP_ARGS=%REPRO_APP_ARGS% --glass-pane"
+    echo Launching with --glass-pane ^(installs frame-spanning glass pane^)
 ) else (
     echo WARNING: unknown arg "%~1" -- ignoring.
 )
