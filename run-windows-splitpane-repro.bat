@@ -239,7 +239,26 @@ popd
 echo Built %WV_JAR%
 
 REM ---------------------------------------------------------------------------
-REM 7. Compile and launch the heavyweight demo
+REM 7. Download FlatLaf (cached locally) so the --flatlaf runtime flag has
+REM    something to load.  The jar lives next to the demo so it never
+REM    pollutes the library classpath.
+REM ---------------------------------------------------------------------------
+set "FLATLAF_VERSION=3.5.4"
+set "FLATLAF_DIR=%REPO_DIR%\demos\WebViewSplitPaneBlankRepro\lib"
+set "FLATLAF_JAR=%FLATLAF_DIR%\flatlaf-%FLATLAF_VERSION%.jar"
+set "FLATLAF_URL=https://repo1.maven.org/maven2/com/formdev/flatlaf/%FLATLAF_VERSION%/flatlaf-%FLATLAF_VERSION%.jar"
+if not exist "%FLATLAF_DIR%" mkdir "%FLATLAF_DIR%"
+if not exist "%FLATLAF_JAR%" (
+    echo Downloading FlatLaf %FLATLAF_VERSION% from Maven Central ...
+    "%PWSH%" -NoProfile -Command "$ProgressPreference='SilentlyContinue'; [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; Invoke-WebRequest -Uri '%FLATLAF_URL%' -OutFile '%FLATLAF_JAR%' -UseBasicParsing"
+    if not exist "%FLATLAF_JAR%" (
+        echo WARNING: failed to download FlatLaf from %FLATLAF_URL%.
+        echo          --flatlaf will fall back to system L&F.
+    )
+)
+
+REM ---------------------------------------------------------------------------
+REM 8. Compile and launch the heavyweight demo
 REM ---------------------------------------------------------------------------
 set "DEMO_DIR=%REPO_DIR%\demos\WebViewSplitPaneBlankRepro"
 set "DEMO_CLASSES=%BUILD_DIR%\classes-demo"
@@ -251,15 +270,31 @@ if errorlevel 1 (
     exit /b 1
 )
 
-echo Launching repro ...
-REM Optional flag: pass "--no-mixing" as the first arg to enable
-REM -Dsun.awt.disableMixing=true so we can test the AWT-mixing hypothesis
-REM at JVM startup without editing the script.
+REM Parse any arguments to this script in any order:
+REM   --no-mixing  -> -Dsun.awt.disableMixing=true at JVM startup
+REM   --flatlaf    -> pass --flatlaf through to the demo so it activates
+REM                   the FlatLaf L&F (instead of the system default)
 set "REPRO_JVM_ARGS="
+set "REPRO_APP_ARGS="
+:argloop
+if "%~1"=="" goto argdone
 if /I "%~1"=="--no-mixing" (
-    set "REPRO_JVM_ARGS=-Dsun.awt.disableMixing=true"
+    set "REPRO_JVM_ARGS=%REPRO_JVM_ARGS% -Dsun.awt.disableMixing=true"
     echo Launching with -Dsun.awt.disableMixing=true
+) else if /I "%~1"=="--flatlaf" (
+    set "REPRO_APP_ARGS=%REPRO_APP_ARGS% --flatlaf"
+    echo Launching with --flatlaf
+) else (
+    echo WARNING: unknown arg "%~1" -- ignoring.
 )
-"%JAVA_HOME%\bin\java.exe" %REPRO_JVM_ARGS% -cp "%DEMO_CLASSES%;%WV_JAR%" ca.weblite.webview.demos.WebViewSplitPaneBlankRepro
+shift
+goto argloop
+:argdone
+
+set "REPRO_CP=%DEMO_CLASSES%;%WV_JAR%"
+if exist "%FLATLAF_JAR%" set "REPRO_CP=%REPRO_CP%;%FLATLAF_JAR%"
+
+echo Launching repro ...
+"%JAVA_HOME%\bin\java.exe" %REPRO_JVM_ARGS% -cp "%REPRO_CP%" ca.weblite.webview.demos.WebViewSplitPaneBlankRepro %REPRO_APP_ARGS%
 
 endlocal

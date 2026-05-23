@@ -4,12 +4,23 @@
  * Reproducer for the Windows-only "WebView renders blank inside deeply
  * nested JSplitPane" bug.
  *
- * Layout mimics a typical IDE/editor: a horizontal top-level split with a
- * sidebar on the left, then a vertical split on the right whose top half
- * is itself a horizontal split containing the WebView in its right pane.
- * That puts the WebView three JSplitPane ancestors deep, which is the
- * shape multiple users have reported triggering the blank render on
- * Windows 10/11 with the WebView2 backend.
+ * Layout mirrors the real app where this reproduces:
+ *   - Horizontal top-level JSplitPane: sidebar on the left, content on
+ *     the right.
+ *   - Right side: a vertical (north/south) JSplitPane.
+ *   - South pane: a JTabbedPane.  The WebView lives in one of the tabs
+ *     (tab[0] "WebView") alongside two pure-Swing siblings.
+ *
+ * The tabbed-pane wrapping matters: each tab change triggers an
+ * addNotify/removeNotify pair on the heavyweight Canvas via the
+ * HierarchyListener inside WebViewHeavyweightComponent, so the bug can
+ * manifest after a tab switch even if the initial display looked fine.
+ *
+ * Optional command-line flag: --flatlaf uses FlatLaf (if on classpath)
+ * instead of the system L&F.  The real app uses FlatLaf, and the L&F
+ * change swaps SplitPaneUI / divider painting -- which is exactly the
+ * surface where the AWT mixing clip code does its lightweight-overlap
+ * analysis -- so it may matter for triggering the bug.
  *
  * What to look for on Windows:
  *   - The WebView2 page is fully loaded -- right-click -> Inspect Element
@@ -17,6 +28,8 @@
  *     viewport size -- but the on-screen Canvas region is white/blank.
  *   - Dragging any divider often "wakes it up" momentarily then it goes
  *     blank again, or stays blank entirely.
+ *   - Try clicking "Cycle tab" to switch away and back; some variants
+ *     of this bug only manifest after the hide-then-show transition.
  *
  * Diagnostic toggles in the toolbar:
  *
@@ -95,6 +108,31 @@ public class WebViewSplitPaneBlankRepro {
         // the heavyweight WebView peer.  Matches the established demos.
         JPopupMenu.setDefaultLightWeightPopupEnabled(false);
         ToolTipManager.sharedInstance().setLightWeightPopupEnabled(false);
+
+        // L&F selection.  Default = system L&F (Windows L&F on Windows,
+        // which matches a typical app baseline).  Pass --flatlaf to
+        // switch to FlatLaf if it's on the classpath -- one of the real
+        // app's confounders was that it used FlatLaf, and we want to
+        // exercise the same SplitPaneUI / divider painting path.  Both
+        // paths fail fast if the requested L&F can't be installed so the
+        // user knows up front.
+        boolean useFlatLaf = java.util.Arrays.asList(args).contains("--flatlaf");
+        try {
+            if (useFlatLaf) {
+                Class<?> laf = Class.forName("com.formdev.flatlaf.FlatLightLaf");
+                laf.getMethod("setup").invoke(null);
+                System.err.println("[repro] FlatLaf enabled");
+            } else {
+                javax.swing.UIManager.setLookAndFeel(
+                    javax.swing.UIManager.getSystemLookAndFeelClassName());
+                System.err.println("[repro] System L&F: "
+                    + javax.swing.UIManager.getLookAndFeel().getName());
+            }
+        } catch (Throwable t) {
+            System.err.println("[repro] L&F setup failed; running with "
+                + "cross-platform default. cause=" + t);
+        }
+
         EventQueue.invokeLater(WebViewSplitPaneBlankRepro::run);
     }
 
@@ -112,7 +150,27 @@ public class WebViewSplitPaneBlankRepro {
         System.err.println("[repro] WebView mode: "
             + WebViewComponent.resolveDefaultMode());
 
-        // ----- Left sidebar (depth-1 child of top-level split) -----
+        // ----- Layout: matches the real app where this reproduces.
+        //
+        //   JFrame
+        //     └─ JSplitPane (HORIZONTAL, top-level)
+        //         ├─ left sidebar (JList)
+        //         └─ JSplitPane (VERTICAL)
+        //             ├─ north: pretend "editor" area
+        //             └─ south: JTabbedPane
+        //                 ├─ tab[0] "WebView": WebView (initial)
+        //                 ├─ tab[1] "Console": text area
+        //                 └─ tab[2] "Problems": list
+        //
+        // WebView ancestor chain:
+        //   topSplit (horizontal)
+        //     └─ rightSplit (vertical)
+        //         └─ southTabs (JTabbedPane)
+        //             └─ webviewHost (JPanel)
+        //                 └─ WebViewHeavyweightComponent
+        //                     └─ Canvas  <-- the HWND that goes blank
+
+        // ----- Left sidebar -----
         DefaultListModel<String> sidebarItems = new DefaultListModel<>();
         for (int i = 1; i <= 20; i++) {
             sidebarItems.addElement("Sidebar item " + i);
@@ -121,53 +179,41 @@ public class WebViewSplitPaneBlankRepro {
         JScrollPane sidebarScroll = new JScrollPane(sidebar);
         sidebarScroll.setPreferredSize(new Dimension(180, 0));
 
-        // ----- Inner editor area: horizontal split with a "file tree" on
-        // the left and the WebView on the right.  This is the second
-        // JSplitPane the WebView sits inside.
-        DefaultListModel<String> filesItems = new DefaultListModel<>();
-        for (int i = 1; i <= 12; i++) {
-            filesItems.addElement("file-" + i + ".java");
-        }
-        JList<String> filesList = new JList<>(filesItems);
-        JTabbedPane filesTabs = new JTabbedPane();
-        filesTabs.addTab("Files", new JScrollPane(filesList));
-        filesTabs.addTab("Outline", new JScrollPane(new JTextArea(
-            "(pretend this is a code outline view)")));
+        // ----- North pane of the vertical split (pretend editor) -----
+        JTextArea editorArea = new JTextArea(
+            "(pretend this is the editor / main content area)\n\n"
+          + "The WebView lives in a tab in the south pane below.\n"
+          + "Drag the vertical divider to give the south pane more / less\n"
+          + "height; click between tabs to test addNotify/removeNotify\n"
+          + "cycles on the heavyweight Canvas.\n");
+        editorArea.setEditable(false);
 
+        // ----- South pane: JTabbedPane with WebView in tab[0] -----
         JPanel webviewHost = new JPanel(new BorderLayout());
-        // First install: unwrapped, default URL.  installWebView() also
-        // populates CURRENT_WV[0] and hooks the canvas-resize log.
         installWebView(webviewHost, false, "https://example.com");
 
-        JSplitPane editorSplit = new JSplitPane(
-            JSplitPane.HORIZONTAL_SPLIT, filesTabs, webviewHost);
-        editorSplit.setResizeWeight(0.2);
-        editorSplit.setContinuousLayout(true);
+        JTabbedPane southTabs = new JTabbedPane();
+        southTabs.addTab("WebView", webviewHost);
+        JTextArea consoleArea = new JTextArea(
+            "(pretend this is a build console)\n");
+        consoleArea.setEditable(false);
+        southTabs.addTab("Console", new JScrollPane(consoleArea));
+        DefaultListModel<String> problemsItems = new DefaultListModel<>();
+        for (int i = 1; i <= 6; i++) {
+            problemsItems.addElement("warning: pretend problem " + i);
+        }
+        southTabs.addTab("Problems",
+            new JScrollPane(new JList<>(problemsItems)));
 
-        // ----- Bottom panel: third JSplitPane (vertical), placing
-        // editorSplit on top and a "console" area on the bottom.  This is
-        // the WebView's outermost split-pane ancestor.
-        JTextArea console = new JTextArea(
-            "(pretend this is a build console / problems view)\n"
-          + "Drag the divider above / below me; on Windows the WebView\n"
-          + "to the upper right may go blank even though devtools say\n"
-          + "the page is fully rendered at the correct size.\n");
-        console.setEditable(false);
-        JSplitPane verticalSplit = new JSplitPane(
-            JSplitPane.VERTICAL_SPLIT, editorSplit, new JScrollPane(console));
-        verticalSplit.setResizeWeight(0.75);
-        verticalSplit.setContinuousLayout(true);
+        // ----- Vertical split: editor (north) / tabbed pane (south) -----
+        JSplitPane rightSplit = new JSplitPane(
+            JSplitPane.VERTICAL_SPLIT, new JScrollPane(editorArea), southTabs);
+        rightSplit.setResizeWeight(0.55);
+        rightSplit.setContinuousLayout(true);
 
-        // ----- Top-level horizontal split: sidebar | (editor + console).
-        // WebView ancestor chain is now:
-        //   JSplitPane (top-level, horizontal)
-        //     └─ JSplitPane (vertical)
-        //         └─ JSplitPane (editor, horizontal)
-        //             └─ JPanel webviewHost
-        //                 └─ WebViewHeavyweightComponent
-        //                     └─ Canvas  <-- the HWND that goes blank
+        // ----- Top-level horizontal split: sidebar | rightSplit -----
         JSplitPane topSplit = new JSplitPane(
-            JSplitPane.HORIZONTAL_SPLIT, sidebarScroll, verticalSplit);
+            JSplitPane.HORIZONTAL_SPLIT, sidebarScroll, rightSplit);
         topSplit.setResizeWeight(0.15);
         topSplit.setContinuousLayout(true);
 
@@ -243,9 +289,32 @@ public class WebViewSplitPaneBlankRepro {
             System.err.println("[repro] forced revalidate/repaint up the chain");
         });
 
+        JButton cycleTabBtn = new JButton("Cycle tab");
+        cycleTabBtn.setToolTipText(
+            "Advance the south JTabbedPane to the next tab and back.  "
+          + "Each tab change triggers the heavyweight Canvas's "
+          + "HierarchyListener to hide/show the native peer.  If the "
+          + "blank render only manifests after a tab switch (vs. on "
+          + "initial display), the bug correlates with the "
+          + "setVisible(false) -> setVisible(true) path rather than the "
+          + "initial attach.");
+        cycleTabBtn.addActionListener(e -> {
+            int n = southTabs.getTabCount();
+            if (n <= 1) return;
+            int next = (southTabs.getSelectedIndex() + 1) % n;
+            southTabs.setSelectedIndex(next);
+            // Bounce back after a short delay so the user can quickly
+            // exercise the away-and-back sequence without two clicks.
+            javax.swing.Timer t = new javax.swing.Timer(300, ev -> {
+                southTabs.setSelectedIndex(0);
+            });
+            t.setRepeats(false);
+            t.start();
+        });
+
         JLabel hint = new JLabel(
-            "Re-launch with -Dsun.awt.disableMixing=true to test the "
-          + "AWT-mixing hypothesis at JVM startup.");
+            "Re-launch with -Dsun.awt.disableMixing=true or --flatlaf "
+          + "to test at JVM startup.");
         hint.setBorder(javax.swing.BorderFactory.createEmptyBorder(0, 12, 0, 0));
 
         JPanel toolbar = new JPanel(new FlowLayout(FlowLayout.LEFT, 4, 4));
@@ -255,6 +324,7 @@ public class WebViewSplitPaneBlankRepro {
         toolbar.add(panelWrapToggle);
         toolbar.add(cutoutToggle);
         toolbar.add(revalidateBtn);
+        toolbar.add(cycleTabBtn);
         toolbar.add(hint);
 
         frame.getContentPane().setLayout(new BorderLayout());

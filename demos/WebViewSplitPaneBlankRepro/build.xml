@@ -31,12 +31,19 @@ Build it first from the project root:  ant jar
         </javac>
     </target>
 
+    <!-- Shared classpath element: webview.jar + compiled demo classes,
+         plus any FlatLaf jar dropped into ./lib (the Windows launcher
+         downloads flatlaf-X.Y.Z.jar there on first run; on other
+         platforms you can drop the jar in manually to test --flatlaf). -->
+    <path id="run.classpath">
+        <pathelement location="${classes.dir}"/>
+        <pathelement location="${webview.jar}"/>
+        <fileset dir="lib" includes="*.jar" erroronmissingdir="false"/>
+    </path>
+
     <target name="run" depends="compile">
         <java classname="${main.class}" fork="true">
-            <classpath>
-                <pathelement location="${classes.dir}"/>
-                <pathelement location="${webview.jar}"/>
-            </classpath>
+            <classpath refid="run.classpath"/>
         </java>
     </target>
 
@@ -47,10 +54,15 @@ Build it first from the project root:  ant jar
     <target name="run-no-mixing" depends="compile">
         <java classname="${main.class}" fork="true">
             <jvmarg value="-Dsun.awt.disableMixing=true"/>
-            <classpath>
-                <pathelement location="${classes.dir}"/>
-                <pathelement location="${webview.jar}"/>
-            </classpath>
+            <classpath refid="run.classpath"/>
+        </java>
+    </target>
+
+    <!-- Run with FlatLaf activated (requires a flatlaf jar in ./lib). -->
+    <target name="run-flatlaf" depends="compile">
+        <java classname="${main.class}" fork="true">
+            <arg value="--flatlaf"/>
+            <classpath refid="run.classpath"/>
         </java>
     </target>
 
