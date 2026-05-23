@@ -5,7 +5,7 @@
  * nested JSplitPane" bug.
  *
  * Mirrors the litecode-app structure that reliably triggers the bug.
- * Five things appear to combine; the recipe was provided by the agent
+ * The recipe combines several factors, each contributed by the agent
  * working on the affected app:
  *
  *   1. Two CardLayouts in the WebView's ancestor chain, each .show()n
@@ -16,12 +16,21 @@
  *      frame.setVisible(true) has already settled.
  *   3. Three nested JSplitPanes (HORIZONTAL outer / HORIZONTAL inner /
  *      VERTICAL inside the inner's left card).
- *   4. The WebView is the LAST tab in a JTabbedPane (10+ tabs), and
- *      that tab is NOT initially selected.  Its first paint() is
- *      deferred until the user clicks the tab.
- *   5. At least one other heavyweight peer somewhere in the frame
- *      (litecode has JediTerm terminals).  This demo plants a
- *      stand-in java.awt.Canvas in a sibling tab to approximate it.
+ *   4. MULTIPLE sibling WebView2 instances created in one shot inside
+ *      the same JTabbedPane.  litecode's BranchDetail builds Design /
+ *      Readme / Notebook viewers as siblings; the strongest current
+ *      hypothesis is that the FIRST WebView claims an HWND / GDI slot
+ *      and subsequent WebViews silently render to invisible regions.
+ *      This demo creates WV1 (initially-selected first tab), WV2/WV3
+ *      (middle tabs), and a bug-target WebView in the LAST tab.
+ *   5. The bug-target WebView's tab is NOT initially selected -- its
+ *      first paint() is deferred until the user clicks that tab,
+ *      AFTER WV1/2/3 have already become displayable.
+ *   6. An ACTIVE heavyweight peer (not just a bare Canvas) doing real
+ *      native rendering in another tab of the same frame.  This demo
+ *      uses ActiveHeavyweightCanvas, a BufferStrategy-driven random-
+ *      colour fill loop at ~30fps, as a stand-in for the JediTerm
+ *      terminal in the real app.
  *
  * Component tree once the deferred build has run:
  *
@@ -42,21 +51,29 @@
  *                 │                   └─ "branchCard" (added later)
  *                 │                       └─ wrapper (BorderLayout)
  *                 │                           └─ innerTabs (JTabbedPane)
- *                 │                               ├─ Placeholder 0..9
- *                 │                               └─ "WebView" tab  <-- bug target
+ *                 │                               ├─ WebView 1   (initially selected)
+ *                 │                               ├─ WebView 2
+ *                 │                               ├─ WebView 3
+ *                 │                               ├─ Placeholder 0..7
+ *                 │                               └─ WebView (bug target)  <-- target
  *                 │                                   └─ webviewHost (BorderLayout)
  *                 │                                       └─ WebViewComponent
  *                 └─ eastTabs (JTabbedPane)
  *                     ├─ Notes (placeholder)
- *                     └─ Heavy (stand-in java.awt.Canvas to add a
- *                               second heavyweight to the frame)
+ *                     └─ Heavy (ActiveHeavyweightCanvas -- BufferStrategy
+ *                               render loop, stands in for JediTerm)
  *
  * What to look for on Windows:
- *   - Click the "WebView" tab (last in innerTabs).  Its first paint()
- *     happens at that moment; this is the bug-trigger step.  DevTools
+ *   - On startup, WV1 paints normally in tab[0].  Click through to
+ *     "WebView (bug target)" (last tab) -- its first paint() happens
+ *     at that moment, AFTER WV1/2/3 are already alive.  DevTools
  *     (right-click -> Inspect Element) should confirm the page is
  *     fully rendered at the correct viewport size while the on-screen
  *     Canvas region is blank.
+ *   - Also worth checking: do WV2 / WV3 render correctly when their
+ *     tabs are first selected?  Any of the four going blank is
+ *     evidence for "later WebViews silently render to invisible
+ *     regions while WV1 hogs a slot."
  *
  * Diagnostic toggles in the toolbar (active once the WebView has been
  * built; click "Select WebView tab" first):
@@ -83,9 +100,11 @@
  *   --no-defer      build the WebView eagerly during run() instead of
  *                   deferring -- baseline for confirming that the
  *                   deferred-attach pattern is what triggers the bug
- *   --webview-first make the WebView tab initially-selected in innerTabs
- *                   instead of the last one -- another baseline for
- *                   confirming that deferred first-paint is the trigger
+ *   --webview-first make the bug-target tab initially-selected (last
+ *                   tab is selected from the start, so its first paint
+ *                   happens at frame.setVisible(true) instead of on
+ *                   user click) -- baseline for confirming that
+ *                   deferred first-paint is part of the trigger
  *
  * Re-launch with -Dsun.awt.disableMixing=true to test the AWT-mixing
  * hypothesis at JVM startup (or pass --no-mixing to the .bat launcher).
@@ -103,6 +122,9 @@ import java.awt.Container;
 import java.awt.Dimension;
 import java.awt.EventQueue;
 import java.awt.FlowLayout;
+import java.awt.Graphics;
+import java.awt.Toolkit;
+import java.awt.image.BufferStrategy;
 import java.awt.Panel;
 import java.awt.Rectangle;
 import java.awt.event.ComponentAdapter;
@@ -246,11 +268,17 @@ public class WebViewSplitPaneBlankRepro {
 
         JPanel heavyHost = new JPanel(new BorderLayout());
         heavyHost.add(new JLabel(
-            " Stand-in heavyweight Canvas (simulates JediTerm)"),
+            " Active heavyweight Canvas (continuously repaints "
+          + "via BufferStrategy -- competes for GDI/DWM resources)"),
             BorderLayout.NORTH);
-        Canvas heavyStandIn = new Canvas();
-        heavyStandIn.setBackground(new Color(0xE0, 0xE0, 0xE0));
-        heavyHost.add(heavyStandIn, BorderLayout.CENTER);
+        // ActiveHeavyweightCanvas does real native rendering on a
+        // background thread (~30fps random-colour fills via
+        // BufferStrategy + Toolkit.sync), which mirrors the
+        // JediTerm-style active heavyweight peer the real app
+        // has in its frame.  A bare java.awt.Canvas is heavyweight
+        // but allocates no rendering surface -- it doesn't reproduce
+        // the GDI/DWM-state effects of an active peer.
+        heavyHost.add(new ActiveHeavyweightCanvas(), BorderLayout.CENTER);
         eastTabs.addTab("Heavy", heavyHost);
 
         // ---- Inner content split (#2): centerPanel | eastTabs.
@@ -350,45 +378,37 @@ public class WebViewSplitPaneBlankRepro {
             System.err.println("[repro] forced revalidate/repaint up the chain");
         });
 
-        JButton selectWebViewTabBtn = new JButton("Select WebView tab");
+        JButton selectWebViewTabBtn = new JButton("Select bug-target tab");
         selectWebViewTabBtn.setToolTipText(
-            "Programmatically select the WebView tab in innerTabs.  "
-          + "This is the bug-trigger step from the recipe -- the "
-          + "WebView's first paint() happens at this moment.");
+            "Programmatically select the bug-target WebView tab "
+          + "(the LAST tab in innerTabs).  This is the bug-trigger "
+          + "step from the recipe -- the bug-target WebView's first "
+          + "paint() happens at this moment, after WV1/2/3 already "
+          + "claimed their HWND slots.");
         selectWebViewTabBtn.addActionListener(e -> {
             if (innerTabs == null) {
                 System.err.println("[repro] innerTabs not built yet");
                 return;
             }
-            int idx = -1;
-            for (int i = 0; i < innerTabs.getTabCount(); i++) {
-                if ("WebView".equals(innerTabs.getTitleAt(i))) {
-                    idx = i;
-                    break;
-                }
-            }
+            int idx = findBugTargetTabIndex(innerTabs);
             if (idx < 0) {
-                System.err.println("[repro] no WebView tab found");
+                System.err.println("[repro] no bug-target tab found");
                 return;
             }
             innerTabs.setSelectedIndex(idx);
-            System.err.println("[repro] selected WebView tab at index " + idx);
+            System.err.println("[repro] selected bug-target tab at index "
+                + idx);
         });
 
         JButton cycleTabBtn = new JButton("Cycle tabs");
         cycleTabBtn.setToolTipText(
-            "Switch to Placeholder 0 and back to WebView after 300ms.  "
-          + "Tests the addNotify/removeNotify cycle on the Canvas via "
-          + "the HierarchyListener.");
+            "Switch to WebView 1 and back to the bug-target tab after "
+          + "300ms.  Tests the addNotify/removeNotify cycle on the "
+          + "bug-target Canvas while the other WebViews continue "
+          + "running.");
         cycleTabBtn.addActionListener(e -> {
             if (innerTabs == null) return;
-            int wvIdx = -1;
-            for (int i = 0; i < innerTabs.getTabCount(); i++) {
-                if ("WebView".equals(innerTabs.getTitleAt(i))) {
-                    wvIdx = i;
-                    break;
-                }
-            }
+            int wvIdx = findBugTargetTabIndex(innerTabs);
             if (wvIdx < 0) return;
             innerTabs.setSelectedIndex(0);
             final int finalWvIdx = wvIdx;
@@ -495,24 +515,61 @@ public class WebViewSplitPaneBlankRepro {
         cardLayout1.show(centerPanel, "repoCard");
         System.err.println("[repro] cardLayout1.show(repoCard)");
 
-        // ---- innerTabs: 10 placeholder tabs + WebView, NOT initially
-        // selected on the WebView (unless --webview-first).  The
-        // WebView's webviewHost goes into the WebView tab.
+        // ---- innerTabs: matches the litecode pattern.  Three WebViews
+        // up front (the "Design / Readme / Notebook" cluster in the
+        // real app) so the JFrame gets multiple heavyweight WebView2
+        // peers parented to it simultaneously, then placeholders, then
+        // the BUG-TARGET WebView in the last tab.  WV1 is the
+        // initially-selected tab so it takes the "first paint" slot
+        // before the user clicks the bug-target tab.
         JTabbedPane tabs = new JTabbedPane();
+
+        // WV1: initially selected, first heavyweight WebView in the JFrame.
+        // Pinned to example.com so the visual is unambiguous if it
+        // renders -- we want to see WHICH of the four goes blank, if any.
+        JPanel firstHost = new JPanel(new BorderLayout());
+        WebViewComponent wv1 = WebViewComponent.create();
+        wv1.setUrl("https://example.com");
+        firstHost.add(wv1, BorderLayout.CENTER);
+        tabs.addTab("WebView 1", firstHost);
+
+        // WV2 / WV3: sibling WebViews to mirror litecode's
+        // Design/Readme/Notebook trio.  Different URLs so they can be
+        // told apart visually.
+        JPanel midHost1 = new JPanel(new BorderLayout());
+        WebViewComponent wv2 = WebViewComponent.create();
+        wv2.setUrl("https://www.iana.org/about");
+        midHost1.add(wv2, BorderLayout.CENTER);
+        tabs.addTab("WebView 2", midHost1);
+
+        JPanel midHost2 = new JPanel(new BorderLayout());
+        WebViewComponent wv3 = WebViewComponent.create();
+        wv3.setUrl("https://www.iana.org/numbers");
+        midHost2.add(wv3, BorderLayout.CENTER);
+        tabs.addTab("WebView 3", midHost2);
+
+        // 8 placeholder tabs between the sibling cluster and the bug
+        // target -- so a tab-click on the bug target traverses a real
+        // tab-strip distance, like in the real app.
+        for (int i = 0; i < 8; i++) {
+            tabs.addTab("Placeholder " + i,
+                new JLabel("Placeholder tab " + i, SwingConstants.CENTER));
+        }
+
+        // BUG-TARGET WebView: tracked via installWebView() in
+        // CURRENT_WV[0] / currentWebviewHost so the toolbar's
+        // diagnostic toggles operate on it.  By default NOT initially
+        // selected; user must click "WebView (bug target)" to trigger
+        // first paint.  --webview-first reverses this so the bug
+        // target is the initially-selected tab (baseline for
+        // "is deferred first-paint the trigger?").
         JPanel webviewHost = new JPanel(new BorderLayout());
         installWebView(webviewHost, false, url);
+        tabs.addTab("WebView (bug target)", webviewHost);
+
         if (WEBVIEW_FIRST) {
-            tabs.addTab("WebView", webviewHost);
-            for (int i = 0; i < 10; i++) {
-                tabs.addTab("Placeholder " + i,
-                    new JLabel("Placeholder tab " + i, SwingConstants.CENTER));
-            }
+            tabs.setSelectedIndex(tabs.getTabCount() - 1);
         } else {
-            for (int i = 0; i < 10; i++) {
-                tabs.addTab("Placeholder " + i,
-                    new JLabel("Placeholder tab " + i, SwingConstants.CENTER));
-            }
-            tabs.addTab("WebView", webviewHost);
             tabs.setSelectedIndex(0);
         }
 
@@ -598,6 +655,91 @@ public class WebViewSplitPaneBlankRepro {
                   + "build.");
             }
         });
+    }
+
+    /**
+     * Find the index of the bug-target tab in innerTabs by exact
+     * title match.  Returns -1 if not found.
+     */
+    private static int findBugTargetTabIndex(JTabbedPane tabs) {
+        for (int i = 0; i < tabs.getTabCount(); i++) {
+            if ("WebView (bug target)".equals(tabs.getTitleAt(i))) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Canvas subclass that, once displayable, allocates a
+     * BufferStrategy and runs a background render loop painting
+     * random-colour fills via {@code bs.getDrawGraphics()} +
+     * {@code Toolkit.sync()} at ~30fps.  Approximates the active
+     * heavyweight peer (JediTerm in the real app) that competes for
+     * GDI / DWM resources alongside the WebView2 child HWNDs.  A bare
+     * java.awt.Canvas is heavyweight but allocates no rendering
+     * surface; it doesn't reproduce the GDI/DWM-state effects of an
+     * active peer.
+     */
+    private static final class ActiveHeavyweightCanvas extends Canvas {
+        private volatile boolean alive = true;
+        private Thread renderThread;
+
+        @Override
+        public void addNotify() {
+            super.addNotify();
+            EventQueue.invokeLater(() -> {
+                if (!isDisplayable()) return;
+                try {
+                    createBufferStrategy(2);
+                } catch (Throwable t) {
+                    System.err.println(
+                        "[repro] ActiveHeavyweightCanvas: "
+                      + "createBufferStrategy failed: " + t);
+                    return;
+                }
+                renderThread = new Thread(this::renderLoop,
+                    "active-canvas-render");
+                renderThread.setDaemon(true);
+                renderThread.start();
+            });
+        }
+
+        @Override
+        public void removeNotify() {
+            alive = false;
+            if (renderThread != null) renderThread.interrupt();
+            super.removeNotify();
+        }
+
+        private void renderLoop() {
+            java.util.Random rng = new java.util.Random();
+            while (alive && isDisplayable()) {
+                try {
+                    Thread.sleep(33);
+                } catch (InterruptedException ie) {
+                    return;
+                }
+                int w = getWidth(), h = getHeight();
+                if (w <= 0 || h <= 0) continue;
+                try {
+                    BufferStrategy bs = getBufferStrategy();
+                    if (bs == null) continue;
+                    Graphics g = bs.getDrawGraphics();
+                    try {
+                        g.setColor(new Color(rng.nextInt(0xFFFFFF)));
+                        g.fillRect(0, 0, w, h);
+                    } finally {
+                        g.dispose();
+                    }
+                    bs.show();
+                    Toolkit.getDefaultToolkit().sync();
+                } catch (Throwable t) {
+                    // Surface invalidated mid-render or shutting down.
+                    return;
+                }
+            }
+        }
     }
 
     /**
