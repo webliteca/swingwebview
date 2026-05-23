@@ -20,6 +20,16 @@
  *
  * Diagnostic toggles in the toolbar:
  *
+ *   "Wrap in java.awt.Panel"
+ *       Tears down the current WebView and reinstalls a fresh one
+ *       with a java.awt.Panel (heavyweight) between it and the
+ *       Swing host.  Tests the agent-suggested workaround of
+ *       inserting an extra heavyweight ancestor above the WebView's
+ *       own Canvas HWND -- if that's enough to break the bad
+ *       lightweight-overlap clip computation in nested JSplitPanes,
+ *       the rendering should come back immediately on toggle.
+ *       The page reloads from the URL field on each toggle.
+ *
  *   "Mixing cutout (this Canvas)"
  *       Calls com.sun.awt.AWTUtilities.setComponentMixingCutoutShape
  *       (JDK 8) or Component.setMixingCutoutShape (JDK 9+) on the
@@ -57,6 +67,7 @@ import java.awt.Container;
 import java.awt.Dimension;
 import java.awt.EventQueue;
 import java.awt.FlowLayout;
+import java.awt.Panel;
 import java.awt.Rectangle;
 import java.awt.event.ComponentAdapter;
 import java.awt.event.ComponentEvent;
@@ -87,19 +98,19 @@ public class WebViewSplitPaneBlankRepro {
         EventQueue.invokeLater(WebViewSplitPaneBlankRepro::run);
     }
 
+    // Mutable single-element holder so the toolbar's action listeners can
+    // address the *current* WebViewComponent across panel-wrap toggle
+    // recreations.  installWebView() rewrites slot [0]; everything else
+    // reads through it.
+    private static final WebViewComponent[] CURRENT_WV = new WebViewComponent[1];
+
     private static void run() {
         JFrame frame = new JFrame(
             "WebView blank-render repro (nested JSplitPane, Windows)");
         frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
 
-        WebViewComponent wv = WebViewComponent.create();
-        wv.setDebug(true);
-        wv.setUrl("https://example.com");
-        wv.setPreferredSize(new Dimension(700, 500));
-
         System.err.println("[repro] WebView mode: "
-            + WebViewComponent.resolveDefaultMode()
-            + " (heavyweight=" + wv.isHeavyweight() + ")");
+            + WebViewComponent.resolveDefaultMode());
 
         // ----- Left sidebar (depth-1 child of top-level split) -----
         DefaultListModel<String> sidebarItems = new DefaultListModel<>();
@@ -124,7 +135,9 @@ public class WebViewSplitPaneBlankRepro {
             "(pretend this is a code outline view)")));
 
         JPanel webviewHost = new JPanel(new BorderLayout());
-        webviewHost.add(wv, BorderLayout.CENTER);
+        // First install: unwrapped, default URL.  installWebView() also
+        // populates CURRENT_WV[0] and hooks the canvas-resize log.
+        installWebView(webviewHost, false, "https://example.com");
 
         JSplitPane editorSplit = new JSplitPane(
             JSplitPane.HORIZONTAL_SPLIT, filesTabs, webviewHost);
@@ -161,8 +174,27 @@ public class WebViewSplitPaneBlankRepro {
         // ----- Toolbar with the diagnostic toggles -----
         JTextField urlField = new JTextField("https://example.com", 40);
         JButton go = new JButton("Go");
-        go.addActionListener(e -> wv.setUrl(urlField.getText().trim()));
-        urlField.addActionListener(e -> wv.setUrl(urlField.getText().trim()));
+        go.addActionListener(e -> CURRENT_WV[0].setUrl(urlField.getText().trim()));
+        urlField.addActionListener(e -> CURRENT_WV[0].setUrl(urlField.getText().trim()));
+
+        JCheckBox panelWrapToggle = new JCheckBox("Wrap in java.awt.Panel");
+        panelWrapToggle.setToolTipText(
+            "Recreate the WebView with a java.awt.Panel (heavyweight) "
+          + "between it and the lightweight Swing webviewHost.  Tests "
+          + "the suggestion that adding a heavyweight ancestor above "
+          + "the WebView's own Canvas changes how AWT computes the "
+          + "lightweight-overlap clip region inside nested JSplitPanes.  "
+          + "Toggling tears down the current WebView (dispose() runs via "
+          + "removeNotify) and reinstalls a fresh one -- the page "
+          + "reloads from the URL field.");
+        panelWrapToggle.addActionListener(e -> {
+            String currentUrl = urlField.getText().trim();
+            installWebView(webviewHost, panelWrapToggle.isSelected(), currentUrl);
+            System.err.println("[repro] reinstalled WebView "
+                + (panelWrapToggle.isSelected()
+                    ? "WRAPPED in java.awt.Panel"
+                    : "UNWRAPPED (direct child of webviewHost)"));
+        });
 
         JCheckBox cutoutToggle = new JCheckBox("Mixing cutout (this Canvas)");
         cutoutToggle.setToolTipText(
@@ -172,6 +204,7 @@ public class WebViewSplitPaneBlankRepro {
           + "lightweight-overlap clip region, this should restore the "
           + "WebView immediately.");
         cutoutToggle.addActionListener(e -> {
+            WebViewComponent wv = CURRENT_WV[0];
             Component canvas = findHostCanvas(wv);
             if (canvas == null) {
                 System.err.println(
@@ -198,7 +231,7 @@ public class WebViewSplitPaneBlankRepro {
           + "stale-layout problem.  If not, it's likely the mixing clip "
           + "region or DComp.");
         revalidateBtn.addActionListener(e -> {
-            Component c = wv;
+            Component c = CURRENT_WV[0];
             while (c != null) {
                 c.invalidate();
                 if (c instanceof javax.swing.JComponent) {
@@ -219,12 +252,60 @@ public class WebViewSplitPaneBlankRepro {
         toolbar.add(new JLabel("URL:"));
         toolbar.add(urlField);
         toolbar.add(go);
+        toolbar.add(panelWrapToggle);
         toolbar.add(cutoutToggle);
         toolbar.add(revalidateBtn);
         toolbar.add(hint);
 
-        // ----- Log Canvas resizes so we can correlate "blank" with bounds
-        // and layout events.  Hooks the Canvas once we can find it.
+        frame.getContentPane().setLayout(new BorderLayout());
+        frame.getContentPane().add(toolbar, BorderLayout.NORTH);
+        frame.getContentPane().add(topSplit, BorderLayout.CENTER);
+        frame.setSize(1200, 800);
+        frame.setLocationRelativeTo(null);
+        frame.setVisible(true);
+    }
+
+    // (Re)install a WebViewComponent into webviewHost, optionally with a
+    // java.awt.Panel between it and the Swing host.  Replaces whatever
+    // is currently there -- removing the previous WebView triggers
+    // removeNotify on its Canvas, which disposes the native peer, so it
+    // is safe to drop the reference.
+    //
+    // Updates CURRENT_WV[0] to the new WebView so the toolbar listeners
+    // see it, and re-hooks the canvas-resize log on the fresh Canvas
+    // (the old listener went with the old peer).
+    private static void installWebView(JPanel webviewHost,
+                                       boolean wrapInPanel,
+                                       String url) {
+        webviewHost.removeAll();
+
+        WebViewComponent wv = WebViewComponent.create();
+        wv.setDebug(true);
+        wv.setUrl(url);
+        wv.setPreferredSize(new Dimension(700, 500));
+        CURRENT_WV[0] = wv;
+        System.err.println("[repro] new WebView heavyweight="
+            + wv.isHeavyweight()
+            + " wrappedInPanel=" + wrapInPanel);
+
+        if (wrapInPanel) {
+            // java.awt.Panel is heavyweight -- it gets a WPanelPeer HWND
+            // on Windows.  Wrapping the WebViewComponent in one inserts
+            // an extra heavyweight ancestor between the WebView's own
+            // Canvas HWND and the lightweight Swing parents (JPanel,
+            // JSplitPanes, ...).  This is the "wrap in a heavyweight
+            // panel" workaround the user's other agent suggested.
+            Panel panel = new Panel(new BorderLayout());
+            panel.add(wv, BorderLayout.CENTER);
+            webviewHost.add(panel, BorderLayout.CENTER);
+        } else {
+            webviewHost.add(wv, BorderLayout.CENTER);
+        }
+        webviewHost.revalidate();
+        webviewHost.repaint();
+
+        // Hook the canvas-resize log on the next EDT tick so addNotify
+        // has had a chance to run and the Canvas exists.
         EventQueue.invokeLater(() -> {
             Component canvas = findHostCanvas(wv);
             if (canvas != null) {
@@ -246,18 +327,11 @@ public class WebViewSplitPaneBlankRepro {
             } else {
                 System.err.println(
                     "[repro] WARNING: could not find a Canvas under the "
-                  + "WebViewComponent.  This demo is intended for the "
-                  + "heavyweight build; on Linux it will run but the "
-                  + "blank-render bug being investigated does not apply.");
+                  + "WebViewComponent.  This demo targets the heavyweight "
+                  + "build; on Linux it runs but the blank-render bug "
+                  + "being investigated does not apply.");
             }
         });
-
-        frame.getContentPane().setLayout(new BorderLayout());
-        frame.getContentPane().add(toolbar, BorderLayout.NORTH);
-        frame.getContentPane().add(topSplit, BorderLayout.CENTER);
-        frame.setSize(1200, 800);
-        frame.setLocationRelativeTo(null);
-        frame.setVisible(true);
     }
 
     // Walks the WebViewComponent looking for the first heavyweight AWT
