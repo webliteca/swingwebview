@@ -292,7 +292,13 @@ if /I "%~1"=="--no-mixing" (
     echo Launching with --webview-first (WebView is initially selected)
 ) else if /I "%~1"=="--glass-pane" (
     set "REPRO_APP_ARGS=%REPRO_APP_ARGS% --glass-pane"
-    echo Launching with --glass-pane ^(installs frame-spanning glass pane^)
+    echo Launching with --glass-pane ^(default-style invisible glass pane^)
+) else if /I "%~1"=="--glass-pane-visible" (
+    set "REPRO_APP_ARGS=%REPRO_APP_ARGS% --glass-pane-visible"
+    echo Launching with --glass-pane-visible ^(visible transparent glass pane^)
+) else if /I "%~1"=="--palette-overlay" (
+    set "REPRO_APP_ARGS=%REPRO_APP_ARGS% --palette-overlay"
+    echo Launching with --palette-overlay ^(PALETTE_LAYER lightweight^)
 ) else (
     echo WARNING: unknown arg "%~1" -- ignoring.
 )

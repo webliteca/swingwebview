@@ -157,7 +157,9 @@ import javax.swing.BorderFactory;
 import javax.swing.DefaultListModel;
 import javax.swing.JButton;
 import javax.swing.JCheckBox;
+import javax.swing.JComponent;
 import javax.swing.JFrame;
+import javax.swing.JLayeredPane;
 import javax.swing.JLabel;
 import javax.swing.JList;
 import javax.swing.JPanel;
@@ -187,6 +189,8 @@ public class WebViewSplitPaneBlankRepro {
             else if ("--no-defer".equals(a)) DEFER_BUILD = false;
             else if ("--webview-first".equals(a)) WEBVIEW_FIRST = true;
             else if ("--glass-pane".equals(a)) GLASS_PANE = true;
+            else if ("--glass-pane-visible".equals(a)) GLASS_PANE_VISIBLE = true;
+            else if ("--palette-overlay".equals(a)) PALETTE_OVERLAY = true;
         }
         try {
             if (useFlatLaf) {
@@ -207,7 +211,9 @@ public class WebViewSplitPaneBlankRepro {
         System.err.println("[repro] flags: --flatlaf=" + useFlatLaf
             + " --no-defer=" + (!DEFER_BUILD)
             + " --webview-first=" + WEBVIEW_FIRST
-            + " --glass-pane=" + GLASS_PANE);
+            + " --glass-pane=" + GLASS_PANE
+            + " --glass-pane-visible=" + GLASS_PANE_VISIBLE
+            + " --palette-overlay=" + PALETTE_OVERLAY);
         EventQueue.invokeLater(WebViewSplitPaneBlankRepro::run);
     }
 
@@ -230,23 +236,42 @@ public class WebViewSplitPaneBlankRepro {
     private static boolean WEBVIEW_FIRST = false;
 
     /**
-     * True: install a setOpaque(false), setVisible(false) JPanel as the
-     * JFrame's glass pane before setVisible.  This is the
-     * litecode-confirmed trigger -- a frame-spanning lightweight above
-     * the contentPane causes the AWT mixing pass to compute a
-     * frame-wide SetWindowRgn cutout on every heavyweight Canvas in the
-     * frame, which clips the WebView2 HWND's pixels even though the
-     * WebView2 controller is rendering correctly.  False (default)
-     * matches the previous repro behaviour (no glass pane).
+     * --glass-pane: install a setOpaque(false), setVisible(false)
+     * JPanel as the JFrame's glass pane before setVisible.
+     *
+     * NOTE: JFrame's default glass pane is already a setVisible(false),
+     * setOpaque(false) empty JPanel (see JRootPane.createGlassPane), so
+     * this flag effectively replaces one default-style panel with
+     * another.  Tested first on the assumption it would match the
+     * litecode pattern.  Did not reproduce.
      */
     private static boolean GLASS_PANE = false;
 
     /**
-     * Reference to the glass pane installed when --glass-pane is set,
-     * so the toolbar's mixing-cutout-on-glass-pane toggle can target
-     * it at runtime.  Null when --glass-pane is not set.
+     * --glass-pane-visible: install a setVisible(TRUE) glass pane
+     * with a single child JLabel covering the frame.  Hypothesis:
+     * the litecode ChatPanel was visible at startup (or had been
+     * laid out while visible) so the mixing pass actually walked
+     * it and computed bounds.
+     */
+    private static boolean GLASS_PANE_VISIBLE = false;
+
+    /**
+     * --palette-overlay: install a setOpaque(false) JComponent at
+     * JLayeredPane.PALETTE_LAYER (above the contentPane in z-order
+     * but below the glass pane), sized to the full layered pane on
+     * every resize.  Mirrors the litecode "stageOverlay" pattern
+     * the agent identified as the other trigger candidate.
+     */
+    private static boolean PALETTE_OVERLAY = false;
+
+    /**
+     * References to the overlay components installed by the flags
+     * above, so the toolbar's "Cutout overlays" toggle can target
+     * them at runtime.  Null when the corresponding flag is unset.
      */
     private static JPanel glassPane;
+    private static JComponent paletteOverlay;
 
     // ---- Cross-handler state ----
 
@@ -401,33 +426,46 @@ public class WebViewSplitPaneBlankRepro {
             canvas.repaint();
         });
 
-        JCheckBox glassPaneCutoutToggle = new JCheckBox("Cutout glass pane");
+        JCheckBox glassPaneCutoutToggle = new JCheckBox("Cutout overlays");
         glassPaneCutoutToggle.setToolTipText(
             "Apply (checked) or clear (unchecked) an empty "
-          + "setMixingCutoutShape on the JFrame's glass pane.  The "
-          + "litecode-confirmed fix: with --glass-pane the WebView "
-          + "renders blank by default; toggling this on excludes the "
-          + "glass pane from AWT's mixing-region calculation and "
-          + "restores rendering without reattaching anything.  No-op "
-          + "if --glass-pane wasn't passed at startup.");
+          + "setMixingCutoutShape on whichever overlays were "
+          + "installed at startup (glass pane and/or PALETTE-layer "
+          + "overlay).  The litecode-confirmed fix: excluding these "
+          + "lightweights from AWT's mixing-region calculation "
+          + "restores rendering on Windows without reattaching "
+          + "anything.  No-op if no overlay flags were passed.");
         glassPaneCutoutToggle.addActionListener(e -> {
-            if (glassPane == null) {
+            int count = 0;
+            java.awt.Shape shape = glassPaneCutoutToggle.isSelected()
+                ? new Rectangle() : null;
+            if (glassPane != null) {
+                applyMixingCutout(glassPane, shape);
+                glassPane.invalidate();
+                glassPane.revalidate();
+                glassPane.repaint();
+                count++;
+            }
+            if (paletteOverlay != null) {
+                applyMixingCutout(paletteOverlay, shape);
+                paletteOverlay.invalidate();
+                paletteOverlay.revalidate();
+                paletteOverlay.repaint();
+                count++;
+            }
+            if (count == 0) {
                 System.err.println(
-                    "[repro] no glass pane installed -- pass --glass-pane "
-                  + "at startup to test the litecode trigger.");
+                    "[repro] no overlays installed -- pass --glass-pane, "
+                  + "--glass-pane-visible, or --palette-overlay at "
+                  + "startup to test the litecode trigger.");
                 glassPaneCutoutToggle.setSelected(false);
                 return;
             }
-            boolean applied = applyMixingCutout(glassPane,
-                glassPaneCutoutToggle.isSelected() ? new Rectangle() : null);
-            System.err.println("[repro] glass-pane mixing-cutout "
+            System.err.println("[repro] overlay mixing-cutout "
                 + (glassPaneCutoutToggle.isSelected() ? "applied" : "cleared")
-                + " -> " + (applied ? "ok" : "FAILED"));
-            // Force a relayout so the new clip takes effect immediately.
-            glassPane.invalidate();
-            glassPane.revalidate();
-            glassPane.repaint();
-            // And kick the WebView's ancestor chain too.
+                + " on " + count + " overlay(s)");
+            // Kick the WebView's ancestor chain too so any cached
+            // clip state gets re-evaluated.
             if (CURRENT_WV[0] != null) {
                 CURRENT_WV[0].invalidate();
                 CURRENT_WV[0].revalidate();
@@ -520,23 +558,64 @@ public class WebViewSplitPaneBlankRepro {
         frame.setSize(1400, 900);
         frame.setLocationRelativeTo(null);
 
-        // Install the glass pane BEFORE setVisible, matching the
-        // litecode pattern.  setOpaque(false) + setVisible(false) --
-        // the litecode agent confirmed that even an invisible, fully
-        // transparent, frame-spanning lightweight is enough to make
-        // the AWT mixing pass compute a SetWindowRgn cutout on every
-        // heavyweight Canvas in the frame.  The "Cutout glass pane"
-        // toolbar toggle flips setMixingCutoutShape on this same
-        // glass pane at runtime so the user can verify the fix
-        // restores rendering in-place.
+        // Install overlay variants BEFORE setVisible, matching different
+        // shapes of the litecode trigger.  The Cutout overlays toolbar
+        // toggle flips setMixingCutoutShape on whichever overlays were
+        // installed.
+        //
+        // NOTE: JFrame's default glass pane is *already* a
+        // setVisible(false) + setOpaque(false) empty JPanel, so
+        // --glass-pane alone is essentially a no-op replacement and
+        // (consistent with my Windows test) doesn't reproduce the bug.
+        // The visible-glass-pane and palette-overlay variants below
+        // are more invasive and closer to what litecode actually does.
         if (GLASS_PANE) {
             glassPane = new JPanel();
             glassPane.setOpaque(false);
             glassPane.setVisible(false);
             frame.setGlassPane(glassPane);
-            System.err.println("[repro] installed frame-spanning glass pane "
-                + "(opaque=false, visible=false) -- expected to trigger "
-                + "the blank-render bug on Windows.");
+            System.err.println("[repro] installed --glass-pane "
+                + "(opaque=false, visible=false, no children)");
+        } else if (GLASS_PANE_VISIBLE) {
+            // Visible-but-transparent glass pane with one child so it
+            // has real bounds + a child contributing to the mixing pass.
+            // Litecode's ChatPanel was probably laid out while visible
+            // before being toggled off.
+            JPanel gp = new JPanel(new BorderLayout());
+            gp.setOpaque(false);
+            JLabel filler = new JLabel(" (visible transparent glass pane)");
+            filler.setOpaque(false);
+            gp.add(filler, BorderLayout.NORTH);
+            gp.setVisible(true);
+            frame.setGlassPane(gp);
+            glassPane = gp;
+            System.err.println("[repro] installed --glass-pane-visible "
+                + "(opaque=false, visible=TRUE, one child)");
+        }
+
+        if (PALETTE_OVERLAY) {
+            // Frame-spanning lightweight at PALETTE_LAYER (above the
+            // contentPane in the layered pane), sized to the layered
+            // pane on every resize.  Mirrors litecode's stageOverlay.
+            paletteOverlay = new JPanel();
+            paletteOverlay.setOpaque(false);
+            paletteOverlay.setVisible(true);
+            JLayeredPane lp = frame.getLayeredPane();
+            lp.add(paletteOverlay, JLayeredPane.PALETTE_LAYER);
+            paletteOverlay.setBounds(0, 0,
+                lp.getWidth(), lp.getHeight());
+            lp.addComponentListener(new ComponentAdapter() {
+                @Override
+                public void componentResized(ComponentEvent e) {
+                    if (paletteOverlay != null) {
+                        paletteOverlay.setBounds(0, 0,
+                            lp.getWidth(), lp.getHeight());
+                    }
+                }
+            });
+            System.err.println("[repro] installed --palette-overlay at "
+                + "PALETTE_LAYER, sized to layered-pane (opaque=false, "
+                + "visible=true)");
         }
 
         frame.setVisible(true);
