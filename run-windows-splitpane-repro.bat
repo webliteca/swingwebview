@@ -264,7 +264,7 @@ set "DEMO_DIR=%REPO_DIR%\demos\WebViewSplitPaneBlankRepro"
 set "DEMO_CLASSES=%BUILD_DIR%\classes-demo"
 if not exist "%DEMO_CLASSES%" mkdir "%DEMO_CLASSES%"
 echo Compiling demo ...
-"%JAVA_HOME%\bin\javac.exe" -d "%DEMO_CLASSES%" -classpath "%WV_JAR%" "%DEMO_DIR%\src\ca\weblite\webview\demos\WebViewSplitPaneBlankRepro.java"
+"%JAVA_HOME%\bin\javac.exe" -encoding UTF-8 -d "%DEMO_CLASSES%" -classpath "%WV_JAR%" "%DEMO_DIR%\src\ca\weblite\webview\demos\WebViewSplitPaneBlankRepro.java"
 if errorlevel 1 (
     echo ERROR: javac failed on demo.
     exit /b 1

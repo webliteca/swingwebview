@@ -43,7 +43,7 @@
  *                 │                       └─ wrapper (BorderLayout)
  *                 │                           └─ innerTabs (JTabbedPane)
  *                 │                               ├─ Placeholder 0..9
- *                 │                               └─ "WebView" tab  ← bug target
+ *                 │                               └─ "WebView" tab  <-- bug target
  *                 │                                   └─ webviewHost (BorderLayout)
  *                 │                                       └─ WebViewComponent
  *                 └─ eastTabs (JTabbedPane)
