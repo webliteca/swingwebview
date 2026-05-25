@@ -52,7 +52,11 @@ Two URL forms are accepted, each resolved differently:
 - **`classpath:foo/bar.html`** — `foo/bar.html` is resolved against `Thread.currentThread().getContextClassLoader()` (captured at the moment `url(...)` is called). Leading slash is tolerated and stripped (`classpath:/foo.html` and `classpath:foo.html` resolve identically). This matches Spring's `ClassPathResource` convention.
 - **`jar:file:/abs/path/app.jar!/foo/bar.html`** — the JAR file at `/abs/path/app.jar` is opened with `java.util.jar.JarFile` and `foo/bar.html` is read from inside it. The standard Java `jar:` URL syntax is honoured, including `jar:file:/path%20with%20spaces/app.jar!/inner.html` URL-encoded forms. JARs over `http(s):` (`jar:https://example.com/app.jar!/...`) are out of scope.
 
-Access control: each navigation generates a fresh 128-bit token from `SecureRandom`. The rewritten URL embeds the token as the first path segment. A request whose first path segment does not match a registered token returns `404 Not Found` — never `400 Bad Request` and never a different code that would let an off-port attacker fingerprint the server. Because the server binds only to `127.0.0.1`, only processes on the same host can reach it at all; the token defends against same-host processes belonging to other users or to lower-privilege code in the same user account.
+Access control has two layers. The **first layer is a per-WebView opt-in flag**, defaulting to **OFF**. Without explicitly calling `setLocalResourcesEnabled(true)` on a given WebView, any `classpath:` or `jar:` URL passed to `url(...)` / `navigate(...)` on that WebView throws `IllegalArgumentException` and no server activity occurs. This protects the common case of applications that use the WebView as a general-purpose browser — passing user-entered address-bar URLs straight to `url(...)` — from accidentally exposing the application's bundled resources to arbitrary user input. Bundled-UI applications opt their UI-loading WebView in once at construction; browser-style applications never call the setter and the WebView simply rejects `classpath:` / `jar:` URLs. The opt-in is **per-WebView instance**: an application embedding both a bundled-UI WebView and a browser WebView in the same JVM can enable local resources on the first and leave them disabled on the second.
+
+The **second layer** is the loopback-server access control already described: each navigation on an opted-in WebView generates a fresh 128-bit token from `SecureRandom`. The rewritten URL embeds the token as the first path segment. A request whose first path segment does not match a registered token returns `404 Not Found` — never `400 Bad Request` and never a different code that would let an off-port attacker fingerprint the server. Because the server binds only to `127.0.0.1`, only processes on the same host can reach it at all; the token defends against same-host processes belonging to other users or to lower-privilege code in the same user account.
+
+The threat model: layer 1 (the opt-in flag) defends against **user-supplied URLs reaching the classpath via the application's own WebView API surface** — the address-bar use case. Layer 2 (loopback bind + per-WebView token) defends against **off-host and same-host-other-process attackers**. Once a WebView has been opted in by the application, **its loaded page is trusted**: an in-page malicious script could enumerate the captured ClassLoader via `fetch('/<token>/...')` requests, but the application is responsible for only opting in WebViews that load known-trusted content. This matches how `file:` URLs work on every other UI toolkit.
 
 Relative-URL sub-resources Just Work: the native engine sees the page as having origin `http://127.0.0.1:<port>` and base path `/<token>/<dir>/`, so `<img src="logo.png">` inside `classpath:ui/index.html` issues a GET for `/<token>/ui/logo.png`, which the server resolves against the same classpath scope. `fetch("data.json")`, `<link rel=stylesheet href="style.css">`, ES module imports, all follow the same path.
 
@@ -65,10 +69,11 @@ Key points:
 
 ### Business Value
 
-- Provide a **drop-in JavaFX-WebView replacement for the bundled-resources case**: callers who today write `webEngine.load(getClass().getResource("ui.html").toExternalForm())` can write `webView.url("classpath:ui.html")` and get the same behaviour, including relative sub-resource resolution.
+- Provide a **drop-in JavaFX-WebView replacement for the bundled-resources case**: callers who today write `webEngine.load(getClass().getResource("ui.html").toExternalForm())` can write `webView.setLocalResourcesEnabled(true).url("classpath:ui.html")` and get the same behaviour, including relative sub-resource resolution.
 - Provide a **uniform URL form** that works identically across `WebView` (in-process top-level), `EmbeddedWebView` (Swing heavyweight), and `OffscreenWebView` (Swing lightweight), with no per-platform / per-component branching at the call site.
+- Provide a **safe-by-default posture** for applications that use the WebView as a general-purpose browser: user-entered `classpath:` / `jar:` URLs are rejected with a clear exception unless the application has explicitly opted that WebView in. The address-bar exposure mistake — possible in JavaFX WebView, which has no such gate — is impossible by default here.
 - Provide **loopback-isolated** resource serving: the embedded port is not reachable off-host and, within the host, individual classpath scopes are not enumerable by other processes without the per-WebView token.
-- Provide a **zero-boilerplate** path: the caller does not start, stop, or even see the HTTP server; lifetime is managed by the library.
+- Provide a **zero-boilerplate** path for bundled-UI apps: a single `setLocalResourcesEnabled(true)` call at WebView construction is the entire opt-in; the caller does not start, stop, or even see the HTTP server; lifetime is managed by the library.
 
 ### Dependencies and Assumptions
 
@@ -81,6 +86,9 @@ Key points:
   - `java.util.jar.JarFile` + `JarEntry#getInputStream` for `jar:` resolution.
   - `java.nio.file.Files#probeContentType(Path)` and `java.net.URLConnection#guessContentTypeFromName(String)` for MIME detection, plus an explicit fallback table for `.html`, `.htm`, `.css`, `.js`, `.mjs`, `.json`, `.svg`, `.wasm`.
 - **Business constraints**:
+  - `setLocalResourcesEnabled(boolean)` MUST default to `false` on every WebView / `EmbeddedWebView` / `OffscreenWebView` / `WebViewComponent` instance. While the flag is `false`, any `url(...)` / `navigate(...)` call with a URL starting with `classpath:` or `jar:` MUST throw `IllegalArgumentException` synchronously, and no server activity (no lazy start, no token allocation, no map mutation) occurs.
+  - The flag is **per-instance**. Different WebViews in the same JVM can independently be enabled or disabled.
+  - When the flag transitions from `true` to `false` on an already-running WebView, **every token registered by that WebView MUST be invalidated immediately**. The currently loaded page's already-fetched bytes continue to render in the engine's memory, but any subsequent sub-resource fetch from the page returns `404 Not Found` from the server (because the token is no longer in the resolver map). This is the conservative interpretation: disabling means disabling for real, not "next navigation only".
   - The server MUST bind to `127.0.0.1` only. Binding to `0.0.0.0` or `::` is a security-relevant defect.
   - The server MUST be a JVM-singleton — no per-WebView server, no port-per-WebView.
   - Tokens MUST come from `SecureRandom` (not `Random`, not `Math.random()`) and MUST be at least 128 bits of entropy.
@@ -90,12 +98,19 @@ Key points:
 
 ### Scope In
 
+- New public per-instance opt-in API, present on every navigate-capable surface:
+  - `WebView.setLocalResourcesEnabled(boolean enabled)` — returns `this` for chaining; default state is `false`.
+  - `WebView.isLocalResourcesEnabled()` — returns the current flag state.
+  - `EmbeddedWebView.setLocalResourcesEnabled(boolean enabled)` / `isLocalResourcesEnabled()` — same shape, default `false`.
+  - `OffscreenWebView.setLocalResourcesEnabled(boolean enabled)` / `isLocalResourcesEnabled()` — same shape, default `false`.
+  - `WebViewComponent.setLocalResourcesEnabled(boolean enabled)` / `isLocalResourcesEnabled()` — concrete `final` methods on the abstract base that store the flag locally (`protected` field), propagate to the underlying `EmbeddedWebView` / `OffscreenWebView` if attached, and replay at attach time (same pattern as `pendingUrl`, `pendingInit`, `pendingBindings`). No new abstract method.
+  - The setter accepts both `true` and `false` at any point in the WebView's life — including after pages have already loaded. The `true → false` transition invalidates this WebView's registered tokens as described in Dependencies.
 - New public API on `ca.weblite.webview.WebView`:
-  - `WebView.url(String)` continues to accept any string; when the string starts with `classpath:` or `jar:`, the new interception path runs before the native engine is told anything.
+  - `WebView.url(String)` continues to accept any string; when the string starts with `classpath:` or `jar:` AND the WebView has local resources enabled, the new interception path runs before the native engine is told anything. When the string starts with `classpath:` or `jar:` AND local resources are NOT enabled, the call throws `IllegalArgumentException` with a message identifying the disabled-feature gate.
   - `WebView.url()` (the getter) returns the **original** caller-supplied URL string (`classpath:foo.html`), not the rewritten loopback URL. The rewritten URL is an internal detail.
-- New behaviour on `ca.weblite.webview.EmbeddedWebView.navigate(String)`: identical interception, identical getter semantics.
-- New behaviour on `ca.weblite.webview.OffscreenWebView.navigate(String)`: identical interception, identical getter semantics.
-- New behaviour on `ca.weblite.webview.swing.WebViewComponent.setUrl(String)` / `getUrl()`: transparently inherits the above through the `EmbeddedWebView` / `OffscreenWebView` it owns. No new method, no new abstract method — the inheritance is by virtue of routing through the underlying view.
+- New behaviour on `ca.weblite.webview.EmbeddedWebView.navigate(String)`: identical interception with identical opt-in gating, identical getter semantics.
+- New behaviour on `ca.weblite.webview.OffscreenWebView.navigate(String)`: identical interception with identical opt-in gating, identical getter semantics.
+- New behaviour on `ca.weblite.webview.swing.WebViewComponent.setUrl(String)` / `getUrl()`: transparently inherits the above through the `EmbeddedWebView` / `OffscreenWebView` it owns. Per-component opt-in flag mirrored to the underlying view.
 - New internal class `ca.weblite.webview.ClasspathResourceServer` (package-private):
   - Singleton, accessed via `ClasspathResourceServer.shared()`. Lazily creates the `HttpServer` on first access.
   - Methods `String register(ClassLoader loader, String basePath)` and `String register(File jarFile, String entryPath)` returning the rewritten `http://127.0.0.1:<port>/<token>/<resource-path>` URL.
@@ -103,10 +118,11 @@ Key points:
   - The `HttpServer` is bound to `127.0.0.1:0` (OS-chosen port) and uses the JDK default executor (single-threaded suffices for loopback; the dispatcher can pool if a benchmark shows contention).
   - JVM-exit `Runtime.addShutdownHook` closes the server.
 - New internal class `ca.weblite.webview.UrlInterceptor` (package-private):
-  - Single static entry `static String maybeRewrite(String url)` invoked from each of the three navigate call sites. Returns either the same string unchanged (non-classpath, non-jar URL) or the rewritten loopback URL.
-  - For `classpath:` URLs: strips the scheme, strips a leading `/` if present, captures `Thread.currentThread().getContextClassLoader()` (or `WebView.class.getClassLoader()` if null), and calls `ClasspathResourceServer.shared().register(loader, basePath)`.
-  - For `jar:file:...!/...` URLs: parses out the JAR path and the entry path (URL-decoded), validates the JAR file exists, and calls `ClasspathResourceServer.shared().register(jarFile, entryPath)`.
-  - For `jar:` URLs whose embedded URL is not `file:` (e.g. `jar:http://...`), throws `IllegalArgumentException` — out of scope.
+  - Single static entry `static String maybeRewrite(String url, Object owner, boolean localResourcesEnabled)` invoked from each of the three navigate call sites. The `owner` is the WebView / `EmbeddedWebView` / `OffscreenWebView` instance issuing the navigate (used by the server for per-WebView token tracking and disposal cleanup). Returns either the same string unchanged (non-classpath, non-jar URL) or the rewritten loopback URL.
+  - If `url` starts with `classpath:` or `jar:` AND `localResourcesEnabled` is `false`, throws `IllegalArgumentException("classpath/jar URLs are disabled on this WebView; call setLocalResourcesEnabled(true) to enable them.")`. No token is allocated, no server state mutates.
+  - For `classpath:` URLs (when enabled): strips the scheme, strips a leading `/` if present, captures `Thread.currentThread().getContextClassLoader()` (or `WebView.class.getClassLoader()` if null), and calls `ClasspathResourceServer.shared().register(owner, loader, basePath)`.
+  - For `jar:file:...!/...` URLs (when enabled): parses out the JAR path and the entry path (URL-decoded), validates the JAR file exists, and calls `ClasspathResourceServer.shared().register(owner, jarFile, entryPath)`.
+  - For `jar:` URLs whose embedded URL is not `file:` (e.g. `jar:http://...`), throws `IllegalArgumentException` — out of scope. This check fires regardless of the opt-in flag state, so callers see the same error for an unsupported `jar:` form whether or not they've opted in.
 - Server request handling:
   - Path format `/<token>/<resource-path...>` — token is the first segment, the rest is the resource path inside the registered scope.
   - Unknown token → `404 Not Found`, empty body, `Content-Type: text/plain; charset=utf-8`.
@@ -135,8 +151,10 @@ Key points:
 
 ### Acceptance Criteria
 
+**ACs 1 through 25 assume `setLocalResourcesEnabled(true)` has been called on the WebView before the `url(...)` / `navigate(...)` call under test.** ACs 26 onward cover the opt-in gate itself.
+
 #### AC1: Top-level classpath URL loads from the captured ClassLoader
-**Given** a `WebView` whose surrounding code has placed `index.html` containing `<title>hi</title>` on the calling thread's context classpath, and the WebView has not yet been shown,
+**Given** a `WebView` with `setLocalResourcesEnabled(true)` whose surrounding code has placed `index.html` containing `<title>hi</title>` on the calling thread's context classpath, and the WebView has not yet been shown,
 **When** the caller invokes `webView.url("classpath:index.html").show()` and JS observes `document.title`,
 **Then** the observed value is `"hi"` and the native engine sees the page origin as `http://127.0.0.1:<port>` (some OS-chosen port).
 
@@ -260,6 +278,46 @@ Key points:
 **When** the caller then calls `webView.url("classpath:second.html")`,
 **Then** the rewritten URL has a token `T2 != T1`, and `T1` remains valid for at least 5 seconds after the second navigation (so any pending sub-resource requests from the first page still resolve), and is invalidated at WebView disposal.
 
+#### AC26: Default state is local resources disabled
+**Given** a freshly constructed `WebView` (or `EmbeddedWebView` / `OffscreenWebView` / any `WebViewComponent` subclass) on which `setLocalResourcesEnabled(...)` has never been called,
+**When** the caller invokes `isLocalResourcesEnabled()`,
+**Then** the return value is `false`.
+
+#### AC27: classpath URL is rejected when local resources are disabled
+**Given** a `WebView` in its default state (`isLocalResourcesEnabled()` returns `false`),
+**When** the caller invokes `webView.url("classpath:index.html")`,
+**Then** the call throws `IllegalArgumentException`, the exception's message mentions `setLocalResourcesEnabled`, the embedded HTTP server is NOT started (port 0 is not bound), and no token is allocated.
+
+#### AC28: jar URL is rejected when local resources are disabled
+**Given** a `WebView` in its default state,
+**When** the caller invokes `webView.url("jar:file:/tmp/test.jar!/index.html")`,
+**Then** the call throws `IllegalArgumentException` referencing `setLocalResourcesEnabled`, the embedded HTTP server is NOT started, and no token is allocated.
+
+#### AC29: Enabling the flag lets classpath URLs succeed
+**Given** a `WebView` on which `setLocalResourcesEnabled(false)` has been the state since construction, and `index.html` is on the classpath,
+**When** the caller invokes `webView.setLocalResourcesEnabled(true).url("classpath:index.html").show()` and JS observes `document.title`,
+**Then** the navigation proceeds normally and produces the same result as AC1.
+
+#### AC30: Disabling the flag mid-life revokes existing tokens immediately
+**Given** a `WebView` after `setLocalResourcesEnabled(true)` and `url("classpath:index.html")` (which registered token `T`), the page has loaded successfully and `T` resolves to a 200 response,
+**When** the caller invokes `webView.setLocalResourcesEnabled(false)`,
+**Then** a subsequent `GET http://127.0.0.1:<port>/<T>/index.html` returns `404 Not Found` within 100 ms of the setter returning, and `isLocalResourcesEnabled()` returns `false`.
+
+#### AC31: Per-WebView granularity — one enabled, one not
+**Given** two `WebView`s in the same JVM where `webView1.setLocalResourcesEnabled(true)` and `webView2` is left in its default disabled state, and `index.html` is on the classpath,
+**When** the caller invokes `webView1.url("classpath:index.html")` (which succeeds) and then `webView2.url("classpath:index.html")` (which throws),
+**Then** `webView1`'s navigation produces a valid rewritten URL and a token in the server's resolver map, AND `webView2`'s call throws `IllegalArgumentException` without affecting `webView1`'s token registration in any way.
+
+#### AC32: Non-classpath / non-jar URLs are unaffected by the flag
+**Given** a `WebView` in its default state (`isLocalResourcesEnabled()` returns `false`),
+**When** the caller invokes `webView.url("https://example.com")` or `webView.url("data:text/html,<h1>hi</h1>")` or `webView.url("file:///tmp/foo.html")`,
+**Then** the call succeeds (no exception thrown) and the URL is passed verbatim to the native engine — the gate only affects `classpath:` and `jar:` schemes.
+
+#### AC33: jar:http URL throws the unsupported-scheme exception regardless of flag state
+**Given** a `WebView` in either the disabled or enabled state,
+**When** the caller invokes `webView.url("jar:http://example.com/app.jar!/foo.html")`,
+**Then** the call throws `IllegalArgumentException` whose message identifies the unsupported `jar:http:` form — and crucially, **this is the same message in both states**. The opt-in gate's message ("classpath/jar URLs are disabled...") does NOT mask the more specific scheme-unsupported message when the flag is off.
+
 ### Non-Functional Expectations
 
 - The first `classpath:` / `jar:` navigation in the JVM incurs the server start-up cost (one-shot, well under 100 ms on a warm JVM). Subsequent navigations reuse the existing server.
@@ -268,6 +326,7 @@ Key points:
 - The token comparison MUST be a constant-time comparison (`MessageDigest.isEqual` or hand-rolled XOR-OR over bytes) — not `String.equals` — so a same-host attacker cannot use timing side-channels to brute-force the token byte-by-byte.
 - All four URL-encoded forms of `..` (`..`, `%2e%2e`, `%2E%2E`, `.%2e`, etc.) must be normalised and rejected before the request path is handed to the ClassLoader. A single URL-decode + canonicalisation pass is sufficient.
 - Server log entries — if any — MUST NOT include the token in plaintext (use a redacted prefix like `<token-prefix>****`). Tokens leaking through stderr logs would defeat the per-WebView isolation.
+- The opt-in flag MUST be checked **before** any URL parsing on the `classpath:` / `jar:` path, so that constructing a malformed `classpath:` URL on a disabled WebView produces the disabled-feature exception (not a parse error). Exception: `jar:http:` (AC33) is rejected with its own message regardless of flag state, because the unsupported-scheme error is more actionable than the disabled-feature error.
 
 ---
 
@@ -276,10 +335,10 @@ Key points:
 **STORY-005-001 (Classpath + JAR Resource URLs)**:
 - ✅ All required sections present (Background, Business Value, Dependencies and Assumptions, Scope In, Scope Out, Acceptance Criteria, Non-Functional Expectations).
 - ✅ ACs use Given-When-Then with concrete inputs (`classpath:index.html`, `jar:file:/tmp/test.jar!/pages/welcome.html`, `<title>hi</title>`) and observable outcomes (`document.title` equals specific string, HTTP status equals specific code).
-- ✅ Business-language ACs — public API surface (`WebView.url`, `EmbeddedWebView.navigate`, `OffscreenWebView.navigate`, `WebViewComponent.setUrl`) appears because that is the caller-visible contract. Internal class names (`ClasspathResourceServer`, `UrlInterceptor`) appear only in Scope-In / Dependencies, never inside AC bodies.
-- ✅ Covers happy path (AC1-AC9: classpath top-level, jar top-level, relative URLs, fetch, leading-slash tolerance, getter, embedded and offscreen modes), validation / business rules (AC10-AC11: missing-resource 404; AC16-AC18: HTTP method handling and Content-Type), error / security conditions (AC12: traversal; AC13: token confusion; AC14: bind address; AC15: token entropy; AC22: scheme rejection), and lifecycle invariants (AC19-AC20: singleton server, shutdown; AC23-AC25: capture-time semantics, disposal, fresh-token-per-nav).
-- ✅ At most three core functional points: (1) URL rewriting at the three navigate sites; (2) embedded HTTP server lifecycle; (3) classpath / JAR resolution.
-- ✅ 3-5 days of work (one server class, one rewriting helper, three two-line interception sites, no native-code touch).
+- ✅ Business-language ACs — public API surface (`WebView.url`, `EmbeddedWebView.navigate`, `OffscreenWebView.navigate`, `WebViewComponent.setUrl`, `setLocalResourcesEnabled`) appears because that is the caller-visible contract. Internal class names (`ClasspathResourceServer`, `UrlInterceptor`) appear only in Scope-In / Dependencies, never inside AC bodies.
+- ✅ Covers happy path (AC1-AC9: classpath top-level, jar top-level, relative URLs, fetch, leading-slash tolerance, getter, embedded and offscreen modes), validation / business rules (AC10-AC11: missing-resource 404; AC16-AC18: HTTP method handling and Content-Type), error / security conditions (AC12: traversal; AC13: token confusion; AC14: bind address; AC15: token entropy; AC22: scheme rejection; AC27-AC33: opt-in gate, default-off, mid-life disable, per-WebView granularity, pass-through for unaffected schemes), and lifecycle invariants (AC19-AC20: singleton server, shutdown; AC23-AC25: capture-time semantics, disposal, fresh-token-per-nav).
+- ✅ At most three core functional points: (1) URL rewriting at the three navigate sites with per-WebView opt-in gating; (2) embedded HTTP server lifecycle; (3) classpath / JAR resolution.
+- ✅ 3-5 days of work (one server class, one rewriting helper, three two-line interception sites, one opt-in flag plumbed through three views + one component, no native-code touch).
 
 ## Final INVEST Re-validation
 
