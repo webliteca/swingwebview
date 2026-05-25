@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project name="WebViewDialogDemo" default="run" basedir=".">
+    <description>Build and run the browser-initiated UI dialogs demo.</description>
+
+    <property name="src.dir" value="src"/>
+    <property name="build.dir" value="build"/>
+    <property name="classes.dir" value="${build.dir}/classes"/>
+    <property name="webview.jar" value="../../dist/WebView.jar"/>
+    <property name="main.class" value="ca.weblite.webview.demos.WebViewDialogDemo"/>
+
+    <target name="check-webview-jar">
+        <available file="${webview.jar}" property="webview.jar.exists"/>
+        <fail unless="webview.jar.exists">
+WebView.jar not found at ${webview.jar}.
+Build it first from the project root, e.g. ./run-linux-demo.sh once to
+produce dist/WebView.jar, or invoke a platform run-*-demo.sh / .bat at
+the repo root.
+        </fail>
+    </target>
+
+    <target name="compile" depends="check-webview-jar">
+        <mkdir dir="${classes.dir}"/>
+        <javac srcdir="${src.dir}" destdir="${classes.dir}"
+               includeantruntime="false" source="1.8" target="1.8">
+            <classpath>
+                <pathelement location="${webview.jar}"/>
+            </classpath>
+        </javac>
+    </target>
+
+    <target name="run" depends="compile">
+        <java classname="${main.class}" fork="true">
+            <classpath>
+                <pathelement location="${classes.dir}"/>
+                <pathelement location="${webview.jar}"/>
+            </classpath>
+        </java>
+    </target>
+
+    <target name="clean">
+        <delete dir="${build.dir}"/>
+    </target>
+</project>

@@ -266,6 +266,23 @@ native static void webview_embed_release_native_focus(long w);
 // Swing EDT.
 native static void webview_embed_set_attach_callback(long w, Object cb);
 
+// Register (or clear, by passing null) a callback invoked for each
+// JS-initiated UI dialog (alert / confirm / prompt) or
+// <input type=file> click inside the embedded WebView.  The callback
+// returns the answer synchronously, releasing the native UI thread
+// once Java has the value.  Implementations route through
+// DialogDispatcher which marshals to the Swing EDT via
+// SwingUtilities.invokeAndWait.  Per-platform delivery:
+//   - macOS:   WKUIDelegate selectors on the WKWebView (STORY-004-001).
+//   - Linux:   script-dialog and run-file-chooser signals on
+//              WebKitWebView (STORY-004-002).
+//   - Windows: ICoreWebView2::add_ScriptDialogOpening event handler
+//              plus put_AreDefaultScriptDialogsEnabled(FALSE)
+//              (STORY-004-003); file picker remains OS-native.
+// cb may be null to clear the registration.  Passing 0 for w is a
+// silent no-op.  Never throws via JNI.
+native static void webview_embed_set_dialog_callback(long w, WebViewDialogCallback cb);
+
 
 // ---------------------------------------------------------------------------
 // Lightweight / offscreen API (currently Linux-only).
@@ -367,6 +384,13 @@ native static int webview_offscreen_open_devtools(long peer);
 // webview_embed_execute_editing_command.  Linux only; macOS / Windows
 // stubs no-op.  Never throws via JNI.
 native static void webview_offscreen_execute_editing_command(long peer, int cmdId);
+
+// Offscreen counterpart to webview_embed_set_dialog_callback.  Used by
+// WebViewLightweightComponent on Linux to bridge JS-initiated dialogs
+// in the offscreen engine to the per-component DialogDispatcher.
+// macOS / Windows native binaries provide a no-op stub (the offscreen
+// engine on those platforms is itself a stub).  Never throws via JNI.
+native static void webview_offscreen_set_dialog_callback(long peer, WebViewDialogCallback cb);
 
 
 }

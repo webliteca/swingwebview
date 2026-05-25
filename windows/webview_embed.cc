@@ -21,6 +21,8 @@
 
 #include <atomic>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <map>
 #include <memory>
@@ -107,6 +109,12 @@ struct Engine {
     EventRegistrationToken message_token{};
     EventRegistrationToken got_focus_token{};
     EventRegistrationToken lost_focus_token{};
+    // EventRegistrationToken for the ScriptDialogOpening handler
+    // registered in create_engine.  Not explicitly removed in
+    // destroy_engine -- the controller / webview Release calls
+    // there detach all event handlers transitively (same as
+    // message_token / got_focus_token / lost_focus_token).
+    EventRegistrationToken script_dialog_token{};
     std::map<std::string, Binding *> bindings;
     JavaVM *jvm = nullptr;
     bool debug = false;
@@ -122,6 +130,14 @@ struct Engine {
     // into the WebView (AWT's MouseGrabber AWTEventListener never sees
     // those clicks because they reach the WebView2 HWND directly).
     jobject click_callback = nullptr;
+    // JNI global ref to the registered WebViewDialogCallback, or nullptr.
+    // Storage only in this canvas (STORY-004-001) -- STORY-004-003 wires
+    // ICoreWebView2::add_ScriptDialogOpening + AreDefaultScriptDialogsEnabled(FALSE)
+    // to actually invoke this callback for JS alert / confirm / prompt.
+    // The Windows file picker remains OS-native (WebView2 exposes no
+    // public hook for <input type=file>), so this callback is never
+    // invoked for the file-picker event kind on Windows.
+    jobject dialog_callback = nullptr;
 };
 
 static void fire_focus_callback(Engine *e, bool became) {
@@ -173,6 +189,171 @@ static void fire_click_callback(Engine *e) {
         }
     }
     if (detach) jvm->DetachCurrentThread();
+}
+
+// ---------------------------------------------------------------------------
+// JS-initiated UI dialog bridge for WebView2.
+//
+// Three helpers mirroring the Linux fire_dialog_* shape (canvas-12 /
+// STORY-004-002), used by ScriptDialogHandler::Invoke below.  Each helper
+// attaches the spawned worker thread to the JVM, calls one of the three
+// WebViewDialogCallback methods, sanitises any pending Java exception, and
+// detaches.  Method names / signatures are byte-identical across all three
+// platform binaries -- the same Java WebViewDialogCallback interface is the
+// target.
+//
+// No fire_dialog_file_picker on Windows: WebView2 exposes no public hook
+// for <input type=file>, so the file picker continues to use the OS-native
+// Common Item Dialog and WebViewFilePickerEvent never fires on Windows.
+// Documented platform limitation per canvas-11 / STORY-004-003 AC4.
+// ---------------------------------------------------------------------------
+
+static void fire_dialog_alert(JavaVM *jvm, jobject callback,
+                              const char *message,
+                              const char *pageUrl,
+                              const char *frameUrl) {
+    if (!jvm || !callback) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK
+                || !env) {
+            return;
+        }
+        detach = true;
+    }
+    if (!env) {
+        if (detach) jvm->DetachCurrentThread();
+        return;
+    }
+    jstring jmsg = env->NewStringUTF(message ? message : "");
+    jstring jpage = env->NewStringUTF(pageUrl ? pageUrl : "");
+    jstring jframe = env->NewStringUTF(frameUrl ? frameUrl : "");
+    jclass cls = env->GetObjectClass(callback);
+    if (cls) {
+        jmethodID m = env->GetMethodID(
+            cls, "onAlert",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+        if (m) {
+            env->CallVoidMethod(callback, m, jmsg, jpage, jframe);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (jmsg) env->DeleteLocalRef(jmsg);
+    if (jpage) env->DeleteLocalRef(jpage);
+    if (jframe) env->DeleteLocalRef(jframe);
+    if (detach) jvm->DetachCurrentThread();
+}
+
+static jboolean fire_dialog_confirm(JavaVM *jvm, jobject callback,
+                                    const char *message,
+                                    const char *pageUrl,
+                                    const char *frameUrl) {
+    if (!jvm || !callback) return JNI_FALSE;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK
+                || !env) {
+            return JNI_FALSE;
+        }
+        detach = true;
+    }
+    if (!env) {
+        if (detach) jvm->DetachCurrentThread();
+        return JNI_FALSE;
+    }
+    jboolean result = JNI_FALSE;
+    jstring jmsg = env->NewStringUTF(message ? message : "");
+    jstring jpage = env->NewStringUTF(pageUrl ? pageUrl : "");
+    jstring jframe = env->NewStringUTF(frameUrl ? frameUrl : "");
+    jclass cls = env->GetObjectClass(callback);
+    if (cls) {
+        jmethodID m = env->GetMethodID(
+            cls, "onConfirm",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z");
+        if (m) {
+            result = env->CallBooleanMethod(callback, m, jmsg, jpage, jframe);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+                result = JNI_FALSE;
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (jmsg) env->DeleteLocalRef(jmsg);
+    if (jpage) env->DeleteLocalRef(jpage);
+    if (jframe) env->DeleteLocalRef(jframe);
+    if (detach) jvm->DetachCurrentThread();
+    return result;
+}
+
+// Caller MUST free() the returned string when done.  Returns nullptr
+// for cancel (Java returned null) or any error path -- the completion
+// lambda treats nullptr as cancel and skips the put_ResultText / Accept
+// calls so WebView2 reports null to the page.
+static char *fire_dialog_prompt(JavaVM *jvm, jobject callback,
+                                const char *message,
+                                const char *defaultValue,
+                                const char *pageUrl,
+                                const char *frameUrl) {
+    if (!jvm || !callback) return nullptr;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK
+                || !env) {
+            return nullptr;
+        }
+        detach = true;
+    }
+    if (!env) {
+        if (detach) jvm->DetachCurrentThread();
+        return nullptr;
+    }
+    char *result = nullptr;
+    jstring jmsg = env->NewStringUTF(message ? message : "");
+    jstring jdefault = env->NewStringUTF(defaultValue ? defaultValue : "");
+    jstring jpage = env->NewStringUTF(pageUrl ? pageUrl : "");
+    jstring jframe = env->NewStringUTF(frameUrl ? frameUrl : "");
+    jclass cls = env->GetObjectClass(callback);
+    if (cls) {
+        jmethodID m = env->GetMethodID(
+            cls, "onPrompt",
+            "(Ljava/lang/String;Ljava/lang/String;"
+            "Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
+        if (m) {
+            jstring jresult = (jstring)env->CallObjectMethod(
+                callback, m, jmsg, jdefault, jpage, jframe);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+                jresult = nullptr;
+            }
+            if (jresult) {
+                const char *cstr = env->GetStringUTFChars(jresult, nullptr);
+                if (cstr) {
+                    size_t n = strlen(cstr);
+                    result = (char *)malloc(n + 1);
+                    if (result) memcpy(result, cstr, n + 1);
+                    env->ReleaseStringUTFChars(jresult, cstr);
+                }
+                env->DeleteLocalRef(jresult);
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (jmsg) env->DeleteLocalRef(jmsg);
+    if (jdefault) env->DeleteLocalRef(jdefault);
+    if (jpage) env->DeleteLocalRef(jpage);
+    if (jframe) env->DeleteLocalRef(jframe);
+    if (detach) jvm->DetachCurrentThread();
+    return result;  // caller owns; free with free()
 }
 
 // IUnknown helper -- gives each WebView2 callback proper refcounting and
@@ -234,6 +415,8 @@ private:
 // Forward declarations.
 static void engine_on_message(Engine *e, LPCWSTR msg);
 static std::wstring utf8_to_wide(const char *s);
+static std::string wide_to_utf8(LPCWSTR w);
+static void dispatch_to_thread(Engine *e, DispatchFn fn);
 
 class FocusHandler : public CallbackBase<
     ICoreWebView2FocusChangedEventHandler> {
@@ -266,6 +449,136 @@ public:
             engine_on_message(m_engine, msg);
             CoTaskMemFree(msg);
         }
+        return S_OK;
+    }
+private:
+    Engine *m_engine;
+};
+
+// ScriptDialogHandler -- bridges WebView2's ScriptDialogOpening event to the
+// per-engine Java DialogDispatcher (canvas-13 / STORY-004-003).  Invoke runs
+// on the WebView2 worker thread per Microsoft's threading model; we must NOT
+// block it synchronously waiting for the EDT (the completion-side
+// dispatch_to_thread would self-deadlock).  Instead we GetDeferral, spawn a
+// short-lived std::thread for the JNI hop into DialogDispatcher (which does
+// SwingUtilities.invokeAndWait), and once the answer is in hand we
+// dispatch_to_thread back onto the WebView2 worker to call
+// Accept / put_ResultText / Complete in the right COM apartment.
+//
+// `args` and `deferral` are AddRef'd before the worker thread launches and
+// Release'd inside the completion lambda -- WebView2 would otherwise release
+// the args between the S_OK return and the completion.
+//
+// On null dialog_callback the safe-default path runs (alert: Accept; confirm:
+// don't Accept -> page sees false; prompt: don't put_ResultText / Accept ->
+// page sees null) so the page's JS thread always resumes.  before-unload
+// routes to fire_dialog_confirm, matching Linux behaviour.  File picker is
+// NOT intercepted -- WebView2 has no public hook.
+class ScriptDialogHandler : public CallbackBase<
+    ICoreWebView2ScriptDialogOpeningEventHandler> {
+public:
+    explicit ScriptDialogHandler(Engine *e) : m_engine(e) {}
+    HRESULT STDMETHODCALLTYPE Invoke(
+        ICoreWebView2 *,
+        ICoreWebView2ScriptDialogOpeningEventArgs *args) override {
+        if (!args || !m_engine) return S_OK;
+
+        COREWEBVIEW2_SCRIPT_DIALOG_KIND kind =
+            COREWEBVIEW2_SCRIPT_DIALOG_KIND_ALERT;
+        args->get_Kind(&kind);
+
+        LPWSTR uri_w = nullptr;
+        LPWSTR msg_w = nullptr;
+        LPWSTR def_w = nullptr;
+        args->get_Uri(&uri_w);
+        args->get_Message(&msg_w);
+        if (kind == COREWEBVIEW2_SCRIPT_DIALOG_KIND_PROMPT) {
+            args->get_DefaultText(&def_w);
+        }
+        std::string uri = wide_to_utf8(uri_w);
+        std::string msg = wide_to_utf8(msg_w);
+        std::string def = wide_to_utf8(def_w);
+        if (uri_w) CoTaskMemFree(uri_w);
+        if (msg_w) CoTaskMemFree(msg_w);
+        if (def_w) CoTaskMemFree(def_w);
+
+        ICoreWebView2Deferral *deferral = nullptr;
+        HRESULT hr = args->GetDeferral(&deferral);
+        if (FAILED(hr) || !deferral) {
+            // Can't defer -- the SDK refused to hand us a deferral.  Rare;
+            // log and let WebView2's default-suppressed flow take its
+            // course (page receives the JS-spec default for each kind).
+            WV_LOG("GetDeferral failed: HRESULT=0x%08lx",
+                   (unsigned long)hr);
+            return S_OK;
+        }
+        args->AddRef();
+
+        Engine *e = m_engine;
+        std::thread([e, args, deferral, kind, uri, msg, def] {
+            jobject cb = e ? e->dialog_callback : nullptr;
+            JavaVM *jvm = e ? e->jvm : nullptr;
+            jboolean confirmed = JNI_FALSE;
+            char *prompt_answer = nullptr;
+            switch (kind) {
+                case COREWEBVIEW2_SCRIPT_DIALOG_KIND_ALERT:
+                    if (cb) fire_dialog_alert(
+                        jvm, cb, msg.c_str(),
+                        uri.c_str(), uri.c_str());
+                    break;
+                case COREWEBVIEW2_SCRIPT_DIALOG_KIND_CONFIRM:
+                case COREWEBVIEW2_SCRIPT_DIALOG_KIND_BEFOREUNLOAD:
+                    if (cb) confirmed = fire_dialog_confirm(
+                        jvm, cb, msg.c_str(),
+                        uri.c_str(), uri.c_str());
+                    break;
+                case COREWEBVIEW2_SCRIPT_DIALOG_KIND_PROMPT:
+                    if (cb) prompt_answer = fire_dialog_prompt(
+                        jvm, cb, msg.c_str(), def.c_str(),
+                        uri.c_str(), uri.c_str());
+                    break;
+                default:
+                    break;
+            }
+
+            // Marshal back onto the WebView2 worker thread; ICoreWebView2*
+            // methods are apartment-bound to the engine's worker, so
+            // Accept / put_ResultText / Complete must NOT run on the Java
+            // worker thread we're currently in.
+            dispatch_to_thread(e, [args, deferral, kind, confirmed,
+                                   prompt_answer] {
+                switch (kind) {
+                    case COREWEBVIEW2_SCRIPT_DIALOG_KIND_ALERT:
+                        args->Accept();
+                        break;
+                    case COREWEBVIEW2_SCRIPT_DIALOG_KIND_CONFIRM:
+                    case COREWEBVIEW2_SCRIPT_DIALOG_KIND_BEFOREUNLOAD:
+                        if (confirmed == JNI_TRUE) args->Accept();
+                        // else: don't Accept -- WebView2 returns false to
+                        // the page.
+                        break;
+                    case COREWEBVIEW2_SCRIPT_DIALOG_KIND_PROMPT:
+                        if (prompt_answer != nullptr) {
+                            std::wstring wtxt = utf8_to_wide(prompt_answer);
+                            args->put_ResultText(wtxt.c_str());
+                            args->Accept();
+                            free(prompt_answer);
+                        }
+                        // else: don't put_ResultText, don't Accept --
+                        // WebView2 returns null to the page.
+                        break;
+                    default:
+                        // Unknown future SDK kind: just Complete the
+                        // deferral without Accept; the page sees the
+                        // JS-spec default.
+                        break;
+                }
+                deferral->Complete();
+                deferral->Release();
+                args->Release();
+            });
+        }).detach();
+
         return S_OK;
     }
 private:
@@ -425,6 +738,11 @@ static void engine_thread(Engine *e, HWND /*parent*/, int width, int height,
                         settings->put_AreDevToolsEnabled(
                             e->debug ? TRUE : FALSE);
                         settings->put_AreDefaultContextMenusEnabled(TRUE);
+                        // Suppress WebView2's built-in alert / confirm /
+                        // prompt dialogs.  Java drives the response via
+                        // the ScriptDialogHandler registered below.
+                        // STORY-004-003.
+                        settings->put_AreDefaultScriptDialogsEnabled(FALSE);
                         settings->Release();
                     }
 
@@ -439,6 +757,20 @@ static void engine_thread(Engine *e, HWND /*parent*/, int width, int height,
                     auto *mh = new MsgHandler(e);
                     e->webview->add_WebMessageReceived(mh, &e->message_token);
                     mh->Release();
+
+                    // Wire JS-initiated dialogs (alert / confirm / prompt
+                    // / before-unload) to the per-engine Java
+                    // DialogDispatcher via the dialog_callback global ref.
+                    // WebView2's built-in dialogs are suppressed by
+                    // put_AreDefaultScriptDialogsEnabled(FALSE) above.
+                    // File picker (<input type=file>) is NOT intercepted
+                    // -- WebView2 exposes no public hook; the OS-native
+                    // Common Item Dialog continues to appear as before.
+                    // STORY-004-003.
+                    auto *sdh = new ScriptDialogHandler(e);
+                    e->webview->add_ScriptDialogOpening(
+                        sdh, &e->script_dialog_token);
+                    sdh->Release();
 
                     // Hook GotFocus / LostFocus on the controller so the
                     // Java side can suppress and restore the previously-
@@ -605,6 +937,22 @@ static void destroy_engine(Engine *e) {
         e->click_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
+    // Symmetric cleanup for the dialog callback global ref.  Storage
+    // only in this canvas; STORY-004-003 will fire the ScriptDialogOpening
+    // event handler off this field, so the symmetric cleanup is required
+    // even though STORY-004-001 itself never invokes the callback on
+    // Windows.
+    if (e->dialog_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->dialog_callback);
+        e->dialog_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     {
         std::lock_guard<std::mutex> lk(e->bindings_mutex);
         for (auto &kv : e->bindings) {
@@ -634,6 +982,23 @@ static std::wstring utf8_to_wide(const char *s) {
     MultiByteToWideChar(CP_UTF8, 0, s, -1, &w[0], n);
     if (!w.empty() && w.back() == L'\0') w.pop_back();
     return w;
+}
+
+// Convert a (possibly null) UTF-16 LPWSTR to a UTF-8 std::string.
+// Returns the empty string for null / empty input or on WideCharToMultiByte
+// failure.  Used by ScriptDialogHandler::Invoke to copy the COM-allocated
+// args strings into UTF-8 std::strings BEFORE the JNI worker thread runs,
+// so we can CoTaskMemFree the LPWSTRs while still on the WebView2 worker
+// (mirrors the inline pattern already used in engine_on_message).
+static std::string wide_to_utf8(LPCWSTR w) {
+    if (!w || *w == L'\0') return std::string();
+    int n = WideCharToMultiByte(CP_UTF8, 0, w, -1, nullptr, 0,
+                                nullptr, nullptr);
+    if (n <= 0) return std::string();
+    std::string s(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, w, -1, &s[0], n, nullptr, nullptr);
+    if (!s.empty() && s.back() == '\0') s.pop_back();
+    return s;
 }
 
 } // namespace embed_win
@@ -941,6 +1306,33 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
     if (cb) {
         e->click_callback = env->NewGlobalRef(cb);
     }
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1dialog_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    // Store the Java callback (JNI global ref) on the Engine.
+    // STORY-004-001 only ships storage on Windows -- STORY-004-003
+    // wires the ICoreWebView2::add_ScriptDialogOpening event handler
+    // off this field plus put_AreDefaultScriptDialogsEnabled(FALSE) so
+    // built-in WebView2 dialogs are suppressed and JS alert / confirm /
+    // prompt route through Java instead.  <input type=file> remains
+    // OS-native on Windows -- WebView2 exposes no public hook for it.
+    auto *e = (Engine *)wv;
+    if (!e) return;
+    if (e->dialog_callback) {
+        env->DeleteGlobalRef(e->dialog_callback);
+        e->dialog_callback = nullptr;
+    }
+    if (cb) {
+        e->dialog_callback = env->NewGlobalRef(cb);
+    }
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1dialog_1callback
+  (JNIEnv *, jclass, jlong, jobject) {
+    // Windows has no offscreen engine; OffscreenWebView.create returns
+    // null on Windows so this JNI bridge should never be reached.
+    // Stub it for link-symmetry across all three native binaries.
 }
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1release_1native_1focus

@@ -2,6 +2,12 @@ dist
 build
 target
 natives
+# Native-lib output dropped by the run-*-demo.{sh,bat} scripts
+# (src/<arch>/libwebview.{so,dylib,dll}); the runtime extractor
+# picks the lib up from the assembled jar, not from src/.
+src/linux_*/
+src/osx_*/
+src/windows_*/
 .DS_Store
 private
 .litecode/
