@@ -2420,6 +2420,55 @@ static jstring frame_url_jstring(JNIEnv *env, id frame, id webView) {
     return page_url_jstring(env, webView);
 }
 
+// UTF-8 std::string variants of the three helpers above.  Used by the
+// WKUIDelegate IMPs to capture string inputs synchronously on AppKit
+// main BEFORE launching the worker thread that does the JNI hop --
+// std::string captures are thread-safe and don't require us to retain
+// NSString instances across thread boundaries.
+static std::string ns_string_to_utf8(id ns) {
+    if (!ns) return std::string();
+    const char *cstr = msg<const char *>(ns, sel("UTF8String"));
+    return cstr ? std::string(cstr) : std::string();
+}
+
+static std::string page_url_utf8(id webView) {
+    if (!webView) return std::string();
+    id url = msg(webView, sel("URL"));
+    if (!url) return std::string();
+    id abs = msg(url, sel("absoluteString"));
+    return ns_string_to_utf8(abs);
+}
+
+static std::string frame_url_utf8(id frame, id webView) {
+    if (frame) {
+        id req = msg(frame, sel("request"));
+        if (req) {
+            id url = msg(req, sel("URL"));
+            if (url) {
+                id abs = msg(url, sel("absoluteString"));
+                std::string s = ns_string_to_utf8(abs);
+                if (!s.empty()) return s;
+            }
+        }
+    }
+    return page_url_utf8(webView);
+}
+
+// Read an NSArray<NSString*> (or nil) into a std::vector<std::string>.
+// Used by impl_run_open_panel to snapshot the mime / extension arrays
+// on AppKit main before handing off to the worker thread.
+static std::vector<std::string> ns_array_to_utf8_vector(id nsArray) {
+    std::vector<std::string> out;
+    if (!nsArray) return out;
+    long count = msg<long>(nsArray, sel("count"));
+    out.reserve((size_t)count);
+    for (long i = 0; i < count; i++) {
+        id ns = msg<id, long>(nsArray, sel("objectAtIndex:"), i);
+        out.push_back(ns_string_to_utf8(ns));
+    }
+    return out;
+}
+
 // Helper: convert an NSArray<NSString*> (or nil) to a fresh
 // jobjectArray of UTF-8 jstrings.  Returns an empty array for nil
 // input -- never returns nullptr -- so the Java side can assume
@@ -2467,46 +2516,101 @@ static JNIEnv *ensure_jni_env(JavaVM *jvm, bool *attached) {
 
 // IMP: -[WebviewEmbedUIDelegate webView:runJavaScriptAlertPanelWithMessage:
 //                               initiatedByFrame:completionHandler:]
+// ----- Deferral pattern (canvas-11 + bug-fix for the synchronous
+// AppKit-main / EDT deadlock) -----------------------------------------
+//
+// WKUIDelegate selectors are invoked on the AppKit main thread.  Doing
+// SwingUtilities.invokeAndWait directly from here deadlocks: the EDT
+// shows a modal JOptionPane, which creates an NSWindow under the hood,
+// which requires AppKit main thread work -- and AppKit main is blocked
+// in invokeAndWait waiting for the EDT to return.  Classic.
+//
+// Fix: copy the completion handler block, return from the selector
+// immediately, and run the JNI hop on a worker thread.  When Java
+// returns the answer, dispatch_async back onto AppKit main to invoke
+// the completion handler (WKWebView requires its completion handlers
+// to fire on the thread they were delivered on -- AppKit main).  Page's
+// JS thread stays suspended for the duration (the completion handler
+// hasn't fired yet), which is exactly the JS-contract behaviour we want.
+//
+// Same deferral pattern Windows uses via GetDeferral + dispatch_to_thread
+// (canvas-13).  Linux doesn't need it because the GTK pump thread is
+// already decoupled from AWT's EDT thread.
+//
+// Block lifetime: blocks passed as ObjC method arguments are stack-
+// allocated and become invalid once the selector returns.  Calling
+// -copy moves the block to the heap and retains it; we balance with
+// -release after we invoke (or skip invoking) it.
 static void impl_run_alert(id self, SEL, id webView, id message,
                            id frame, id completionHandler) {
     Engine *e = (Engine *)objc_getAssociatedObject(self, "eng");
-    auto run_completion = [&] {
-        // void(^)(void)
-        ((void (^)(void))completionHandler)();
-    };
+
+    // Copy the completion handler block so it survives past selector
+    // return.  See block-lifetime note above.
+    id ch = msg(completionHandler, sel("copy"));
+
+    // Capture string inputs synchronously while still on AppKit main;
+    // std::string captures cross thread boundaries trivially without
+    // having to retain NSStrings.
+    std::string msg_utf8 = ns_string_to_utf8(message);
+    std::string page_url = page_url_utf8(webView);
+    std::string frame_url = frame_url_utf8(frame, webView);
+
     if (!e || !e->dialog_callback) {
-        run_completion();
+        // No Java handler wired (yet, or after disposal).  Fire
+        // completion synchronously with the safe default -- we're
+        // already on AppKit main, no need for dispatch_async.
+        ((void (^)(void))ch)();
+        msg(ch, sel("release"));
         return;
     }
-    bool attached = false;
-    JNIEnv *env = ensure_jni_env(e->jvm, &attached);
-    if (!env) {
-        run_completion();
-        return;
-    }
-    jstring jmsg = ns_to_jstring(env, message);
-    jstring jpage = page_url_jstring(env, webView);
-    jstring jframe = frame_url_jstring(env, frame, webView);
-    jclass cls = env->GetObjectClass(e->dialog_callback);
-    if (cls) {
-        jmethodID mid = env->GetMethodID(
-            cls, "onAlert",
-            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
-        if (mid) {
-            env->CallVoidMethod(e->dialog_callback, mid,
-                                jmsg, jpage, jframe);
-            if (env->ExceptionCheck()) {
-                env->ExceptionDescribe();
-                env->ExceptionClear();
-            }
+
+    JavaVM *jvm = e->jvm;
+    jobject cb = e->dialog_callback;
+
+    // Hand off to a worker thread.  AppKit main returns immediately
+    // so the EDT can use AppKit for the modal Swing dialog without
+    // contention.  Detached thread because we never need to join.
+    std::thread([jvm, cb, msg_utf8, page_url, frame_url, ch]() {
+        JNIEnv *env = nullptr;
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK
+                || !env) {
+            // JVM attach failed; can't call Java.  Still must fire
+            // the completion handler so the page's JS thread resumes.
+            dispatch_async(dispatch_get_main_queue(), ^{
+                ((void (^)(void))ch)();
+                msg(ch, sel("release"));
+            });
+            return;
         }
-        env->DeleteLocalRef(cls);
-    }
-    if (jmsg) env->DeleteLocalRef(jmsg);
-    if (jpage) env->DeleteLocalRef(jpage);
-    if (jframe) env->DeleteLocalRef(jframe);
-    if (attached) e->jvm->DetachCurrentThread();
-    run_completion();
+        jstring jmsg = env->NewStringUTF(msg_utf8.c_str());
+        jstring jpage = env->NewStringUTF(page_url.c_str());
+        jstring jframe = env->NewStringUTF(frame_url.c_str());
+        jclass cls = env->GetObjectClass(cb);
+        if (cls) {
+            jmethodID mid = env->GetMethodID(cls, "onAlert",
+                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+            if (mid) {
+                env->CallVoidMethod(cb, mid, jmsg, jpage, jframe);
+                if (env->ExceptionCheck()) {
+                    env->ExceptionDescribe();
+                    env->ExceptionClear();
+                }
+            }
+            env->DeleteLocalRef(cls);
+        }
+        if (jmsg) env->DeleteLocalRef(jmsg);
+        if (jpage) env->DeleteLocalRef(jpage);
+        if (jframe) env->DeleteLocalRef(jframe);
+        jvm->DetachCurrentThread();
+
+        // Java returned.  Fire the completion handler on AppKit main
+        // (WKWebView requires it) and release our copy of the block.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ((void (^)(void))ch)();
+            msg(ch, sel("release"));
+        });
+    }).detach();
 }
 
 // IMP: -[WebviewEmbedUIDelegate webView:runJavaScriptConfirmPanelWithMessage:
@@ -2514,44 +2618,59 @@ static void impl_run_alert(id self, SEL, id webView, id message,
 static void impl_run_confirm(id self, SEL, id webView, id message,
                              id frame, id completionHandler) {
     Engine *e = (Engine *)objc_getAssociatedObject(self, "eng");
-    auto run_completion = [&](BOOL result) {
-        ((void (^)(BOOL))completionHandler)(result);
-    };
+    id ch = msg(completionHandler, sel("copy"));
+    std::string msg_utf8 = ns_string_to_utf8(message);
+    std::string page_url = page_url_utf8(webView);
+    std::string frame_url = frame_url_utf8(frame, webView);
+
     if (!e || !e->dialog_callback) {
-        run_completion(NO);
+        ((void (^)(BOOL))ch)(NO);
+        msg(ch, sel("release"));
         return;
     }
-    bool attached = false;
-    JNIEnv *env = ensure_jni_env(e->jvm, &attached);
-    if (!env) {
-        run_completion(NO);
-        return;
-    }
-    jboolean result = JNI_FALSE;
-    jstring jmsg = ns_to_jstring(env, message);
-    jstring jpage = page_url_jstring(env, webView);
-    jstring jframe = frame_url_jstring(env, frame, webView);
-    jclass cls = env->GetObjectClass(e->dialog_callback);
-    if (cls) {
-        jmethodID mid = env->GetMethodID(
-            cls, "onConfirm",
-            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z");
-        if (mid) {
-            result = env->CallBooleanMethod(
-                e->dialog_callback, mid, jmsg, jpage, jframe);
-            if (env->ExceptionCheck()) {
-                env->ExceptionDescribe();
-                env->ExceptionClear();
-                result = JNI_FALSE;
-            }
+    JavaVM *jvm = e->jvm;
+    jobject cb = e->dialog_callback;
+
+    std::thread([jvm, cb, msg_utf8, page_url, frame_url, ch]() {
+        JNIEnv *env = nullptr;
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK
+                || !env) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                ((void (^)(BOOL))ch)(NO);
+                msg(ch, sel("release"));
+            });
+            return;
         }
-        env->DeleteLocalRef(cls);
-    }
-    if (jmsg) env->DeleteLocalRef(jmsg);
-    if (jpage) env->DeleteLocalRef(jpage);
-    if (jframe) env->DeleteLocalRef(jframe);
-    if (attached) e->jvm->DetachCurrentThread();
-    run_completion(result == JNI_TRUE ? YES : NO);
+        jboolean result = JNI_FALSE;
+        jstring jmsg = env->NewStringUTF(msg_utf8.c_str());
+        jstring jpage = env->NewStringUTF(page_url.c_str());
+        jstring jframe = env->NewStringUTF(frame_url.c_str());
+        jclass cls = env->GetObjectClass(cb);
+        if (cls) {
+            jmethodID mid = env->GetMethodID(cls, "onConfirm",
+                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z");
+            if (mid) {
+                result = env->CallBooleanMethod(
+                    cb, mid, jmsg, jpage, jframe);
+                if (env->ExceptionCheck()) {
+                    env->ExceptionDescribe();
+                    env->ExceptionClear();
+                    result = JNI_FALSE;
+                }
+            }
+            env->DeleteLocalRef(cls);
+        }
+        if (jmsg) env->DeleteLocalRef(jmsg);
+        if (jpage) env->DeleteLocalRef(jpage);
+        if (jframe) env->DeleteLocalRef(jframe);
+        jvm->DetachCurrentThread();
+
+        BOOL outcome = (result == JNI_TRUE ? YES : NO);
+        dispatch_async(dispatch_get_main_queue(), ^{
+            ((void (^)(BOOL))ch)(outcome);
+            msg(ch, sel("release"));
+        });
+    }).detach();
 }
 
 // IMP: -[WebviewEmbedUIDelegate webView:runJavaScriptTextInputPanelWithPrompt:
@@ -2560,59 +2679,81 @@ static void impl_run_prompt(id self, SEL, id webView, id prompt,
                             id defaultText, id frame,
                             id completionHandler) {
     Engine *e = (Engine *)objc_getAssociatedObject(self, "eng");
-    auto run_completion = [&](id text) {
-        // void(^)(NSString *)
-        ((void (^)(id))completionHandler)(text);
-    };
+    id ch = msg(completionHandler, sel("copy"));
+    std::string msg_utf8 = ns_string_to_utf8(prompt);
+    std::string default_utf8 = ns_string_to_utf8(defaultText);
+    std::string page_url = page_url_utf8(webView);
+    std::string frame_url = frame_url_utf8(frame, webView);
+
     if (!e || !e->dialog_callback) {
-        run_completion(nil);
+        ((void (^)(id))ch)(nil);
+        msg(ch, sel("release"));
         return;
     }
-    bool attached = false;
-    JNIEnv *env = ensure_jni_env(e->jvm, &attached);
-    if (!env) {
-        run_completion(nil);
-        return;
-    }
-    id result_ns = nil;
-    jstring jmsg = ns_to_jstring(env, prompt);
-    jstring jdefault = ns_to_jstring(env, defaultText);
-    jstring jpage = page_url_jstring(env, webView);
-    jstring jframe = frame_url_jstring(env, frame, webView);
-    jclass cls = env->GetObjectClass(e->dialog_callback);
-    if (cls) {
-        jmethodID mid = env->GetMethodID(
-            cls, "onPrompt",
-            "(Ljava/lang/String;Ljava/lang/String;"
-            "Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
-        if (mid) {
-            jstring jresult = (jstring)env->CallObjectMethod(
-                e->dialog_callback, mid,
-                jmsg, jdefault, jpage, jframe);
-            if (env->ExceptionCheck()) {
-                env->ExceptionDescribe();
-                env->ExceptionClear();
-                jresult = nullptr;
-            }
-            if (jresult) {
-                const char *cstr = env->GetStringUTFChars(jresult, nullptr);
-                if (cstr) {
-                    result_ns = ns_str(cstr);
-                    env->ReleaseStringUTFChars(jresult, cstr);
-                }
-                env->DeleteLocalRef(jresult);
-            }
+    JavaVM *jvm = e->jvm;
+    jobject cb = e->dialog_callback;
+
+    std::thread([jvm, cb, msg_utf8, default_utf8, page_url,
+                 frame_url, ch]() {
+        JNIEnv *env = nullptr;
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK
+                || !env) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                ((void (^)(id))ch)(nil);
+                msg(ch, sel("release"));
+            });
+            return;
         }
-        env->DeleteLocalRef(cls);
-    }
-    if (jmsg) env->DeleteLocalRef(jmsg);
-    if (jdefault) env->DeleteLocalRef(jdefault);
-    if (jpage) env->DeleteLocalRef(jpage);
-    if (jframe) env->DeleteLocalRef(jframe);
-    if (attached) e->jvm->DetachCurrentThread();
-    // result_ns is nil → cancel (page sees prompt() return null per
-    // the JS contract); non-nil NSString → page sees the entered text.
-    run_completion(result_ns);
+        // Capture the result as a std::string with a "cancelled" flag
+        // we send to the main-thread block.  std::string can't
+        // distinguish "" from null, so use a separate bool.
+        std::string result_utf8;
+        bool cancelled = true;
+        jstring jmsg = env->NewStringUTF(msg_utf8.c_str());
+        jstring jdefault = env->NewStringUTF(default_utf8.c_str());
+        jstring jpage = env->NewStringUTF(page_url.c_str());
+        jstring jframe = env->NewStringUTF(frame_url.c_str());
+        jclass cls = env->GetObjectClass(cb);
+        if (cls) {
+            jmethodID mid = env->GetMethodID(cls, "onPrompt",
+                "(Ljava/lang/String;Ljava/lang/String;"
+                "Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;");
+            if (mid) {
+                jstring jresult = (jstring)env->CallObjectMethod(
+                    cb, mid, jmsg, jdefault, jpage, jframe);
+                if (env->ExceptionCheck()) {
+                    env->ExceptionDescribe();
+                    env->ExceptionClear();
+                    jresult = nullptr;
+                }
+                if (jresult) {
+                    const char *cstr =
+                        env->GetStringUTFChars(jresult, nullptr);
+                    if (cstr) {
+                        result_utf8 = cstr;
+                        cancelled = false;
+                        env->ReleaseStringUTFChars(jresult, cstr);
+                    }
+                    env->DeleteLocalRef(jresult);
+                }
+            }
+            env->DeleteLocalRef(cls);
+        }
+        if (jmsg) env->DeleteLocalRef(jmsg);
+        if (jdefault) env->DeleteLocalRef(jdefault);
+        if (jpage) env->DeleteLocalRef(jpage);
+        if (jframe) env->DeleteLocalRef(jframe);
+        jvm->DetachCurrentThread();
+
+        // Build the NSString result on AppKit main before invoking
+        // the completion handler -- nil means cancel (page sees null
+        // per the JS contract), non-nil means the entered text.
+        dispatch_async(dispatch_get_main_queue(), ^{
+            id text = cancelled ? nil : ns_str(result_utf8.c_str());
+            ((void (^)(id))ch)(text);
+            msg(ch, sel("release"));
+        });
+    }).detach();
 }
 
 // IMP: -[WebviewEmbedUIDelegate webView:runOpenPanelWithParameters:
@@ -2630,116 +2771,158 @@ static void impl_run_prompt(id self, SEL, id webView, id prompt,
 static void impl_run_open_panel(id self, SEL, id webView, id parameters,
                                 id frame, id completionHandler) {
     Engine *e = (Engine *)objc_getAssociatedObject(self, "eng");
-    auto run_completion = [&](id urls) {
-        // void(^)(NSArray<NSURL *> *)
-        ((void (^)(id))completionHandler)(urls);
-    };
-    if (!e || !e->dialog_callback) {
-        run_completion(nil);
-        return;
-    }
-    bool attached = false;
-    JNIEnv *env = ensure_jni_env(e->jvm, &attached);
-    if (!env) {
-        run_completion(nil);
-        return;
-    }
+    id ch = msg(completionHandler, sel("copy"));
 
+    // Snapshot parameters on AppKit main.  WKOpenPanelParameters and
+    // its private _acceptedMIMETypes / _acceptedFileExtensions
+    // accessors must be invoked here, not from a worker thread, since
+    // WKWebView's object graph isn't guaranteed thread-safe.
     BOOL multiple = NO;
+    std::vector<std::string> mime_types;
+    std::vector<std::string> ext_types;
     if (parameters) {
         multiple = msg<BOOL>(parameters, sel("allowsMultipleSelection"));
-    }
-
-    id mime_types = nil;
-    id ext_types = nil;
-    // _acceptedMIMETypes / _acceptedFileExtensions are private
-    // (underscore-prefixed) accessors on WKOpenPanelParameters that have
-    // been stable since macOS 10.12.  Probe respondsToSelector: rather
-    // than blindly invoking them so a hypothetical future macOS that
-    // removes or renames the selectors degrades gracefully (we pass an
-    // empty array to Java and the default JFileChooser shows all files;
-    // the page's own client-side `accept` validation still works).
-    //
-    // Probing via the ObjC runtime keeps this file as plain C++ -- the
-    // Objective-C++ @try/@catch syntax can't be used because
-    // src_c/webview_embed.cpp is compiled with `c++` not `clang++ -x
-    // objective-c++` (see build-mac.sh and .github/workflows/build.yml).
-    if (parameters) {
+        // _acceptedMIMETypes / _acceptedFileExtensions are private
+        // (underscore-prefixed) accessors on WKOpenPanelParameters that
+        // have been stable since macOS 10.12.  Probe respondsToSelector:
+        // rather than blindly invoking them so a hypothetical future
+        // macOS that removes or renames the selectors degrades
+        // gracefully (we pass an empty array to Java and the default
+        // JFileChooser shows all files; the page's own client-side
+        // `accept` validation still works).
+        //
+        // Probing via the ObjC runtime keeps this file as plain C++ --
+        // the Objective-C++ @try/@catch syntax can't be used because
+        // src_c/webview_embed.cpp is compiled with `c++`, not
+        // `clang++ -x objective-c++`.
         SEL mime_sel = sel("_acceptedMIMETypes");
         if (msg<BOOL, SEL>(parameters, sel("respondsToSelector:"),
                            mime_sel)) {
-            mime_types = msg<id>(parameters, mime_sel);
+            mime_types = ns_array_to_utf8_vector(
+                msg<id>(parameters, mime_sel));
         }
         SEL ext_sel = sel("_acceptedFileExtensions");
         if (msg<BOOL, SEL>(parameters, sel("respondsToSelector:"),
                            ext_sel)) {
-            ext_types = msg<id>(parameters, ext_sel);
+            ext_types = ns_array_to_utf8_vector(
+                msg<id>(parameters, ext_sel));
         }
     }
+    std::string page_url = page_url_utf8(webView);
+    std::string frame_url = frame_url_utf8(frame, webView);
 
-    jobjectArray jmimes = ns_array_to_jstring_array(env, mime_types);
-    jobjectArray jexts = ns_array_to_jstring_array(env, ext_types);
-    jstring jpage = page_url_jstring(env, webView);
-    jstring jframe = frame_url_jstring(env, frame, webView);
+    if (!e || !e->dialog_callback) {
+        ((void (^)(id))ch)(nil);
+        msg(ch, sel("release"));
+        return;
+    }
+    JavaVM *jvm = e->jvm;
+    jobject cb = e->dialog_callback;
 
-    jobjectArray jresult = nullptr;
-    jclass cls = env->GetObjectClass(e->dialog_callback);
-    if (cls) {
-        jmethodID mid = env->GetMethodID(
-            cls, "onFilePicker",
-            "(Z[Ljava/lang/String;[Ljava/lang/String;"
-            "Ljava/lang/String;Ljava/lang/String;)[Ljava/lang/String;");
-        if (mid) {
-            jresult = (jobjectArray)env->CallObjectMethod(
-                e->dialog_callback, mid,
-                (jboolean)(multiple == YES ? JNI_TRUE : JNI_FALSE),
-                jmimes, jexts, jpage, jframe);
-            if (env->ExceptionCheck()) {
-                env->ExceptionDescribe();
-                env->ExceptionClear();
-                jresult = nullptr;
+    std::thread([jvm, cb, multiple, mime_types, ext_types,
+                 page_url, frame_url, ch]() {
+        JNIEnv *env = nullptr;
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK
+                || !env) {
+            dispatch_async(dispatch_get_main_queue(), ^{
+                ((void (^)(id))ch)(nil);
+                msg(ch, sel("release"));
+            });
+            return;
+        }
+
+        // Build the input string-arrays in this worker (NewStringUTF
+        // requires a JNIEnv).
+        jclass strCls = env->FindClass("java/lang/String");
+        auto vec_to_jarray = [&](const std::vector<std::string> &v) {
+            jobjectArray a = env->NewObjectArray(
+                (jsize)v.size(), strCls, nullptr);
+            for (size_t i = 0; i < v.size(); i++) {
+                jstring s = env->NewStringUTF(v[i].c_str());
+                if (s) {
+                    env->SetObjectArrayElement(a, (jsize)i, s);
+                    env->DeleteLocalRef(s);
+                }
             }
-        }
-        env->DeleteLocalRef(cls);
-    }
+            return a;
+        };
+        jobjectArray jmimes = vec_to_jarray(mime_types);
+        jobjectArray jexts = vec_to_jarray(ext_types);
+        jstring jpage = env->NewStringUTF(page_url.c_str());
+        jstring jframe = env->NewStringUTF(frame_url.c_str());
 
-    id urls = nil;
-    if (jresult) {
-        jsize n = env->GetArrayLength(jresult);
-        if (n > 0) {
-            id NSURLcls = objc_cls("NSURL");
-            id arr = msg(objc_cls("NSMutableArray"),
-                         sel("arrayWithCapacity:"), (long)n);
-            for (jsize i = 0; i < n; i++) {
-                jstring js = (jstring)env->GetObjectArrayElement(
-                    jresult, i);
-                if (!js) continue;
-                const char *cstr = env->GetStringUTFChars(js, nullptr);
-                if (cstr) {
-                    id path_ns = ns_str(cstr);
+        // Capture chosen file paths as a std::vector<std::string> so
+        // we can build the NSArray<NSURL*> back on AppKit main (NSURL
+        // construction is technically thread-safe but staying on main
+        // keeps the WKWebView completion-handler invocation simple).
+        std::vector<std::string> chosen_paths;
+
+        jclass cls = env->GetObjectClass(cb);
+        if (cls) {
+            jmethodID mid = env->GetMethodID(cls, "onFilePicker",
+                "(Z[Ljava/lang/String;[Ljava/lang/String;"
+                "Ljava/lang/String;Ljava/lang/String;)[Ljava/lang/String;");
+            if (mid) {
+                jobjectArray jresult = (jobjectArray)env->CallObjectMethod(
+                    cb, mid,
+                    (jboolean)(multiple == YES ? JNI_TRUE : JNI_FALSE),
+                    jmimes, jexts, jpage, jframe);
+                if (env->ExceptionCheck()) {
+                    env->ExceptionDescribe();
+                    env->ExceptionClear();
+                    jresult = nullptr;
+                }
+                if (jresult) {
+                    jsize n = env->GetArrayLength(jresult);
+                    chosen_paths.reserve((size_t)n);
+                    for (jsize i = 0; i < n; i++) {
+                        jstring js = (jstring)env->GetObjectArrayElement(
+                            jresult, i);
+                        if (!js) continue;
+                        const char *cstr =
+                            env->GetStringUTFChars(js, nullptr);
+                        if (cstr) {
+                            chosen_paths.emplace_back(cstr);
+                            env->ReleaseStringUTFChars(js, cstr);
+                        }
+                        env->DeleteLocalRef(js);
+                    }
+                    env->DeleteLocalRef(jresult);
+                }
+            }
+            env->DeleteLocalRef(cls);
+        }
+        if (jmimes) env->DeleteLocalRef(jmimes);
+        if (jexts) env->DeleteLocalRef(jexts);
+        if (jpage) env->DeleteLocalRef(jpage);
+        if (jframe) env->DeleteLocalRef(jframe);
+        if (strCls) env->DeleteLocalRef(strCls);
+        jvm->DetachCurrentThread();
+
+        // Build NSArray<NSURL*> on AppKit main and invoke completion.
+        // Empty paths vector → nil → user cancelled (empty FileList).
+        dispatch_async(dispatch_get_main_queue(), ^{
+            id urls = nil;
+            if (!chosen_paths.empty()) {
+                id NSURLcls = objc_cls("NSURL");
+                id arr = msg(objc_cls("NSMutableArray"),
+                             sel("arrayWithCapacity:"),
+                             (long)chosen_paths.size());
+                for (const std::string &path : chosen_paths) {
+                    id path_ns = ns_str(path.c_str());
                     id url = msg<id, id>(
                         NSURLcls, sel("fileURLWithPath:"), path_ns);
                     if (url) {
                         msg<void, id>(arr, sel("addObject:"), url);
                     }
-                    env->ReleaseStringUTFChars(js, cstr);
                 }
-                env->DeleteLocalRef(js);
+                long count = msg<long>(arr, sel("count"));
+                if (count > 0) urls = arr;
             }
-            long arr_count = msg<long>(arr, sel("count"));
-            if (arr_count > 0) urls = arr;
-        }
-        env->DeleteLocalRef(jresult);
-    }
-
-    if (jmimes) env->DeleteLocalRef(jmimes);
-    if (jexts) env->DeleteLocalRef(jexts);
-    if (jpage) env->DeleteLocalRef(jpage);
-    if (jframe) env->DeleteLocalRef(jframe);
-    if (attached) e->jvm->DetachCurrentThread();
-    // urls nil → user cancelled (page receives an empty FileList);
-    // non-nil NSArray<NSURL*> → page receives the chosen files.
-    run_completion(urls);
+            ((void (^)(id))ch)(urls);
+            msg(ch, sel("release"));
+        });
+    }).detach();
 }
 
 static Class get_webview_embed_ui_delegate_cls() {
