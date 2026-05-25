@@ -157,19 +157,28 @@ public class WebViewDialogDemo {
         installHandler(wv, MODE_DEFAULT, line -> append(log, line));
         append(log, "[demo] handler mode → " + MODE_DEFAULT);
 
-        // Load the inline test page via data: URL.  Using a data: URL
-        // (rather than addOnBeforeLoad + about:blank) keeps the demo
-        // self-contained and ensures the page's history origin is
-        // stable for AC18's pageUrl/frameUrl checks.
+        // Load the inline test page via base64-encoded data: URL.  Using
+        // a data: URL (rather than addOnBeforeLoad + about:blank) keeps
+        // the demo self-contained and ensures the page's history origin
+        // is stable for AC18's pageUrl/frameUrl checks.
         //
-        // Pass the HTML raw -- WKWebView (macOS) does NOT percent-decode
-        // a `data:text/html` body before passing it to the HTML parser,
-        // so any %20-encoded space would render literally as "%20" and
-        // the buttons wouldn't appear.  WebKitGTK and WebView2 tolerate
-        // raw spaces and inline characters in data URL bodies the same
-        // way the existing WebViewAsyncEvalDemo does
-        // (demos/WebViewAsyncEvalDemo/...:74).
-        wv.setUrl("data:text/html;charset=utf-8," + html);
+        // Base64 encoding (not percent-encoding) avoids two distinct
+        // WKWebView pitfalls hit during this PR:
+        //
+        //   1. Percent-encoding the body so spaces -> %20 makes WKWebView
+        //      render the literal "%20" strings in <h2> text because it
+        //      does NOT percent-decode the body before parsing as HTML.
+        //   2. Passing the body raw lets WKWebView's URL parser treat the
+        //      first '#' character (we have #eef and #666 CSS colours)
+        //      as a fragment delimiter, truncating the HTML mid-CSS-rule
+        //      and rendering a blank page.
+        //
+        // Base64 sidesteps both: no URL-special characters in the
+        // encoded body, and the engines all decode base64 before
+        // passing to the HTML parser.  Universally supported.
+        String b64 = java.util.Base64.getEncoder().encodeToString(
+            html.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        wv.setUrl("data:text/html;charset=utf-8;base64," + b64);
     }
 
     private static void installHandler(
