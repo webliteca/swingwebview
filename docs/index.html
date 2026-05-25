@@ -34,12 +34,12 @@
 <section id="top" class="hero">
   <div class="container hero-inner">
     <div class="hero-text">
-      <span class="eyebrow">ca.weblite:webview &middot; v1.0.2 &middot; MIT</span>
+      <span class="eyebrow">ca.weblite:webview &middot; v1.0.7 &middot; MIT</span>
       <h1>A native WebView, embedded in your <em>Java&nbsp;Swing</em> app.</h1>
       <p class="lede">
-        Cross-platform.  Heavyweight on macOS &amp; Windows, lightweight on
-        Linux.  Native libs bundled in the jar &mdash; one Maven dependency,
-        zero install steps.
+        Cross-platform &mdash; native WebKit / WebView2 rendering on macOS,
+        Linux, and Windows.  Native libs bundled in the jar &mdash; one
+        Maven dependency, zero install steps.
       </p>
       <div class="hero-ctas">
         <a class="btn btn-primary" href="#install">Get started in 30 seconds</a>
@@ -80,7 +80,7 @@ frame.setVisible(true);</code></pre>
 <pre id="pom"><code class="language-xml">&lt;dependency&gt;
     &lt;groupId&gt;ca.weblite&lt;/groupId&gt;
     &lt;artifactId&gt;webview&lt;/artifactId&gt;
-    &lt;version&gt;1.0.2&lt;/version&gt;
+    &lt;version&gt;1.0.7&lt;/version&gt;
 &lt;/dependency&gt;</code></pre>
   </div>
 
@@ -91,7 +91,7 @@ frame.setVisible(true);</code></pre>
         <span class="code-card-file">build.gradle</span>
         <button class="copy-btn" data-copy="gradle">Copy</button>
       </div>
-<pre id="gradle"><code class="language-java">implementation 'ca.weblite:webview:1.0.2'</code></pre>
+<pre id="gradle"><code class="language-java">implementation 'ca.weblite:webview:1.0.7'</code></pre>
     </div>
   </details>
 
@@ -107,8 +107,8 @@ frame.setVisible(true);</code></pre>
   <header class="snippet-header">
     <span class="step-pill">Step 2</span>
     <h2>Show a web page in a JFrame</h2>
-    <p>One factory call.  <code>WebViewComponent.create()</code> picks
-       heavyweight or lightweight automatically for the current platform.</p>
+    <p>One factory call.  <code>WebViewComponent.create()</code> returns
+       the right native WebView for the current platform.</p>
   </header>
   <div class="code-card">
     <div class="code-card-bar">
@@ -146,9 +146,10 @@ public class Demo {
 <section id="platforms" class="block">
   <h2>Platform support</h2>
   <p class="muted">
-    The factory picks the right mode per platform.  Force a specific
-    mode with <code>WebViewComponent.create(Mode.HEAVYWEIGHT)</code>
-    or the <code>ca.weblite.webview.mode</code> system property.
+    <code>WebViewComponent.create()</code> returns a fully-functional
+    native WebView on each supported platform &mdash; rendering, mouse,
+    keyboard, scrolling, resize, and tab visibility all work out of the
+    box.
   </p>
 
   <div class="platform-grid">
@@ -159,10 +160,8 @@ public class Demo {
         <h3>macOS</h3>
         <span class="subtle">Cocoa &middot; WKWebView</span>
       </header>
-      <dl>
-        <dt>Heavyweight</dt><dd>Full &mdash; rendering, input, resize, tab visibility.</dd>
-        <dt>Lightweight</dt><dd>Stub &mdash; falls back to default Swing background.</dd>
-      </dl>
+      <p>Full native embedding on 10.13+.  Hardware-accelerated WKWebView
+         with Swing widgets layered around it.</p>
     </article>
 
     <article class="platform-card">
@@ -171,10 +170,9 @@ public class Demo {
         <h3>Linux</h3>
         <span class="subtle">WebKitGTK &middot; X11</span>
       </header>
-      <dl>
-        <dt>Heavyweight</dt><dd>Rendering, mouse, scroll, resize, tabs.  Caret blink is unreliable under <code>XReparentWindow</code>.</dd>
-        <dt>Lightweight</dt><dd><strong>Full</strong> &mdash; rendering + mouse + keyboard.</dd>
-      </dl>
+      <p>Full rendering, mouse, and keyboard via WebKitGTK.  Requires
+         <code>libwebkit2gtk-4.1</code> (or <code>4.0</code>) and an X11
+         display.</p>
     </article>
 
     <article class="platform-card">
@@ -183,10 +181,8 @@ public class Demo {
         <h3>Windows</h3>
         <span class="subtle">WebView2</span>
       </header>
-      <dl>
-        <dt>Heavyweight</dt><dd>Full &mdash; rendering, input, resize, tab visibility on Windows&nbsp;11.</dd>
-        <dt>Lightweight</dt><dd>Stub.</dd>
-      </dl>
+      <p>Full native embedding on Windows&nbsp;11 and recent Windows&nbsp;10
+         via the Microsoft Edge WebView2 Runtime.</p>
     </article>
 
   </div>
@@ -274,8 +270,8 @@ public class Demo {
 
   <div class="demo-grid">
     <a class="demo-card" href="https://github.com/webliteca/swingwebview/tree/master/demos/WebViewHeavyweightDemo" target="_blank" rel="noopener">
-      <h3>Heavyweight + Lightweight</h3>
-      <p>Side-by-side, with Swing widgets (JComboBox, tabs) interacting around the WebView.</p>
+      <h3>Swing integration</h3>
+      <p>WebViews embedded alongside Swing widgets (JComboBox, tabs) interacting around them.</p>
     </a>
     <a class="demo-card" href="https://github.com/webliteca/swingwebview/tree/master/demos/WebViewAsyncEvalDemo" target="_blank" rel="noopener">
       <h3>Async JS eval</h3>
