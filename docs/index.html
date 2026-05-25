@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>WebView for Java Swing &middot; ca.weblite:webview</title>
+<meta name="description" content="A cross-platform native WebView component for embedding in Java Swing applications. Bundled native libraries for macOS, Linux, and Windows — no extra install step." />
+<link rel="stylesheet" href="styles.css" />
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/styles/atom-one-dark.min.css" />
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/java.min.js"></script>
+<script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/languages/xml.min.js"></script>
+<script defer src="app.js"></script>
+</head>
+<body>
+
+<header class="topnav">
+  <div class="container nav-inner">
+    <a class="brand" href="#top">
+      <span class="brand-mark">&lt;/&gt;</span>
+      <span class="brand-text">Swing<strong>WebView</strong></span>
+    </a>
+    <nav>
+      <a href="#install">Install</a>
+      <a href="#quickstart">Quick start</a>
+      <a href="#platforms">Platforms</a>
+      <a href="#js-interop">JS interop</a>
+      <a href="#demos">Demos</a>
+      <a class="nav-cta" href="https://github.com/webliteca/swingwebview" target="_blank" rel="noopener">GitHub &#x2197;</a>
+    </nav>
+  </div>
+</header>
+
+<section id="top" class="hero">
+  <div class="container hero-inner">
+    <div class="hero-text">
+      <span class="eyebrow">ca.weblite:webview &middot; v1.0.2 &middot; MIT</span>
+      <h1>A native WebView, embedded in your <em>Java&nbsp;Swing</em> app.</h1>
+      <p class="lede">
+        Cross-platform.  Heavyweight on macOS &amp; Windows, lightweight on
+        Linux.  Native libs bundled in the jar &mdash; one Maven dependency,
+        zero install steps.
+      </p>
+      <div class="hero-ctas">
+        <a class="btn btn-primary" href="#install">Get started in 30 seconds</a>
+        <a class="btn btn-ghost" href="https://github.com/webliteca/swingwebview" target="_blank" rel="noopener">View source on GitHub</a>
+      </div>
+      <ul class="hero-badges">
+        <li><span class="dot mac"></span>macOS &middot; WKWebView</li>
+        <li><span class="dot linux"></span>Linux &middot; WebKitGTK</li>
+        <li><span class="dot win"></span>Windows &middot; WebView2</li>
+      </ul>
+    </div>
+    <div class="hero-card" aria-hidden="true">
+<pre><code class="language-java">WebViewComponent wv = WebViewComponent.create();
+wv.setUrl("https://example.com");
+
+JFrame frame = new JFrame("Hello WebView");
+frame.add(wv, BorderLayout.CENTER);
+frame.pack();
+frame.setVisible(true);</code></pre>
+    </div>
+  </div>
+</section>
+
+<main class="container">
+
+<section id="install" class="snippet-block">
+  <header class="snippet-header">
+    <span class="step-pill">Step 1</span>
+    <h2>Add the dependency</h2>
+    <p>Drop this into your <code>pom.xml</code>. The jar bundles the
+       native libraries for macOS, Linux, and Windows.</p>
+  </header>
+  <div class="code-card">
+    <div class="code-card-bar">
+      <span class="code-card-file">pom.xml</span>
+      <button class="copy-btn" data-copy="pom">Copy</button>
+    </div>
+<pre id="pom"><code class="language-xml">&lt;dependency&gt;
+    &lt;groupId&gt;ca.weblite&lt;/groupId&gt;
+    &lt;artifactId&gt;webview&lt;/artifactId&gt;
+    &lt;version&gt;1.0.2&lt;/version&gt;
+&lt;/dependency&gt;</code></pre>
+  </div>
+
+  <details class="alt-build">
+    <summary>Using Gradle?</summary>
+    <div class="code-card">
+      <div class="code-card-bar">
+        <span class="code-card-file">build.gradle</span>
+        <button class="copy-btn" data-copy="gradle">Copy</button>
+      </div>
+<pre id="gradle"><code class="language-java">implementation 'ca.weblite:webview:1.0.2'</code></pre>
+    </div>
+  </details>
+
+  <aside class="callout callout-info">
+    <strong>Windows note.</strong>  Requires the system-wide Microsoft Edge
+    WebView2 Runtime, which ships with current Windows&nbsp;11 / Edge.  On
+    older Windows, install the Evergreen Runtime from
+    <a href="https://developer.microsoft.com/microsoft-edge/webview2/" target="_blank" rel="noopener">developer.microsoft.com/microsoft-edge/webview2</a>.
+  </aside>
+</section>
+
+<section id="quickstart" class="snippet-block">
+  <header class="snippet-header">
+    <span class="step-pill">Step 2</span>
+    <h2>Show a web page in a JFrame</h2>
+    <p>One factory call.  <code>WebViewComponent.create()</code> picks
+       heavyweight or lightweight automatically for the current platform.</p>
+  </header>
+  <div class="code-card">
+    <div class="code-card-bar">
+      <span class="code-card-file">Demo.java</span>
+      <button class="copy-btn" data-copy="demo">Copy</button>
+    </div>
+<pre id="demo"><code class="language-java">import ca.weblite.webview.swing.WebViewComponent;
+import javax.swing.*;
+import java.awt.*;
+
+public class Demo {
+    public static void main(String[] args) {
+        SwingUtilities.invokeLater(() -&gt; {
+            WebViewComponent wv = WebViewComponent.create();
+            wv.setUrl("https://example.com");
+            wv.setPreferredSize(new Dimension(900, 600));
+
+            JFrame frame = new JFrame("WebView Demo");
+            frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
+            frame.add(wv, BorderLayout.CENTER);
+            frame.pack();
+            frame.setVisible(true);
+        });
+    }
+}</code></pre>
+  </div>
+
+  <p class="muted small">
+    That's it &mdash; <code>mvn package &amp;&amp; java -jar
+    target/your-app.jar</code> and you have a native WebView running
+    inside Swing.
+  </p>
+</section>
+
+<section id="platforms" class="block">
+  <h2>Platform support</h2>
+  <p class="muted">
+    The factory picks the right mode per platform.  Force a specific
+    mode with <code>WebViewComponent.create(Mode.HEAVYWEIGHT)</code>
+    or the <code>ca.weblite.webview.mode</code> system property.
+  </p>
+
+  <div class="platform-grid">
+
+    <article class="platform-card">
+      <header>
+        <span class="dot mac large"></span>
+        <h3>macOS</h3>
+        <span class="subtle">Cocoa &middot; WKWebView</span>
+      </header>
+      <dl>
+        <dt>Heavyweight</dt><dd>Full &mdash; rendering, input, resize, tab visibility.</dd>
+        <dt>Lightweight</dt><dd>Stub &mdash; falls back to default Swing background.</dd>
+      </dl>
+    </article>
+
+    <article class="platform-card">
+      <header>
+        <span class="dot linux large"></span>
+        <h3>Linux</h3>
+        <span class="subtle">WebKitGTK &middot; X11</span>
+      </header>
+      <dl>
+        <dt>Heavyweight</dt><dd>Rendering, mouse, scroll, resize, tabs.  Caret blink is unreliable under <code>XReparentWindow</code>.</dd>
+        <dt>Lightweight</dt><dd><strong>Full</strong> &mdash; rendering + mouse + keyboard.</dd>
+      </dl>
+    </article>
+
+    <article class="platform-card">
+      <header>
+        <span class="dot win large"></span>
+        <h3>Windows</h3>
+        <span class="subtle">WebView2</span>
+      </header>
+      <dl>
+        <dt>Heavyweight</dt><dd>Full &mdash; rendering, input, resize, tab visibility on Windows&nbsp;11.</dd>
+        <dt>Lightweight</dt><dd>Stub.</dd>
+      </dl>
+    </article>
+
+  </div>
+</section>
+
+<section id="js-interop" class="block alt-bg">
+  <h2>Talking to JavaScript</h2>
+  <p class="muted">
+    Three methods cover the whole interop surface &mdash;
+    fire-and-forget, round-trip-with-result, and page-initiated callbacks.
+  </p>
+
+  <div class="three-col">
+
+    <div>
+      <h3><code>eval(String&nbsp;js)</code></h3>
+      <p>Fire-and-forget.  Use for side effects.</p>
+<pre><code class="language-java">wv.eval("document.title = 'Hi';");</code></pre>
+    </div>
+
+    <div>
+      <h3><code>evalAsync(String&nbsp;js)</code></h3>
+      <p>Returns a <code>CompletableFuture&lt;String&gt;</code> resolved with the
+         JSON-stringified result.  Continuations land on the EDT.</p>
+<pre><code class="language-java">wv.evalAsync("return [window.scrollX, window.scrollY];")
+  .thenAccept(json -&gt; System.out.println(json));</code></pre>
+    </div>
+
+    <div>
+      <h3><code>addJavascriptCallback(...)</code></h3>
+      <p>Exposes a Java callback at <code>window.&lt;name&gt;(arg)</code> for the page to invoke.</p>
+<pre><code class="language-java">wv.addJavascriptCallback("notify", arg -&gt; {
+    System.out.println("page said: " + arg);
+});</code></pre>
+    </div>
+
+  </div>
+
+  <aside class="callout callout-warn">
+    <strong>Use <code>return</code> inside <code>evalAsync</code>.</strong>
+    The snippet runs inside an IIFE, so a bare expression is not the IIFE's
+    return value.
+  </aside>
+</section>
+
+<section id="dialogs" class="block">
+  <h2>Browser-initiated dialogs</h2>
+  <p class="muted">
+    <code>window.alert</code>, <code>confirm</code>, <code>prompt</code>,
+    and <code>&lt;input type="file"&gt;</code> are all routed through
+    <code>WebViewDialogHandler</code>.  The default handler shows
+    Swing dialogs; install your own to customise or suppress them.
+  </p>
+
+  <div class="code-card">
+    <div class="code-card-bar">
+      <span class="code-card-file">Dialog handler</span>
+      <button class="copy-btn" data-copy="dialog">Copy</button>
+    </div>
+<pre id="dialog"><code class="language-java">wv.setDialogHandler(new WebViewDialogHandler() {
+    @Override public boolean confirmOpened(WebViewConfirmEvent e) {
+        return JOptionPane.showConfirmDialog(
+            frame, e.message(), "Confirm",
+            JOptionPane.OK_CANCEL_OPTION) == JOptionPane.OK_OPTION;
+    }
+});</code></pre>
+  </div>
+
+  <p class="muted small">
+    Pass <code>null</code> to install the headless-test drop handler
+    (alert no-op, confirm &rarr; <code>false</code>, prompt &rarr;
+    <code>null</code>, file picker &rarr; empty list).  Pass
+    <code>WebViewDialogHandler.DEFAULT</code> to reset to the Swing
+    default.
+  </p>
+</section>
+
+<section id="demos" class="block alt-bg">
+  <h2>Runnable demos</h2>
+  <p class="muted">
+    Each demo has launcher scripts at the project root
+    (<code>run-mac-*.sh</code>, <code>run-linux-*.sh</code>,
+    <code>run-windows-*.bat</code>).
+  </p>
+
+  <div class="demo-grid">
+    <a class="demo-card" href="https://github.com/webliteca/swingwebview/tree/master/demos/WebViewHeavyweightDemo" target="_blank" rel="noopener">
+      <h3>Heavyweight + Lightweight</h3>
+      <p>Side-by-side, with Swing widgets (JComboBox, tabs) interacting around the WebView.</p>
+    </a>
+    <a class="demo-card" href="https://github.com/webliteca/swingwebview/tree/master/demos/WebViewAsyncEvalDemo" target="_blank" rel="noopener">
+      <h3>Async JS eval</h3>
+      <p>Primitive / object / Promise results, exceptions surfacing as <code>JavaScriptEvalException</code>, EDT continuations.</p>
+    </a>
+    <a class="demo-card" href="https://github.com/webliteca/swingwebview/tree/master/demos/WebViewDialogDemo" target="_blank" rel="noopener">
+      <h3>Dialog handlers</h3>
+      <p>Default Swing, custom programmatic answers, and headless drop mode &mdash; for all four dialog kinds.</p>
+    </a>
+    <a class="demo-card" href="https://github.com/webliteca/swingwebview/tree/master/demos/WebViewContextMenuDemo" target="_blank" rel="noopener">
+      <h3>Context menus</h3>
+      <p>Right-click target descriptors: link / image / editable / selection, and <code>setDefaultContextMenuEnabled</code>.</p>
+    </a>
+    <a class="demo-card" href="https://github.com/webliteca/swingwebview/tree/master/demos/WebViewConsoleDemo" target="_blank" rel="noopener">
+      <h3>Console (standalone)</h3>
+      <p>The non-Swing <code>WebView</code> primitive, driven from a console app.</p>
+    </a>
+  </div>
+</section>
+
+<section id="building" class="block">
+  <h2>Building from source</h2>
+  <div class="code-card">
+    <div class="code-card-bar">
+      <span class="code-card-file">shell</span>
+      <button class="copy-btn" data-copy="build">Copy</button>
+    </div>
+<pre id="build"><code>git clone https://github.com/webliteca/swingwebview
+cd swingwebview
+mvn -DskipTests package</code></pre>
+  </div>
+  <p class="muted small">
+    Produces <code>target/webview-1.0-SNAPSHOT.jar</code>.  Targets Java&nbsp;8
+    bytecode; works on JDK&nbsp;8 and any newer LTS.  Native libs are
+    rebuilt by <code>build-mac.sh</code> /
+    <code>build-linux.sh</code> / <code>build-windows.sh</code>;
+    the cross-platform fat jar is produced by the GitHub Actions
+    release workflow.
+  </p>
+</section>
+
+</main>
+
+<footer class="site-footer">
+  <div class="container footer-inner">
+    <div>
+      <strong>SwingWebView</strong>
+      <p>MIT-licensed.  Java port of Serge Zaitsev's
+        <a href="https://github.com/zserge/webview" target="_blank" rel="noopener">webview</a>
+        by <a href="https://sjhannah.com" target="_blank" rel="noopener">Steve Hannah</a>.</p>
+    </div>
+    <div>
+      <h4>Links</h4>
+      <ul>
+        <li><a href="https://github.com/webliteca/swingwebview" target="_blank" rel="noopener">GitHub repository</a></li>
+        <li><a href="https://github.com/webliteca/swingwebview/blob/master/README.md" target="_blank" rel="noopener">Full README</a></li>
+        <li><a href="https://central.sonatype.com/artifact/ca.weblite/webview" target="_blank" rel="noopener">Maven Central</a></li>
+      </ul>
+    </div>
+    <div>
+      <h4>Credits</h4>
+      <ul>
+        <li><a href="https://sjhannah.com" target="_blank" rel="noopener">Steve Hannah</a> &mdash; Java port</li>
+        <li><a href="https://zserge.com" target="_blank" rel="noopener">Serge Zaitsev</a> &mdash; original webview</li>
+      </ul>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
