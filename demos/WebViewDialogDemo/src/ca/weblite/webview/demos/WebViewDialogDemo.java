@@ -161,7 +161,15 @@ public class WebViewDialogDemo {
         // (rather than addOnBeforeLoad + about:blank) keeps the demo
         // self-contained and ensures the page's history origin is
         // stable for AC18's pageUrl/frameUrl checks.
-        wv.setUrl("data:text/html;charset=utf-8," + urlEncode(html));
+        //
+        // Pass the HTML raw -- WKWebView (macOS) does NOT percent-decode
+        // a `data:text/html` body before passing it to the HTML parser,
+        // so any %20-encoded space would render literally as "%20" and
+        // the buttons wouldn't appear.  WebKitGTK and WebView2 tolerate
+        // raw spaces and inline characters in data URL bodies the same
+        // way the existing WebViewAsyncEvalDemo does
+        // (demos/WebViewAsyncEvalDemo/...:74).
+        wv.setUrl("data:text/html;charset=utf-8," + html);
     }
 
     private static void installHandler(
@@ -211,25 +219,6 @@ public class WebViewDialogDemo {
             log.append(line + "\n");
             log.setCaretPosition(log.getDocument().getLength());
         });
-    }
-
-    /** Tiny URL-encoder for the data: URL.  Only escapes characters
-     *  that confuse the URL parsers we care about (space, # / ? & %)
-     *  — the inline HTML contains none of those except spaces. */
-    private static String urlEncode(String s) {
-        StringBuilder sb = new StringBuilder(s.length() * 2);
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            if (c == ' ') sb.append("%20");
-            else if (c == '#') sb.append("%23");
-            else if (c == '%') sb.append("%25");
-            else if (c == '?') sb.append("%3F");
-            else if (c == '&') sb.append("%26");
-            else if (c == '"') sb.append("%22");
-            else if (c == '\n') sb.append("%0A");
-            else sb.append(c);
-        }
-        return sb.toString();
     }
 
     @FunctionalInterface
