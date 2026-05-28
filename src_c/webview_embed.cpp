@@ -2029,7 +2029,9 @@ static void gtk_off_snapshot_into(OffEngine *e, JNIEnv *env,
         int stride = cairo_image_surface_get_stride(dst);
         if (data) {
             for (int y = 0; y < h; y++) {
-                std::memcpy(tmp.data() + (size_t)y * (size_t)w,
+                size_t dst_offset = (size_t)y * (size_t)w;
+                if (dst_offset + (size_t)w > tmp.size()) break;
+                std::memcpy(tmp.data() + dst_offset,
                             data + (size_t)y * (size_t)stride,
                             (size_t)w * 4);
             }
