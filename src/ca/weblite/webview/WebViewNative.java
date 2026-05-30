@@ -283,6 +283,27 @@ native static void webview_embed_set_attach_callback(long w, Object cb);
 // silent no-op.  Never throws via JNI.
 native static void webview_embed_set_dialog_callback(long w, WebViewDialogCallback cb);
 
+// Register (or clear, by passing null) a callback invoked when the
+// embedded page initiates a download -- HTTP responses carrying
+// Content-Disposition: attachment, or non-renderable MIME types the
+// engine classifies as downloads.  The callback returns the chosen
+// destination path synchronously: the native engine is suspended
+// waiting for the answer; bytes are written only after the callback
+// returns a non-null path.  Implementations route through
+// DownloadDispatcher which marshals to the Swing EDT via
+// SwingUtilities.invokeAndWait.  Per-platform delivery:
+//   - macOS:   WKNavigationDelegate didBecomeDownload: selectors plus
+//              a WKDownloadDelegate decideDestinationUsingResponse:
+//              selector.  Requires macOS 11.3+.
+//   - Linux:   WebKitWebContext::download-started signal on the
+//              shared default context, routed to this engine via the
+//              native WebView-to-engine map.
+//   - Windows: ICoreWebView2_4::add_DownloadStarting event handler.
+//              Requires a modern Evergreen WebView2 Runtime.
+// cb may be null to clear the registration.  Passing 0 for w is a
+// silent no-op.  Never throws via JNI.
+native static void webview_embed_set_download_callback(long w, WebViewDownloadCallback cb);
+
 
 // ---------------------------------------------------------------------------
 // Lightweight / offscreen API (currently Linux-only).
@@ -391,6 +412,14 @@ native static void webview_offscreen_execute_editing_command(long peer, int cmdI
 // macOS / Windows native binaries provide a no-op stub (the offscreen
 // engine on those platforms is itself a stub).  Never throws via JNI.
 native static void webview_offscreen_set_dialog_callback(long peer, WebViewDialogCallback cb);
+
+// Offscreen counterpart to webview_embed_set_download_callback.
+// Used by WebViewLightweightComponent on Linux to bridge browser-
+// initiated downloads in the offscreen engine to the per-component
+// DownloadDispatcher.  macOS / Windows native binaries provide a
+// no-op stub (the offscreen engine on those platforms is itself a
+// stub).  Never throws via JNI.
+native static void webview_offscreen_set_download_callback(long peer, WebViewDownloadCallback cb);
 
 
 }

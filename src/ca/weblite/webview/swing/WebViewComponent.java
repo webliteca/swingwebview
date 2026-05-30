@@ -8,9 +8,11 @@ package ca.weblite.webview.swing;
 import ca.weblite.webview.ConsoleDispatcher;
 import ca.weblite.webview.ConsoleListener;
 import ca.weblite.webview.DialogDispatcher;
+import ca.weblite.webview.DownloadDispatcher;
 import ca.weblite.webview.JavaScriptEvalException;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewDialogHandler;
+import ca.weblite.webview.WebViewDownloadHandler;
 import ca.weblite.webview.WebViewMouseDispatcher;
 import ca.weblite.webview.WebViewMouseListener;
 
@@ -75,6 +77,14 @@ public abstract class WebViewComponent extends JComponent {
      *  on their native peer at peer-attach time that delegates to this
      *  dispatcher's {@code dispatch*} methods. */
     protected final DialogDispatcher dialogDispatcher = new DialogDispatcher(this);
+
+    /** Per-component browser-download fan-out hub.  Holds the active
+     *  {@link WebViewDownloadHandler} and marshals each native-side
+     *  download-starting request onto the Swing EDT.  Subclasses
+     *  install a {@link ca.weblite.webview.WebViewDownloadCallback}
+     *  on their native peer at peer-attach time that delegates to
+     *  this dispatcher's {@code dispatchDownload} method. */
+    protected final DownloadDispatcher downloadDispatcher = new DownloadDispatcher(this);
 
     /** Implementation mode for {@link #create(Mode)}. */
     public enum Mode {
@@ -472,5 +482,52 @@ public abstract class WebViewComponent extends JComponent {
      */
     public final WebViewDialogHandler getDialogHandler() {
         return dialogDispatcher.getHandler();
+    }
+
+    // ---------------------------------------------------------------------
+    // Browser-initiated download handler API.
+    //
+    // The handler covers HTTP responses the engine classifies as
+    // downloads (Content-Disposition: attachment; non-renderable
+    // MIME types).  Default behaviour saves to ~/Downloads with
+    // (N) de-duplication.  Callers replace it wholesale via
+    // setDownloadHandler; passing null installs an internal drop
+    // handler that cancels all downloads without UI (useful for
+    // headless tests).  See WebViewDownloadHandler for the full
+    // contract, including the macOS 11.3+ caveat and the modern
+    // Evergreen WebView2 Runtime requirement on Windows.
+    // ---------------------------------------------------------------------
+
+    /**
+     * Install (or replace) the {@link WebViewDownloadHandler} that
+     * receives browser-initiated download requests.  Passing
+     * {@code null} does NOT reset to the framework default — it
+     * installs an internal drop handler that cancels every
+     * download synchronously without UI.  To reset to the stock
+     * {@code ~/Downloads} default, pass
+     * {@link WebViewDownloadHandler#DEFAULT} explicitly.
+     *
+     * <p>Safe to call before the component is displayed.  Safe to
+     * call from any thread.  Replacement is atomic; the next
+     * dispatch picks up the new handler.
+     *
+     * <p>See {@link WebViewDownloadHandler} for the full contract,
+     * including the Swing EDT threading rules and the
+     * {@code evalAsync(...).get()} self-deadlock hazard.
+     */
+    public final WebViewComponent setDownloadHandler(WebViewDownloadHandler handler) {
+        downloadDispatcher.setHandler(handler);
+        return this;
+    }
+
+    /**
+     * @return the active {@link WebViewDownloadHandler}.  Never
+     * returns {@code null} — returns
+     * {@link WebViewDownloadHandler#DEFAULT} when no caller has
+     * installed one, and returns the internal drop singleton when
+     * caller passed {@code null} to {@link #setDownloadHandler}.
+     */
+    public final WebViewDownloadHandler getDownloadHandler() {
+        return downloadDispatcher.getHandler();
     }
 }

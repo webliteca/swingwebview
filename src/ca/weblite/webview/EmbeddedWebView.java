@@ -449,6 +449,50 @@ public class EmbeddedWebView {
     }
 
     /**
+     * Register (or clear, by passing {@code null}) a callback invoked
+     * when the embedded page initiates a download — HTTP responses
+     * carrying {@code Content-Disposition: attachment}, or
+     * non-renderable MIME types the engine classifies as downloads.
+     * Like {@link #setDialogCallback}, the callback RETURNS a value
+     * to the engine synchronously: the chosen destination path as a
+     * {@link String}, or {@code null} to cancel. The native engine
+     * is suspended waiting for the answer; bytes are written only
+     * after the callback returns a non-null path.
+     *
+     * <p>Implementations MUST marshal to the EDT (the library-provided
+     * implementation routes through
+     * {@link ca.weblite.webview.DownloadDispatcher} which uses
+     * {@code SwingUtilities.invokeAndWait}).
+     *
+     * <p>Anchoring the callback in {@code heap} is required so the
+     * JVM does not garbage-collect the lambda while the native side
+     * holds a global ref.
+     *
+     * <p>Per-platform delivery:
+     * <ul>
+     *   <li><b>macOS</b>: {@code WKNavigationDelegate}
+     *       {@code didBecomeDownload:} selectors plus a
+     *       {@code WKDownloadDelegate.decideDestinationUsingResponse:}
+     *       selector on the resulting {@code WKDownload}. Requires
+     *       macOS 11.3 or later; older macOS silently drops downloads.</li>
+     *   <li><b>Linux heavyweight</b>: {@code WebKitWebContext::download-started}
+     *       signal on the shared default context, routed to this
+     *       engine via the native WebView-to-engine map.</li>
+     *   <li><b>Windows</b>: {@code ICoreWebView2_4::add_DownloadStarting}
+     *       event handler. Requires a modern Evergreen WebView2
+     *       Runtime; older runtimes silently drop downloads.</li>
+     * </ul>
+     */
+    public EmbeddedWebView setDownloadCallback(WebViewDownloadCallback cb) {
+        checkAlive();
+        if (cb != null) {
+            heap.add(cb);
+        }
+        WebViewNative.webview_embed_set_download_callback(peer, cb);
+        return this;
+    }
+
+    /**
      * Windows-only: force Win32 keyboard focus back to the AWT-owned parent
      * HWND, so subsequent keystrokes route to AWT instead of the WebView2
      * child HWND.  Used by the Java-side global focus-owner listener when

@@ -321,6 +321,78 @@ See [`demos/WebViewDialogDemo/`](demos/WebViewDialogDemo/README.md)
 for a runnable example that exercises all four dialog kinds in each
 of the three handler modes (default, custom, drop).
 
+## Downloads
+
+HTTP responses that the embedded browser engine classifies as
+downloads — those carrying `Content-Disposition: attachment`, or
+whose MIME type the engine cannot render inline — surface to the
+host application via `WebViewComponent.setDownloadHandler`.  The
+handler picks where the file lands; the engine writes the bytes.
+
+```java
+WebViewComponent wv = WebViewComponent.create();
+wv.setDownloadHandler(new WebViewDownloadHandler() {
+    @Override
+    public File downloadRequested(WebViewDownloadEvent event) {
+        // event.suggestedFilename(), event.sourceUrl(),
+        // event.mimeType(), event.totalBytes()
+        return new File("/var/data/incoming", event.suggestedFilename());
+    }
+});
+```
+
+The handler returns the destination `File` (the engine writes the
+bytes there) or `null` to cancel the download before any bytes are
+written.
+
+**Default behaviour** (when no handler is installed, or when
+`WebViewDownloadHandler.DEFAULT` is installed explicitly): files
+land in `${user.home}/Downloads` under the engine-supplied filename.
+If a file of that name already exists, ` (1)`, ` (2)`, … are
+appended before the last `.`-segment, matching the de-duplication
+convention of Chrome / Edge / Safari.  After 999 collisions the
+default handler returns `null` and the download is cancelled.
+
+**Suppression / headless tests**: `wv.setDownloadHandler(null)`
+installs an internal drop handler that cancels every download
+synchronously without UI.  Note that `setDownloadHandler(null)` is
+NOT the same as `setDownloadHandler(WebViewDownloadHandler.DEFAULT)`
+— null cancels; `DEFAULT` saves to `~/Downloads`.  Callers wanting
+to reset to the default after a previous null pass `DEFAULT`
+explicitly.
+
+**Threading**: the handler runs on the Swing EDT.  Marshaling from
+the native engine's UI thread is handled by `DownloadDispatcher`.
+The page's JavaScript thread continues normally during the
+destination decision — the click handler that initiated the
+download has already returned; only the engine's transfer is
+deferred until the handler answers.
+
+**Platform caveats**:
+
+* **macOS** requires macOS 11.3 or later for `WKDownload`.  Older
+  macOS lacks the `didBecomeDownload:` navigation-delegate
+  selectors and downloads silently drop.  The native side probes
+  `WKDownload` availability at engine creation and logs a one-line
+  stderr warning if absent.
+* **Windows** requires a modern Evergreen WebView2 Runtime that
+  exposes the `ICoreWebView2_4` interface.  Older runtimes lack the
+  `DownloadStarting` event and downloads silently drop.
+* **Linux** resolves `~/Downloads` via `user.home`; it does NOT
+  consult `XDG_DOWNLOAD_DIR`.  Users wanting XDG awareness override
+  `downloadRequested` themselves.  Both heavyweight and lightweight
+  modes route downloads through the same shared `WebKitWebContext`
+  signal, so behaviour is identical in both modes.
+* **`<a download="...">` attribute** — per the HTML spec, browsers
+  honour the `download` attribute only for same-origin URLs;
+  cross-origin downloads use whatever filename the
+  `Content-Disposition` response header specifies.  The handler
+  sees whichever the engine resolves.
+
+See [`demos/WebViewDownloadDemo/`](demos/WebViewDownloadDemo/README.md)
+for a runnable example exercising the three handler modes (default,
+custom, drop) against a small embedded HTTP server.
+
 ## Demo
 
 See [`demos/WebViewHeavyweightDemo/`](demos/WebViewHeavyweightDemo/README.md)
@@ -345,6 +417,12 @@ Additional demos:
   (`alert` / `confirm` / `prompt` / file picker), a custom handler
   returning programmatic answers, and the
   `setDialogHandler(null)` drop mode for headless tests.
+* `demos/WebViewDownloadDemo/` — exercises the new
+  `WebViewDownloadHandler` API: the default `~/Downloads` policy
+  with `(N)` de-duplication, a custom handler routing to a temp
+  directory, and the `setDownloadHandler(null)` cancel-all mode
+  for headless tests.  Bundles an embedded `HttpServer` serving
+  three download payloads.
 
 ## Building from source
 

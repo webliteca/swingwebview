@@ -11,6 +11,7 @@ import ca.weblite.webview.EmbeddedWebView;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewClickCallback;
 import ca.weblite.webview.WebViewDialogCallback;
+import ca.weblite.webview.WebViewDownloadCallback;
 import ca.weblite.webview.WebViewFocusCallback;
 import ca.weblite.webview.WebViewMouseDispatcher;
 import java.awt.AWTEvent;
@@ -200,6 +201,12 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         // false / null / empty) without invoking the handler against
         // a half-disposed component.
         dialogDispatcher.disposeAll();
+        // Same disposal-precedes-native-teardown reasoning as
+        // dialogDispatcher: any in-flight download event arriving
+        // from the native side mid-teardown returns the safe
+        // fallback (null = cancel) without invoking the handler
+        // against a half-disposed component.
+        downloadDispatcher.disposeAll();
         if (embedded != null) {
             EmbeddedWebView e = embedded;
             embedded = null;
@@ -535,6 +542,26 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
                                          String frameUrl) {
                 return dialogDispatcher.dispatchFilePicker(
                     multiple, mimeTypes, extensions, pageUrl, frameUrl);
+            }
+        });
+        // Install the download bridge so HTTP responses the engine
+        // classifies as downloads (Content-Disposition: attachment,
+        // non-renderable MIME types) route to the per-component
+        // WebViewDownloadHandler.  Anchored in EmbeddedWebView.heap
+        // by setDownloadCallback so the JVM does not collect the
+        // lambda while the native side holds a global ref.  The
+        // callback delegates to downloadDispatcher.dispatchDownload,
+        // which does the EDT hop via SwingUtilities.invokeAndWait
+        // and returns the handler's chosen path to the native
+        // deferral (or null to cancel before any bytes are written).
+        embedded.setDownloadCallback(new WebViewDownloadCallback() {
+            @Override
+            public String onDownloadStarting(String suggestedFilename,
+                                             String sourceUrl,
+                                             String mimeType,
+                                             long totalBytes) {
+                return downloadDispatcher.dispatchDownload(
+                    suggestedFilename, sourceUrl, mimeType, totalBytes);
             }
         });
     }

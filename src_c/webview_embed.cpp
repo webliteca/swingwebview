@@ -390,6 +390,17 @@ struct Engine {
     // the global ref without dropping the canvas-004-002 changes.
     jobject dialog_callback = nullptr;
 
+    // JNI global ref to the registered WebViewDownloadCallback, or
+    // nullptr.  Read by the shared download-started signal handler
+    // installed once per process on the default WebKitWebContext
+    // (see handle_download_started below).  The handler routes to
+    // the correct engine via g_webkit_view_owners, then reads this
+    // field; null means "no Java handler wired", which short-circuits
+    // to webkit_download_cancel.  Cleared in gtk_destroy_engine
+    // BEFORE the WebKitWebView is removed from g_webkit_view_owners
+    // so any in-flight handler observes a null field.
+    jobject download_callback = nullptr;
+
     Engine() {}
     ~Engine() {}
 };
@@ -689,6 +700,253 @@ static gchar **fire_dialog_file_picker(JavaVM *jvm, jobject callback,
     return result;  // caller owns; free with g_strfreev
 }
 
+// ===========================================================================
+// Browser-initiated downloads (STORY-005-001).
+//
+// WebKitGTK raises downloads via the `download-started` signal on
+// WebKitWebContext.  Connecting that signal claims the download (the
+// engine waits for `decide-destination` to fire and either calls
+// webkit_download_set_destination(...) or webkit_download_cancel(...)).
+//
+// Critical routing concern: this codebase uses the *shared default*
+// WebKitWebContext implicitly (every webkit_web_view_new() returns a
+// view with that context), so the `download-started` signal fires for
+// EVERY WebKit view in the JVM that uses the default context -- including
+// third-party WebKit instances we don't own.  Connecting the signal
+// per-engine would multiply-fire for the same download.
+//
+// Approach: connect the signal ONCE per process (ensure_download_signal
+// _connected guards with an atomic CAS), route to the originating engine
+// via g_webkit_view_owners (a process-global map keyed by
+// WebKitWebView*), and -- crucially -- return without claiming when the
+// originating view is not in the map.  Foreign WebViews continue to run
+// their own default download flow.  We never call
+// webkit_download_cancel on a foreign download; that would be intrusive.
+//
+// Parallels the macOS g_webview_map shape (declared in the Cocoa block
+// below).
+// ===========================================================================
+
+enum class EngineOwnerKind { ENGINE, OFFENGINE };
+
+struct EngineOwner {
+    EngineOwnerKind kind;
+    void *ptr;  // Engine* or OffEngine* depending on kind
+};
+
+static std::mutex g_webkit_view_owners_mutex;
+static std::map<WebKitWebView *, EngineOwner> g_webkit_view_owners;
+static std::atomic<bool> g_download_signal_connected{false};
+
+// Forward declaration -- the OffEngine struct is defined later in this
+// file, and the routing closure below needs to read the download_callback
+// field off whichever variant owns the originating WebKitWebView.
+struct OffEngine;
+
+// Read the (jvm, download_callback) pair off the routed owner.  Returns
+// {nullptr, nullptr} when the owner is invalid or has no Java callback
+// installed.
+static void resolve_download_target(const EngineOwner &owner,
+                                    JavaVM **out_jvm,
+                                    jobject *out_cb);
+
+// Snapshot of the per-download context used by the decide-destination
+// closure.  Allocated when download-started fires; freed when
+// decide-destination resolves.
+struct DownloadDecideContext {
+    JavaVM *jvm;
+    jobject cb;  // owning ref into g_webkit_view_owners' engine; NOT a
+                 // separate global ref -- we read it again when the
+                 // signal fires to defend against handler replacement
+                 // racing with download progression.
+    EngineOwner owner;  // for re-resolving cb at decide-destination time
+};
+
+// Fire the Java WebViewDownloadCallback.onDownloadStarting method
+// from the GTK pump thread.  Returns a freshly-allocated std::string
+// holding the absolute destination path the Java handler chose, or an
+// empty string to indicate cancel.  Caller owns the std::string.
+static std::string fire_download_starting(JavaVM *jvm, jobject cb,
+                                          const char *suggested_filename,
+                                          const char *source_url,
+                                          const char *mime_type,
+                                          jlong total_bytes) {
+    if (!cb || !jvm) return std::string();
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        jvm->AttachCurrentThread((void **)&env, nullptr);
+        detach = true;
+    }
+    if (!env) return std::string();
+    std::string result;
+    jclass cls = env->GetObjectClass(cb);
+    if (cls) {
+        jmethodID mid = env->GetMethodID(
+            cls, "onDownloadStarting",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;J)"
+            "Ljava/lang/String;");
+        if (mid) {
+            jstring jname = env->NewStringUTF(
+                suggested_filename ? suggested_filename : "");
+            jstring jurl = env->NewStringUTF(source_url ? source_url : "");
+            jstring jmime = env->NewStringUTF(mime_type ? mime_type : "");
+            jobject ret = env->CallObjectMethod(
+                cb, mid, jname, jurl, jmime, total_bytes);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            } else if (ret) {
+                const char *utf = env->GetStringUTFChars((jstring)ret, nullptr);
+                if (utf) {
+                    result = std::string(utf);
+                    env->ReleaseStringUTFChars((jstring)ret, utf);
+                }
+                env->DeleteLocalRef(ret);
+            }
+            if (jname) env->DeleteLocalRef(jname);
+            if (jurl) env->DeleteLocalRef(jurl);
+            if (jmime) env->DeleteLocalRef(jmime);
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (detach) jvm->DetachCurrentThread();
+    return result;
+}
+
+// decide-destination callback: fires when the WebKitDownload needs a
+// destination URI.  Returning TRUE claims the decision; we always claim
+// once a download has reached this point (we already routed to an
+// owned engine in handle_download_started below).
+static gboolean on_decide_destination(WebKitDownload *download,
+                                      const gchar * /*suggested_filename*/,
+                                      gpointer user_data) {
+    DownloadDecideContext *ctx = (DownloadDecideContext *)user_data;
+    if (!ctx) {
+        webkit_download_cancel(download);
+        return TRUE;
+    }
+    // Re-resolve the callback at decide-destination time so a
+    // setDownloadHandler(null) call between download-started and
+    // decide-destination is honoured (the engine's download_callback
+    // field may have been cleared mid-flight).
+    JavaVM *jvm = nullptr;
+    jobject cb = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_webkit_view_owners_mutex);
+        // The owner may have been removed since download-started fired
+        // (engine destroyed mid-flight).  Re-check.
+        WebKitWebView *wv = webkit_download_get_web_view(download);
+        auto it = g_webkit_view_owners.find(wv);
+        if (it != g_webkit_view_owners.end()) {
+            resolve_download_target(it->second, &jvm, &cb);
+        }
+    }
+    if (!cb || !jvm) {
+        webkit_download_cancel(download);
+        delete ctx;
+        return TRUE;
+    }
+    // Read the response fields.  All these accessors are safe with NULL
+    // returns (suggested filename, mime type), and we coerce to safe
+    // defaults for the JNI call.
+    WebKitURIResponse *response = webkit_download_get_response(download);
+    WebKitURIRequest *request = webkit_download_get_request(download);
+    const char *suggested = response
+        ? webkit_uri_response_get_suggested_filename(response)
+        : nullptr;
+    const char *src_url = request ? webkit_uri_request_get_uri(request) : nullptr;
+    const char *mime = response
+        ? webkit_uri_response_get_mime_type(response)
+        : nullptr;
+    guint64 content_length = response
+        ? webkit_uri_response_get_content_length(response)
+        : 0;
+    // WebKitGTK reports 0 when Content-Length is absent.  Map to -1
+    // per the WebViewDownloadEvent.totalBytes() contract.  A legitimate
+    // 0-byte response also collapses to -1, which is the documented
+    // tradeoff (story 1 Ambiguities).
+    jlong total = (content_length == 0) ? -1L : (jlong)content_length;
+
+    std::string path = fire_download_starting(
+        jvm, cb, suggested, src_url, mime, total);
+    if (path.empty()) {
+        webkit_download_cancel(download);
+        delete ctx;
+        return TRUE;
+    }
+    GError *err = nullptr;
+    gchar *uri = g_filename_to_uri(path.c_str(), nullptr, &err);
+    if (!uri) {
+        if (err) g_error_free(err);
+        webkit_download_cancel(download);
+        delete ctx;
+        return TRUE;
+    }
+    webkit_download_set_destination(download, uri);
+    g_free(uri);
+    delete ctx;
+    return TRUE;
+}
+
+// download-started callback on the shared default WebKitWebContext.
+// Fires for every WebKit view in the process that uses the default
+// context, including foreign views we don't own.  We route to the
+// originating engine via g_webkit_view_owners and skip without claiming
+// when the view is foreign.
+static void handle_download_started(WebKitWebContext * /*context*/,
+                                    WebKitDownload *download,
+                                    gpointer /*user_data*/) {
+    if (!download) return;
+    WebKitWebView *wv = webkit_download_get_web_view(download);
+    if (!wv) return;
+    EngineOwner owner;
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> lk(g_webkit_view_owners_mutex);
+        auto it = g_webkit_view_owners.find(wv);
+        if (it != g_webkit_view_owners.end()) {
+            owner = it->second;
+            found = true;
+        }
+    }
+    if (!found) {
+        // Foreign view -- don't claim.  WebKit will run its own
+        // default download flow (built-in GTK dialog, etc.).
+        return;
+    }
+    JavaVM *jvm = nullptr;
+    jobject cb = nullptr;
+    resolve_download_target(owner, &jvm, &cb);
+    if (!cb || !jvm) {
+        // Owned view but no Java handler installed yet (or it was
+        // cleared).  Cancel this download -- the WebViewComponent's
+        // contract is "no handler = no download", consistent with how
+        // setDialogHandler(null) suppresses dialogs.
+        webkit_download_cancel(download);
+        return;
+    }
+    DownloadDecideContext *ctx = new DownloadDecideContext{jvm, cb, owner};
+    g_signal_connect(download, "decide-destination",
+                     G_CALLBACK(on_decide_destination), ctx);
+}
+
+// Connect the shared download-started signal handler exactly once per
+// process.  Idempotent: subsequent calls observe the already-set atomic
+// and return without reconnecting.  Called lazily from
+// gtk_set_download_callback / gtk_off_set_download_callback the first
+// time a Java handler is registered, so non-download-using callers pay
+// no cost.
+static void ensure_download_signal_connected() {
+    bool expected = false;
+    if (!g_download_signal_connected.compare_exchange_strong(expected, true)) {
+        return;
+    }
+    WebKitWebContext *ctx = webkit_web_context_get_default();
+    g_signal_connect(ctx, "download-started",
+                     G_CALLBACK(handle_download_started), nullptr);
+}
+
 // Shared inner dispatcher for the `script-dialog` signal.  Engine-agnostic;
 // the per-engine wrappers (on_script_dialog_engine /
 // on_script_dialog_off_engine) pull jvm + dialog_callback + page URL out
@@ -933,6 +1191,16 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
         e->web = webkit_web_view_new();
         e->manager =
             webkit_web_view_get_user_content_manager(WEBKIT_WEB_VIEW(e->web));
+
+        // Register this WebKitWebView in the process-global owner map
+        // so the shared download-started signal handler (installed
+        // once per process by ensure_download_signal_connected) can
+        // route downloads from this view back to this engine.
+        {
+            std::lock_guard<std::mutex> lk(g_webkit_view_owners_mutex);
+            g_webkit_view_owners[WEBKIT_WEB_VIEW(e->web)] =
+                EngineOwner{EngineOwnerKind::ENGINE, (void *)e};
+        }
 
         // Force software compositing.  WebKitGTK's hardware-accelerated
         // path uses DMA-BUF / GL surfaces that frequently fail when the
@@ -1248,6 +1516,26 @@ static void gtk_destroy_engine(Engine *e) {
         e->dialog_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
+    // Remove from the download-routing map BEFORE clearing the global
+    // ref so any in-flight download-started firing during teardown
+    // either (a) finds no owner entry (foreign-view skip path) or
+    // (b) finds an owner with null callback (cancel path).  Both
+    // safe; neither calls into a freed ref.
+    if (e->web) {
+        std::lock_guard<std::mutex> lk(g_webkit_view_owners_mutex);
+        g_webkit_view_owners.erase(WEBKIT_WEB_VIEW(e->web));
+    }
+    if (e->download_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm && e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->download_callback);
+        e->download_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     GtkPump::instance().run_sync([&] {
         if (e->redraw_timer_id) {
             g_source_remove(e->redraw_timer_id);
@@ -1407,6 +1695,23 @@ static void gtk_set_dialog_callback(Engine *e, JNIEnv *env, jobject cb) {
     }
 }
 
+// Register (or clear, when cb is null) the Java WebViewDownloadCallback
+// for this engine.  Lazily connects the process-global download-started
+// signal handler on the default WebKitWebContext (idempotent CAS).
+// Mirrors gtk_set_dialog_callback's storage lifecycle.
+static void gtk_set_download_callback(Engine *e, JNIEnv *env, jobject cb) {
+    if (!e) return;
+    if (e->download_callback) {
+        env->DeleteGlobalRef(e->download_callback);
+        e->download_callback = nullptr;
+    }
+    if (cb) {
+        e->download_callback = env->NewGlobalRef(cb);
+    }
+    // Lazy connect once per process.  Idempotent.
+    ensure_download_signal_connected();
+}
+
 // ===========================================================================
 // Linux / GTK lightweight (offscreen) engine
 //
@@ -1434,7 +1739,34 @@ struct OffEngine {
     // handle_script_dialog / handle_run_file_chooser inner functions
     // declared in the heavyweight engine block above.
     jobject dialog_callback = nullptr;
+
+    // JNI global ref to the registered WebViewDownloadCallback, or
+    // nullptr.  Lightweight half of the heavyweight Engine field of
+    // the same name; the shared download-started signal handler
+    // routes to either Engine* or OffEngine* via g_webkit_view_owners.
+    jobject download_callback = nullptr;
 };
+
+// Forward-declared earlier (right before handle_download_started) so
+// the on_decide_destination / handle_download_started closures can call
+// it.  Body lives here because it needs both struct definitions in
+// scope to dereference the variant ptr correctly.
+static void resolve_download_target(const EngineOwner &owner,
+                                    JavaVM **out_jvm,
+                                    jobject *out_cb) {
+    *out_jvm = nullptr;
+    *out_cb = nullptr;
+    if (!owner.ptr) return;
+    if (owner.kind == EngineOwnerKind::ENGINE) {
+        Engine *e = (Engine *)owner.ptr;
+        *out_jvm = e->jvm;
+        *out_cb = e->download_callback;
+    } else {
+        OffEngine *e = (OffEngine *)owner.ptr;
+        *out_jvm = e->jvm;
+        *out_cb = e->download_callback;
+    }
+}
 
 // Per-OffEngine wrapper for the `script-dialog` signal.  Reads page URL,
 // jvm, and dialog_callback from the lightweight OffEngine struct and
@@ -1507,6 +1839,16 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
         e->web = webkit_web_view_new();
         e->manager =
             webkit_web_view_get_user_content_manager(WEBKIT_WEB_VIEW(e->web));
+
+        // Register this offscreen WebKitWebView in the process-global
+        // owner map alongside heavyweight engines.  The shared
+        // download-started signal handler routes via this map and
+        // dispatches to the OffEngine* via the tagged-union owner.
+        {
+            std::lock_guard<std::mutex> lk(g_webkit_view_owners_mutex);
+            g_webkit_view_owners[WEBKIT_WEB_VIEW(e->web)] =
+                EngineOwner{EngineOwnerKind::OFFENGINE, (void *)e};
+        }
 
         // Software compositing -- same rationale as the heavyweight engine:
         // hardware-accelerated paths assume on-screen surfaces, and we are
@@ -1642,6 +1984,14 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
 
 static void gtk_off_destroy_engine(OffEngine *e) {
     if (!e) return;
+    // Remove from the download-routing map BEFORE the widget is
+    // destroyed so e->web is still a live WebKitWebView* for the
+    // erase key.  Any in-flight download-started signal firing now
+    // observes a missing owner entry and skips without claiming.
+    if (e->web) {
+        std::lock_guard<std::mutex> lk(g_webkit_view_owners_mutex);
+        g_webkit_view_owners.erase(WEBKIT_WEB_VIEW(e->web));
+    }
     GtkPump::instance().run_sync([&] {
         if (e->window) {
             gtk_widget_destroy(e->window);
@@ -1658,6 +2008,17 @@ static void gtk_off_destroy_engine(OffEngine *e) {
         }
         if (env) env->DeleteGlobalRef(e->dialog_callback);
         e->dialog_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
+    if (e->download_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->download_callback);
+        e->download_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
     for (auto &kv : e->bindings) {
@@ -1684,6 +2045,21 @@ static void gtk_off_destroy_engine(OffEngine *e) {
 // does NOT install the WebKitGTK signal handlers; STORY-004-002 wires
 // the script-dialog + run-file-chooser handlers on the offscreen
 // WebKitWebView.
+// Register (or clear, when cb is null) the Java WebViewDownloadCallback
+// for the offscreen engine.  Same lifecycle as gtk_set_download_callback.
+static void gtk_off_set_download_callback(OffEngine *e, JNIEnv *env,
+                                          jobject cb) {
+    if (!e) return;
+    if (e->download_callback) {
+        env->DeleteGlobalRef(e->download_callback);
+        e->download_callback = nullptr;
+    }
+    if (cb) {
+        e->download_callback = env->NewGlobalRef(cb);
+    }
+    ensure_download_signal_connected();
+}
+
 static void gtk_off_set_dialog_callback(OffEngine *e, JNIEnv *env,
                                         jobject cb) {
     if (!e) return;
@@ -2171,6 +2547,31 @@ struct Engine {
     // released in cocoa_destroy_engine after we clear the WKWebView's
     // uiDelegate property.
     id ui_delegate = nullptr;
+
+    // JNI global ref to the registered WebViewDownloadCallback, or
+    // nullptr.  Read by the WKDownloadDelegate
+    // decideDestinationUsingResponse: selector below (which uses the
+    // 480798c worker-thread pattern -- see impl_dl_decide_destination).
+    // Cleared in cocoa_destroy_engine BEFORE the navigation /
+    // download delegates are released so any in-flight selector
+    // reads a null field instead of a freed ref.
+    jobject download_callback = nullptr;
+
+    // Per-engine WKNavigationDelegate instance assigned via
+    // setNavigationDelegate: at engine creation, but ONLY when
+    // WKDownload is available at runtime (macOS 11.3+).  When
+    // unavailable, this stays null and navigation events use
+    // WKWebView's default behaviour (no download-routing hook).
+    // Retained by us (WKWebView keeps a weak reference per Apple
+    // convention).
+    id navigation_delegate = nullptr;
+
+    // Per-engine WKDownloadDelegate instance.  Set as each
+    // WKDownload's delegate inside the navigation delegate's
+    // didBecomeDownload: selectors.  Multiple concurrent downloads
+    // share the same delegate instance; the Engine* lookup happens
+    // per-download via objc_getAssociatedObject(download, "eng").
+    id download_delegate = nullptr;
 };
 
 // Process-global map from WKWebView (id) to its owning Engine*.  Populated
@@ -2974,6 +3375,245 @@ static void cocoa_set_dialog_callback(Engine *e, JNIEnv *env, jobject cb) {
 }
 
 // ---------------------------------------------------------------------------
+// WKDownload bridge (STORY-005-001).
+//
+// WKWebView surfaces downloads via the navigation delegate's
+// didBecomeDownload: selectors (macOS 11.3+) -- there is no other path.
+// The delegate the WKDownload then consults for the destination
+// decision is its own `delegate` property, conforming to
+// WKDownloadDelegate.  We attach two separate ObjC classes:
+//   1. WebviewEmbedNavigationDelegate -- intercepts didBecomeDownload:
+//      and sets the new WKDownload's delegate.
+//   2. WebviewEmbedDownloadDelegate -- handles the destination
+//      decision callback.
+//
+// They are intentionally separate classes (not a merged
+// WebviewEmbedUIDelegate extension) per Canvas Decision 3: navigation
+// vs UI vs download are three different protocols on three different
+// objects.  Each engine builds one instance of each class at create
+// time and associates an Engine* on it so selectors can recover the
+// engine via objc_getAssociatedObject.
+//
+// The decideDestinationUsingResponse: selector follows the 480798c
+// deferral pattern VERBATIM (mirroring impl_run_alert above):
+//   1. Copy the completion handler block so it survives selector
+//      return.
+//   2. Snapshot all NSString inputs to std::string on AppKit main.
+//   3. Spawn std::thread for the JNI hop.
+//   4. dispatch_async back to AppKit main to invoke the completion
+//      handler.  Release the copied block inside the lambda.
+// Deviating from this pattern WILL deadlock the same way the dialog
+// selectors did before 480798c -- the bug `480798c` was written to
+// fix.  See Canvas Safeguards.
+// ---------------------------------------------------------------------------
+
+static std::once_flag g_webview_embed_navigation_delegate_once;
+static Class g_webview_embed_navigation_delegate_cls = nil;
+static std::once_flag g_webview_embed_download_delegate_once;
+static Class g_webview_embed_download_delegate_cls = nil;
+
+// Selector IMP: -[WebviewEmbedDownloadDelegate
+//   download:decideDestinationUsingResponse:suggestedFilename:
+//   completionHandler:]
+//
+// The completion handler signature is `void(^)(NSURL * _Nullable url)`;
+// invoking with nil cancels the download.  The Engine* is recovered
+// via objc_getAssociatedObject(download, "eng") -- set by the
+// navigation delegate's didBecomeDownload: when the WKDownload was
+// first handed to us.
+static void impl_dl_decide_destination(id /*self*/, SEL,
+                                       id download,
+                                       id response,
+                                       id suggestedFilename,
+                                       id completionHandler) {
+    Engine *e = (Engine *)objc_getAssociatedObject(download, "eng");
+
+    // Copy the completion handler block so it survives past selector
+    // return.  Same block-lifetime rule as the dialog selectors.
+    id ch = msg(completionHandler, sel("copy"));
+
+    // Snapshot strings on AppKit main BEFORE spawning the worker
+    // thread.  These captures cross the thread boundary as
+    // std::string, which is safe; we never retain NSString instances.
+    std::string filename_utf8 = ns_string_to_utf8(suggestedFilename);
+
+    // Source URL: WKDownload exposes originalRequest -> NSURL ->
+    // absoluteString.  All accessors are safe to call on AppKit main.
+    std::string source_url;
+    {
+        id req = msg(download, sel("originalRequest"));
+        if (req) {
+            id url = msg(req, sel("URL"));
+            if (url) {
+                id abs = msg(url, sel("absoluteString"));
+                source_url = ns_string_to_utf8(abs);
+            }
+        }
+    }
+    std::string mime_utf8 = ns_string_to_utf8(msg<id>(response, sel("MIMEType")));
+    long long expected = (long long)msg<long long>(
+        response, sel("expectedContentLength"));
+    // NSURLResponseUnknownLength is -1; map to -1 in the event.
+    jlong total = (expected < 0) ? -1L : (jlong)expected;
+
+    if (!e || !e->download_callback) {
+        // No Java handler wired.  Cancel the download by firing the
+        // completion handler with nil -- we're already on AppKit main,
+        // no need for dispatch_async.
+        ((void (^)(id))ch)(nil);
+        msg(ch, sel("release"));
+        return;
+    }
+
+    JavaVM *jvm = e->jvm;
+    jobject cb = e->download_callback;
+
+    // Hand off to a worker thread.  AppKit main returns immediately
+    // so the EDT can run the destination handler (which may itself
+    // touch AppKit through Swing dialogs) without contention.
+    std::thread([jvm, cb, filename_utf8, source_url, mime_utf8, total, ch]() {
+        JNIEnv *env = nullptr;
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK
+                || !env) {
+            // JVM attach failed; can't call Java.  Still must fire
+            // the completion handler so the WKDownload doesn't hang.
+            // Cancel.
+            dispatch_async(dispatch_get_main_queue(), ^{
+                ((void (^)(id))ch)(nil);
+                msg(ch, sel("release"));
+            });
+            return;
+        }
+        std::string path_utf8;
+        jstring jname = env->NewStringUTF(filename_utf8.c_str());
+        jstring jurl = env->NewStringUTF(source_url.c_str());
+        jstring jmime = env->NewStringUTF(mime_utf8.c_str());
+        jclass cls = env->GetObjectClass(cb);
+        if (cls) {
+            jmethodID mid = env->GetMethodID(
+                cls, "onDownloadStarting",
+                "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;J)"
+                "Ljava/lang/String;");
+            if (mid) {
+                jobject ret = env->CallObjectMethod(
+                    cb, mid, jname, jurl, jmime, total);
+                if (env->ExceptionCheck()) {
+                    env->ExceptionDescribe();
+                    env->ExceptionClear();
+                } else if (ret) {
+                    const char *utf = env->GetStringUTFChars(
+                        (jstring)ret, nullptr);
+                    if (utf) {
+                        path_utf8 = std::string(utf);
+                        env->ReleaseStringUTFChars((jstring)ret, utf);
+                    }
+                    env->DeleteLocalRef(ret);
+                }
+            }
+            env->DeleteLocalRef(cls);
+        }
+        if (jname) env->DeleteLocalRef(jname);
+        if (jurl) env->DeleteLocalRef(jurl);
+        if (jmime) env->DeleteLocalRef(jmime);
+        jvm->DetachCurrentThread();
+
+        // Java returned.  Fire the completion handler on AppKit main
+        // (WKDownload requires it) with either the chosen path or nil
+        // (cancel).  Release the copied block.
+        std::string captured_path = path_utf8;
+        dispatch_async(dispatch_get_main_queue(), ^{
+            id url = nil;
+            if (!captured_path.empty()) {
+                id ns_path = ns_str(captured_path);
+                url = msg<id, id>(objc_cls("NSURL"),
+                                  sel("fileURLWithPath:"), ns_path);
+            }
+            ((void (^)(id))ch)(url);
+            msg(ch, sel("release"));
+        });
+    }).detach();
+}
+
+// Selector IMP: -[WebviewEmbedNavigationDelegate
+//   webView:navigationAction:didBecomeDownload:]
+// and
+// Selector IMP: -[WebviewEmbedNavigationDelegate
+//   webView:navigationResponse:didBecomeDownload:]
+//
+// Both selectors do the same work: associate the engine on the
+// WKDownload (so the download delegate's selectors can recover it)
+// and set the WKDownload's delegate to the engine's download delegate.
+static void impl_did_become_download_action(id self, SEL, id /*webView*/,
+                                            id /*action*/, id download) {
+    Engine *e = (Engine *)objc_getAssociatedObject(self, "eng");
+    if (!e || !download) return;
+    objc_setAssociatedObject(download, "eng", (id)e,
+                             OBJC_ASSOCIATION_ASSIGN);
+    if (e->download_delegate) {
+        msg<void, id>(download, sel("setDelegate:"), e->download_delegate);
+    }
+}
+
+static void impl_did_become_download_response(id self, SEL, id /*webView*/,
+                                              id /*response*/, id download) {
+    Engine *e = (Engine *)objc_getAssociatedObject(self, "eng");
+    if (!e || !download) return;
+    objc_setAssociatedObject(download, "eng", (id)e,
+                             OBJC_ASSOCIATION_ASSIGN);
+    if (e->download_delegate) {
+        msg<void, id>(download, sel("setDelegate:"), e->download_delegate);
+    }
+}
+
+static Class get_webview_embed_navigation_delegate_cls() {
+    std::call_once(g_webview_embed_navigation_delegate_once, [] {
+        Class c = objc_allocateClassPair((Class)objc_cls("NSObject"),
+                                         "WebviewEmbedNavigationDelegate", 0);
+        // Don't add the WKNavigationDelegate protocol explicitly --
+        // some method-signature checks happen at the protocol-conformance
+        // level and the encoded signatures here cover the only two
+        // selectors we implement.  WKWebView will still dispatch to us
+        // for any selector our class responds to.
+        class_addMethod(c, sel("webView:navigationAction:didBecomeDownload:"),
+                        (IMP)impl_did_become_download_action, "v@:@@@");
+        class_addMethod(c, sel("webView:navigationResponse:didBecomeDownload:"),
+                        (IMP)impl_did_become_download_response, "v@:@@@");
+        objc_registerClassPair(c);
+        g_webview_embed_navigation_delegate_cls = c;
+    });
+    return g_webview_embed_navigation_delegate_cls;
+}
+
+static Class get_webview_embed_download_delegate_cls() {
+    std::call_once(g_webview_embed_download_delegate_once, [] {
+        Class c = objc_allocateClassPair((Class)objc_cls("NSObject"),
+                                         "WebviewEmbedDownloadDelegate", 0);
+        class_addMethod(
+            c,
+            sel("download:decideDestinationUsingResponse:"
+                "suggestedFilename:completionHandler:"),
+            (IMP)impl_dl_decide_destination, "v@:@@@@");
+        objc_registerClassPair(c);
+        g_webview_embed_download_delegate_cls = c;
+    });
+    return g_webview_embed_download_delegate_cls;
+}
+
+// Register (or clear, when cb is null) the Java WebViewDownloadCallback
+// for this engine.  Mirrors cocoa_set_dialog_callback.  The download
+// delegate's selectors read e->download_callback on every dispatch.
+static void cocoa_set_download_callback(Engine *e, JNIEnv *env, jobject cb) {
+    if (!e) return;
+    if (e->download_callback) {
+        env->DeleteGlobalRef(e->download_callback);
+        e->download_callback = nullptr;
+    }
+    if (cb) {
+        e->download_callback = env->NewGlobalRef(cb);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Mouse-down hook on WKWebView.
 //
 // We swizzle -[WKWebView mouseDown:], -[WKWebView rightMouseDown:], and
@@ -3638,6 +4278,38 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
         // uiDelegate is a weak reference per WebKit convention).  Stash
         // it on the engine so cocoa_destroy_engine can release it.
         e->ui_delegate = ui_delegate;
+
+        // Browser-download bridge: install a WKNavigationDelegate (NEW
+        // -- the engine had no navigation delegate before this canvas)
+        // so HTTP responses the engine classifies as downloads route
+        // to Java via DownloadDispatcher.  Gated on WKDownload
+        // availability (macOS 11.3+); on older macOS the class doesn't
+        // exist and the didBecomeDownload: selectors cannot fire.
+        // We skip the install entirely on older macOS, leaving the
+        // engine to use WKWebView's default navigation behaviour
+        // (which silently drops downloads -- the pre-canvas state).
+        if (objc_getClass("WKDownload") != nil) {
+            Class nav_cls = get_webview_embed_navigation_delegate_cls();
+            id nav_delegate = msg((id)nav_cls, sel("new"));
+            objc_setAssociatedObject(
+                nav_delegate, "eng", (id)e, OBJC_ASSOCIATION_ASSIGN);
+            msg<void, id>(e->webview,
+                          sel("setNavigationDelegate:"), nav_delegate);
+            e->navigation_delegate = nav_delegate;
+
+            Class dl_cls = get_webview_embed_download_delegate_cls();
+            id dl_delegate = msg((id)dl_cls, sel("new"));
+            objc_setAssociatedObject(
+                dl_delegate, "eng", (id)e, OBJC_ASSOCIATION_ASSIGN);
+            e->download_delegate = dl_delegate;
+        } else {
+            static std::atomic_flag warned = ATOMIC_FLAG_INIT;
+            if (!warned.test_and_set()) {
+                fprintf(stderr,
+                        "[webview] WKDownload unavailable (macOS < 11.3); "
+                        "download support disabled\n");
+            }
+        }
         // Install the external.invoke shim.
         id script = msg(objc_cls("WKUserScript"), sel("alloc"));
         script = msg<id, id, long, BOOL>(
@@ -3774,6 +4446,25 @@ static void cocoa_destroy_engine(Engine *e) {
         e->dialog_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
+    // Same treatment for the download-callback global ref BEFORE the
+    // navigation / download delegates are released on AppKit main:
+    // any in-flight WKDownloadDelegate selector that already passed
+    // the e->download_callback null check observes a now-null field
+    // when it gets to the JNI hop and fires the completion handler
+    // with nil (cancel).  Released here -- outside the async lambda
+    // -- because the lambda runs on AppKit main later and we still
+    // have the EDT JNIEnv available right now.
+    if (e->download_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->download_callback);
+        e->download_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     cocoa_run_on_main_async([e] {
         // Mark destroyed FIRST.  Any LATER-firing lambdas that read this
         // flag short-circuit; FIFO ordering on the main queue makes
@@ -3793,6 +4484,11 @@ static void cocoa_destroy_engine(Engine *e) {
             // the cleared field (WKWebView holds a weak reference to
             // uiDelegate per Apple's convention).
             msg<void, id>(e->webview, sel("setUIDelegate:"), (id)nullptr);
+            // Same treatment for the navigation delegate: clear FIRST,
+            // then release.  Safe to call even when no delegate was
+            // installed (older macOS without WKDownload).
+            msg<void, id>(e->webview,
+                          sel("setNavigationDelegate:"), (id)nullptr);
             // If we added the WKWebView as a subview, remove it before
             // releasing so AppKit unwinds the view hierarchy cleanly.
             msg<void>(e->webview, sel("removeFromSuperview"));
@@ -3800,6 +4496,25 @@ static void cocoa_destroy_engine(Engine *e) {
         if (e->ui_delegate) {
             msg<void>(e->ui_delegate, sel("release"));
             e->ui_delegate = nullptr;
+        }
+        if (e->navigation_delegate) {
+            msg<void>(e->navigation_delegate, sel("release"));
+            e->navigation_delegate = nullptr;
+        }
+        if (e->download_delegate) {
+            // The download delegate is shared across any concurrent
+            // WKDownloads; each download's associated Engine* is
+            // OBJC_ASSOCIATION_ASSIGN (non-owning) and becomes a
+            // dangling pointer once we free the Engine below.  Any
+            // late WKDownload selector firing after this point would
+            // recover that dangling Engine* and either see the
+            // null download_callback (cancel path) or, worst case,
+            // walk into freed memory.  Releasing the delegate here
+            // does NOT detach its association from outstanding
+            // WKDownloads, but in practice the WKDownloads are
+            // released by WKWebView teardown before we get here.
+            msg<void>(e->download_delegate, sel("release"));
+            e->download_delegate = nullptr;
         }
         if (e->host_view) {
             msg<void>(e->host_view, sel("release"));
@@ -4475,6 +5190,18 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
 #endif
 }
 
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1download_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    if (wv == 0) return;
+#ifdef WEBVIEW_GTK
+    embed::gtk_set_download_callback((embed::Engine *)wv, env, cb);
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_set_download_callback((embed::Engine *)wv, env, cb);
+#else
+    (void)env; (void)cb;
+#endif
+}
+
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1dialog_1callback
   (JNIEnv *env, jclass, jlong peer, jobject cb) {
     if (peer == 0) return;
@@ -4484,6 +5211,17 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
     // macOS / Windows have no offscreen engine; the Java
     // OffscreenWebView.setDialogCallback never gets here because
     // OffscreenWebView.create returns null on those platforms.
+    (void)env; (void)cb;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1download_1callback
+  (JNIEnv *env, jclass, jlong peer, jobject cb) {
+    if (peer == 0) return;
+#ifdef WEBVIEW_GTK
+    embed::gtk_off_set_download_callback((embed::OffEngine *)peer, env, cb);
+#else
+    // macOS / Windows: offscreen engine is a stub; no-op.
     (void)env; (void)cb;
 #endif
 }

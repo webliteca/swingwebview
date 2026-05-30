@@ -316,6 +316,31 @@ public class OffscreenWebView {
         return this;
     }
 
+    /**
+     * Register (or clear, by passing {@code null}) a callback invoked
+     * when the embedded page initiates a download in the offscreen
+     * engine.  See
+     * {@link EmbeddedWebView#setDownloadCallback(WebViewDownloadCallback)}
+     * for the full contract — semantics are identical.
+     *
+     * <p>On macOS / Windows, where the offscreen engine itself is a
+     * stub, this method has no effect — the native stub is a no-op.
+     * Linux lightweight is the only platform where the offscreen
+     * path actually dispatches download requests; downloads on
+     * Linux flow through the shared
+     * {@code WebKitWebContext::download-started} signal connection
+     * the heavyweight bridge already installs (one connection per
+     * process, routed via the shared WebView-to-engine map).
+     */
+    public OffscreenWebView setDownloadCallback(WebViewDownloadCallback cb) {
+        checkAlive();
+        if (cb != null) {
+            heap.add(cb);
+        }
+        WebViewNative.webview_offscreen_set_download_callback(peer, cb);
+        return this;
+    }
+
     /** Release native resources. */
     public void dispose() {
         if (peer != 0L) {

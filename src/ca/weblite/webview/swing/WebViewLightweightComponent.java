@@ -11,6 +11,7 @@ import ca.weblite.webview.GdkInput;
 import ca.weblite.webview.OffscreenWebView;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewDialogCallback;
+import ca.weblite.webview.WebViewDownloadCallback;
 import ca.weblite.webview.WebViewMouseDispatcher;
 
 import java.awt.Color;
@@ -272,6 +273,21 @@ public class WebViewLightweightComponent extends WebViewComponent {
                     multiple, mimeTypes, extensions, pageUrl, frameUrl);
             }
         });
+        // Install the download bridge alongside the dialog bridge:
+        // same anchoring (heap), same EDT-marshal semantics.  On
+        // Linux this wires the offscreen engine into the shared
+        // WebKitWebContext::download-started signal handler; on
+        // macOS / Windows the native offscreen stub no-ops.
+        engine.setDownloadCallback(new WebViewDownloadCallback() {
+            @Override
+            public String onDownloadStarting(String suggestedFilename,
+                                             String sourceUrl,
+                                             String mimeType,
+                                             long totalBytes) {
+                return downloadDispatcher.dispatchDownload(
+                    suggestedFilename, sourceUrl, mimeType, totalBytes);
+            }
+        });
         for (String js : pendingInit) {
             engine.addOnBeforeLoad(js);
         }
@@ -303,6 +319,7 @@ public class WebViewLightweightComponent extends WebViewComponent {
         // native side mid-teardown returns the safe fallback without
         // invoking the handler against a half-disposed component.
         dialogDispatcher.disposeAll();
+        downloadDispatcher.disposeAll();
         if (engine != null) {
             OffscreenWebView ow = engine;
             engine = null;
