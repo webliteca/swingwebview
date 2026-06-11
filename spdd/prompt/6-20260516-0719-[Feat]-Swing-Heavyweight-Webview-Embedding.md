@@ -20,7 +20,17 @@ generated_at: 2026-05-16T07:19:13-07:00
   - Track Swing visibility transitions (e.g. tab switching in a
     `JTabbedPane`, parent hidden) so the heavyweight peer hides
     when the Swing-side region is not showing
-    (`WebViewHeavyweightComponent.java:208`).
+    (`WebViewHeavyweightComponent.java:208`). Visibility is not
+    driven by transitions alone: the peer's *initial* visibility
+    is seeded from the component's current showing state at
+    peer-create time, so a peer created while its Swing region
+    is not showing (e.g. the component is built inside a
+    not-selected `JTabbedPane` tab or other not-showing nested
+    container) starts hidden instead of defaulting to visible.
+    Without this seed the heavyweight peer would paint over
+    whatever region is actually showing — most visibly on macOS,
+    where the native attach is asynchronous and can complete
+    after the tab has already been deselected.
   - Replay pending URL, init scripts, and bindings at peer-create
     time (`WebViewHeavyweightComponent.java:152`).
   - Resize the native peer when the Swing region changes
@@ -1271,7 +1281,23 @@ File: `src/ca/weblite/webview/swing/WebViewHeavyweightComponent.java`
        `embedded.addJavascriptCallback`
        (`WebViewHeavyweightComponent.java:155`). Navigate to
        `pendingUrl` (`WebViewHeavyweightComponent.java:158`).
-       Finally call `sizeNative()` to apply current bounds.
+       Call `sizeNative()` to apply current bounds.
+       **Finally, seed the peer's initial visibility from the
+       component's current showing state**: call
+       `embedded.setVisible(isShowing())`. This closes the
+       create-while-hidden race — a peer created while its Swing
+       region is not showing (e.g. built inside a not-selected
+       `JTabbedPane` tab) must not default to visible. The
+       `EmbeddedCanvas` `HierarchyListener` only fires on
+       `SHOWING_CHANGED` *transitions* and any hide-transition
+       that occurred before `embedded` was assigned was dropped
+       (the listener early-returns when `embedded == null`), so
+       seeding here is the only path that hides such a peer. On
+       macOS the native dispatch queue is FIFO, so the seeded
+       `setVisible(false)` is ordered after the asynchronous
+       attach epilogue's `addSubview:` and reliably hides the
+       WKWebView even though the attach completed after the tab
+       was deselected.
 
 ### 6. Size Native Peer — sizeNative
 File: `src/ca/weblite/webview/swing/WebViewHeavyweightComponent.java`
@@ -2495,6 +2521,20 @@ Files:
 - HierarchyListener only acts on `SHOWING_CHANGED` events to
   avoid running the visibility/resize logic on unrelated
   hierarchy changes (`WebViewHeavyweightComponent.java:211`).
+- The heavyweight peer must never paint while its Swing region
+  is not showing. Because the `HierarchyListener` reacts only to
+  `SHOWING_CHANGED` *transitions* (and drops any transition that
+  fires before `embedded` is assigned), transition tracking
+  alone does not cover the create-while-hidden case. `createPeer`
+  therefore seeds the peer's visibility from `isShowing()` as its
+  final step so a peer attached inside a not-showing region
+  (not-selected `JTabbedPane` tab, hidden ancestor) starts hidden
+  rather than defaulting to visible. This matters most on macOS,
+  where the asynchronous native attach can complete after the
+  region has been deselected; the seeded `setVisible(false)` is
+  FIFO-ordered after the attach epilogue and hides the peer
+  without requiring the user to toggle the tab to force a
+  `SHOWING_CHANGED`.
 - `EmbeddedWebView.checkAlive` guards every JNI operation
   against use-after-dispose (`EmbeddedWebView.java:204`).
 - `WebViewHeavyweightComponent.openDevTools()` returns
