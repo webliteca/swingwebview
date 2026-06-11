@@ -537,6 +537,20 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
                     multiple, mimeTypes, extensions, pageUrl, frameUrl);
             }
         });
+        // Seed the peer's initial visibility from the component's current
+        // showing state.  The HierarchyListener (see EmbeddedCanvas) only
+        // fires on SHOWING_CHANGED *transitions*, and any hide-transition
+        // that occurred before `embedded` was assigned was dropped (the
+        // listener early-returns while embedded == null).  Without this
+        // seed a peer created while its Swing region is not showing -- e.g.
+        // the component is built inside a not-selected JTabbedPane tab or
+        // other not-showing nested container -- would default to visible
+        // and paint over whatever region is actually showing.  On macOS
+        // the native attach is asynchronous and the dispatch queue is
+        // FIFO, so this setVisible(false) is ordered after the attach
+        // epilogue's addSubview: and reliably hides the WKWebView even
+        // when the attach completes after the tab has been deselected.
+        embedded.setVisible(isShowing());
     }
 
     private void handleNativeClick() {
