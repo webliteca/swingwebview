@@ -508,6 +508,33 @@ generated_at: 2026-05-16T07:19:13-07:00
   inside Swing requires converting the canvas's location to the
   AWT Window content-pane coordinate space and subtracting the
   window insets (`WebViewHeavyweightComponent.java:171`).
+- **ABI-correct Objective-C struct-return dispatch on macOS.**
+  The generic typed `objc_msgSend` dispatch helper used for
+  native AppKit calls (`src_c/webview_embed.cpp`) is only valid
+  for selectors whose return value comes back in registers and
+  for passing struct-by-value *arguments*. Selectors that
+  *return* a struct larger than 16 bytes — notably `NSRect` /
+  `CGRect` (32 bytes), as produced by the `-[NSView bounds]`
+  query used to position the WKWebView on the
+  `NSWindow.contentView` host path in `cocoa_set_bounds` — MUST
+  be dispatched through an architecture-correct struct-return
+  variant: `objc_msgSend_stret` on `x86_64`, and plain
+  `objc_msgSend` on `arm64` (which has no `objc_msgSend_stret`
+  and returns large structs via the `x8` register). On the
+  `x86_64` SysV ABI a large struct return is passed by a hidden
+  pointer in the first integer-argument register, so dispatching
+  such a selector through plain `objc_msgSend` shifts the
+  receiver/selector registers by one and the runtime dereferences
+  the stack return-buffer pointer as the receiver — a SIGSEGV in
+  `objc_msgSend`. This is why heavyweight embedding crashed on
+  Intel Macs (issue #36) whenever the host view resolved to
+  `NSWindow.contentView` — the path taken under the JetBrains
+  Runtime, which exposes no per-Canvas AWT `NSView`. The
+  per-Canvas AWT `NSView` path (`host_is_awt == true`) never
+  queries `bounds` and is unaffected. This is a pure
+  ABI-correctness requirement: observable geometry and
+  positioning behavior is unchanged on every platform that
+  already worked.
 - **Trade-off accepted: heavyweight popup interaction.** Because
   the WebView is a real heavyweight peer, lightweight Swing
   popups (`JComboBox` dropdowns, tooltips, menus) render BEHIND

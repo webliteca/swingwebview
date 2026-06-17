@@ -295,16 +295,26 @@ run_demo() {
 phase_b() {
   hdr "Phase B: end-to-end demo under JBR 25 (webview $WEBVIEW_VERSION)"
 
-  # 1. Fetch the library jar (bundles the native dylib; no other runtime deps).
-  local jar="$CACHE/webview-$WEBVIEW_VERSION.jar"
-  if [[ ! -f "$jar" ]]; then
-    local url="https://repo1.maven.org/maven2/ca/weblite/webview/$WEBVIEW_VERSION/webview-$WEBVIEW_VERSION.jar"
-    say "Downloading $url"
-    if ! curl -fL --retry 3 -o "$jar" "$url"; then
-      bad "Could not download webview-$WEBVIEW_VERSION.jar"; return 2
+  # 1. Obtain the library jar (bundles the native dylib; no other runtime deps).
+  #    Set WEBVIEW_JAR=/path/to/locally-built/webview.jar to verify a patched
+  #    build (e.g. after ./build-mac.sh && mvn -q package); otherwise the
+  #    released version is pulled from Maven Central.
+  local jar
+  if [[ -n "${WEBVIEW_JAR:-}" ]]; then
+    [[ -f "$WEBVIEW_JAR" ]] || { bad "WEBVIEW_JAR set but not found: $WEBVIEW_JAR"; return 2; }
+    jar="$WEBVIEW_JAR"
+    ok "Using local library jar (verifying patched build): $jar"
+  else
+    jar="$CACHE/webview-$WEBVIEW_VERSION.jar"
+    if [[ ! -f "$jar" ]]; then
+      local url="https://repo1.maven.org/maven2/ca/weblite/webview/$WEBVIEW_VERSION/webview-$WEBVIEW_VERSION.jar"
+      say "Downloading $url"
+      if ! curl -fL --retry 3 -o "$jar" "$url"; then
+        bad "Could not download webview-$WEBVIEW_VERSION.jar"; return 2
+      fi
     fi
+    ok "Library jar: $jar"
   fi
-  ok "Library jar: $jar"
 
   # 2. Write the exact demo from the issue.
   cat > "$WORK/Main.java" <<'JAVA'
