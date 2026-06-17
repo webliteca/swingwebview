@@ -2064,6 +2064,28 @@ static inline Ret msg(id receiver, SEL selector, Args... args) {
     return reinterpret_cast<Fn>(objc_msgSend)(receiver, selector, args...);
 }
 
+// Struct-return-safe dispatch.  msg<>() above is only valid for selectors
+// whose return value comes back in registers (and for passing struct-by-value
+// *arguments*).  Selectors that *return* a struct larger than 16 bytes --
+// notably NSRect / CGRect (32 bytes), e.g. -[NSView bounds] -- must NOT go
+// through plain objc_msgSend on x86_64: the SysV ABI passes such returns via a
+// hidden pointer in the first integer-argument register, which shifts self/cmd
+// by one slot so the runtime dereferences the stack return-buffer as the
+// receiver -- a SIGSEGV in objc_msgSend.  x86_64 must dispatch these through
+// objc_msgSend_stret; arm64 has no objc_msgSend_stret and returns large
+// structs via the x8 register, so plain objc_msgSend is correct there.  See
+// the "ABI-correct Objective-C struct-return dispatch on macOS" norm in the
+// heavyweight-embedding Canvas (issue #36).
+template <typename Ret, typename... Args>
+static inline Ret msg_stret(id receiver, SEL selector, Args... args) {
+    using Fn = Ret (*)(id, SEL, Args...);
+#if defined(__x86_64__)
+    return reinterpret_cast<Fn>(objc_msgSend_stret)(receiver, selector, args...);
+#else
+    return reinterpret_cast<Fn>(objc_msgSend)(receiver, selector, args...);
+#endif
+}
+
 static id ns_str(const char *s) {
     return msg(objc_cls("NSString"), sel("stringWithUTF8String:"), s);
 }
@@ -3885,7 +3907,7 @@ static void cocoa_set_bounds(Engine *e, int x, int y, int w, int h) {
                               CGRectMake(0, 0, fw, fh));
             return;
         }
-        CGRect b = msg<CGRect>(e->host_view, sel("bounds"));
+        CGRect b = msg_stret<CGRect>(e->host_view, sel("bounds"));
         BOOL flipped = msg<BOOL>(e->host_view, sel("isFlipped"));
         CGFloat outY = flipped
             ? fy
