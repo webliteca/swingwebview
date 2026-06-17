@@ -13,7 +13,7 @@ Add the dependency to your `pom.xml`:
 <dependency>
     <groupId>ca.weblite</groupId>
     <artifactId>webview</artifactId>
-    <version>1.0.7</version>
+    <version>1.0.9</version>
 </dependency>
 ```
 
