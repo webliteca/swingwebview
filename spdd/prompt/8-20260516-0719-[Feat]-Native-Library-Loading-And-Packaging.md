@@ -302,6 +302,16 @@ Files: `.github/workflows/build.yml`,
      `maven-release.yml` publishes, gated on `v*` tag pushes.
 
 ## N · Norms
+- The developer `build-*.sh` scripts must quote every shell
+  expansion that carries a filesystem path — `"${JAVA_HOME}"`
+  above all — in compiler include/library flags and anywhere
+  else a path is interpolated. JDKs are routinely installed at
+  paths containing spaces (e.g. a JetBrains Runtime bundled
+  inside `/Applications/IntelliJ IDEA CE.app/Contents/jbr/Contents/Home`);
+  an unquoted `-I${JAVA_HOME}/include` word-splits on the space
+  and the build fails with "no such file or directory: 'IDEA'".
+  Quoting keeps the scripts usable with any JDK regardless of
+  where it lives.
 - Use `NativeLoader.loadLibrary` (or rely on the static
   initializer in `WebViewNative`) — do not call
   `System.loadLibrary` or `System.load` directly from feature
