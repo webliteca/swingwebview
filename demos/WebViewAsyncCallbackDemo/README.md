@@ -57,8 +57,23 @@ compiles this demo, and launches it.
 
 ## What you should see
 
-A window with a text field and buttons. Click them and watch the in-page
-log:
+A split window: the WebView on top (a heading, a text field pre-filled
+with `Hello, WebView`, a row of five buttons, and an in-page log box),
+and a Java-side log pane below it. Clicking a button logs the round trip
+in **both** panes — the in-page log shows the awaited result, the Java
+pane shows the thread hops (`bind on AppKit/native thread` →
+`worker thread` → `resolve`), which is the visible proof that the work
+never runs on, or blocks, the UI thread.
+
+> **Blank / thin strip on the left edge?** That was a sizing bug in an
+> earlier version of this demo where the WebView was the bare frame's
+> only child: on macOS the native WKWebView attaches asynchronously and
+> could be left at a near-zero frame with no later relayout to fix it.
+> The demo now hosts the WebView in a `JSplitPane` and re-asserts the
+> divider after the frame is shown, matching the other working demos. If
+> you still see it, resizing the window by a few pixels forces a repaint.
+
+Click the buttons and watch the in-page log:
 
 - **reverse** / **upper** — Java returns a transformed string; the
   `await`ed value appears in the log.

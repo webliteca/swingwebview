@@ -30,13 +30,19 @@ import ca.weblite.webview.swing.WebViewComponent;
 import java.awt.BorderLayout;
 import java.awt.Dimension;
 import java.awt.EventQueue;
+import java.awt.Font;
 import java.io.UnsupportedEncodingException;
 import java.util.Base64;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
 import java.util.concurrent.Executors;
+import java.util.function.Consumer;
 import javax.swing.JFrame;
 import javax.swing.JPopupMenu;
+import javax.swing.JScrollPane;
+import javax.swing.JSplitPane;
+import javax.swing.JTextArea;
+import javax.swing.SwingUtilities;
 import javax.swing.ToolTipManager;
 
 public class WebViewAsyncCallbackDemo {
@@ -73,6 +79,17 @@ public class WebViewAsyncCallbackDemo {
 
         final WebViewComponent wv = WebViewComponent.create();
 
+        // Java-side log.  The page has its own log, but this one proves the
+        // threading on the Java side: the inbound call lands on the native
+        // UI thread, the work runs on a worker thread, and nothing blocks.
+        final JTextArea javaLog = new JTextArea(8, 80);
+        javaLog.setEditable(false);
+        javaLog.setFont(new Font(Font.MONOSPACED, Font.PLAIN, 12));
+        final Consumer<String> log = msg -> SwingUtilities.invokeLater(() -> {
+            javaLog.append(msg + "\n");
+            javaLog.setCaretPosition(javaLog.getDocument().getLength());
+        });
+
         // 1. Install the JS glue at document-start of every page.  It
         //    defines window.callJava(method, arg) -> Promise, and the
         //    window.__rpc_resolve(b64) sink that Java calls back into.
@@ -81,17 +98,34 @@ public class WebViewAsyncCallbackDemo {
         // 2. Register the (void) inbound binding.  This is a STANDARD
         //    addJavascriptCallback — the result travels back out-of-band
         //    via eval, so the binding itself stays fire-and-forget.
-        wv.addJavascriptCallback(INBOUND_BINDING, raw -> handleCall(wv, raw));
+        wv.addJavascriptCallback(INBOUND_BINDING, raw -> handleCall(wv, raw, log));
 
         wv.setUrl("data:text/html;charset=utf-8," + PAGE_HTML);
 
-        wv.setPreferredSize(new Dimension(820, 560));
+        // Embed the WebView in a split pane with the Java log below.  This
+        // matches the layout of the other working demos: a heavyweight
+        // native WebView that is the *sole* child of a bare frame can be
+        // left at a near-zero native frame because its async attach (on
+        // macOS) completes with no subsequent relayout to re-size it.
+        // Living inside a split pane guarantees a post-show relayout, and
+        // the explicit setDividerLocation below forces one more after the
+        // frame is realized.
+        wv.setPreferredSize(new Dimension(900, 540));
+        final JSplitPane split = new JSplitPane(JSplitPane.VERTICAL_SPLIT,
+            wv, new JScrollPane(javaLog));
+        split.setResizeWeight(0.72);
+
         JFrame frame = new JFrame("WebViewAsyncCallbackDemo");
         frame.setDefaultCloseOperation(JFrame.EXIT_ON_CLOSE);
-        frame.getContentPane().add(wv, BorderLayout.CENTER);
+        frame.getContentPane().add(split, BorderLayout.CENTER);
         frame.pack();
         frame.setLocationRelativeTo(null);
         frame.setVisible(true);
+
+        // Re-assert the divider once the frame is realized; the resulting
+        // canvas resize re-runs the heavyweight peer's sizeNative() after
+        // the macOS async attach has had a chance to complete.
+        EventQueue.invokeLater(() -> split.setDividerLocation(0.72));
     }
 
     /**
@@ -101,7 +135,8 @@ public class WebViewAsyncCallbackDemo {
      * UI thread is never held while the "business logic" runs — this is
      * what keeps the round trip deadlock-free.
      */
-    private static void handleCall(WebViewComponent wv, String rawEnvelope) {
+    private static void handleCall(WebViewComponent wv, String rawEnvelope,
+                                   Consumer<String> log) {
         // The native engine hands us {"name":..,"seq":..,"args":["<b64>"]}.
         String b64 = extractFirstArg(rawEnvelope);
         if (b64 == null) return;
@@ -119,17 +154,27 @@ public class WebViewAsyncCallbackDemo {
         final String method = rec.substring(p1 + 1, p2);
         final String arg = rec.substring(p2 + 1);
 
+        log.accept("<- " + method + "(\"" + arg + "\")  [bind on "
+            + Thread.currentThread().getName() + "]");
+
         // Do the work asynchronously; resolve (or reject) when it's done.
         CompletableFuture
-            .supplyAsync(() -> invokeMethod(method, arg), WORKER)
+            .supplyAsync(() -> {
+                log.accept("   computing #" + id + " [worker "
+                    + Thread.currentThread().getName() + "]");
+                return invokeMethod(method, arg);
+            }, WORKER)
             .whenComplete((result, error) -> {
                 if (error != null) {
                     Throwable cause = error.getCause() != null
                         ? error.getCause() : error;
+                    log.accept("-> reject #" + id + ": "
+                        + cause.getClass().getSimpleName());
                     resolve(wv, id, false,
                         cause.getClass().getSimpleName() + ": "
                             + cause.getMessage());
                 } else {
+                    log.accept("-> resolve #" + id + " = \"" + result + "\"");
                     resolve(wv, id, true, result);
                 }
             });
