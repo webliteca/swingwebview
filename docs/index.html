@@ -191,8 +191,9 @@ public class Demo {
 <section id="js-interop" class="block alt-bg">
   <h2>Talking to JavaScript</h2>
   <p class="muted">
-    Three methods cover the whole interop surface &mdash;
-    fire-and-forget, round-trip-with-result, and page-initiated callbacks.
+    Four methods cover the whole interop surface &mdash; fire-and-forget,
+    round-trip-with-result, page-initiated callbacks, and value-returning
+    Java functions.
   </p>
 
   <div class="three-col">
@@ -213,10 +214,18 @@ public class Demo {
 
     <div>
       <h3><code>addJavascriptCallback(...)</code></h3>
-      <p>Exposes a Java callback at <code>window.&lt;name&gt;(arg)</code> for the page to invoke.</p>
+      <p>Exposes a fire-and-forget Java callback at <code>window.&lt;name&gt;(arg)</code> for the page to invoke.</p>
 <pre><code class="language-java">wv.addJavascriptCallback("notify", arg -&gt; {
     System.out.println("page said: " + arg);
 });</code></pre>
+    </div>
+
+    <div>
+      <h3><code>addJavascriptFunction(...)</code></h3>
+      <p>Exposes a <em>value-returning</em> Java function &mdash; the page <code>await</code>s a result. No JavaScript glue; the sync handler runs off the UI thread.</p>
+<pre><code class="language-java">wv.addJavascriptFunction("reverse", (String arg) -&gt;
+    new StringBuilder(arg).reverse().toString());
+// page:  const r = await window.reverse("abc");</code></pre>
     </div>
 
   </div>
@@ -276,6 +285,10 @@ public class Demo {
     <a class="demo-card" href="https://github.com/webliteca/swingwebview/tree/master/demos/WebViewAsyncEvalDemo" target="_blank" rel="noopener">
       <h3>Async JS eval</h3>
       <p>Primitive / object / Promise results, exceptions surfacing as <code>JavaScriptEvalException</code>, EDT continuations.</p>
+    </a>
+    <a class="demo-card" href="https://github.com/webliteca/swingwebview/tree/master/demos/WebViewAsyncCallbackDemo" target="_blank" rel="noopener">
+      <h3>JS&rarr;Java functions</h3>
+      <p>Value-returning <code>addJavascriptFunction</code>: sync handlers run off-thread, async <code>CompletableFuture</code> handlers, errors rejecting the page Promise &mdash; no JS glue.</p>
     </a>
     <a class="demo-card" href="https://github.com/webliteca/swingwebview/tree/master/demos/WebViewDialogDemo" target="_blank" rel="noopener">
       <h3>Dialog handlers</h3>
