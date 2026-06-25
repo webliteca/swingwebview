@@ -14,6 +14,7 @@ import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewClickCallback;
 import ca.weblite.webview.WebViewDialogCallback;
 import ca.weblite.webview.WebViewFocusCallback;
+import ca.weblite.webview.WebViewAttachListener;
 import ca.weblite.webview.WebViewMouseDispatcher;
 import java.awt.AWTEvent;
 import java.awt.event.AWTEventListener;
@@ -514,6 +515,22 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         }
         embedded.navigate(pendingUrl);
         sizeNative();
+        // On macOS the WKWebView attaches asynchronously: the sizeNative()
+        // above runs before the native view exists and is a no-op, and a
+        // frame that never receives a later AWT resize would leave the
+        // WebView at a zero/stale frame (blank).  Re-run sizeNative() once
+        // the attach resolves.  The listener fires on the EDT (immediately
+        // on the next tick on Windows/Linux, where attach is synchronous).
+        embedded.addOnAttachComplete(new WebViewAttachListener() {
+            @Override
+            public void onAttached(EmbeddedWebView webView) {
+                sizeNative();
+            }
+            @Override
+            public void onAttachFailed(EmbeddedWebView webView, Throwable cause) {
+                // Engine is unusable; existing teardown paths discard it.
+            }
+        });
         // Install the native focus callback so we can mirror WKWebView's
         // first-responder state into Swing's visual focus indicators.
         // The lambda is anchored in EmbeddedWebView.heap via

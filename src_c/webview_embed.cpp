@@ -3921,6 +3921,45 @@ static void cocoa_navigate(Engine *e, std::string url) {
     cocoa_run_on_main_async([=] {
         if (!e || e->destroyed.load()) return;
         if (!e->webview) return;
+        // WKWebView's loadRequest: silently refuses data: URLs (a
+        // long-standing WKWebView restriction) -- the page renders blank
+        // with no error.  Route data:text/html through
+        // loadHTMLString:baseURL: instead, decoding the body from base64
+        // or percent-encoding as the prefix indicates.
+        static const std::string DATA_HTML = "data:text/html";
+        if (url.compare(0, DATA_HTML.size(), DATA_HTML) == 0) {
+            size_t comma = url.find(',');
+            if (comma != std::string::npos) {
+                std::string meta = url.substr(0, comma);
+                std::string body = url.substr(comma + 1);
+                id html = nullptr;
+                if (meta.find(";base64") != std::string::npos) {
+                    id b64 = ns_str(body.c_str());
+                    id data = msg<id, id, unsigned long>(
+                        msg<id>(objc_cls("NSData"), sel("alloc")),
+                        sel("initWithBase64EncodedString:options:"),
+                        b64, (unsigned long)0);
+                    if (data) {
+                        // NSUTF8StringEncoding == 4
+                        html = msg<id, id, unsigned long>(
+                            msg<id>(objc_cls("NSString"), sel("alloc")),
+                            sel("initWithData:encoding:"),
+                            data, (unsigned long)4);
+                    }
+                } else {
+                    id raw = ns_str(body.c_str());
+                    id decoded = msg<id, id>(
+                        raw, sel("stringByRemovingPercentEncoding"));
+                    html = decoded ? decoded : raw;
+                }
+                if (html) {
+                    msg<void, id, id>(e->webview,
+                                      sel("loadHTMLString:baseURL:"),
+                                      html, (id)nullptr);
+                    return;
+                }
+            }
+        }
         id nsurl = msg<id, id>(objc_cls("NSURL"), sel("URLWithString:"),
                                ns_str(url.c_str()));
         id req = msg<id, id>(objc_cls("NSURLRequest"),
