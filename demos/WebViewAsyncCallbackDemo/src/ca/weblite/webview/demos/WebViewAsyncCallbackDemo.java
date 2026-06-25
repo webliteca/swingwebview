@@ -27,11 +27,17 @@ package ca.weblite.webview.demos;
 
 import ca.weblite.webview.swing.WebViewComponent;
 
+import com.sun.net.httpserver.HttpServer;
+
 import java.awt.BorderLayout;
 import java.awt.Dimension;
 import java.awt.EventQueue;
 import java.awt.Font;
+import java.io.IOException;
+import java.io.OutputStream;
 import java.io.UnsupportedEncodingException;
+import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
 import java.util.Base64;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Executor;
@@ -100,16 +106,17 @@ public class WebViewAsyncCallbackDemo {
         //    via eval, so the binding itself stays fire-and-forget.
         wv.addJavascriptCallback(INBOUND_BINDING, raw -> handleCall(wv, raw, log));
 
-        wv.setUrl("data:text/html;charset=utf-8," + PAGE_HTML);
+        // Serve the page over a localhost HTTP server instead of a data:
+        // URL.  The embedded macOS engine navigates via WKWebView's
+        // loadRequest:, which silently refuses data: URLs (a long-standing
+        // WKWebView restriction) -- the page would load fine in a normal
+        // browser but show blank in the embedded view.  An http://localhost
+        // URL loads identically to any remote site (loopback is exempt from
+        // App Transport Security, so plain HTTP is fine).
+        int port = startPageServer();
+        wv.setUrl("http://localhost:" + port + "/");
 
-        // Embed the WebView in a split pane with the Java log below.  This
-        // matches the layout of the other working demos: a heavyweight
-        // native WebView that is the *sole* child of a bare frame can be
-        // left at a near-zero native frame because its async attach (on
-        // macOS) completes with no subsequent relayout to re-size it.
-        // Living inside a split pane guarantees a post-show relayout, and
-        // the explicit setDividerLocation below forces one more after the
-        // frame is realized.
+        // Embed the WebView in a split pane with the Java log below.
         wv.setPreferredSize(new Dimension(900, 540));
         final JSplitPane split = new JSplitPane(JSplitPane.VERTICAL_SPLIT,
             wv, new JScrollPane(javaLog));
@@ -121,31 +128,37 @@ public class WebViewAsyncCallbackDemo {
         frame.pack();
         frame.setLocationRelativeTo(null);
         frame.setVisible(true);
+    }
 
-        // Workaround for a heavyweight-component limitation: on macOS the
-        // native WKWebView attaches ASYNCHRONOUSLY, but
-        // WebViewHeavyweightComponent only positions it on a resize/move
-        // event -- it does not re-run sizeNative() when the async attach
-        // completes.  The synchronous sizeNative() at first paint therefore
-        // no-ops (the native view isn't ready yet), and a simple frame may
-        // never get a later resize, leaving the WebView at a zero/stale
-        // frame (blank).  Nudge the layout a few times across the first
-        // second so at least one resize lands after the attach resolves.
-        // The real fix belongs in the library (re-size on attach
-        // completion); see this demo's README.
-        final int[] ticks = {0};
-        final javax.swing.Timer nudge = new javax.swing.Timer(250, null);
-        nudge.addActionListener(ev -> {
-            split.setDividerLocation(0.72);
-            Dimension sz = frame.getSize();
-            // Net-zero jiggle: a real size delta is what fires the
-            // canvas's componentResized -> sizeNative path.
-            frame.setSize(sz.width, sz.height + (ticks[0] % 2 == 0 ? 1 : -1));
-            if (++ticks[0] >= 4) nudge.stop();
-        });
-        nudge.setInitialDelay(200);
-        nudge.setRepeats(true);
-        nudge.start();
+    /**
+     * Start a tiny localhost HTTP server that serves {@link #PAGE_HTML} at
+     * {@code /}.  Returns the chosen ephemeral port.  Bound to the loopback
+     * interface only; daemon-threaded so it never blocks JVM exit.
+     */
+    private static int startPageServer() {
+        try {
+            HttpServer server = HttpServer.create(
+                new InetSocketAddress("localhost", 0), 0);
+            final byte[] body = PAGE_HTML.getBytes(StandardCharsets.UTF_8);
+            server.createContext("/", exchange -> {
+                exchange.getResponseHeaders().set(
+                    "Content-Type", "text/html; charset=utf-8");
+                exchange.sendResponseHeaders(200, body.length);
+                try (OutputStream os = exchange.getResponseBody()) {
+                    os.write(body);
+                }
+            });
+            Executor pool = Executors.newCachedThreadPool(r -> {
+                Thread t = new Thread(r, "page-http");
+                t.setDaemon(true);
+                return t;
+            });
+            server.setExecutor(pool);
+            server.start();
+            return server.getAddress().getPort();
+        } catch (IOException e) {
+            throw new RuntimeException("could not start page server", e);
+        }
     }
 
     /**

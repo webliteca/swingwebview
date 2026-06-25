@@ -65,19 +65,16 @@ pane shows the thread hops (`bind on AppKit/native thread` →
 `worker thread` → `resolve`), which is the visible proof that the work
 never runs on, or blocks, the UI thread.
 
-> **Blank window / content slivered to the left edge?** This is a
-> heavyweight-component limitation, not a bug in this page (the HTML
-> renders perfectly in a normal browser). On macOS the native WKWebView
-> attaches *asynchronously*, but `WebViewHeavyweightComponent` only
-> positions it on a resize/move event and does **not** re-run its
-> `sizeNative()` when the async attach completes. The first (synchronous)
-> sizing call no-ops because the native view isn't ready yet, so a simple
-> frame that never gets a later resize leaves the WebView at a zero/stale
-> frame — hence the blank/strip, and why the symptom varies run to run.
-> This demo works around it by nudging the layout a few times in the
-> first second after the window appears. The proper fix is in the library
-> (re-size on attach completion); if you still see a blank WebView,
-> dragging the window edge a few pixels forces it to appear.
+> **Why a localhost HTTP server instead of a `data:` URL?** On macOS the
+> embedded engine navigates via `WKWebView`'s `loadRequest:`, which
+> **silently refuses `data:` URLs** — a long-standing WKWebView
+> restriction. The page renders fine in a normal browser but shows blank
+> in the embedded view, and no amount of resizing fixes it because the
+> content never loaded. Serving the same HTML over `http://localhost`
+> loads identically to any remote site (loopback is exempt from App
+> Transport Security, so plain HTTP is allowed). The proper library-level
+> fix is for `cocoa_navigate` to load `data:` URLs via
+> `loadHTMLString:baseURL:` instead of `loadRequest:`.
 
 Click the buttons and watch the in-page log:
 
