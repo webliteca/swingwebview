@@ -1264,3 +1264,33 @@ Files:
   the standalone `WebView` surface's opposite
   `marshalToEdt = false` branch documented in
   [[in-process-webview-java-api]].
+
+## Addendum · Async JavaScript Functions integration (see [[webview-async-javascript-functions]])
+
+Wires the value-returning JS→Java function API (Canvas 14:
+`FunctionDispatcher`, `JavascriptFunction`, `AsyncJavascriptFunction`)
+into `OffscreenWebView` (and `WebViewLightweightComponent`, which buffers pre-display registrations and replays them at engine bring-up), mirroring the existing `EvalDispatcher`/`evalAsync`
+integration. No native changes.
+
+- **Construct.** `OffscreenWebView` (and `WebViewLightweightComponent`, which buffers pre-display registrations and replays them at engine bring-up) holds a `final FunctionDispatcher`
+  constructed with a `FunctionDispatcher.FunctionSink` whose `eval`
+  and `addOnBeforeLoad` delegate to `webview_offscreen_eval`/`webview_offscreen_init` (guarded so they no-op
+  when the peer is absent).
+- **Install at peer bring-up.** Alongside the eval bridge, install
+  `FunctionDispatcher.SHIM_JS` in `create(...)` and bind the reserved
+  `FunctionDispatcher.INBOUND_CHANNEL` to a `WebViewNativeCallback`
+  that routes into `functionDispatcher.dispatch(arg)`. The callback is
+  anchored in the surface's `heap` (JNI lifecycle norm) so the native
+  global ref stays reachable.
+- **Public API.** Two overloads, `addJavascriptFunction(String,
+  JavascriptFunction)` and `addJavascriptFunction(String,
+  AsyncJavascriptFunction)`, delegate to
+  `functionDispatcher.registerSync` / `registerAsync`. The reserved
+  `__webview_` prefix and JS-identifier validity are enforced by the
+  dispatcher (the Swing components additionally fast-fail the reserved
+  prefix at the call site, matching `addJavascriptCallback`).
+- **Teardown.** `functionDispatcher.disposeAll()` is called from the
+  surface's existing dispose path (next to
+  `evalDispatcher.disposeAllPending()`), shutting down the worker pool.
+- **Out of scope:** `FunctionDispatcher` and the two functional
+  interfaces themselves — owned by [[webview-async-javascript-functions]].

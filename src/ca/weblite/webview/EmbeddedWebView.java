@@ -67,6 +67,15 @@ public class EmbeddedWebView {
     private final EvalDispatcher evalDispatcher;
 
     /**
+     * Per-engine hub for {@link #addJavascriptFunction} — value-returning
+     * JS&rarr;Java functions.  Its {@code FunctionSink} issues
+     * {@code webview_embed_eval} / {@code webview_embed_init} when
+     * {@code peer != 0}; the sink-level guard is belt-and-suspenders
+     * against a destroy that races a dispatch.
+     */
+    private final FunctionDispatcher functionDispatcher;
+
+    /**
      * Attach lifecycle state.  Reads and writes are confined to the
      * Swing EDT.  Initialised to {@link AttachState#PENDING}; the
      * native attach-completion callback drives the transition to
@@ -110,6 +119,23 @@ public class EmbeddedWebView {
                 }
             }
         }, true, "EmbeddedWebView");
+        this.functionDispatcher = new FunctionDispatcher(
+            new FunctionDispatcher.FunctionSink() {
+                @Override
+                public void eval(String js) {
+                    long p = EmbeddedWebView.this.peer;
+                    if (p != 0L) {
+                        WebViewNative.webview_embed_eval(p, js);
+                    }
+                }
+                @Override
+                public void addOnBeforeLoad(String js) {
+                    long p = EmbeddedWebView.this.peer;
+                    if (p != 0L) {
+                        WebViewNative.webview_embed_init(p, js);
+                    }
+                }
+            }, "EmbeddedWebView");
         // Anchor the attach callback against GC for as long as the engine
         // is alive; the native side holds a JNI global ref but releasing
         // it via the destroy lambda is the only mechanism that drops the
@@ -175,6 +201,19 @@ public class EmbeddedWebView {
         };
         ewv.heap.add(evalCb);
         WebViewNative.webview_embed_bind(p, EvalDispatcher.CHANNEL_NAME, evalCb, p);
+        // Install the addJavascriptFunction bridge the same way: SHIM_JS at
+        // document-start and the reserved inbound binding that routes page
+        // calls into the FunctionDispatcher.  Anchored in heap so the JNI
+        // global ref stays reachable.
+        WebViewNative.webview_embed_init(p, FunctionDispatcher.SHIM_JS);
+        WebViewNativeCallback fnCb = new WebViewNativeCallback() {
+            @Override
+            public void invoke(String arg, long wv) {
+                ewv.functionDispatcher.dispatch(arg);
+            }
+        };
+        ewv.heap.add(fnCb);
+        WebViewNative.webview_embed_bind(p, FunctionDispatcher.INBOUND_CHANNEL, fnCb, p);
         return ewv;
     }
 
@@ -298,6 +337,28 @@ public class EmbeddedWebView {
         };
         heap.add(fn);
         WebViewNative.webview_embed_bind(peer, name, fn, peer);
+        return this;
+    }
+
+    /**
+     * Register a synchronous Java-backed JavaScript function under
+     * {@code window.<name>}.  See {@link JavascriptFunction}.  The handler
+     * runs on a background thread; the page calls
+     * {@code await window.<name>(arg)}.
+     */
+    public EmbeddedWebView addJavascriptFunction(String name, JavascriptFunction fn) {
+        checkAlive();
+        functionDispatcher.registerSync(name, fn);
+        return this;
+    }
+
+    /**
+     * Register an asynchronous Java-backed JavaScript function under
+     * {@code window.<name>}.  See {@link AsyncJavascriptFunction}.
+     */
+    public EmbeddedWebView addJavascriptFunction(String name, AsyncJavascriptFunction fn) {
+        checkAlive();
+        functionDispatcher.registerAsync(name, fn);
         return this;
     }
 
@@ -605,6 +666,7 @@ public class EmbeddedWebView {
             // such a late callback finds an empty pending map and
             // silently drops.
             evalDispatcher.disposeAllPending();
+            functionDispatcher.disposeAll();
             // Clear any native focus callback BEFORE we hand off to destroy,
             // so the swizzled responder hooks never fire into a freed Java
             // global ref.  checkAlive would still pass here since peer is

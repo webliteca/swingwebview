@@ -198,7 +198,7 @@ dispatcher decisions and Win32 `SetFocus` calls.
 
 ## Talking to JavaScript
 
-Three methods on `WebViewComponent` (and on the standalone `WebView`)
+Four methods on `WebViewComponent` (and on the standalone `WebView`)
 cover the JS-interop surface:
 
 * **`eval(String js)`** — fire-and-forget.  Runs the snippet in the
@@ -215,9 +215,22 @@ cover the JS-interop surface:
   **use `return` to yield a value** — a bare expression is not the
   IIFE's return.
 * **`addJavascriptCallback(String name, JavascriptCallback cb)`** —
-  exposes a Java callback at `window.<name>(arg)` for the page to
-  call.  Use when the page initiates the conversation, or when a
-  long-lived JS subscription needs to push events to Java.
+  exposes a *fire-and-forget* Java callback at `window.<name>(arg)`
+  for the page to call.  The callback returns nothing to JS.  Use when
+  the page initiates the conversation, or when a long-lived JS
+  subscription needs to push events to Java.
+* **`addJavascriptFunction(String name, JavascriptFunction fn)`** —
+  exposes a *value-returning* Java function at `window.<name>(arg)`.
+  In the page it returns a Promise: `const r = await window.<name>(arg)`.
+  No JavaScript glue — the Java side is just a lambda.  The library
+  runs the (synchronous) handler on a background thread, so it can
+  block safely without freezing the UI or deadlocking the engine UI
+  thread against the EDT — the reason this exists instead of a
+  synchronous, value-returning `addJavascriptCallback`.  A
+  `CompletableFuture<String>`-returning overload
+  (`AsyncJavascriptFunction`) covers inherently-async work.  Results
+  are strings (return JSON text for structured data); a thrown
+  exception rejects the page-side Promise.
 
 ```java
 WebViewComponent wv = WebViewComponent.create();
@@ -242,6 +255,11 @@ wv.evalAsync("return missing.value;").exceptionally(t -> {
     }
     return null;
 });
+
+// Expose a value-returning Java function to the page — no JS glue.
+wv.addJavascriptFunction("reverse", (String arg) ->
+    new StringBuilder(arg).reverse().toString());
+// in the page:  const r = await window.reverse("abc");   // "cba"
 ```
 
 **Threading.**  On `WebViewComponent` (both heavyweight and lightweight)
@@ -340,6 +358,10 @@ Additional demos:
   throws and Promise rejections surfacing as
   `JavaScriptEvalException`, concurrent in-flight calls, and EDT
   delivery of continuations.
+* `demos/WebViewAsyncCallbackDemo/` — exercises
+  `addJavascriptFunction(...)`: value-returning JS→Java functions
+  (sync handlers run off-thread, async `CompletableFuture` handlers,
+  errors rejecting the page Promise) with no JavaScript glue.
 * `demos/WebViewDialogDemo/` — exercises the new
   `WebViewDialogHandler` API: default Swing dialogs
   (`alert` / `confirm` / `prompt` / file picker), a custom handler

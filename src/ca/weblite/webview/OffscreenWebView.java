@@ -55,6 +55,14 @@ public class OffscreenWebView {
      */
     private final EvalDispatcher evalDispatcher;
 
+    /**
+     * Per-engine hub for {@link #addJavascriptFunction} — value-returning
+     * JS&rarr;Java functions.  Mirrors the offscreen {@code evalDispatcher}
+     * wiring; the {@code FunctionSink} issues {@code webview_offscreen_eval}
+     * / {@code webview_offscreen_init} when {@code peer != 0}.
+     */
+    private final FunctionDispatcher functionDispatcher;
+
     private OffscreenWebView(long peer) {
         this.peer = peer;
         this.evalDispatcher = new EvalDispatcher(new EvalDispatcher.EvalSink() {
@@ -66,6 +74,23 @@ public class OffscreenWebView {
                 }
             }
         }, true, "OffscreenWebView");
+        this.functionDispatcher = new FunctionDispatcher(
+            new FunctionDispatcher.FunctionSink() {
+                @Override
+                public void eval(String js) {
+                    long p = OffscreenWebView.this.peer;
+                    if (p != 0L) {
+                        WebViewNative.webview_offscreen_eval(p, js);
+                    }
+                }
+                @Override
+                public void addOnBeforeLoad(String js) {
+                    long p = OffscreenWebView.this.peer;
+                    if (p != 0L) {
+                        WebViewNative.webview_offscreen_init(p, js);
+                    }
+                }
+            }, "OffscreenWebView");
     }
 
     /**
@@ -94,6 +119,16 @@ public class OffscreenWebView {
         };
         ow.heap.add(evalCb);
         WebViewNative.webview_offscreen_bind(p, EvalDispatcher.CHANNEL_NAME, evalCb, p);
+        // Install the addJavascriptFunction bridge the same way.
+        WebViewNative.webview_offscreen_init(p, FunctionDispatcher.SHIM_JS);
+        WebViewNativeCallback fnCb = new WebViewNativeCallback() {
+            @Override
+            public void invoke(String arg, long wv) {
+                ow.functionDispatcher.dispatch(arg);
+            }
+        };
+        ow.heap.add(fnCb);
+        WebViewNative.webview_offscreen_bind(p, FunctionDispatcher.INBOUND_CHANNEL, fnCb, p);
         return ow;
     }
 
@@ -236,6 +271,26 @@ public class OffscreenWebView {
     }
 
     /**
+     * Register a synchronous Java-backed JavaScript function under
+     * {@code window.<name>}.  See {@link JavascriptFunction}.
+     */
+    public OffscreenWebView addJavascriptFunction(String name, JavascriptFunction fn) {
+        checkAlive();
+        functionDispatcher.registerSync(name, fn);
+        return this;
+    }
+
+    /**
+     * Register an asynchronous Java-backed JavaScript function under
+     * {@code window.<name>}.  See {@link AsyncJavascriptFunction}.
+     */
+    public OffscreenWebView addJavascriptFunction(String name, AsyncJavascriptFunction fn) {
+        checkAlive();
+        functionDispatcher.registerAsync(name, fn);
+        return this;
+    }
+
+    /**
      * Dispatch a Runnable onto the offscreen WebView's native UI thread.
      */
     public OffscreenWebView dispatch(final Runnable r) {
@@ -331,6 +386,7 @@ public class OffscreenWebView {
             // the drain ensures such a late callback finds an empty
             // pending map and silently drops.
             evalDispatcher.disposeAllPending();
+            functionDispatcher.disposeAll();
             peer = 0L;
             WebViewNative.webview_offscreen_destroy(p);
             heap.clear();

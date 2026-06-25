@@ -2748,3 +2748,80 @@ Files:
   re-introduce a race between binding registration and
   page-load JS calls that the existing canvas code already
   documents around.
+
+## Addendum · Async JavaScript Functions integration (see [[webview-async-javascript-functions]])
+
+Wires the value-returning JS→Java function API (Canvas 14:
+`FunctionDispatcher`, `JavascriptFunction`, `AsyncJavascriptFunction`)
+into `EmbeddedWebView` (and `WebViewHeavyweightComponent`, which buffers pre-display registrations and replays them in `createPeer`), mirroring the existing `EvalDispatcher`/`evalAsync`
+integration. No native changes.
+
+- **Construct.** `EmbeddedWebView` (and `WebViewHeavyweightComponent`, which buffers pre-display registrations and replays them in `createPeer`) holds a `final FunctionDispatcher`
+  constructed with a `FunctionDispatcher.FunctionSink` whose `eval`
+  and `addOnBeforeLoad` delegate to `webview_embed_eval`/`webview_embed_init` (guarded so they no-op
+  when the peer is absent).
+- **Install at peer bring-up.** Alongside the eval bridge, install
+  `FunctionDispatcher.SHIM_JS` in the `attach(...)` factory and bind the reserved
+  `FunctionDispatcher.INBOUND_CHANNEL` to a `WebViewNativeCallback`
+  that routes into `functionDispatcher.dispatch(arg)`. The callback is
+  anchored in the surface's `heap` (JNI lifecycle norm) so the native
+  global ref stays reachable.
+- **Public API.** Two overloads, `addJavascriptFunction(String,
+  JavascriptFunction)` and `addJavascriptFunction(String,
+  AsyncJavascriptFunction)`, delegate to
+  `functionDispatcher.registerSync` / `registerAsync`. The reserved
+  `__webview_` prefix and JS-identifier validity are enforced by the
+  dispatcher (the Swing components additionally fast-fail the reserved
+  prefix at the call site, matching `addJavascriptCallback`).
+- **Teardown.** `functionDispatcher.disposeAll()` is called from the
+  surface's existing dispose path (next to
+  `evalDispatcher.disposeAllPending()`), shutting down the worker pool.
+- **Out of scope:** `FunctionDispatcher` and the two functional
+  interfaces themselves — owned by [[webview-async-javascript-functions]].
+
+## Addendum · Bug fixes (macOS embedded engine)
+
+Two defects found via the WebViewAsyncCallbackDemo on macOS Intel.
+
+### Fix 1 · data: URLs must load via loadHTMLString:baseURL:
+
+`cocoa_navigate` (src_c/webview_embed.cpp) navigated every URL with
+`WKWebView -loadRequest:`. WKWebView **silently refuses `data:` URLs**
+through `loadRequest:` (a long-standing WKWebView restriction): the page
+renders blank with no error, and no resize/repaint recovers it because
+the content never loaded.
+
+- Requirement: a `data:text/html[...][;base64],<body>` URL passed to
+  `navigate(...)` MUST render its HTML.
+- Approach: in `cocoa_navigate`, detect a `data:text/html` URL, split at
+  the first comma into the metadata prefix and the body, decode the body
+  (`NSData -initWithBase64EncodedString:` when the prefix contains
+  `;base64`, otherwise `NSString -stringByRemovingPercentEncoding` with a
+  fallback to the raw body when percent-decoding yields nil), and load it
+  with `WKWebView -loadHTMLString:baseURL:` (nil base URL). All other URLs
+  (http/https/file/non-html data) keep the existing `loadRequest:` path.
+- Norms/Safeguards: ObjC dispatch uses the existing `msg<>()` typed
+  helper (object and NSUInteger args are register-passed, matching the
+  file's existing usage); no struct-return calls are introduced. Never
+  throws across JNI; a malformed data: URL falls through to the raw body.
+
+### Fix 2 · re-size the heavyweight peer when the async attach completes
+
+`WebViewHeavyweightComponent.sizeNative()` ran only at first paint (when
+the macOS WKWebView attach is still in flight and the native view is not
+yet positionable) and on subsequent AWT resize/move events. A frame whose
+WebView is the sole child, with no later resize, left the native view at
+a zero/stale frame (blank / content slivered to an edge; nondeterministic
+by timing).
+
+- Requirement: after the macOS asynchronous attach resolves, the native
+  WebView MUST be positioned to the canvas bounds without requiring a
+  user resize.
+- Approach: in `createPeer`, register a `WebViewAttachListener` via
+  `EmbeddedWebView.addOnAttachComplete(...)` whose `onAttached` calls
+  `sizeNative()`. The listener fires on the Swing EDT once attach resolves
+  (immediately/next-tick on Windows/Linux where attach is synchronous),
+  so the bounds are re-applied after the WKWebView exists.
+- Safeguards: `onAttachFailed` is a no-op (the engine is unusable and
+  discarded by existing paths). Idempotent with the existing
+  resize/move-driven `sizeNative()` calls.
