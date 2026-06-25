@@ -122,10 +122,30 @@ public class WebViewAsyncCallbackDemo {
         frame.setLocationRelativeTo(null);
         frame.setVisible(true);
 
-        // Re-assert the divider once the frame is realized; the resulting
-        // canvas resize re-runs the heavyweight peer's sizeNative() after
-        // the macOS async attach has had a chance to complete.
-        EventQueue.invokeLater(() -> split.setDividerLocation(0.72));
+        // Workaround for a heavyweight-component limitation: on macOS the
+        // native WKWebView attaches ASYNCHRONOUSLY, but
+        // WebViewHeavyweightComponent only positions it on a resize/move
+        // event -- it does not re-run sizeNative() when the async attach
+        // completes.  The synchronous sizeNative() at first paint therefore
+        // no-ops (the native view isn't ready yet), and a simple frame may
+        // never get a later resize, leaving the WebView at a zero/stale
+        // frame (blank).  Nudge the layout a few times across the first
+        // second so at least one resize lands after the attach resolves.
+        // The real fix belongs in the library (re-size on attach
+        // completion); see this demo's README.
+        final int[] ticks = {0};
+        final javax.swing.Timer nudge = new javax.swing.Timer(250, null);
+        nudge.addActionListener(ev -> {
+            split.setDividerLocation(0.72);
+            Dimension sz = frame.getSize();
+            // Net-zero jiggle: a real size delta is what fires the
+            // canvas's componentResized -> sizeNative path.
+            frame.setSize(sz.width, sz.height + (ticks[0] % 2 == 0 ? 1 : -1));
+            if (++ticks[0] >= 4) nudge.stop();
+        });
+        nudge.setInitialDelay(200);
+        nudge.setRepeats(true);
+        nudge.start();
     }
 
     /**

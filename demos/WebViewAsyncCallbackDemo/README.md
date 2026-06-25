@@ -65,13 +65,19 @@ pane shows the thread hops (`bind on AppKit/native thread` →
 `worker thread` → `resolve`), which is the visible proof that the work
 never runs on, or blocks, the UI thread.
 
-> **Blank / thin strip on the left edge?** That was a sizing bug in an
-> earlier version of this demo where the WebView was the bare frame's
-> only child: on macOS the native WKWebView attaches asynchronously and
-> could be left at a near-zero frame with no later relayout to fix it.
-> The demo now hosts the WebView in a `JSplitPane` and re-asserts the
-> divider after the frame is shown, matching the other working demos. If
-> you still see it, resizing the window by a few pixels forces a repaint.
+> **Blank window / content slivered to the left edge?** This is a
+> heavyweight-component limitation, not a bug in this page (the HTML
+> renders perfectly in a normal browser). On macOS the native WKWebView
+> attaches *asynchronously*, but `WebViewHeavyweightComponent` only
+> positions it on a resize/move event and does **not** re-run its
+> `sizeNative()` when the async attach completes. The first (synchronous)
+> sizing call no-ops because the native view isn't ready yet, so a simple
+> frame that never gets a later resize leaves the WebView at a zero/stale
+> frame — hence the blank/strip, and why the symptom varies run to run.
+> This demo works around it by nudging the layout a few times in the
+> first second after the window appears. The proper fix is in the library
+> (re-size on attach completion); if you still see a blank WebView,
+> dragging the window edge a few pixels forces it to appear.
 
 Click the buttons and watch the in-page log:
 
