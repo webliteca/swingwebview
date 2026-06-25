@@ -3948,7 +3948,7 @@ static void cocoa_navigate(Engine *e, std::string url) {
                     }
                 } else {
                     id raw = ns_str(body.c_str());
-                    id decoded = msg<id, id>(
+                    id decoded = msg<id>(
                         raw, sel("stringByRemovingPercentEncoding"));
                     html = decoded ? decoded : raw;
                 }
