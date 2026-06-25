@@ -56,6 +56,10 @@ public class DialogDispatcherTest {
         }
         @Override public WebViewComponent addJavascriptCallback(
                 String name, WebView.JavascriptCallback cb) { return this; }
+        @Override public WebViewComponent addJavascriptFunction(
+                String name, JavascriptFunction fn) { return this; }
+        @Override public WebViewComponent addJavascriptFunction(
+                String name, AsyncJavascriptFunction fn) { return this; }
         @Override public WebViewComponent dispatch(Runnable r) { return this; }
         @Override public void dispose() { }
     }

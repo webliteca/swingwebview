@@ -215,6 +215,39 @@ public abstract class WebViewComponent extends JComponent {
                                                            WebView.JavascriptCallback cb);
 
     /**
+     * Register a synchronous Java-backed JavaScript function. In the page it
+     * appears as a global returning a Promise: {@code const r = await
+     * window.<name>(arg)}. The handler runs on a background thread (never the
+     * engine UI thread), so it can do blocking work without freezing the UI
+     * or deadlocking; its returned {@code String} resolves the Promise and a
+     * thrown exception rejects it. May be called before display; the
+     * page-side wrapper is installed once the component is displayable.
+     *
+     * <p>This is the deadlock-free, Java-only way to return a value to
+     * JavaScript — no JavaScript glue and no synchronous round trip. See
+     * {@link ca.weblite.webview.JavascriptFunction}.
+     *
+     * @throws IllegalArgumentException if {@code name} starts with
+     *         {@link #RESERVED_BINDING_PREFIX} or is not a valid JS
+     *         identifier.
+     */
+    public abstract WebViewComponent addJavascriptFunction(String name,
+                                                           ca.weblite.webview.JavascriptFunction fn);
+
+    /**
+     * Register an asynchronous Java-backed JavaScript function whose handler
+     * returns a {@code CompletableFuture<String>}. The page-side Promise
+     * resolves/rejects when the future completes. See
+     * {@link ca.weblite.webview.AsyncJavascriptFunction}.
+     *
+     * @throws IllegalArgumentException if {@code name} starts with
+     *         {@link #RESERVED_BINDING_PREFIX} or is not a valid JS
+     *         identifier.
+     */
+    public abstract WebViewComponent addJavascriptFunction(String name,
+                                                           ca.weblite.webview.AsyncJavascriptFunction fn);
+
+    /**
      * Dispatch a {@code Runnable} onto the native WebView's UI thread.  No-op
      * until the component is displayable -- transient work is not buffered.
      */

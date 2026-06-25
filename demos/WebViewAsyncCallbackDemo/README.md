@@ -1,50 +1,49 @@
 # WebViewAsyncCallbackDemo
 
-A runnable answer to the recurring request: *"can `addJavascriptCallback`
-return a result to JavaScript?"*
+Shows `addJavascriptFunction` — the Java-friendly way to expose a
+**value-returning** function to JavaScript, with **no JavaScript glue**.
 
-A **synchronous**, value-returning binding is the wrong tool: it would
-block the engine's UI thread (AppKit main thread on macOS, the WebView2
-worker on Windows, the GTK main thread on Linux) until Java produced the
-value, and the moment the Java handler needs the Swing EDT you get a
-classic two-thread deadlock — the exact hazard
+```java
+wv.addJavascriptFunction("reverse", (String arg) ->
+    new StringBuilder(arg).reverse().toString());
+// in the page:  const r = await window.reverse("abc");   // "cba"
+```
+
+That's the whole API. The page sees `window.reverse` as a normal function
+returning a Promise; your Java lambda produces the result.
+
+## Why not a synchronous `addJavascriptCallback` that returns a value?
+
+It would block the engine UI thread (AppKit main thread on macOS, the
+WebView2 worker on Windows, the GTK main thread on Linux) until Java
+produced the value, and the moment the handler touched the Swing EDT you
+would deadlock — the hazard
 `requirements/[User-story-4]eliminate-edt-appkit-sync-deadlock-on-macos.md`
-was written to remove.
+exists to prevent. `addJavascriptFunction` is deadlock-free by
+construction: the page gets a Promise, the synchronous handler runs on a
+background thread, and the result is delivered back through a
+non-blocking `eval`.
 
-This demo shows the **deadlock-free** alternative: an asynchronous,
-**Promise-returning** call. It is the mirror image of
-`WebViewComponent.evalAsync` (Java→JS with an async result) run in the
-opposite direction (JS→Java with an async result), and it uses **only
-the existing public API** — `addJavascriptCallback`, `addOnBeforeLoad`,
-and `eval`. No library changes.
+## Two flavors
 
-## How it works
+- **Synchronous** (`JavascriptFunction`, `String run(String)`): the
+  library runs your handler on a background worker thread, so it can block
+  (DB call, file IO, `Thread.sleep`) without freezing the UI. Return value
+  resolves the Promise; throwing rejects it.
+- **Asynchronous** (`AsyncJavascriptFunction`,
+  `CompletableFuture<String> run(String)`): for work that is already a
+  future. The Promise settles when the future completes.
 
-```
-JS:   const r = await window.callJava('reverse', 'abc');   // r === 'cba'
-```
+Both are overloads of `addJavascriptFunction`. A lambda returning a
+`String` binds to the sync overload; one returning a `CompletableFuture`
+binds to the async overload. Type the lambda parameter explicitly
+(`(String arg) -> ...`) so the compiler can tell them apart; a throw-only
+lambda needs a cast (`(JavascriptFunction) (String arg) -> { throw ... }`).
 
-1. A document-start shim (installed via `addOnBeforeLoad`) defines
-   `window.callJava(method, arg)`. It assigns a request id, stores the
-   Promise's `{resolve, reject}`, and posts `<id>|<method>|<arg>`
-   (base64) through a normal **void** binding, then returns the Promise.
-2. The Java callback (`__rpc_call`) receives the request on the native
-   UI thread, immediately hops **off** it onto a background worker
-   (`CompletableFuture.supplyAsync`), and runs the actual logic there —
-   so the UI thread is never held.
-3. When the work finishes, Java calls `eval("window.__rpc_resolve('…')")`
-   with the base64 result. `eval` is asynchronous and non-blocking.
-4. The shim's `__rpc_resolve` looks up the pending Promise by id and
-   settles it.
-
-Nothing ever blocks one thread waiting on the other, so there is no
-deadlock. The base64-on-a-single-string-channel convention is copied
-verbatim from `ca.weblite.webview.EvalDispatcher`, which is why the demo
-needs no JSON-parsing dependency.
+Results are **strings** (string passthrough, like `evalAsync`). For
+structured data, return JSON text and `JSON.parse` it in the page.
 
 ## Running
-
-From the repo root:
 
 ```
 ./run-mac-async-callback-demo.sh      # macOS (Intel or Apple Silicon)
@@ -52,56 +51,25 @@ From the repo root:
 ```
 
 Override the JDK with `JAVA_HOME=/path/to/jdk ./run-mac-async-callback-demo.sh`.
-Each script builds the native lib (if stale), builds `dist/WebView.jar`,
-compiles this demo, and launches it.
 
 ## What you should see
 
-A split window: the WebView on top (a heading, a text field pre-filled
-with `Hello, WebView`, a row of five buttons, and an in-page log box),
-and a Java-side log pane below it. Clicking a button logs the round trip
-in **both** panes — the in-page log shows the awaited result, the Java
-pane shows the thread hops (`bind on AppKit/native thread` →
-`worker thread` → `resolve`), which is the visible proof that the work
-never runs on, or blocks, the UI thread.
-
-> **Why a localhost HTTP server instead of a `data:` URL?** On macOS the
-> embedded engine navigates via `WKWebView`'s `loadRequest:`, which
-> **silently refuses `data:` URLs** — a long-standing WKWebView
-> restriction. The page renders fine in a normal browser but shows blank
-> in the embedded view, and no amount of resizing fixes it because the
-> content never loaded. Serving the same HTML over `http://localhost`
-> loads identically to any remote site (loopback is exempt from App
-> Transport Security, so plain HTTP is allowed). The proper library-level
-> fix is for `cocoa_navigate` to load `data:` URLs via
-> `loadHTMLString:baseURL:` instead of `loadRequest:`.
-
+A split window: the WebView on top (input + buttons), the Java log below.
 Click the buttons and watch the in-page log:
 
-- **reverse** / **upper** — Java returns a transformed string; the
-  `await`ed value appears in the log.
-- **slowEcho (1.5s)** — Java sleeps 1.5s on the worker thread before
-  resolving. The window stays fully responsive the whole time (drag it,
-  click other buttons) — the proof that nothing is blocked. A
-  synchronous binding would freeze the UI here, or deadlock.
-- **fail (rejects)** — the Java handler throws; the Promise rejects and
-  the `.catch` fires with the message.
-- **5× concurrent** — five overlapping calls; each result returns to its
-  own caller (ids keep them from cross-talking), slow ones simply settle
-  later.
+- **reverse** / **upper** — Java returns a transformed string.
+- **slowEcho (1.5s)** — the handler sleeps 1.5s on a worker thread; the
+  window stays fully responsive (drag it during the wait). The Java log
+  shows the handler thread is `webview-fn-…`, not the EDT.
+- **fail (rejects)** — the handler throws; the Promise rejects and the
+  `.catch` fires.
+- **asyncLookup** — an `AsyncJavascriptFunction` returning a future.
+- **5× concurrent** — overlapping calls; each result returns to its own
+  caller, slow ones simply settle later.
 
-## Extending to structured results
-
-The channel is string-typed for clarity. For structured data, return
-JSON from `invokeMethod(...)` on the Java side and `JSON.parse` it in the
-shim's `__rpc_resolve` (the one spot that touches the value). The
-transport (ids, base64, the resolve hop) stays identical.
-
-## Making it first-class
-
-If you want this without the boilerplate, the natural library addition is
-`addJavascriptCallbackAsync(name, Function<String, CompletableFuture<?>>)`
-— the sibling of `evalAsync`, reusing the same `EvalDispatcher`
-reserved-channel plumbing. That is a behavior change, so per `CLAUDE.md`
-it goes through `/spdd-prompt-update` + `/spdd-generate` against
-`spdd/prompt/10-…-Webview-Async-Javascript-Eval.md`, not a hand-edit.
+> **Why a localhost HTTP server?** The embedded macOS engine navigates
+> with `WKWebView`'s `loadRequest:`, which silently refuses `data:` URLs.
+> The demo serves its HTML over `http://localhost` so it loads like any
+> remote site. (The library also handles `data:` URLs correctly now via
+> `loadHTMLString:` — this demo keeps the server so it runs identically on
+> every platform.)

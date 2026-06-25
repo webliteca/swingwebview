@@ -5,9 +5,11 @@
  */
 package ca.weblite.webview.swing;
 
+import ca.weblite.webview.AsyncJavascriptFunction;
 import ca.weblite.webview.ConsoleDispatcher;
 import ca.weblite.webview.EditingCommand;
 import ca.weblite.webview.EmbeddedWebView;
+import ca.weblite.webview.JavascriptFunction;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewClickCallback;
 import ca.weblite.webview.WebViewDialogCallback;
@@ -89,6 +91,10 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
     private final List<String> pendingInit = new ArrayList<String>();
     private final Map<String, WebView.JavascriptCallback> pendingBindings =
             new LinkedHashMap<String, WebView.JavascriptCallback>();
+    private final Map<String, JavascriptFunction> pendingSyncFunctions =
+            new LinkedHashMap<String, JavascriptFunction>();
+    private final Map<String, AsyncJavascriptFunction> pendingAsyncFunctions =
+            new LinkedHashMap<String, AsyncJavascriptFunction>();
     private KeyEventDispatcher editingShortcutDispatcher;
     private PropertyChangeListener focusOwnerListener;
     private AWTEventListener globalMouseListener;
@@ -174,6 +180,36 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         pendingBindings.put(name, cb);
         if (embedded != null) {
             embedded.addJavascriptCallback(name, cb);
+        }
+        return this;
+    }
+
+    @Override
+    public WebViewComponent addJavascriptFunction(String name, JavascriptFunction fn) {
+        if (name != null && name.startsWith(RESERVED_BINDING_PREFIX)) {
+            throw new IllegalArgumentException(
+                "name is reserved for internal use: names starting with \""
+                + RESERVED_BINDING_PREFIX + "\" are not allowed (got \""
+                + name + "\")");
+        }
+        pendingSyncFunctions.put(name, fn);
+        if (embedded != null) {
+            embedded.addJavascriptFunction(name, fn);
+        }
+        return this;
+    }
+
+    @Override
+    public WebViewComponent addJavascriptFunction(String name, AsyncJavascriptFunction fn) {
+        if (name != null && name.startsWith(RESERVED_BINDING_PREFIX)) {
+            throw new IllegalArgumentException(
+                "name is reserved for internal use: names starting with \""
+                + RESERVED_BINDING_PREFIX + "\" are not allowed (got \""
+                + name + "\")");
+        }
+        pendingAsyncFunctions.put(name, fn);
+        if (embedded != null) {
+            embedded.addJavascriptFunction(name, fn);
         }
         return this;
     }
@@ -469,6 +505,12 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         }
         for (Map.Entry<String, WebView.JavascriptCallback> e : pendingBindings.entrySet()) {
             embedded.addJavascriptCallback(e.getKey(), e.getValue());
+        }
+        for (Map.Entry<String, JavascriptFunction> e : pendingSyncFunctions.entrySet()) {
+            embedded.addJavascriptFunction(e.getKey(), e.getValue());
+        }
+        for (Map.Entry<String, AsyncJavascriptFunction> e : pendingAsyncFunctions.entrySet()) {
+            embedded.addJavascriptFunction(e.getKey(), e.getValue());
         }
         embedded.navigate(pendingUrl);
         sizeNative();

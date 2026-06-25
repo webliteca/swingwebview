@@ -5,9 +5,11 @@
  */
 package ca.weblite.webview.swing;
 
+import ca.weblite.webview.AsyncJavascriptFunction;
 import ca.weblite.webview.ConsoleDispatcher;
 import ca.weblite.webview.EditingCommand;
 import ca.weblite.webview.GdkInput;
+import ca.weblite.webview.JavascriptFunction;
 import ca.weblite.webview.OffscreenWebView;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewDialogCallback;
@@ -93,6 +95,10 @@ public class WebViewLightweightComponent extends WebViewComponent {
     private final List<String> pendingInit = new ArrayList<String>();
     private final Map<String, WebView.JavascriptCallback> pendingBindings =
             new LinkedHashMap<String, WebView.JavascriptCallback>();
+    private final Map<String, JavascriptFunction> pendingSyncFunctions =
+            new LinkedHashMap<String, JavascriptFunction>();
+    private final Map<String, AsyncJavascriptFunction> pendingAsyncFunctions =
+            new LinkedHashMap<String, AsyncJavascriptFunction>();
     private KeyEventDispatcher editingShortcutDispatcher;
 
     public WebViewLightweightComponent() {
@@ -277,6 +283,12 @@ public class WebViewLightweightComponent extends WebViewComponent {
         }
         for (Map.Entry<String, WebView.JavascriptCallback> ent : pendingBindings.entrySet()) {
             engine.addJavascriptCallback(ent.getKey(), ent.getValue());
+        }
+        for (Map.Entry<String, JavascriptFunction> ent : pendingSyncFunctions.entrySet()) {
+            engine.addJavascriptFunction(ent.getKey(), ent.getValue());
+        }
+        for (Map.Entry<String, AsyncJavascriptFunction> ent : pendingAsyncFunctions.entrySet()) {
+            engine.addJavascriptFunction(ent.getKey(), ent.getValue());
         }
         allocateBuffer(w, h);
         engine.navigate(pendingUrl);
@@ -472,6 +484,36 @@ public class WebViewLightweightComponent extends WebViewComponent {
         pendingBindings.put(name, cb);
         if (engine != null) {
             engine.addJavascriptCallback(name, cb);
+        }
+        return this;
+    }
+
+    @Override
+    public WebViewComponent addJavascriptFunction(String name, JavascriptFunction fn) {
+        if (name != null && name.startsWith(RESERVED_BINDING_PREFIX)) {
+            throw new IllegalArgumentException(
+                "name is reserved for internal use: names starting with \""
+                + RESERVED_BINDING_PREFIX + "\" are not allowed (got \""
+                + name + "\")");
+        }
+        pendingSyncFunctions.put(name, fn);
+        if (engine != null) {
+            engine.addJavascriptFunction(name, fn);
+        }
+        return this;
+    }
+
+    @Override
+    public WebViewComponent addJavascriptFunction(String name, AsyncJavascriptFunction fn) {
+        if (name != null && name.startsWith(RESERVED_BINDING_PREFIX)) {
+            throw new IllegalArgumentException(
+                "name is reserved for internal use: names starting with \""
+                + RESERVED_BINDING_PREFIX + "\" are not allowed (got \""
+                + name + "\")");
+        }
+        pendingAsyncFunctions.put(name, fn);
+        if (engine != null) {
+            engine.addJavascriptFunction(name, fn);
         }
         return this;
     }

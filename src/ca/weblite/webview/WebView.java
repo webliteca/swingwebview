@@ -105,6 +105,17 @@ public class WebView {
     private final EvalDispatcher evalDispatcher;
 
     /**
+     * Per-engine hub for {@link #addJavascriptFunction} — value-returning
+     * JS&rarr;Java functions.  Its {@code FunctionSink} routes
+     * {@code addOnBeforeLoad} through this instance's own buffering
+     * {@link #addOnBeforeLoad(String)} (so functions registered before
+     * {@link #show()} are replayed at document-start once the window is
+     * shown) and issues a live {@code webview_eval} only once a peer
+     * exists.
+     */
+    private final FunctionDispatcher functionDispatcher;
+
+    /**
      * Creates a new webview.
      */
     public WebView() {
@@ -117,6 +128,22 @@ public class WebView {
                 }
             }
         }, false, "WebView");
+        this.functionDispatcher = new FunctionDispatcher(
+            new FunctionDispatcher.FunctionSink() {
+                @Override
+                public void eval(String js) {
+                    long p = peer;
+                    if (p != 0L) {
+                        WebViewNative.webview_eval(p, js);
+                    }
+                }
+                @Override
+                public void addOnBeforeLoad(String js) {
+                    // Delegates to the buffering addOnBeforeLoad so per-name
+                    // wrappers survive both the pre-show and post-show cases.
+                    WebView.this.addOnBeforeLoad(js);
+                }
+            }, "WebView");
     }
     
     /**
@@ -216,6 +243,29 @@ public class WebView {
     }
     
     /**
+     * Register a synchronous Java-backed JavaScript function under
+     * {@code window.<name>}.  In the page, call it as
+     * {@code const r = await window.<name>(arg)}.  See
+     * {@link JavascriptFunction}.  May be called before {@link #show()};
+     * the page-side wrapper is installed at document-start once shown.
+     * @return this
+     */
+    public WebView addJavascriptFunction(String name, JavascriptFunction fn) {
+        functionDispatcher.registerSync(name, fn);
+        return this;
+    }
+
+    /**
+     * Register an asynchronous Java-backed JavaScript function under
+     * {@code window.<name>}.  See {@link AsyncJavascriptFunction}.
+     * @return this
+     */
+    public WebView addJavascriptFunction(String name, AsyncJavascriptFunction fn) {
+        functionDispatcher.registerAsync(name, fn);
+        return this;
+    }
+
+    /**
      * Execute javascript.
      * @param js Javscript to run
      * @return
@@ -287,6 +337,10 @@ public class WebView {
         // before any user init script.  Idempotency-guarded inside the
         // shim itself by window.__webview_eval_installed__.
         WebViewNative.webview_init(peer, EvalDispatcher.SHIM_JS);
+        // Install the addJavascriptFunction base shim BEFORE the buffered
+        // onBeforeLoad scripts so window.__webview_fn_invoke exists before
+        // any per-name wrapper (registered pre-show, replayed below) runs.
+        WebViewNative.webview_init(peer, FunctionDispatcher.SHIM_JS);
         for (String js : onBeforeLoad) {
             WebViewNative.webview_init(peer, js);
         }
@@ -301,6 +355,11 @@ public class WebView {
         };
         heap.add(evalCb);
         WebViewNative.webview_bind(peer, EvalDispatcher.CHANNEL_NAME, evalCb, peer);
+        WebViewNativeCallback fnCb = (String arg, long wv) -> {
+            functionDispatcher.dispatch(arg);
+        };
+        heap.add(fnCb);
+        WebViewNative.webview_bind(peer, FunctionDispatcher.INBOUND_CHANNEL, fnCb, peer);
         for (final String key : bindings.keySet()) {
             WebViewNativeCallback fn = (String arg2, long wv) -> {
                 JavascriptCallback cb = bindings.get(key);
@@ -319,6 +378,7 @@ public class WebView {
         // not hang.
         peer = 0L;
         evalDispatcher.disposeAllPending();
+        functionDispatcher.disposeAll();
     }
 
 }
