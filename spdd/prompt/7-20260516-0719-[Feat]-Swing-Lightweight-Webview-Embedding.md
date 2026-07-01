@@ -1144,6 +1144,19 @@ Files:
   same contract as the heavyweight
   `webview_embed_execute_editing_command` norm in
   [[swing-heavyweight-webview-embedding]].
+- **Offscreen embedding diagnostics are quiet by default.** The
+  informational `[webview-embed]` traces emitted from the offscreen
+  engine path in `src_c/webview_embed.cpp` — `offscreen engine
+  ready (WxH)` and `offscreen load_uri: …` — MUST be routed through
+  the same gated `EMBED_LOG(...)` logger the heavyweight path uses, so
+  a normal lightweight launch prints NO `[webview-embed]` lines to
+  stderr. The switch is the shared `DEBUG_WEBVIEW_EMBED` environment
+  variable (cached in `embed_verbose()`); the offscreen path shares
+  the JAWT-resolution helpers with the heavyweight engine, so those
+  traces obey the same flag. This is the same quiet-by-default logging
+  norm defined for the heavyweight engine in
+  [[swing-heavyweight-webview-embedding]]; genuine error/failure
+  messages (e.g. WebKit `load-failed`) still print unconditionally.
 
 ## S · Safeguards
 - `OffscreenWebView.create` returns `null` for unsupported

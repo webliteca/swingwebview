@@ -55,6 +55,25 @@
 namespace embed {
 
 // ---------------------------------------------------------------------------
+// Diagnostic logging
+// ---------------------------------------------------------------------------
+
+// Embedding diagnostics are quiet by default.  Informational/success
+// "[webview-embed] ..." traces are routed through EMBED_LOG and only reach
+// stderr when the DEBUG_WEBVIEW_EMBED environment variable is set; a normal
+// embed/launch therefore prints nothing.  Genuine error/failure conditions
+// stay on a plain fprintf(stderr, ...) path so real problems are always
+// visible.  This is the same switch that gates the per-frame draw#/frame-clock
+// instrumentation below, so one flag controls all embedding diagnostics.
+static bool embed_verbose() {
+    static const bool verbose = (getenv("DEBUG_WEBVIEW_EMBED") != nullptr);
+    return verbose;
+}
+
+#define EMBED_LOG(...) \
+    do { if (embed_verbose()) fprintf(stderr, __VA_ARGS__); } while (0)
+
+// ---------------------------------------------------------------------------
 // JAWT helpers
 // ---------------------------------------------------------------------------
 
@@ -77,13 +96,13 @@ static jawt_get_awt_fn resolve_jawt_get_awt() {
     // without us having to know the JDK install layout.
     void *sym = dlsym(RTLD_DEFAULT, "JAWT_GetAWT");
     if (sym != nullptr) {
-        fprintf(stderr,
+        EMBED_LOG(
             "[webview-embed] Resolved JAWT_GetAWT via RTLD_DEFAULT at %p\n",
             sym);
         cached = reinterpret_cast<jawt_get_awt_fn>(sym);
         return cached;
     }
-    fprintf(stderr,
+    EMBED_LOG(
         "[webview-embed] JAWT_GetAWT not visible in RTLD_DEFAULT; "
         "trying explicit dlopen of libjawt.\n");
 
@@ -110,7 +129,7 @@ static jawt_get_awt_fn resolve_jawt_get_awt() {
     for (const auto &path : candidates) {
         handle = dlopen(path.c_str(), RTLD_NOW | RTLD_GLOBAL);
         if (handle != nullptr) {
-            fprintf(stderr,
+            EMBED_LOG(
                 "[webview-embed] dlopen'd libjawt from \"%s\"\n",
                 path.c_str());
             break;
@@ -128,7 +147,7 @@ static jawt_get_awt_fn resolve_jawt_get_awt() {
             "[webview-embed] dlsym JAWT_GetAWT failed: %s\n", dlerror());
         return nullptr;
     }
-    fprintf(stderr,
+    EMBED_LOG(
         "[webview-embed] Resolved JAWT_GetAWT via dlsym at %p\n", sym);
     cached = reinterpret_cast<jawt_get_awt_fn>(sym);
     return cached;
@@ -171,7 +190,7 @@ struct JawtLock {
         for (jint m : masks) {
             awt.version = m;
             if (fn(env, &awt)) {
-                fprintf(stderr,
+                EMBED_LOG(
                     "[webview-embed] JAWT_GetAWT succeeded with mask 0x%x\n",
                     (unsigned)m);
                 got = true;
@@ -900,7 +919,7 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
 
         Window child = GDK_WINDOW_XID(gdkw);
         Display *gdkd = GDK_WINDOW_XDISPLAY(gdkw);
-        fprintf(stderr,
+        EMBED_LOG(
             "[webview-embed] Reparenting GTK X11 window 0x%lx under AWT "
             "Canvas X11 window 0x%lx (display %s).\n",
             (unsigned long)child, (unsigned long)e->parent_xid,
@@ -971,7 +990,7 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
                 int idx = (int)ev;
                 const char *n = (idx >= 0 && idx < 4) ? names[idx] : "?";
                 const char *uri = webkit_web_view_get_uri(wv);
-                fprintf(stderr,
+                EMBED_LOG(
                     "[webview-embed] load-%s: %s\n",
                     n, uri ? uri : "(null)");
             };
@@ -1083,7 +1102,7 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
                     // is the focus widget within the popup, so any
                     // keys that arrive get dispatched to it.
                     gtk_widget_grab_focus(eng->web);
-                    fprintf(stderr,
+                    EMBED_LOG(
                         "[webview-embed] click @ (%.0f,%.0f) -> "
                         "focus grabbed (web_xid=0x%lx)\n",
                         x, y,
@@ -1131,7 +1150,7 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
                 return G_SOURCE_CONTINUE;
             };
         e->redraw_timer_id = g_timeout_add(16, redraw_tick, e);
-        fprintf(stderr,
+        EMBED_LOG(
             "[webview-embed] repaint timer started (id=%u, period=16ms).\n",
             (unsigned)e->redraw_timer_id);
 
@@ -1144,7 +1163,7 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
         //     (no => begin_updating isn't taking effect on this window)
         //   - widget state right after show_all
         //     (mapped/realized/drawable/viewable + allocation)
-        if (getenv("DEBUG_WEBVIEW_EMBED")) {
+        if (embed_verbose()) {
             auto on_draw =
                 +[](GtkWidget *w, cairo_t *, gpointer name) -> gboolean {
                     static guint counter = 0;
@@ -1306,7 +1325,7 @@ static void gtk_set_bounds(Engine *e, int /*x*/, int /*y*/,
 static void gtk_navigate(Engine *e, std::string url) {
     GtkPump::instance().run_async([=] {
         if (!e->web) return;
-        fprintf(stderr,
+        EMBED_LOG(
             "[webview-embed] webkit_web_view_load_uri: %s\n", url.c_str());
         webkit_web_view_load_uri(WEBKIT_WEB_VIEW(e->web), url.c_str());
     });
@@ -1634,7 +1653,7 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
         delete e;
         return nullptr;
     }
-    fprintf(stderr,
+    EMBED_LOG(
         "[webview-embed] offscreen engine ready (%dx%d)\n",
         e->width, e->height);
     return e;
@@ -1735,7 +1754,7 @@ static void gtk_off_resize(OffEngine *e, int w, int h) {
 static void gtk_off_navigate(OffEngine *e, std::string url) {
     GtkPump::instance().run_async([=] {
         if (!e->web) return;
-        fprintf(stderr,
+        EMBED_LOG(
             "[webview-embed] offscreen load_uri: %s\n", url.c_str());
         webkit_web_view_load_uri(WEBKIT_WEB_VIEW(e->web), url.c_str());
     });
@@ -3597,7 +3616,7 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
                     }
                 }
             }
-            fprintf(stderr,
+            EMBED_LOG(
                 "[webview-embed] Found NSView %s; %s\n", cls_name,
                 host_is_awt ? "using directly" :
                 (host ? "deferring to NSWindow.contentView" : "no window"));
@@ -3611,7 +3630,7 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
             // it; make sure it is so AppKit composites WKWebView properly.
             msg<void, BOOL>(host, sel("setWantsLayer:"), YES);
             msg<void, id>(host, sel("addSubview:"), e->webview);
-            fprintf(stderr,
+            EMBED_LOG(
                 "[webview-embed] WKWebView added as subview of %s at %p\n",
                 host_kind, host);
             // Hide the WKWebView until the first setBounds positions it

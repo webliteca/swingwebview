@@ -2528,6 +2528,38 @@ Files:
   and the analysis in
   `spdd/analysis/GGQPA-XXX-202605201900-[Analysis]-edt-appkit-sync-deadlock-elimination.md`
   document the full reasoning.
+- **Native embedding diagnostics are quiet by default.** Every
+  informational or success `[webview-embed]` trace emitted by the
+  native embed code in `src_c/webview_embed.cpp` MUST be gated behind
+  a single verbose switch so that a normal embed/launch prints NO
+  `[webview-embed]` lines and no per-frame `draw#` traces to stderr.
+  This covers the JAWT-resolution traces (`Resolved JAWT_GetAWT via
+  RTLD_DEFAULT`/`via dlsym`, the "not visible in RTLD_DEFAULT; trying
+  dlopen" fallback note, `dlopen'd libjawt from …`), the
+  `JAWT_GetAWT succeeded with mask …` success line, the GTK
+  `Reparenting …` and `repaint timer started` traces, the WebKit
+  `load-<phase>` lifecycle trace, the click/focus-grab trace, the
+  `webkit_web_view_load_uri: …` navigation trace, and the macOS
+  host-NSView discovery (`Found NSView …`) and
+  `WKWebView added as subview of …` attach traces. The switch is the
+  `DEBUG_WEBVIEW_EMBED` environment variable, read once and cached in
+  a `embed_verbose()` helper and routed through an `EMBED_LOG(...)`
+  macro that no-ops unless verbose. It reuses the SAME environment
+  variable that already gates the per-frame `draw#`/frame-clock
+  instrumentation, so one flag controls all embedding diagnostics.
+  Genuine error/failure conditions MUST continue to print
+  unconditionally via plain `fprintf(stderr, …)` — specifically: no
+  `JAWT_GetAWT` symbol available, `dlopen`/`dlsym` of libjawt failed,
+  every JAWT version mask rejected, `GetDrawingSurface`/
+  `GetDrawingSurfaceInfo` returned NULL, `JAWT_LOCK_ERROR`,
+  `gtk_widget_get_window` returned NULL after realize, non-X11
+  `GdkWindow`, WebKit `load-failed`, and the macOS "could not locate
+  any host NSView" layer-only-fallback WARNING. The `windows/
+  webview_embed.cc` port already follows this shape (its `WV_LOG`
+  calls are all failure paths or already gated behind
+  `WEBVIEW_DEBUG_SHORTCUT`), so no unconditional info traces exist
+  there to silence. Document the `DEBUG_WEBVIEW_EMBED` flag in the
+  README debugging section alongside `debugShortcut`.
 
 ## S · Safeguards
 - `EmbeddedWebView.attach` validates `parent != null` AND
