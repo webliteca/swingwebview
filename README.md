@@ -196,6 +196,32 @@ For debugging, set `-Dca.weblite.webview.debugShortcut=true` (Java
 side) and `WEBVIEW_DEBUG_SHORTCUT=1` (native side) to log the
 dispatcher decisions and Win32 `SetFocus` calls.
 
+The native embedding layer (`src_c/webview_embed.cpp`) is **quiet by
+default** — a normal embed/launch prints no `[webview-embed]` lines to
+stderr.  Set `DEBUG_WEBVIEW_EMBED=1` on the way in — for example
+`DEBUG_WEBVIEW_EMBED=1 java -jar your-app.jar` — to restore the full
+verbose trace: JAWT resolution, the `JAWT_GetAWT` version-mask that
+succeeded, GTK reparenting, the WebKit load lifecycle, click/focus
+grabs, the repaint timer, navigation, the per-frame `draw#`/frame-clock
+instrumentation, and (on macOS) host-`NSView` discovery and
+`WKWebView` subview attachment.  Genuine error/failure conditions
+(missing `JAWT_GetAWT`, `dlopen`/`dlsym` failures, a rejected JAWT
+version mask, a `JAWT_LOCK_ERROR`, a non-X11 `GdkWindow`, a WebKit
+`load-failed`, or the macOS layer-only-fallback warning) always print,
+regardless of the flag.  The Windows port
+(`windows/webview_embed.cc`) already logs only on failure, so it has
+no default chatter to silence.
+
+> This flag is read by the native library, so it only takes effect
+> once you are running against a native build that includes it —
+> the natives are produced by `build-{linux,mac,windows}.sh` / the CI
+> release matrix rather than checked into the repo, so downstream
+> consumers pick it up after the next native release.
+>
+> The macOS `ApplePersistenceIgnoreState: Existing state will not be
+> touched …` line is emitted by AppKit itself, not by this library,
+> so it is unaffected by `DEBUG_WEBVIEW_EMBED`.
+
 ## Talking to JavaScript
 
 Four methods on `WebViewComponent` (and on the standalone `WebView`)
