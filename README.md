@@ -402,13 +402,14 @@ wv.setPopupHandler(new WebViewPopupHandler() {
   return the allow/deny decision before yielding to the browser engine);
   keep it fast, thread-safe, and free of Swing access.  `popupOpened` /
   `popupClosed` are asynchronous notifications delivered on the EDT.
-* **Platform coverage (current).**  macOS heavyweight (WKWebView) opens
-  popups via the `WKUIDelegate createWebViewWithConfiguration:` /
-  `webViewDidClose:` pair (Canvas 15).  **Linux** (WebKitGTK `create`
-  signal) and **Windows** (WebView2 `NewWindowRequested`) are specified in
-  Canvas 15 but land in follow-up coverage canvases; until then
-  `window.open` stays blocked on those platforms (the handler reference is
-  held but no native callback fires).
+* **Platform coverage.**  All three engines open native, opener-linked
+  popup windows: macOS heavyweight (WKWebView) via the `WKUIDelegate
+  createWebViewWithConfiguration:` / `webViewDidClose:` pair (Canvas 15);
+  **Linux** heavyweight *and* lightweight (WebKitGTK `create` /
+  `ready-to-show` / `close` signals, Canvas 16); and **Windows**
+  (WebView2 `NewWindowRequested` + the child's `WindowCloseRequested`,
+  Canvas 17).  `setPopupHandler(null)` blocks `window.open` on every
+  platform.
 
 See [`demos/WebViewPopupDemo/`](demos/WebViewPopupDemo/README.md) for a
 runnable example that exercises the allow / custom / block modes.

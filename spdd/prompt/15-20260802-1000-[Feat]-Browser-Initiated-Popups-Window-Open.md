@@ -870,22 +870,21 @@ File: `test/ca/weblite/webview/PopupDispatcherTest.java`
 
 - **Native coverage status (per-iteration, mirrors Canvas 11).** The
   full Java contract (Operations 1–8, 12) and the **macOS** native
-  implementation (Operation 9) ship in this iteration; the demo
-  (13), README (14) and `PopupDispatcherTest` (15) land with them.
-  The **Linux** (Operation 10) and **Windows** (Operation 11) native
-  callback sites are specified here but land in follow-up canvases
-  (16 / 17), exactly as the dialog feature staged macOS → Linux →
-  Windows across Canvases 11 → 12 → 13. Until those land,
-  `setPopupHandler` registrations on Linux / Windows are inert (the
-  handler reference is held in the dispatcher but no native callback
-  is wired), so `window.open` continues to be blocked there. The
-  Java layer introduced here is designed so the Linux / Windows
-  stories wire their native callbacks without re-shaping the Java
-  side. A maintainer who lands Linux / Windows coverage MUST update
-  this note and the README caveat in lockstep. The native code in
-  this repository is validated on-device via `WebViewPopupDemo`
-  under the project's no-automated-GUI-tests policy; the sandbox
-  that generated this iteration had no native toolchain, so the
-  macOS selector code is pattern-faithful to the shipped dialog
-  selectors but MUST be built and exercised on a macOS device before
-  release.
+  implementation (Operation 9) shipped in the first iteration; the demo
+  (13), README (14) and `PopupDispatcherTest` (15) landed with them.
+  The **Linux** (Operation 10) native callback site landed in Canvas 16
+  ([[browser-initiated-popups-linux-coverage]]) and the **Windows**
+  (Operation 11) native callback site landed in Canvas 17
+  ([[browser-initiated-popups-windows-coverage]]), exactly as the dialog
+  feature staged macOS → Linux → Windows across Canvases 11 → 12 → 13.
+  **All three platforms are now wired**: `window.open` opens a native,
+  opener-linked popup window on macOS (WKWebView), Linux (WebKitGTK), and
+  Windows (WebView2), and `setPopupHandler(null)` blocks it everywhere.
+  The Java layer introduced here was designed so the Linux / Windows
+  stories wired their native callbacks without re-shaping the Java side,
+  which is how it played out. The native code in this repository is
+  validated on-device via `WebViewPopupDemo` under the project's
+  no-automated-GUI-tests policy; the sandbox that generated each
+  iteration had no native toolchain, so the selector / signal / event
+  code is pattern-faithful to the shipped dialog handlers but MUST be
+  built and exercised on each target device before release.
