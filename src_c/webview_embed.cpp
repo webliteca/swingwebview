@@ -2997,6 +2997,10 @@ static void impl_run_open_panel(id self, SEL, id webView, id parameters,
 // the window and tears the child engine down.
 // ---------------------------------------------------------------------------
 
+// Forward declaration: impl_create_web_view (below) builds each child engine's
+// UI delegate from the shared class, whose definition follows this block.
+static Class get_webview_embed_ui_delegate_cls();
+
 // Fire an async notification (onPopupOpened / onPopupClosed) into Java on a
 // detached worker thread so AppKit main is not blocked.  Void return.
 static void fire_popup_notify_opened(JavaVM *jvm, jobject cb, jlong popup_id,
@@ -3134,8 +3138,12 @@ static id impl_create_web_view(id self, SEL, id webView, id configuration,
         if (jn) env->DeleteLocalRef(jn);
         if (jp) env->DeleteLocalRef(jp);
     }
-    if (attached) jvm->DetachCurrentThread();
-    if (!allow) return nullptr;
+    // NOTE: keep the thread attached until AFTER the child engine's global
+    // refs are created below — detaching here would invalidate `env`.
+    if (!allow) {
+        if (attached) jvm->DetachCurrentThread();
+        return nullptr;
+    }
 
     // Size the popup: use the requested size, else a typical auth-popup size.
     int W = req_w > 0 ? req_w : 500;
@@ -3145,7 +3153,10 @@ static id impl_create_web_view(id self, SEL, id webView, id configuration,
     id child = msg(objc_cls("WKWebView"), sel("alloc"));
     child = msg<id, CGRect, id>(child, sel("initWithFrame:configuration:"),
                                 CGRectMake(0, 0, W, H), configuration);
-    if (!child) return nullptr;
+    if (!child) {
+        if (attached) jvm->DetachCurrentThread();
+        return nullptr;
+    }
 
     // Host it in an engine-owned NSWindow (titled|closable|miniaturizable|
     // resizable = 1|2|4|8; NSBackingStoreBuffered = 2).
@@ -3166,7 +3177,7 @@ static id impl_create_web_view(id self, SEL, id webView, id configuration,
     child_e->config = configuration;
     child_e->manager = msg(configuration, sel("userContentController"));
     child_e->popup_window = win;
-    child_e->popup_id = (jlong)(intptr_t)child_e;
+    child_e->popup_id = (jlong)child_e;
     if (env) {
         child_e->popup_callback = env->NewGlobalRef(cb);
         if (e->dialog_callback)
@@ -3182,7 +3193,12 @@ static id impl_create_web_view(id self, SEL, id webView, id configuration,
         g_webview_map[child] = child_e;
     }
 
+    // Global refs are created; safe to detach now if we attached above.
+    if (attached) jvm->DetachCurrentThread();
+
     // Notify the opener's PopupDispatcher (async) that the popup is open.
+    // fire_popup_notify_opened attaches its own worker thread; it does not
+    // use `env`.
     fire_popup_notify_opened(jvm, cb, child_e->popup_id, target, "",
                              gesture, W, H, page);
     return child;
