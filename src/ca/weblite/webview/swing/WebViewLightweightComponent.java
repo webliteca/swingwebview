@@ -13,6 +13,7 @@ import ca.weblite.webview.JavascriptFunction;
 import ca.weblite.webview.OffscreenWebView;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewDialogCallback;
+import ca.weblite.webview.WebViewPopupCallback;
 import ca.weblite.webview.WebViewMouseDispatcher;
 
 import java.awt.Color;
@@ -278,6 +279,32 @@ public class WebViewLightweightComponent extends WebViewComponent {
                     multiple, mimeTypes, extensions, pageUrl, frameUrl);
             }
         });
+        // Install the popup bridge (window.open) on the offscreen engine.
+        // Linux dispatches via the WebKitGTK create signal; on macOS /
+        // Windows the offscreen engine is a stub and this call is a
+        // native-side no-op.
+        engine.setPopupCallback(new WebViewPopupCallback() {
+            @Override
+            public boolean onPopupRequested(String targetUrl, String targetName,
+                                            boolean userGesture, int width,
+                                            int height, String pageUrl) {
+                return popupDispatcher.dispatchPopupRequested(
+                    targetUrl, targetName, userGesture, width, height, pageUrl);
+            }
+            @Override
+            public void onPopupOpened(long popupId, String targetUrl,
+                                      String targetName, boolean userGesture,
+                                      int width, int height, String pageUrl) {
+                popupDispatcher.dispatchPopupOpened(
+                    popupId, targetUrl, targetName, userGesture, width, height,
+                    pageUrl);
+            }
+            @Override
+            public void onPopupClosed(long popupId, String targetUrl,
+                                      String pageUrl) {
+                popupDispatcher.dispatchPopupClosed(popupId, targetUrl, pageUrl);
+            }
+        });
         for (String js : pendingInit) {
             engine.addOnBeforeLoad(js);
         }
@@ -315,6 +342,7 @@ public class WebViewLightweightComponent extends WebViewComponent {
         // native side mid-teardown returns the safe fallback without
         // invoking the handler against a half-disposed component.
         dialogDispatcher.disposeAll();
+        popupDispatcher.disposeAll();
         if (engine != null) {
             OffscreenWebView ow = engine;
             engine = null;

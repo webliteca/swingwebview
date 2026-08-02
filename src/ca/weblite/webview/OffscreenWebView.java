@@ -371,6 +371,32 @@ public class OffscreenWebView {
         return this;
     }
 
+    /**
+     * Offscreen counterpart to
+     * {@link EmbeddedWebView#setPopupCallback} — bridges
+     * {@code window.open} popup requests in the offscreen engine to the
+     * per-component {@link PopupDispatcher}.
+     *
+     * <p>Anchoring the callback in {@code heap} is required so the JVM does
+     * not garbage-collect the adapter while the native side holds a global
+     * ref.
+     *
+     * <p>On macOS / Windows, where the offscreen engine itself is a stub,
+     * this method has no effect — the native stub is a no-op.  Linux is the
+     * only platform where the offscreen path actually dispatches popup
+     * requests (WebKitGTK {@code create} signal).
+     *
+     * @return {@code this} for chaining
+     */
+    public OffscreenWebView setPopupCallback(WebViewPopupCallback cb) {
+        checkAlive();
+        if (cb != null) {
+            heap.add(cb);
+        }
+        WebViewNative.webview_offscreen_set_popup_callback(peer, cb);
+        return this;
+    }
+
     /** Release native resources. */
     public void dispose() {
         if (peer != 0L) {

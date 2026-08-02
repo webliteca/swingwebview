@@ -138,6 +138,14 @@ struct Engine {
     // public hook for <input type=file>), so this callback is never
     // invoked for the file-picker event kind on Windows.
     jobject dialog_callback = nullptr;
+
+    // JNI global ref to the registered WebViewPopupCallback, or nullptr —
+    // Canvas 15.  Stored here on Windows; the follow-up Windows coverage
+    // canvas wires ICoreWebView2::add_NewWindowRequested off this field
+    // (put_NewWindow with a controller from the same environment) plus the
+    // child's add_WindowCloseRequested so window.open opens a native window
+    // linked to the opener.  Until then window.open stays blocked on Windows.
+    jobject popup_callback = nullptr;
 };
 
 static void fire_focus_callback(Engine *e, bool became) {
@@ -1333,6 +1341,29 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
     // Windows has no offscreen engine; OffscreenWebView.create returns
     // null on Windows so this JNI bridge should never be reached.
     // Stub it for link-symmetry across all three native binaries.
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1popup_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    // Canvas 15 ships the callback storage on Windows; the follow-up
+    // Windows coverage canvas wires ICoreWebView2::add_NewWindowRequested
+    // off this field.  Until then storing the ref is a harmless no-op and
+    // window.open stays blocked on Windows.
+    auto *e = (Engine *)wv;
+    if (!e) return;
+    if (e->popup_callback) {
+        env->DeleteGlobalRef(e->popup_callback);
+        e->popup_callback = nullptr;
+    }
+    if (cb) {
+        e->popup_callback = env->NewGlobalRef(cb);
+    }
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1popup_1callback
+  (JNIEnv *, jclass, jlong, jobject) {
+    // Windows has no offscreen engine; stub for link-symmetry across all
+    // three native binaries.
 }
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1release_1native_1focus

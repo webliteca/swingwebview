@@ -283,6 +283,25 @@ native static void webview_embed_set_attach_callback(long w, Object cb);
 // silent no-op.  Never throws via JNI.
 native static void webview_embed_set_dialog_callback(long w, WebViewDialogCallback cb);
 
+// Register (or clear, by passing null) a callback invoked when the
+// embedded page requests a popup (window.open / target=_blank).  The
+// callback's onPopupRequested returns the allow/deny decision
+// synchronously on the native UI thread; onPopupOpened / onPopupClosed
+// are async notifications the library marshals to the EDT via
+// SwingUtilities.invokeLater.  When a popup is allowed the native engine
+// creates the child web view LINKED to the opener and hosts it in a
+// native top-level window it owns.  Per-platform delivery:
+//   - macOS:   WKUIDelegate createWebViewWithConfiguration: +
+//              webViewDidClose: on the WKWebView.
+//   - Linux:   create / ready-to-show / close signals on WebKitWebView
+//              (child created via webkit_web_view_new_with_related_view).
+//   - Windows: ICoreWebView2::add_NewWindowRequested (put_NewWindow with
+//              a controller from the same environment) plus the child's
+//              add_WindowCloseRequested.
+// cb may be null to clear the registration.  Passing 0 for w is a
+// silent no-op.  Never throws via JNI.
+native static void webview_embed_set_popup_callback(long w, WebViewPopupCallback cb);
+
 
 // ---------------------------------------------------------------------------
 // Lightweight / offscreen API (currently Linux-only).
@@ -391,6 +410,13 @@ native static void webview_offscreen_execute_editing_command(long peer, int cmdI
 // macOS / Windows native binaries provide a no-op stub (the offscreen
 // engine on those platforms is itself a stub).  Never throws via JNI.
 native static void webview_offscreen_set_dialog_callback(long peer, WebViewDialogCallback cb);
+
+// Offscreen counterpart to webview_embed_set_popup_callback.  Used by
+// WebViewLightweightComponent on Linux to bridge window.open requests in
+// the offscreen engine to the per-component PopupDispatcher.  macOS /
+// Windows native binaries provide a no-op stub (the offscreen engine on
+// those platforms is itself a stub).  Never throws via JNI.
+native static void webview_offscreen_set_popup_callback(long peer, WebViewPopupCallback cb);
 
 
 }
