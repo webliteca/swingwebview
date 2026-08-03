@@ -752,7 +752,15 @@ Files: `src/ca/weblite/webview/swing/WebViewHeavyweightComponent.java`,
 Files: `demos/WebViewPopupDemo/…`
 1. `JPopupMenu.setDefaultLightWeightPopupEnabled(false)` +
    `ToolTipManager…setLightWeightPopupEnabled(false)` at startup.
-2. Inline page (via `addOnBeforeLoad` + `about:blank`) with buttons:
+2. Inline page loaded via a **base64-encoded `data:` URL** — build
+   the HTML string, base64-encode it (`java.util.Base64`), and call
+   `setUrl("data:text/html;charset=utf-8;base64," + b64)`, exactly as
+   `WebViewDialogDemo` does. Do **not** use `addOnBeforeLoad` +
+   `about:blank`: that path renders a blank page on macOS WKWebView
+   (empty content area, no controls), and raw/percent-encoded `data:`
+   bodies hit two WKWebView pitfalls the dialog demo documents (literal
+   `%20` text; truncation at the first `#` in CSS colours). Base64 is
+   cross-engine reliable and sidesteps both. The page has buttons:
    `window.open('https://example.com','_blank','width=520,height=640')`,
    a `target=_blank` link, and a button that reports
    `window.open(...) === null` to a console line (verifies allow vs

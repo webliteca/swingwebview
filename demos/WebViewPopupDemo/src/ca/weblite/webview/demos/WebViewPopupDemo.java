@@ -80,10 +80,6 @@ public class WebViewPopupDemo {
           + "}"
           + "</script></body></html>";
 
-        wv.addOnBeforeLoad(
-            "document.open();document.write("
-          + toJsString(html) + ");document.close();");
-
         final JTextArea log = new JTextArea();
         log.setEditable(false);
         wv.addConsoleListener(new ConsoleListener() {
@@ -140,7 +136,14 @@ public class WebViewPopupDemo {
         f.setLocationRelativeTo(null);
         f.setVisible(true);
 
-        wv.setUrl("about:blank");
+        // Load the inline page via a base64-encoded data: URL, mirroring
+        // WebViewDialogDemo.  Base64 avoids the WKWebView blank-page
+        // pitfalls of addOnBeforeLoad + about:blank and of raw/percent-
+        // encoded data: bodies (literal "%20" text; truncation at the
+        // first '#' in CSS colours) and decodes reliably on every engine.
+        String b64 = java.util.Base64.getEncoder().encodeToString(
+            html.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        wv.setUrl("data:text/html;charset=utf-8;base64," + b64);
     }
 
     private static void append(JTextArea log, String line) {
@@ -148,21 +151,5 @@ public class WebViewPopupDemo {
             log.append(line + "\n");
             log.setCaretPosition(log.getDocument().getLength());
         });
-    }
-
-    /** Encode an HTML string as a JS string literal for document.write. */
-    private static String toJsString(String s) {
-        StringBuilder b = new StringBuilder("\"");
-        for (int i = 0; i < s.length(); i++) {
-            char c = s.charAt(i);
-            switch (c) {
-                case '"':  b.append("\\\""); break;
-                case '\\': b.append("\\\\"); break;
-                case '\n': b.append("\\n"); break;
-                case '\r': break;
-                default:   b.append(c);
-            }
-        }
-        return b.append("\"").toString();
     }
 }
