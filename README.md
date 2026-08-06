@@ -18,12 +18,18 @@ Add the dependency to your `pom.xml`:
 ```
 
 The jar bundles the native libraries for macOS, Linux, and Windows — no
-additional native install step is required, with one exception:
+additional native install step is required beyond the platform's system
+web engine:
 
 * **Windows** requires the system-wide Microsoft Edge WebView2 Runtime,
   which ships with current Windows 11 / Edge.  On older Windows, install
   the Evergreen Runtime from
   <https://developer.microsoft.com/microsoft-edge/webview2/>.
+* **Linux** requires a system WebKitGTK — either **4.1** (Ubuntu 22.04+)
+  or **4.0** (Ubuntu 20.04).  The bundled `libwebview.so` resolves
+  whichever is present at load time (no `webkit2gtk` SONAME is
+  hard-linked), so a single jar runs on both.
+* **macOS** needs nothing extra — WKWebView ships with the OS.
 
 ## Platform support
 

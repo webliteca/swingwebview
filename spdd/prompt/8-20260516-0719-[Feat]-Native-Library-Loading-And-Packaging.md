@@ -392,6 +392,12 @@ Files: `src_c/webkit_loader.h`, `src_c/webkit_loader.cpp`,
    job if any `NEEDED` entry matches `webkit2gtk` or
    `javascriptcoregtk` — the machine-checked proof the artifact
    carries no hard WebKit dependency.
+6. README: the "Platform support" preamble documents the Linux
+   runtime requirement as a single portable binary — the bundled
+   `libwebview.so` loads on either WebKitGTK **4.1** (Ubuntu 22.04+)
+   or **4.0** (Ubuntu 20.04) present at load time, with no separate
+   per-version build, alongside the existing Windows WebView2-Runtime
+   note.
 
 ## N · Norms
 - The developer `build-*.sh` scripts must quote every shell

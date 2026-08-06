@@ -38,11 +38,15 @@ ant run
 Requires a built `dist/WebView.jar` at the project root (run any
 `run-{linux,mac,windows}-demo.sh` once first to produce it).
 
-## Platform status (this iteration)
+## Platform status
 
-macOS heavyweight (WKWebView) is wired in Canvas 15 — popups open in a
-native window linked to the opener.  On **Linux** and **Windows** the
-embedded engine still blocks `window.open` until the follow-up coverage
-canvases land (WebKitGTK `create` signal / WebView2 `NewWindowRequested`);
-on those platforms the demo's mode switcher still updates the log pane, but
-the embedded engine does not yet open popups.
+All three platforms open a native, opener-linked popup window when a popup
+is allowed:
+
+- **macOS** — WKWebView `createWebViewWithConfiguration:` (Canvas 15).
+- **Linux** — WebKitGTK `create` signal, heavyweight *and* lightweight
+  (Canvas 16).
+- **Windows** — WebView2 `NewWindowRequested` (Canvas 17).
+
+`setPopupHandler(null)` blocks `window.open` (it returns `null`) on every
+platform.

@@ -767,7 +767,14 @@ Files: `demos/WebViewPopupDemo/…`
    block). A JComboBox switches handler modes: Default (allow),
    Block (`setPopupHandler(null)`), Custom (logs
    `popupOpened`/`popupClosed`).
-3. `build.xml` + `README.md` mirror `WebViewDialogDemo`.
+3. `build.xml` + `README.md` mirror `WebViewDialogDemo`. The demo
+   `README.md`'s platform-status section mirrors the **Native coverage
+   status** note (Safeguards): all three platforms open a native,
+   opener-linked popup — macOS (WKWebView, Canvas 15), Linux (WebKitGTK
+   `create`, heavyweight *and* lightweight, Canvas 16), Windows (WebView2
+   `NewWindowRequested`, Canvas 17) — and `setPopupHandler(null)` blocks
+   `window.open` on every platform. It must not describe Linux/Windows as
+   unimplemented or "follow-up".
 
 ### 14. README
 File: `README.md`
