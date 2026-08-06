@@ -8,9 +8,11 @@ package ca.weblite.webview.swing;
 import ca.weblite.webview.ConsoleDispatcher;
 import ca.weblite.webview.ConsoleListener;
 import ca.weblite.webview.DialogDispatcher;
+import ca.weblite.webview.PopupDispatcher;
 import ca.weblite.webview.JavaScriptEvalException;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewDialogHandler;
+import ca.weblite.webview.WebViewPopupHandler;
 import ca.weblite.webview.WebViewMouseDispatcher;
 import ca.weblite.webview.WebViewMouseListener;
 
@@ -75,6 +77,13 @@ public abstract class WebViewComponent extends JComponent {
      *  on their native peer at peer-attach time that delegates to this
      *  dispatcher's {@code dispatch*} methods. */
     protected final DialogDispatcher dialogDispatcher = new DialogDispatcher(this);
+
+    /** Per-component fan-out hub for browser-initiated popups
+     *  ({@code window.open}).  Subclasses install a
+     *  {@link ca.weblite.webview.WebViewPopupCallback} on their native peer at
+     *  peer-attach time that delegates to this dispatcher's {@code dispatch*}
+     *  methods. */
+    protected final PopupDispatcher popupDispatcher = new PopupDispatcher(this);
 
     /** Implementation mode for {@link #create(Mode)}. */
     public enum Mode {
@@ -505,5 +514,39 @@ public abstract class WebViewComponent extends JComponent {
      */
     public final WebViewDialogHandler getDialogHandler() {
         return dialogDispatcher.getHandler();
+    }
+
+    /**
+     * Install the handler for browser-initiated popups
+     * ({@code window.open}, {@code target="_blank"}).  When a popup is
+     * allowed the native engine opens it in a separate native window linked
+     * to the opener (so OAuth "sign-in with popup" flows work).
+     *
+     * <p>Passing {@code null} installs an internal drop handler that blocks
+     * all popups ({@code window.open} returns {@code null}) — the pre-feature
+     * behaviour, available as an explicit opt-out.  To reset to the framework
+     * default (allow all), pass {@link WebViewPopupHandler#DEFAULT}
+     * explicitly.
+     *
+     * <p>See {@link WebViewPopupHandler} for the full contract, including the
+     * native-owned-window model and the threading rules
+     * ({@code popupRequested} runs on the native UI thread; notifications run
+     * on the EDT).
+     *
+     * @return {@code this} for chaining
+     */
+    public final WebViewComponent setPopupHandler(WebViewPopupHandler handler) {
+        popupDispatcher.setHandler(handler);
+        return this;
+    }
+
+    /**
+     * @return the active {@link WebViewPopupHandler}.  Never returns
+     * {@code null} — returns {@link WebViewPopupHandler#DEFAULT} when no
+     * caller has installed one, and returns the internal drop singleton when
+     * caller passed {@code null} to {@link #setPopupHandler}.
+     */
+    public final WebViewPopupHandler getPopupHandler() {
+        return popupDispatcher.getHandler();
     }
 }

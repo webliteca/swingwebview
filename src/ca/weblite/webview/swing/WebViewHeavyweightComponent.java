@@ -13,6 +13,7 @@ import ca.weblite.webview.JavascriptFunction;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewClickCallback;
 import ca.weblite.webview.WebViewDialogCallback;
+import ca.weblite.webview.WebViewPopupCallback;
 import ca.weblite.webview.WebViewFocusCallback;
 import ca.weblite.webview.WebViewAttachListener;
 import ca.weblite.webview.WebViewMouseDispatcher;
@@ -237,6 +238,7 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         // false / null / empty) without invoking the handler against
         // a half-disposed component.
         dialogDispatcher.disposeAll();
+        popupDispatcher.disposeAll();
         if (embedded != null) {
             EmbeddedWebView e = embedded;
             embedded = null;
@@ -594,6 +596,33 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
                                          String frameUrl) {
                 return dialogDispatcher.dispatchFilePicker(
                     multiple, mimeTypes, extensions, pageUrl, frameUrl);
+            }
+        });
+        // Install the popup bridge so window.open / target=_blank route to
+        // the per-component WebViewPopupHandler.  onPopupRequested returns
+        // the allow/deny decision synchronously on the native UI thread (no
+        // EDT hop); onPopupOpened / onPopupClosed are async notifications the
+        // dispatcher marshals to the EDT via invokeLater.
+        embedded.setPopupCallback(new WebViewPopupCallback() {
+            @Override
+            public boolean onPopupRequested(String targetUrl, String targetName,
+                                            boolean userGesture, int width,
+                                            int height, String pageUrl) {
+                return popupDispatcher.dispatchPopupRequested(
+                    targetUrl, targetName, userGesture, width, height, pageUrl);
+            }
+            @Override
+            public void onPopupOpened(long popupId, String targetUrl,
+                                      String targetName, boolean userGesture,
+                                      int width, int height, String pageUrl) {
+                popupDispatcher.dispatchPopupOpened(
+                    popupId, targetUrl, targetName, userGesture, width, height,
+                    pageUrl);
+            }
+            @Override
+            public void onPopupClosed(long popupId, String targetUrl,
+                                      String pageUrl) {
+                popupDispatcher.dispatchPopupClosed(popupId, targetUrl, pageUrl);
             }
         });
         // Seed the peer's initial visibility from the component's current

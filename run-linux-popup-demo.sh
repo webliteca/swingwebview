@@ -1,22 +1,31 @@
 #!/bin/bash
 # One-shot script: build the Linux native lib, build WebView.jar, compile
-# and run the browser-initiated UI dialogs demo (WebViewDialogDemo).
+# and run the browser-initiated popup demo (WebViewPopupDemo).
 #
-# Exercises window.alert / window.confirm / window.prompt and
-# <input type="file"> across three handler modes (Default Swing dialogs,
-# Custom programmatic answers, Drop / null = suppress).  See
-# demos/WebViewDialogDemo/README.md for the AC-mapped manual test
-# checklist.
+# Exercises window.open(url, name, features) and <a target="_blank"> across
+# three handler modes (Default = allow, Custom = allow + log
+# popupOpened/popupClosed, Block = setPopupHandler(null) => window.open
+# returns null).  See demos/WebViewPopupDemo/README.md for the AC-mapped
+# manual test checklist (allow, opener linkage, notifications, requested
+# size, block, window.close()).
 #
-# Usage:    ./run-linux-dialog-demo.sh             # lightweight (default)
-#           ./run-linux-dialog-demo.sh heavyweight # force heavyweight mode
-#           ./run-linux-dialog-demo.sh lightweight # force lightweight mode
-#           WEBVIEW_MODE=heavyweight ./run-linux-dialog-demo.sh
+# On Linux the allowed popup is created from WebKitGTK's "create" signal and
+# hosted in a native GTK top-level window linked to the opener; window.close()
+# fires the child's "close" signal, which tears the popup window down.
 #
-# STORY-004-002 requires AC verification in BOTH modes; run the script
-# twice (once per mode) to cover the full acceptance matrix.
+# NOTE: this builds libwebview.so WITHOUT linking WebKitGTK/JavaScriptCore
+# (they are dlopen'd at runtime, 4.1 preferred / 4.0 fallback, by
+# src_c/webkit_loader.cpp), so it also exercises that runtime-resolution path.
 #
-# Override JDK:  JAVA_HOME=/path/to/jdk ./run-linux-dialog-demo.sh
+# Usage:    ./run-linux-popup-demo.sh             # lightweight (default)
+#           ./run-linux-popup-demo.sh heavyweight # force heavyweight mode
+#           ./run-linux-popup-demo.sh lightweight # force lightweight mode
+#           WEBVIEW_MODE=heavyweight ./run-linux-popup-demo.sh
+#
+# Popups work in BOTH embedding modes on Linux; run the script twice (once
+# per mode) to cover the full matrix.
+#
+# Override JDK:  JAVA_HOME=/path/to/jdk ./run-linux-popup-demo.sh
 #
 # Required packages:
 #   - g++, pkg-config
@@ -71,7 +80,7 @@ for tool in "$JAVAC" "$JAVA" "$JAR"; do
 done
 
 # ---------------------------------------------------------------------------
-# 2. Pick a WebKit pkg-config name
+# 2. Pick a WebKit pkg-config name (for HEADERS only; not linked)
 # ---------------------------------------------------------------------------
 if pkg-config --exists webkit2gtk-4.1; then
     WEBKIT_PKG=webkit2gtk-4.1
@@ -89,7 +98,7 @@ if ! pkg-config --exists gtk+-3.0; then
     echo "gtk+-3.0 (libgtk-3-dev) is required." >&2
     exit 1
 fi
-echo "Using WebKit package: $WEBKIT_PKG"
+echo "Using WebKit package (headers only): $WEBKIT_PKG"
 
 if ! printf '#include <X11/Intrinsic.h>\nint main(){return 0;}\n' | \
         g++ -E -x c++ - >/dev/null 2>&1; then
@@ -167,16 +176,16 @@ cp "$SO" "$STAGE/$NATIVE_DIR/libwebview.so"
 echo "Built $WV_JAR"
 
 # ---------------------------------------------------------------------------
-# 6. Compile and run the dialog demo
+# 6. Compile and run the popup demo
 # ---------------------------------------------------------------------------
-DEMO_DIR="$REPO_DIR/demos/WebViewDialogDemo"
-DEMO_CLASSES="$BUILD_DIR/classes-dialog-demo"
+DEMO_DIR="$REPO_DIR/demos/WebViewPopupDemo"
+DEMO_CLASSES="$BUILD_DIR/classes-popup-demo"
 mkdir -p "$DEMO_CLASSES"
 echo "Compiling demo ..."
 "$JAVAC" -d "$DEMO_CLASSES" -classpath "$WV_JAR" \
-    "$DEMO_DIR/src/ca/weblite/webview/demos/WebViewDialogDemo.java"
+    "$DEMO_DIR/src/ca/weblite/webview/demos/WebViewPopupDemo.java"
 
-echo "Launching WebViewDialogDemo (mode=$MODE) ..."
+echo "Launching WebViewPopupDemo (mode=$MODE) ..."
 # Force the X11 GDK backend; embedding via XReparentWindow needs a real X11
 # GdkDisplay on both sides.
 export GDK_BACKEND=x11
@@ -186,4 +195,4 @@ export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
 exec "$JAVA" \
     "-Dca.weblite.webview.mode=$MODE" \
     -cp "$DEMO_CLASSES:$WV_JAR" \
-    ca.weblite.webview.demos.WebViewDialogDemo
+    ca.weblite.webview.demos.WebViewPopupDemo

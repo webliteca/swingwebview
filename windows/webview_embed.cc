@@ -138,6 +138,27 @@ struct Engine {
     // public hook for <input type=file>), so this callback is never
     // invoked for the file-picker event kind on Windows.
     jobject dialog_callback = nullptr;
+
+    // JNI global ref to the registered WebViewPopupCallback, or nullptr —
+    // Canvas 15.  Stored here on Windows; the follow-up Windows coverage
+    // canvas wires ICoreWebView2::add_NewWindowRequested off this field
+    // (put_NewWindow with a controller from the same environment) plus the
+    // child's add_WindowCloseRequested so window.open opens a native window
+    // linked to the opener.  Until then window.open stays blocked on Windows.
+    jobject popup_callback = nullptr;
+
+    // EventRegistrationToken for the NewWindowRequested handler registered in
+    // the controller-ready callback (Canvas 17).  Not explicitly removed in
+    // destroy_engine -- the controller / webview Release detaches it
+    // transitively, like the other tokens.
+    EventRegistrationToken new_window_token{};
+
+    // The ICoreWebView2Environment this engine was created from, AddRef'd at
+    // environment-ready and Release'd in destroy_engine (Canvas 17).  The
+    // NewWindowRequested handler creates the child popup controller from THIS
+    // environment so the popup is a linked view (window.opener / postMessage
+    // work) -- a controller from a different environment is not linked.
+    ICoreWebView2Environment *environment = nullptr;
 };
 
 static void fire_focus_callback(Engine *e, bool became) {
@@ -585,6 +606,372 @@ private:
     Engine *m_engine;
 };
 
+// ---------------------------------------------------------------------------
+// Popup (window.open) support — Canvas 17 (Windows / WebView2).
+//
+// window.open / target=_blank raises ICoreWebView2::NewWindowRequested.  Invoke
+// runs on the WebView2 worker thread and must NOT block it, so we use the
+// deferral pattern (like ScriptDialogHandler): GetDeferral, hop to Java on a
+// short-lived worker for the allow/deny decision, then dispatch_to_thread back
+// onto the WebView2 worker to create the child (via put_NewWindow with a
+// controller built from the SAME environment, so window.opener / postMessage
+// work) and Complete the deferral.  The engine owns the popup HWND; the child's
+// WindowCloseRequested destroys it.
+// ---------------------------------------------------------------------------
+
+// A child popup's native state: an engine-owned top-level window hosting a
+// linked child WebView2.  Freed in PopupWndProc's WM_DESTROY.
+struct PopupWindow {
+    HWND hwnd = nullptr;
+    ICoreWebView2Controller *controller = nullptr;
+    ICoreWebView2 *webview = nullptr;
+    Engine *opener = nullptr;   // for jvm + popup_callback (notifications)
+    jlong popup_id = 0;
+    std::string url;
+    EventRegistrationToken close_token{};
+};
+
+static LRESULT CALLBACK PopupWndProc(HWND hwnd, UINT msg, WPARAM wp,
+                                     LPARAM lp) {
+    PopupWindow *pw = (PopupWindow *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    switch (msg) {
+    case WM_SIZE:
+        if (pw && pw->controller) {
+            RECT r;
+            GetClientRect(hwnd, &r);
+            pw->controller->put_Bounds(r);
+        }
+        return 0;
+    case WM_DESTROY:
+        if (pw) {
+            if (pw->webview) { pw->webview->Release(); pw->webview = nullptr; }
+            if (pw->controller) {
+                pw->controller->Close();
+                pw->controller->Release();
+                pw->controller = nullptr;
+            }
+            SetWindowLongPtr(hwnd, GWLP_USERDATA, 0);
+            delete pw;
+        }
+        return 0;
+    default:
+        return DefWindowProc(hwnd, msg, wp, lp);
+    }
+}
+
+static ATOM ensure_popup_class_registered() {
+    static ATOM atom = 0;
+    if (atom != 0) return atom;
+    WNDCLASSEX wc{};
+    wc.cbSize = sizeof(wc);
+    wc.hInstance = GetModuleHandle(nullptr);
+    wc.lpszClassName = "WebViewEmbedPopup";
+    wc.lpfnWndProc = PopupWndProc;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    atom = RegisterClassEx(&wc);
+    return atom;
+}
+
+// Synchronous allow/deny hop into Java (runs on the JNI worker thread the
+// NewWindowRequested handler spins up).  Returns false on null callback,
+// attach failure, or any exception (block-on-error default).
+static bool fire_popup_requested_win(Engine *e, const char *url, bool gesture,
+                                     int w, int h, const char *page) {
+    if (!e || !e->popup_callback || !e->jvm) return false;
+    JavaVM *jvm = e->jvm;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return false;
+        detach = true;
+    }
+    bool allow = false;
+    jstring ju = env->NewStringUTF(url ? url : "");
+    jstring jn = env->NewStringUTF("");
+    jstring jp = env->NewStringUTF(page ? page : "");
+    jclass cls = env->GetObjectClass(e->popup_callback);
+    if (cls) {
+        jmethodID mid = env->GetMethodID(cls, "onPopupRequested",
+            "(Ljava/lang/String;Ljava/lang/String;ZIILjava/lang/String;)Z");
+        if (mid) {
+            jboolean r = env->CallBooleanMethod(e->popup_callback, mid, ju, jn,
+                gesture ? JNI_TRUE : JNI_FALSE, (jint)w, (jint)h, jp);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+                r = JNI_FALSE;
+            }
+            allow = (r == JNI_TRUE);
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (ju) env->DeleteLocalRef(ju);
+    if (jn) env->DeleteLocalRef(jn);
+    if (jp) env->DeleteLocalRef(jp);
+    if (detach) jvm->DetachCurrentThread();
+    return allow;
+}
+
+// Fire onPopupOpened (fire-and-forget; the Java dispatcher marshals to the
+// EDT via invokeLater).  Runs on the WebView2 worker thread.
+static void fire_popup_opened_win(Engine *e, jlong popup_id, const char *url,
+                                  bool gesture, int w, int h,
+                                  const char *page) {
+    if (!e || !e->popup_callback || !e->jvm) return;
+    JavaVM *jvm = e->jvm;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return;
+        detach = true;
+    }
+    jstring ju = env->NewStringUTF(url ? url : "");
+    jstring jn = env->NewStringUTF("");
+    jstring jp = env->NewStringUTF(page ? page : "");
+    jclass cls = env->GetObjectClass(e->popup_callback);
+    if (cls) {
+        jmethodID mid = env->GetMethodID(cls, "onPopupOpened",
+            "(JLjava/lang/String;Ljava/lang/String;ZIILjava/lang/String;)V");
+        if (mid) {
+            env->CallVoidMethod(e->popup_callback, mid, popup_id, ju, jn,
+                gesture ? JNI_TRUE : JNI_FALSE, (jint)w, (jint)h, jp);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (ju) env->DeleteLocalRef(ju);
+    if (jn) env->DeleteLocalRef(jn);
+    if (jp) env->DeleteLocalRef(jp);
+    if (detach) jvm->DetachCurrentThread();
+}
+
+// Fire onPopupClosed.  Runs on the WebView2 worker thread.
+static void fire_popup_closed_win(Engine *e, jlong popup_id, const char *url,
+                                  const char *page) {
+    if (!e || !e->popup_callback || !e->jvm) return;
+    JavaVM *jvm = e->jvm;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return;
+        detach = true;
+    }
+    jstring ju = env->NewStringUTF(url ? url : "");
+    jstring jp = env->NewStringUTF(page ? page : "");
+    jclass cls = env->GetObjectClass(e->popup_callback);
+    if (cls) {
+        jmethodID mid = env->GetMethodID(cls, "onPopupClosed",
+            "(JLjava/lang/String;Ljava/lang/String;)V");
+        if (mid) {
+            env->CallVoidMethod(e->popup_callback, mid, popup_id, ju, jp);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (ju) env->DeleteLocalRef(ju);
+    if (jp) env->DeleteLocalRef(jp);
+    if (detach) jvm->DetachCurrentThread();
+}
+
+// window.close() from the popup (or the user closing the native window).
+// Notify onPopupClosed, then DestroyWindow -> PopupWndProc WM_DESTROY frees
+// the controller/webview and deletes the PopupWindow.
+class PopupCloseHandler : public CallbackBase<
+    ICoreWebView2WindowCloseRequestedEventHandler> {
+public:
+    explicit PopupCloseHandler(PopupWindow *pw) : m_pw(pw) {}
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *, IUnknown *) override {
+        if (!m_pw) return S_OK;
+        fire_popup_closed_win(m_pw->opener, m_pw->popup_id,
+                              m_pw->url.c_str(), "");
+        if (m_pw->hwnd) DestroyWindow(m_pw->hwnd);
+        return S_OK;
+    }
+private:
+    PopupWindow *m_pw;
+};
+
+// NewWindowRequested -> allow/deny via Java, then create the linked child in an
+// engine-owned top-level window.  Deferral pattern; see the block comment.
+class NewWindowRequestedHandler : public CallbackBase<
+    ICoreWebView2NewWindowRequestedEventHandler> {
+public:
+    explicit NewWindowRequestedHandler(Engine *e) : m_engine(e) {}
+    HRESULT STDMETHODCALLTYPE Invoke(
+        ICoreWebView2 *,
+        ICoreWebView2NewWindowRequestedEventArgs *args) override {
+        if (!args || !m_engine) return S_OK;
+
+        LPWSTR uri_w = nullptr;
+        args->get_Uri(&uri_w);
+        std::string uri = wide_to_utf8(uri_w);
+        if (uri_w) CoTaskMemFree(uri_w);
+
+        BOOL user_initiated = FALSE;
+        args->get_IsUserInitiated(&user_initiated);
+
+        int req_w = -1, req_h = -1;
+        ICoreWebView2WindowFeatures *feat = nullptr;
+        if (SUCCEEDED(args->get_WindowFeatures(&feat)) && feat) {
+            BOOL has_size = FALSE;
+            feat->get_HasSize(&has_size);
+            if (has_size) {
+                UINT32 fw = 0, fh = 0;
+                feat->get_Width(&fw);
+                feat->get_Height(&fh);
+                if (fw > 0) req_w = (int)fw;
+                if (fh > 0) req_h = (int)fh;
+            }
+            feat->Release();
+        }
+
+        // Opener document URL (best effort).
+        std::string page;
+        {
+            LPWSTR src = nullptr;
+            if (m_engine->webview &&
+                SUCCEEDED(m_engine->webview->get_Source(&src)) && src) {
+                page = wide_to_utf8(src);
+            }
+            if (src) CoTaskMemFree(src);
+        }
+
+        ICoreWebView2Deferral *deferral = nullptr;
+        HRESULT hr = args->GetDeferral(&deferral);
+        if (FAILED(hr) || !deferral) {
+            WV_LOG("NewWindowRequested GetDeferral failed: HRESULT=0x%08lx",
+                   (unsigned long)hr);
+            return S_OK;  // WebView2 opens its own default window (fallback)
+        }
+        args->AddRef();
+
+        Engine *e = m_engine;
+        bool gesture = (user_initiated != FALSE);
+        std::thread([e, args, deferral, uri, page, gesture, req_w, req_h] {
+            bool allow = fire_popup_requested_win(e, uri.c_str(), gesture,
+                                                  req_w, req_h, page.c_str());
+            dispatch_to_thread(e, [e, args, deferral, uri, page, gesture,
+                                   req_w, req_h, allow] {
+                if (!allow) {
+                    args->put_Handled(TRUE);   // block; window.open -> null
+                    deferral->Complete();
+                    deferral->Release();
+                    args->Release();
+                    return;
+                }
+                int W = req_w > 0 ? req_w : 500;
+                int H = req_h > 0 ? req_h : 650;
+                ensure_popup_class_registered();
+                HWND popup = CreateWindowEx(
+                    0, "WebViewEmbedPopup", "Popup", WS_OVERLAPPEDWINDOW,
+                    CW_USEDEFAULT, CW_USEDEFAULT, W, H,
+                    nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
+                if (!popup || !e->environment) {
+                    if (popup) DestroyWindow(popup);
+                    args->put_Handled(TRUE);   // blocked
+                    deferral->Complete();
+                    deferral->Release();
+                    args->Release();
+                    return;
+                }
+                PopupWindow *pw = new PopupWindow();
+                pw->hwnd = popup;
+                pw->opener = e;
+                pw->popup_id = (jlong)(LONG_PTR)pw;
+                pw->url = uri;
+                SetWindowLongPtr(popup, GWLP_USERDATA, (LONG_PTR)pw);
+
+                auto *ctrl_handler = new ControllerHandler(
+                    [e, args, deferral, pw, uri, page, gesture, W, H]
+                    (HRESULT r2, ICoreWebView2Controller *ctrl) {
+                        if (FAILED(r2) || !ctrl) {
+                            WV_LOG("popup CreateController completion failed: "
+                                   "0x%08lx", (unsigned long)r2);
+                            args->put_Handled(TRUE);   // blocked
+                            deferral->Complete();
+                            deferral->Release();
+                            args->Release();
+                            DestroyWindow(pw->hwnd);   // WM_DESTROY frees pw
+                            return;
+                        }
+                        ctrl->AddRef();
+                        pw->controller = ctrl;
+                        ICoreWebView2 *child = nullptr;
+                        ctrl->get_CoreWebView2(&child);
+                        if (child) { child->AddRef(); pw->webview = child; }
+
+                        args->put_NewWindow(child);   // LINKED to opener
+                        args->put_Handled(TRUE);
+                        deferral->Complete();
+
+                        RECT rc;
+                        GetClientRect(pw->hwnd, &rc);
+                        ctrl->put_Bounds(rc);
+                        ctrl->put_IsVisible(TRUE);
+                        ShowWindow(pw->hwnd, SW_SHOW);
+
+                        if (child) {
+                            // Nested popups + dialogs from inside the popup,
+                            // reusing the opener's callbacks.
+                            EventRegistrationToken nw_t{};
+                            auto *nwh = new NewWindowRequestedHandler(e);
+                            child->add_NewWindowRequested(nwh, &nw_t);
+                            nwh->Release();
+
+                            ICoreWebView2Settings *settings = nullptr;
+                            if (SUCCEEDED(child->get_Settings(&settings)) &&
+                                settings) {
+                                settings->put_AreDefaultScriptDialogsEnabled(
+                                    FALSE);
+                                settings->Release();
+                            }
+                            EventRegistrationToken sd_t{};
+                            auto *sdh = new ScriptDialogHandler(e);
+                            child->add_ScriptDialogOpening(sdh, &sd_t);
+                            sdh->Release();
+
+                            auto *pch = new PopupCloseHandler(pw);
+                            child->add_WindowCloseRequested(pch,
+                                                            &pw->close_token);
+                            pch->Release();
+                        }
+
+                        fire_popup_opened_win(e, pw->popup_id, uri.c_str(),
+                                              gesture, W, H, page.c_str());
+
+                        deferral->Release();
+                        args->Release();
+                    });
+                HRESULT rc2 = e->environment->CreateCoreWebView2Controller(
+                    pw->hwnd, ctrl_handler);
+                ctrl_handler->Release();
+                if (FAILED(rc2)) {
+                    WV_LOG("popup CreateCoreWebView2Controller call failed: "
+                           "0x%08lx", (unsigned long)rc2);
+                    args->put_Handled(TRUE);
+                    deferral->Complete();
+                    deferral->Release();
+                    args->Release();
+                    DestroyWindow(pw->hwnd);   // WM_DESTROY frees pw
+                }
+            });
+        }).detach();
+
+        return S_OK;
+    }
+private:
+    Engine *m_engine;
+};
+
 static void engine_on_message(Engine *e, LPCWSTR msg) {
     if (!msg) return;
     int n = WideCharToMultiByte(CP_UTF8, 0, msg, -1, nullptr, 0, nullptr, nullptr);
@@ -705,6 +1092,10 @@ static void engine_thread(Engine *e, HWND /*parent*/, int width, int height,
                 init_done.clear();
                 return;
             }
+            // Keep the environment alive so NewWindowRequested can build the
+            // child popup controller from it (linked view) -- Canvas 17.
+            e->environment = env;
+            env->AddRef();
             auto *ctrl_handler = new ControllerHandler(
                 [&](HRESULT r2, ICoreWebView2Controller *ctrl) {
                     if (FAILED(r2) || !ctrl) {
@@ -784,6 +1175,13 @@ static void engine_thread(Engine *e, HWND /*parent*/, int width, int height,
                     auto *lh = new FocusHandler(e, false);
                     ctrl->add_LostFocus(lh, &e->lost_focus_token);
                     lh->Release();
+
+                    // window.open / target=_blank -> native popup window
+                    // linked to the opener (Canvas 17).
+                    auto *nwh = new NewWindowRequestedHandler(e);
+                    e->webview->add_NewWindowRequested(
+                        nwh, &e->new_window_token);
+                    nwh->Release();
 
                     init_done.clear();
                 });
@@ -952,6 +1350,25 @@ static void destroy_engine(Engine *e) {
         if (env) env->DeleteGlobalRef(e->dialog_callback);
         e->dialog_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
+    }
+    // Symmetric cleanup for the popup callback global ref (Canvas 17).  The
+    // NewWindowRequested handler fires off this field, so clear it before the
+    // worker thread tears down.
+    if (e->popup_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->popup_callback);
+        e->popup_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
+    // Release the environment ref taken at environment-ready (Canvas 17).
+    if (e->environment) {
+        e->environment->Release();
+        e->environment = nullptr;
     }
     {
         std::lock_guard<std::mutex> lk(e->bindings_mutex);
@@ -1333,6 +1750,29 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
     // Windows has no offscreen engine; OffscreenWebView.create returns
     // null on Windows so this JNI bridge should never be reached.
     // Stub it for link-symmetry across all three native binaries.
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1popup_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    // Canvas 15 ships the callback storage on Windows; the follow-up
+    // Windows coverage canvas wires ICoreWebView2::add_NewWindowRequested
+    // off this field.  Until then storing the ref is a harmless no-op and
+    // window.open stays blocked on Windows.
+    auto *e = (Engine *)wv;
+    if (!e) return;
+    if (e->popup_callback) {
+        env->DeleteGlobalRef(e->popup_callback);
+        e->popup_callback = nullptr;
+    }
+    if (cb) {
+        e->popup_callback = env->NewGlobalRef(cb);
+    }
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1popup_1callback
+  (JNIEnv *, jclass, jlong, jobject) {
+    // Windows has no offscreen engine; stub for link-symmetry across all
+    // three native binaries.
 }
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1release_1native_1focus

@@ -18,12 +18,18 @@ Add the dependency to your `pom.xml`:
 ```
 
 The jar bundles the native libraries for macOS, Linux, and Windows — no
-additional native install step is required, with one exception:
+additional native install step is required beyond the platform's system
+web engine:
 
 * **Windows** requires the system-wide Microsoft Edge WebView2 Runtime,
   which ships with current Windows 11 / Edge.  On older Windows, install
   the Evergreen Runtime from
   <https://developer.microsoft.com/microsoft-edge/webview2/>.
+* **Linux** requires a system WebKitGTK — either **4.1** (Ubuntu 22.04+)
+  or **4.0** (Ubuntu 20.04).  The bundled `libwebview.so` resolves
+  whichever is present at load time (no `webkit2gtk` SONAME is
+  hard-linked), so a single jar runs on both.
+* **macOS** needs nothing extra — WKWebView ships with the OS.
 
 ## Platform support
 
@@ -364,6 +370,55 @@ wv.setDialogHandler(new WebViewDialogHandler() {
 See [`demos/WebViewDialogDemo/`](demos/WebViewDialogDemo/README.md)
 for a runnable example that exercises all four dialog kinds in each
 of the three handler modes (default, custom, drop).
+
+## Browser-initiated popups (`window.open`)
+
+Pages can call `window.open(url, name, features)` or click a link / form
+with `target="_blank"`.  `WebViewComponent.setPopupHandler` lets the host
+application allow, observe, or block those popups:
+
+```java
+wv.setPopupHandler(new WebViewPopupHandler() {
+    @Override public boolean popupRequested(WebViewPopupEvent e) {
+        return e.targetUrl().startsWith("https://");   // allow only https
+    }
+    @Override public void popupOpened(WebViewPopupEvent e) {
+        System.out.println("popup: " + e.targetUrl());
+    }
+});
+```
+
+* **Native-owned window.**  When a popup is allowed the *native engine*
+  creates the child web view **linked to the opener** and hosts it in a
+  fresh native top-level window that the engine sizes, shows, and
+  destroys.  The opener linkage is what makes OAuth "sign-in with popup"
+  flows work — the popup calls `window.opener.postMessage(...)` then
+  `window.close()`, which only succeed when the popup is a real linked
+  view rather than an independent tab.  The handler only decides *policy*
+  (`popupRequested`) and *observes* the lifecycle (`popupOpened` /
+  `popupClosed`); it does not open, host, or size the window.
+* **Default behaviour.**  With no handler installed every popup is allowed.
+* **Blocking popups.**  Pass `null`: `wv.setPopupHandler(null)` blocks all
+  popups (`window.open` returns `null`) — the pre-feature behaviour,
+  available as an explicit opt-out.  To reset to the framework default
+  (allow), pass `WebViewPopupHandler.DEFAULT` explicitly — `null` is NOT a
+  reset.
+* **Threading.**  `popupRequested` runs on the **native UI thread**,
+  synchronously and **off the EDT** (the platform popup callback must
+  return the allow/deny decision before yielding to the browser engine);
+  keep it fast, thread-safe, and free of Swing access.  `popupOpened` /
+  `popupClosed` are asynchronous notifications delivered on the EDT.
+* **Platform coverage.**  All three engines open native, opener-linked
+  popup windows: macOS heavyweight (WKWebView) via the `WKUIDelegate
+  createWebViewWithConfiguration:` / `webViewDidClose:` pair (Canvas 15);
+  **Linux** heavyweight *and* lightweight (WebKitGTK `create` /
+  `ready-to-show` / `close` signals, Canvas 16); and **Windows**
+  (WebView2 `NewWindowRequested` + the child's `WindowCloseRequested`,
+  Canvas 17).  `setPopupHandler(null)` blocks `window.open` on every
+  platform.
+
+See [`demos/WebViewPopupDemo/`](demos/WebViewPopupDemo/README.md) for a
+runnable example that exercises the allow / custom / block modes.
 
 ## Demo
 

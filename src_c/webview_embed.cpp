@@ -43,6 +43,9 @@
 #include <gdk/gdk.h>
 #include <gdk/gdkx.h>
 #include <webkit2/webkit2.h>
+// Route WebKitGTK/JSC through the runtime-resolved loader (no hard SONAME dep).
+#include "webkit_loader.h"
+#include "webkit_shim.h"
 #endif
 
 #ifdef WEBVIEW_COCOA
@@ -408,6 +411,15 @@ struct Engine {
     // is declared here so the JNI bridge function can store / clear
     // the global ref without dropping the canvas-004-002 changes.
     jobject dialog_callback = nullptr;
+
+    // JNI global ref to the registered WebViewPopupCallback, or nullptr.
+    // Populated by gtk_set_popup_callback; cleared in gtk_destroy_engine.
+    // The `create` signal handler wired in gtk_create_engine invokes it
+    // (onPopupRequested / onPopupOpened / onPopupClosed) so window.open /
+    // target=_blank open a native GTK popup window linked to the opener --
+    // Canvas 16.  A child (popup) web view inherits this ref via its own
+    // PopupEngine so nested popups work.
+    jobject popup_callback = nullptr;
 
     Engine() {}
     ~Engine() {}
@@ -837,6 +849,324 @@ static gboolean on_run_file_chooser_engine(WebKitWebView *web,
     return handle_run_file_chooser(e->jvm, e->dialog_callback, uri, request);
 }
 
+// ---------------------------------------------------------------------------
+// Popup (window.open) support — Canvas 16 (Linux / WebKitGTK).
+//
+// window.open / target=_blank is delivered to a WebKitWebView through the
+// `create` signal, whose handler must RETURN a new (linked) WebKitWebView for
+// WebKit to drive, or NULL to block.  The child is created with
+// webkit_web_view_new_with_related_view(opener) so it is LINKED to the opener
+// (window.opener / postMessage work — required for OAuth signInWithPopup) and
+// hosted in an engine-owned GTK_WINDOW_TOPLEVEL.  ready-to-show sizes/shows the
+// window and fires onPopupOpened; close destroys it and fires onPopupClosed.
+//
+// The allow/deny hop (onPopupRequested) is SYNCHRONOUS on the GTK main thread
+// (the create handler must return the child before yielding to WebKit), exactly
+// like the script-dialog confirm path.  onPopupOpened / onPopupClosed are
+// fire-and-forget; the Java PopupDispatcher marshals them to the EDT via
+// invokeLater (non-blocking), so the GTK main thread is never blocked — no
+// detached worker thread is needed (unlike the macOS AppKit-main path).
+// ---------------------------------------------------------------------------
+
+// A child popup's native state: a standalone on-screen GTK toplevel hosting a
+// WebKit-related child web view.  Distinct from Engine / OffEngine — no AWT
+// reparenting, no offscreen blitting.  The inherited popup_callback /
+// dialog_callback global refs are freed in on_close_popup.
+struct PopupEngine {
+    GtkWidget *window = nullptr;        // GTK_WINDOW_TOPLEVEL
+    WebKitWebView *web = nullptr;       // the related child web view
+    JavaVM *jvm = nullptr;
+    jobject popup_callback = nullptr;   // inherited global ref
+    jobject dialog_callback = nullptr;  // inherited global ref, may be null
+    jlong popup_id = 0;
+};
+
+// Synchronous allow/deny hop into Java on the GTK main thread.  Returns false
+// on null callback, attach failure, or any exception (block-on-error default).
+static bool fire_popup_requested(JavaVM *jvm, jobject cb,
+                                 const char *url, const char *name,
+                                 bool gesture, int w, int h,
+                                 const char *page) {
+    if (!jvm || !cb) return false;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return false;
+        detach = true;
+    }
+    bool allow = false;
+    jstring ju = env->NewStringUTF(url ? url : "");
+    jstring jn = env->NewStringUTF(name ? name : "");
+    jstring jp = env->NewStringUTF(page ? page : "");
+    jclass cls = env->GetObjectClass(cb);
+    if (cls) {
+        jmethodID mid = env->GetMethodID(cls, "onPopupRequested",
+            "(Ljava/lang/String;Ljava/lang/String;ZIILjava/lang/String;)Z");
+        if (mid) {
+            jboolean r = env->CallBooleanMethod(cb, mid, ju, jn,
+                gesture ? JNI_TRUE : JNI_FALSE, (jint)w, (jint)h, jp);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+                r = JNI_FALSE;
+            }
+            allow = (r == JNI_TRUE);
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (ju) env->DeleteLocalRef(ju);
+    if (jn) env->DeleteLocalRef(jn);
+    if (jp) env->DeleteLocalRef(jp);
+    if (detach) jvm->DetachCurrentThread();
+    return allow;
+}
+
+// Fire onPopupOpened.  CallVoidMethod (fire-and-forget); the Java dispatcher
+// marshals to the EDT via invokeLater so this does not block the GTK main
+// thread.
+static void fire_gtk_popup_opened(JavaVM *jvm, jobject cb, jlong popup_id,
+                                  const char *url, const char *name,
+                                  bool gesture, int w, int h,
+                                  const char *page) {
+    if (!jvm || !cb) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return;
+        detach = true;
+    }
+    jstring ju = env->NewStringUTF(url ? url : "");
+    jstring jn = env->NewStringUTF(name ? name : "");
+    jstring jp = env->NewStringUTF(page ? page : "");
+    jclass cls = env->GetObjectClass(cb);
+    if (cls) {
+        jmethodID mid = env->GetMethodID(cls, "onPopupOpened",
+            "(JLjava/lang/String;Ljava/lang/String;ZIILjava/lang/String;)V");
+        if (mid) {
+            env->CallVoidMethod(cb, mid, popup_id, ju, jn,
+                gesture ? JNI_TRUE : JNI_FALSE, (jint)w, (jint)h, jp);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (ju) env->DeleteLocalRef(ju);
+    if (jn) env->DeleteLocalRef(jn);
+    if (jp) env->DeleteLocalRef(jp);
+    if (detach) jvm->DetachCurrentThread();
+}
+
+// Fire onPopupClosed.  Does NOT delete the inherited global refs — the caller
+// (on_close_popup) frees them after this synchronous call returns.  dialog_cb
+// is unused here; it is freed by the caller alongside popup_cb.
+static void fire_gtk_popup_closed(JavaVM *jvm, jobject popup_cb,
+                                  jobject dialog_cb, jlong popup_id,
+                                  const char *url, const char *page) {
+    (void)dialog_cb;
+    if (!jvm || !popup_cb) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return;
+        detach = true;
+    }
+    jstring ju = env->NewStringUTF(url ? url : "");
+    jstring jp = env->NewStringUTF(page ? page : "");
+    jclass cls = env->GetObjectClass(popup_cb);
+    if (cls) {
+        jmethodID mid = env->GetMethodID(cls, "onPopupClosed",
+            "(JLjava/lang/String;Ljava/lang/String;)V");
+        if (mid) {
+            env->CallVoidMethod(popup_cb, mid, popup_id, ju, jp);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (ju) env->DeleteLocalRef(ju);
+    if (jp) env->DeleteLocalRef(jp);
+    if (detach) jvm->DetachCurrentThread();
+}
+
+// Forward declarations for the child-popup signal handlers (defined below;
+// referenced by handle_create_web_view when connecting the child's signals).
+static GtkWidget *on_create_web_view_popup(WebKitWebView *web,
+        WebKitNavigationAction *nav, gpointer user_data);
+static gboolean on_script_dialog_popup(WebKitWebView *web,
+        WebKitScriptDialog *dialog, gpointer user_data);
+static gboolean on_run_file_chooser_popup(WebKitWebView *web,
+        WebKitFileChooserRequest *request, gpointer user_data);
+static void on_ready_to_show_popup(WebKitWebView *web, gpointer user_data);
+static void on_close_popup(WebKitWebView *web, gpointer user_data);
+
+// Shared inner handler for the `create` signal.  Engine-agnostic: the three
+// wrappers (engine / off_engine / popup) pull jvm + popup_callback +
+// dialog_callback from their struct and call here.  Returns a new linked child
+// WebKitWebView for WebKit to adopt, or NULL to block the popup.
+static GtkWidget *handle_create_web_view(JavaVM *jvm, jobject popup_cb,
+                                         jobject dialog_cb,
+                                         WebKitWebView *opener,
+                                         WebKitNavigationAction *nav) {
+    if (!popup_cb) return NULL;
+
+    const char *uri = "";
+    if (nav) {
+        WebKitURIRequest *req = webkit_navigation_action_get_request(nav);
+        if (req) {
+            const char *u = webkit_uri_request_get_uri(req);
+            if (u) uri = u;
+        }
+    }
+    bool gesture =
+        nav ? (webkit_navigation_action_is_user_gesture(nav) != FALSE) : true;
+    const char *page = opener ? webkit_web_view_get_uri(opener) : nullptr;
+    if (!page) page = "";
+
+    // Synchronous allow/deny.  Size is not known until ready-to-show, so pass
+    // -1/-1 here (matching the event contract's "unspecified" sentinel).
+    if (!fire_popup_requested(jvm, popup_cb, uri, "", gesture, -1, -1, page))
+        return NULL;
+
+    // Create the child LINKED to the opener (window.opener / postMessage).
+    GtkWidget *childw = webkit_web_view_new_with_related_view(opener);
+    if (!childw) return NULL;
+    WebKitWebView *child = WEBKIT_WEB_VIEW(childw);
+
+    // Host it in an engine-owned native top-level window.
+    GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+    gtk_window_set_title(GTK_WINDOW(win), "Popup");
+    gtk_container_add(GTK_CONTAINER(win), childw);
+
+    PopupEngine *pe = new PopupEngine();
+    pe->window = win;
+    pe->web = child;
+    pe->jvm = jvm;
+    pe->popup_id = (jlong)(intptr_t)pe;
+
+    // Inherit fresh global refs so the popup can raise dialogs / nested popups
+    // and notify onPopupClosed even after the opener is gone.
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) == JNI_OK)
+            detach = true;
+    }
+    if (env) {
+        pe->popup_callback = env->NewGlobalRef(popup_cb);
+        if (dialog_cb) pe->dialog_callback = env->NewGlobalRef(dialog_cb);
+        if (detach) jvm->DetachCurrentThread();
+    }
+
+    // Nested popups + dialogs from inside the popup, and the show/close hooks.
+    g_signal_connect(child, "create",
+                     (GCallback)on_create_web_view_popup, pe);
+    g_signal_connect(child, "script-dialog",
+                     (GCallback)on_script_dialog_popup, pe);
+    g_signal_connect(child, "run-file-chooser",
+                     (GCallback)on_run_file_chooser_popup, pe);
+    g_signal_connect(child, "ready-to-show",
+                     (GCallback)on_ready_to_show_popup, pe);
+    g_signal_connect(child, "close",
+                     (GCallback)on_close_popup, pe);
+
+    // WebKit adopts the floating reference on the returned view.
+    return childw;
+}
+
+// child `ready-to-show`: size from window properties (fallback 500x650), show,
+// then notify onPopupOpened.
+static void on_ready_to_show_popup(WebKitWebView *web, gpointer user_data) {
+    PopupEngine *pe = static_cast<PopupEngine *>(user_data);
+    if (!pe) return;
+    int W = 500, H = 650;
+    WebKitWindowProperties *props = webkit_web_view_get_window_properties(web);
+    if (props) {
+        GdkRectangle geo = {0, 0, 0, 0};
+        webkit_window_properties_get_geometry(props, &geo);
+        if (geo.width > 0) W = geo.width;
+        if (geo.height > 0) H = geo.height;
+    }
+    if (pe->window) {
+        gtk_window_set_default_size(GTK_WINDOW(pe->window), W, H);
+        gtk_widget_show_all(pe->window);
+        gtk_window_present(GTK_WINDOW(pe->window));
+    }
+    const char *url = webkit_web_view_get_uri(web);
+    fire_gtk_popup_opened(pe->jvm, pe->popup_callback, pe->popup_id,
+                          url ? url : "", "", true, W, H, "");
+}
+
+// child `close`: window.close() (or the user closed the window).  Notify
+// onPopupClosed, destroy the window, free the inherited refs, delete the
+// PopupEngine.  Because the notify is synchronous and the Java side only reads
+// the event it correlated at open time, freeing the refs here is safe.
+static void on_close_popup(WebKitWebView *web, gpointer user_data) {
+    PopupEngine *pe = static_cast<PopupEngine *>(user_data);
+    if (!pe) return;
+    const char *url = webkit_web_view_get_uri(web);
+    fire_gtk_popup_closed(pe->jvm, pe->popup_callback, pe->dialog_callback,
+                          pe->popup_id, url ? url : "", "");
+    if (pe->window) {
+        gtk_widget_destroy(pe->window);
+        pe->window = nullptr;
+        pe->web = nullptr;
+    }
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (pe->jvm && pe->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (pe->jvm->AttachCurrentThread((void **)&env, nullptr) == JNI_OK)
+            detach = true;
+    }
+    if (env) {
+        if (pe->popup_callback) env->DeleteGlobalRef(pe->popup_callback);
+        if (pe->dialog_callback) env->DeleteGlobalRef(pe->dialog_callback);
+        if (detach) pe->jvm->DetachCurrentThread();
+    }
+    pe->popup_callback = nullptr;
+    pe->dialog_callback = nullptr;
+    delete pe;
+}
+
+// Per-PopupEngine wrappers (nested popup + dialogs from inside a popup).
+static GtkWidget *on_create_web_view_popup(WebKitWebView *web,
+        WebKitNavigationAction *nav, gpointer user_data) {
+    PopupEngine *pe = static_cast<PopupEngine *>(user_data);
+    if (!pe) return NULL;
+    return handle_create_web_view(pe->jvm, pe->popup_callback,
+                                  pe->dialog_callback, web, nav);
+}
+static gboolean on_script_dialog_popup(WebKitWebView *web,
+        WebKitScriptDialog *dialog, gpointer user_data) {
+    PopupEngine *pe = static_cast<PopupEngine *>(user_data);
+    if (!pe) return TRUE;
+    const gchar *uri = webkit_web_view_get_uri(web);
+    return handle_script_dialog(pe->jvm, pe->dialog_callback, uri, dialog);
+}
+static gboolean on_run_file_chooser_popup(WebKitWebView *web,
+        WebKitFileChooserRequest *request, gpointer user_data) {
+    PopupEngine *pe = static_cast<PopupEngine *>(user_data);
+    if (!pe) return TRUE;
+    const gchar *uri = webkit_web_view_get_uri(web);
+    return handle_run_file_chooser(pe->jvm, pe->dialog_callback, uri, request);
+}
+
+// Per-Engine wrapper for the `create` signal (heavyweight).  Mirrors
+// on_script_dialog_engine — the divergence is the shared inner it delegates to.
+static GtkWidget *on_create_web_view_engine(WebKitWebView *web,
+        WebKitNavigationAction *nav, gpointer user_data) {
+    Engine *e = static_cast<Engine *>(user_data);
+    if (!e) return NULL;
+    return handle_create_web_view(e->jvm, e->popup_callback,
+                                  e->dialog_callback, web, nav);
+}
+
 static void engine_on_message(Engine *e, const char *msg) {
     if (msg == nullptr) return;
     // The message is JSON: {name, seq, args}.  We mirror the bind format used
@@ -1022,6 +1352,9 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
                          (GCallback)on_script_dialog_engine, e);
         g_signal_connect(WEBKIT_WEB_VIEW(e->web), "run-file-chooser",
                          (GCallback)on_run_file_chooser_engine, e);
+        // window.open / target=_blank -> native popup window (Canvas 16).
+        g_signal_connect(WEBKIT_WEB_VIEW(e->web), "create",
+                         (GCallback)on_create_web_view_engine, e);
 
         // Wire up the "external" message handler.
         g_signal_connect(
@@ -1267,6 +1600,18 @@ static void gtk_destroy_engine(Engine *e) {
         e->dialog_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
+    // Same treatment for the popup-callback global ref (Canvas 16).
+    if (e->popup_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm && e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->popup_callback);
+        e->popup_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     GtkPump::instance().run_sync([&] {
         if (e->redraw_timer_id) {
             g_source_remove(e->redraw_timer_id);
@@ -1426,6 +1771,19 @@ static void gtk_set_dialog_callback(Engine *e, JNIEnv *env, jobject cb) {
     }
 }
 
+// Register (or clear, when cb is null) the Java WebViewPopupCallback for this
+// heavyweight engine (Canvas 16).  Mirrors gtk_set_dialog_callback.
+static void gtk_set_popup_callback(Engine *e, JNIEnv *env, jobject cb) {
+    if (!e) return;
+    if (e->popup_callback) {
+        env->DeleteGlobalRef(e->popup_callback);
+        e->popup_callback = nullptr;
+    }
+    if (cb) {
+        e->popup_callback = env->NewGlobalRef(cb);
+    }
+}
+
 // ===========================================================================
 // Linux / GTK lightweight (offscreen) engine
 //
@@ -1453,6 +1811,13 @@ struct OffEngine {
     // handle_script_dialog / handle_run_file_chooser inner functions
     // declared in the heavyweight engine block above.
     jobject dialog_callback = nullptr;
+
+    // JNI global ref to the registered WebViewPopupCallback, or nullptr.
+    // Set by gtk_off_set_popup_callback; cleared in gtk_off_destroy_engine.
+    // Invoked by the `create` signal handler installed in
+    // gtk_off_create_engine, which routes through the shared
+    // handle_create_web_view inner function (Canvas 16).
+    jobject popup_callback = nullptr;
 };
 
 // Per-OffEngine wrapper for the `script-dialog` signal.  Reads page URL,
@@ -1477,6 +1842,16 @@ static gboolean on_run_file_chooser_off_engine(
     if (!e) return TRUE;
     const gchar *uri = webkit_web_view_get_uri(web);
     return handle_run_file_chooser(e->jvm, e->dialog_callback, uri, request);
+}
+
+// Per-OffEngine wrapper for the `create` signal (lightweight).  Delegates to
+// the shared handle_create_web_view with the OffEngine's callbacks (Canvas 16).
+static GtkWidget *on_create_web_view_off_engine(WebKitWebView *web,
+        WebKitNavigationAction *nav, gpointer user_data) {
+    OffEngine *e = static_cast<OffEngine *>(user_data);
+    if (!e) return NULL;
+    return handle_create_web_view(e->jvm, e->popup_callback,
+                                  e->dialog_callback, web, nav);
 }
 
 // Parallel of engine_on_message for OffEngine: parse the {name, seq, args}
@@ -1568,6 +1943,9 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
                          (GCallback)on_script_dialog_off_engine, e);
         g_signal_connect(WEBKIT_WEB_VIEW(e->web), "run-file-chooser",
                          (GCallback)on_run_file_chooser_off_engine, e);
+        // window.open / target=_blank -> native popup window (Canvas 16).
+        g_signal_connect(WEBKIT_WEB_VIEW(e->web), "create",
+                         (GCallback)on_create_web_view_off_engine, e);
 
         webkit_user_content_manager_add_script(
             e->manager,
@@ -1679,6 +2057,18 @@ static void gtk_off_destroy_engine(OffEngine *e) {
         e->dialog_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
+    // Same treatment for the popup-callback global ref (Canvas 16).
+    if (e->popup_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->popup_callback);
+        e->popup_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     for (auto &kv : e->bindings) {
         Binding *b = kv.second;
         JNIEnv *env = nullptr;
@@ -1712,6 +2102,20 @@ static void gtk_off_set_dialog_callback(OffEngine *e, JNIEnv *env,
     }
     if (cb) {
         e->dialog_callback = env->NewGlobalRef(cb);
+    }
+}
+
+// Register (or clear, when cb is null) the Java WebViewPopupCallback for this
+// offscreen engine (Canvas 16).  Mirrors gtk_off_set_dialog_callback.
+static void gtk_off_set_popup_callback(OffEngine *e, JNIEnv *env,
+                                       jobject cb) {
+    if (!e) return;
+    if (e->popup_callback) {
+        env->DeleteGlobalRef(e->popup_callback);
+        e->popup_callback = nullptr;
+    }
+    if (cb) {
+        e->popup_callback = env->NewGlobalRef(cb);
     }
 }
 
@@ -2212,6 +2616,20 @@ struct Engine {
     // released in cocoa_destroy_engine after we clear the WKWebView's
     // uiDelegate property.
     id ui_delegate = nullptr;
+
+    // JNI global ref to the registered WebViewPopupCallback, or nullptr.
+    // Read by the createWebViewWithConfiguration: / webViewDidClose:
+    // selectors to decide/notify popups.  For a child (popup) engine this
+    // is inherited from the opener at creation so onPopupClosed can reach
+    // the opener's PopupDispatcher.  Cleared before ui_delegate is
+    // released.
+    jobject popup_callback = nullptr;
+
+    // For a child (popup) engine only: the NSWindow the engine created to
+    // host the popup web view, and the opaque id correlating the
+    // onPopupOpened / onPopupClosed pair.  nullptr / 0 on a normal engine.
+    id popup_window = nullptr;
+    jlong popup_id = 0;
 };
 
 // Process-global map from WKWebView (id) to its owning Engine*.  Populated
@@ -2966,6 +3384,288 @@ static void impl_run_open_panel(id self, SEL, id webView, id parameters,
     }).detach();
 }
 
+// ---------------------------------------------------------------------------
+// Popup (window.open) support — Canvas 15.
+//
+// window.open / target=_blank is delivered to WKWebView through the
+// WKUIDelegate selector
+//   webView:createWebViewWithConfiguration:forNavigationAction:windowFeatures:
+// which must RETURN the child WKWebView (or nil to block) synchronously.
+// Unlike the dialog selectors (which defer to a worker thread and fire a
+// completion handler), the popup channel needs the decision inline, so the
+// allow/deny hop into Java (onPopupRequested) is synchronous on AppKit main.
+// The child web view is created from the SAME WKWebViewConfiguration WebKit
+// hands us so it is LINKED to the opener (window.opener / postMessage work —
+// required for OAuth signInWithPopup).  We host it in an NSWindow the engine
+// owns.  window.close() from the popup fires webViewDidClose:, which closes
+// the window and tears the child engine down.
+// ---------------------------------------------------------------------------
+
+// Forward declaration: impl_create_web_view (below) builds each child engine's
+// UI delegate from the shared class, whose definition follows this block.
+static Class get_webview_embed_ui_delegate_cls();
+
+// Fire an async notification (onPopupOpened / onPopupClosed) into Java on a
+// detached worker thread so AppKit main is not blocked.  Void return.
+static void fire_popup_notify_opened(JavaVM *jvm, jobject cb, jlong popup_id,
+                                     std::string url, std::string name,
+                                     bool gesture, int w, int h,
+                                     std::string page) {
+    if (!jvm || !cb) return;
+    std::thread([jvm, cb, popup_id, url, name, gesture, w, h, page]() {
+        JNIEnv *env = nullptr;
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return;
+        jstring ju = env->NewStringUTF(url.c_str());
+        jstring jn = env->NewStringUTF(name.c_str());
+        jstring jp = env->NewStringUTF(page.c_str());
+        jclass cls = env->GetObjectClass(cb);
+        if (cls) {
+            jmethodID mid = env->GetMethodID(cls, "onPopupOpened",
+                "(JLjava/lang/String;Ljava/lang/String;ZIILjava/lang/String;)V");
+            if (mid) {
+                env->CallVoidMethod(cb, mid, popup_id, ju, jn,
+                                    gesture ? JNI_TRUE : JNI_FALSE,
+                                    (jint)w, (jint)h, jp);
+                if (env->ExceptionCheck()) {
+                    env->ExceptionDescribe();
+                    env->ExceptionClear();
+                }
+            }
+            env->DeleteLocalRef(cls);
+        }
+        if (ju) env->DeleteLocalRef(ju);
+        if (jn) env->DeleteLocalRef(jn);
+        if (jp) env->DeleteLocalRef(jp);
+        jvm->DetachCurrentThread();
+    }).detach();
+}
+
+// Fires onPopupClosed and then takes ownership of the child engine's two
+// inherited global refs (popup_cb, dialog_cb), deleting them after the JNI
+// call.  Ownership transfer avoids a use-after-free: the caller must NOT
+// delete these refs itself (the async worker outlives the caller's teardown).
+// dialog_cb may be nullptr.
+static void fire_popup_notify_closed(JavaVM *jvm, jobject popup_cb,
+                                     jobject dialog_cb, jlong popup_id,
+                                     std::string url, std::string page) {
+    if (!jvm) return;
+    std::thread([jvm, popup_cb, dialog_cb, popup_id, url, page]() {
+        JNIEnv *env = nullptr;
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return;
+        if (popup_cb) {
+            jstring ju = env->NewStringUTF(url.c_str());
+            jstring jp = env->NewStringUTF(page.c_str());
+            jclass cls = env->GetObjectClass(popup_cb);
+            if (cls) {
+                jmethodID mid = env->GetMethodID(cls, "onPopupClosed",
+                    "(JLjava/lang/String;Ljava/lang/String;)V");
+                if (mid) {
+                    env->CallVoidMethod(popup_cb, mid, popup_id, ju, jp);
+                    if (env->ExceptionCheck()) {
+                        env->ExceptionDescribe();
+                        env->ExceptionClear();
+                    }
+                }
+                env->DeleteLocalRef(cls);
+            }
+            if (ju) env->DeleteLocalRef(ju);
+            if (jp) env->DeleteLocalRef(jp);
+        }
+        // Now free the inherited global refs (ownership transferred to us).
+        if (popup_cb) env->DeleteGlobalRef(popup_cb);
+        if (dialog_cb) env->DeleteGlobalRef(dialog_cb);
+        jvm->DetachCurrentThread();
+    }).detach();
+}
+
+// Read an NSNumber* (or nil) window-feature dimension into an int, or -1.
+static int popup_feature_int(id nsNumber) {
+    if (!nsNumber) return -1;
+    return (int)msg<int>(nsNumber, sel("intValue"));
+}
+
+// WKUIDelegate createWebViewWithConfiguration:forNavigationAction:windowFeatures:
+// Returns the child WKWebView, or nil to block.
+static id impl_create_web_view(id self, SEL, id webView, id configuration,
+                               id navigationAction, id windowFeatures) {
+    Engine *e = (Engine *)objc_getAssociatedObject(self, "eng");
+    if (!e || !e->popup_callback) return nullptr;
+
+    // Extract the request URL, gesture, and requested size.
+    std::string target;
+    {
+        id req = msg(navigationAction, sel("request"));
+        id url = req ? msg(req, sel("URL")) : nullptr;
+        id abs = url ? msg(url, sel("absoluteString")) : nullptr;
+        if (abs) target = ns_string_to_utf8(abs);
+    }
+    std::string page = page_url_utf8(webView);
+    int req_w = popup_feature_int(msg(windowFeatures, sel("width")));
+    int req_h = popup_feature_int(msg(windowFeatures, sel("height")));
+    // window.open in practice requires a user gesture; report true.
+    bool gesture = true;
+
+    // Synchronous allow/deny hop into Java (AppKit main -> JNI).
+    JavaVM *jvm = e->jvm;
+    jobject cb = e->popup_callback;
+    JNIEnv *env = nullptr;
+    bool attached = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return nullptr;
+        attached = true;
+    }
+    bool allow = false;
+    {
+        jstring ju = env->NewStringUTF(target.c_str());
+        jstring jn = env->NewStringUTF("");
+        jstring jp = env->NewStringUTF(page.c_str());
+        jclass cls = env->GetObjectClass(cb);
+        if (cls) {
+            jmethodID mid = env->GetMethodID(cls, "onPopupRequested",
+                "(Ljava/lang/String;Ljava/lang/String;ZIILjava/lang/String;)Z");
+            if (mid) {
+                jboolean r = env->CallBooleanMethod(cb, mid, ju, jn,
+                    gesture ? JNI_TRUE : JNI_FALSE, (jint)req_w, (jint)req_h, jp);
+                if (env->ExceptionCheck()) {
+                    env->ExceptionDescribe();
+                    env->ExceptionClear();
+                    r = JNI_FALSE;
+                }
+                allow = (r == JNI_TRUE);
+            }
+            env->DeleteLocalRef(cls);
+        }
+        if (ju) env->DeleteLocalRef(ju);
+        if (jn) env->DeleteLocalRef(jn);
+        if (jp) env->DeleteLocalRef(jp);
+    }
+    // NOTE: keep the thread attached until AFTER the child engine's global
+    // refs are created below — detaching here would invalidate `env`.
+    if (!allow) {
+        if (attached) jvm->DetachCurrentThread();
+        return nullptr;
+    }
+
+    // Size the popup: use the requested size, else a typical auth-popup size.
+    int W = req_w > 0 ? req_w : 500;
+    int H = req_h > 0 ? req_h : 650;
+
+    // Create the child WKWebView LINKED to the opener via the passed config.
+    id child = msg(objc_cls("WKWebView"), sel("alloc"));
+    child = msg<id, CGRect, id>(child, sel("initWithFrame:configuration:"),
+                                CGRectMake(0, 0, W, H), configuration);
+    if (!child) {
+        if (attached) jvm->DetachCurrentThread();
+        return nullptr;
+    }
+
+    // Host it in an engine-owned NSWindow (titled|closable|miniaturizable|
+    // resizable = 1|2|4|8; NSBackingStoreBuffered = 2).
+    id win = msg(objc_cls("NSWindow"), sel("alloc"));
+    win = msg<id, CGRect, unsigned long, unsigned long, BOOL>(
+        win, sel("initWithContentRect:styleMask:backing:defer:"),
+        CGRectMake(0, 0, W, H), (unsigned long)15, (unsigned long)2, NO);
+    msg<void, id>(win, sel("setTitle:"), ns_str("Popup"));
+    msg<void, id>(win, sel("setContentView:"), child);
+    msg<void>(win, sel("center"));
+    msg<void, id>(win, sel("makeKeyAndOrderFront:"), nullptr);
+
+    // Build the child Engine, inheriting the opener's callbacks so the popup
+    // supports dialogs / nested popups and can notify onPopupClosed.
+    Engine *child_e = new Engine();
+    child_e->webview = child;
+    child_e->jvm = jvm;
+    child_e->config = configuration;
+    child_e->manager = msg(configuration, sel("userContentController"));
+    child_e->popup_window = win;
+    child_e->popup_id = (jlong)child_e;
+    if (env) {
+        child_e->popup_callback = env->NewGlobalRef(cb);
+        if (e->dialog_callback)
+            child_e->dialog_callback = env->NewGlobalRef(e->dialog_callback);
+    }
+    Class uicls = get_webview_embed_ui_delegate_cls();
+    id ui = msg((id)uicls, sel("new"));
+    objc_setAssociatedObject(ui, "eng", (id)child_e, OBJC_ASSOCIATION_ASSIGN);
+    msg<void, id>(child, sel("setUIDelegate:"), ui);
+    child_e->ui_delegate = ui;
+    {
+        std::lock_guard<std::mutex> lk(g_webview_map_mutex);
+        g_webview_map[child] = child_e;
+    }
+
+    // Global refs are created; safe to detach now if we attached above.
+    if (attached) jvm->DetachCurrentThread();
+
+    // Notify the opener's PopupDispatcher (async) that the popup is open.
+    // fire_popup_notify_opened attaches its own worker thread; it does not
+    // use `env`.
+    fire_popup_notify_opened(jvm, cb, child_e->popup_id, target, "",
+                             gesture, W, H, page);
+    return child;
+}
+
+// WKUIDelegate webViewDidClose: — the popup called window.close().  Runs on
+// AppKit main.  We tear down the child engine's native objects synchronously
+// here and hand the inherited Java global refs to the async close-notify
+// worker, which fires onPopupClosed and then frees them (ownership transfer —
+// see fire_popup_notify_closed).  The worker only reads captured-by-value
+// state, never `e`, so deleting `e` here is safe.
+static void impl_web_view_did_close(id self, SEL, id webView) {
+    Engine *e = (Engine *)objc_getAssociatedObject(self, "eng");
+    if (!e) return;
+    std::string url = page_url_utf8(webView);
+    JavaVM *jvm = e->jvm;
+    jobject popup_cb = e->popup_callback;
+    jobject dialog_cb = e->dialog_callback;
+    jlong pid = e->popup_id;
+
+    // Detach the delegate and drop from the map BEFORE releasing so no
+    // in-flight selector dereferences a freed engine.
+    msg<void, id>(webView, sel("setUIDelegate:"), nullptr);
+    {
+        std::lock_guard<std::mutex> lk(g_webview_map_mutex);
+        g_webview_map.erase(webView);
+    }
+    if (e->popup_window) {
+        msg<void>(e->popup_window, sel("close"));
+    }
+
+    // Notify Java and transfer ownership of the two inherited global refs.
+    fire_popup_notify_closed(jvm, popup_cb, dialog_cb, pid, url, "");
+
+    // Release native objects and free the engine.  The refs are now owned by
+    // the worker, so we must not touch them here.
+    e->popup_callback = nullptr;
+    e->dialog_callback = nullptr;
+    if (e->ui_delegate) { msg(e->ui_delegate, sel("release")); e->ui_delegate = nullptr; }
+    if (e->popup_window) { msg(e->popup_window, sel("release")); e->popup_window = nullptr; }
+    // Balance the +1 from the [[WKWebView alloc] init...] in
+    // impl_create_web_view.  WebKit and (until now) the NSWindow contentView
+    // held their own refs; releasing our alloc ref lets the child web view
+    // deallocate once WebKit drops its reference.  (Retain/release balance
+    // here is a prime candidate for on-device zombie/Instruments validation.)
+    if (e->webview) { msg(e->webview, sel("release")); }
+    e->webview = nullptr;
+    delete e;
+}
+
+// Register (or clear, when cb is null) the Java WebViewPopupCallback for this
+// engine.  Mirrors cocoa_set_dialog_callback.
+static void cocoa_set_popup_callback(Engine *e, JNIEnv *env, jobject cb) {
+    if (!e) return;
+    if (e->popup_callback) {
+        env->DeleteGlobalRef(e->popup_callback);
+        e->popup_callback = nullptr;
+    }
+    if (cb) {
+        e->popup_callback = env->NewGlobalRef(cb);
+    }
+}
+
 static Class get_webview_embed_ui_delegate_cls() {
     std::call_once(g_webview_embed_ui_delegate_once, [] {
         Class c = objc_allocateClassPair((Class)objc_cls("NSObject"),
@@ -2991,6 +3691,16 @@ static Class get_webview_embed_ui_delegate_cls() {
             sel("webView:runOpenPanelWithParameters:"
                 "initiatedByFrame:completionHandler:"),
             (IMP)impl_run_open_panel, "v@:@@@@");
+        // Popup (window.open) support — Canvas 15.
+        class_addMethod(
+            c,
+            sel("webView:createWebViewWithConfiguration:"
+                "forNavigationAction:windowFeatures:"),
+            (IMP)impl_create_web_view, "@@:@@@@");
+        class_addMethod(
+            c,
+            sel("webViewDidClose:"),
+            (IMP)impl_web_view_did_close, "v@:@");
         objc_registerClassPair(c);
         g_webview_embed_ui_delegate_cls = c;
     });
@@ -4564,6 +5274,34 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
     // macOS / Windows have no offscreen engine; the Java
     // OffscreenWebView.setDialogCallback never gets here because
     // OffscreenWebView.create returns null on those platforms.
+    (void)env; (void)cb;
+#endif
+}
+
+// Popup (window.open) callback registration — Canvas 15 (Java + macOS),
+// Canvas 16 (Linux / GTK).  Windows native popup site lands in Canvas 17, so
+// that branch stays a no-op for now and window.open stays blocked there (the
+// Java handler reference is held but no native callback is invoked).
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1popup_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    if (wv == 0) return;
+#ifdef WEBVIEW_GTK
+    embed::gtk_set_popup_callback((embed::Engine *)wv, env, cb);
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_set_popup_callback((embed::Engine *)wv, env, cb);
+#else
+    (void)env; (void)cb;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1popup_1callback
+  (JNIEnv *env, jclass, jlong peer, jobject cb) {
+    if (peer == 0) return;
+#ifdef WEBVIEW_GTK
+    embed::gtk_off_set_popup_callback((embed::OffEngine *)peer, env, cb);
+#else
+    // macOS / Windows have no offscreen engine; OffscreenWebView.create
+    // returns null there so this is never reached.
     (void)env; (void)cb;
 #endif
 }

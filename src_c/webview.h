@@ -410,6 +410,11 @@ inline std::string json_parse(std::string s, std::string key, int index) {
 #include <gtk/gtk.h>
 #include <webkit2/webkit2.h>
 
+// Route WebKitGTK/JSC through the runtime-resolved loader so libwebview.so
+// carries no hard dependency on a specific webkit2gtk SONAME (4.0 vs 4.1).
+#include "webkit_loader.h"
+#include "webkit_shim.h"
+
 namespace webview {
 
 class browser_engine {

@@ -122,6 +122,16 @@ generated_at: 2026-05-16T07:19:13-07:00
   `WebView2Loader.lib` is statically linked into `webview.dll`
   on Windows so no separate `WebView2Loader.dll` ships in the jar
   (`.github/workflows/build.yml:171`).
+- `src_c/webkit_loader.h`, `src_c/webkit_loader.cpp`,
+  `src_c/webkit_shim.h` — the **Linux-only runtime WebKitGTK /
+  JavaScriptCore loader** (Operation 7). After this,
+  `libwebview.so` carries **no** `DT_NEEDED` on
+  `libwebkit2gtk-4.{0,1}` or `libjavascriptcoregtk-4.{0,1}`; those
+  are `dlopen`ed at `JNI_OnLoad` (4.1 preferred, 4.0 fallback) and
+  every WebKit/JSC call site is routed through function pointers
+  via `webkit_shim.h`. GTK3/GLib remain normally linked. macOS
+  (WKWebView) and Windows (WebView2) builds are untouched — the
+  loader compiles only under `WEBVIEW_GTK` / `__linux__`.
 - `pom.xml:65-75` — Maven resource entries that copy each
   per-architecture directory from `natives/<arch>/` into
   `target/classes/<arch>/` at JAR-build time, so they land at the
@@ -300,6 +310,94 @@ Files: `.github/workflows/build.yml`,
    - `build.yml` runs on every push/PR to `master`, producing
      a downloadable jar artifact but not publishing. Only
      `maven-release.yml` publishes, gated on `v*` tag pushes.
+   - The Linux `native` job asserts, via `readelf -d` on the
+     built `libwebview.so`, that it has **no** `NEEDED` entry
+     matching `webkit2gtk` or `javascriptcoregtk` (4.0 or 4.1)
+     — a machine-checked guarantee of the single-portable-binary
+     property (Operation 7). A hard WebKit/JSC link dependency
+     fails the build.
+
+### 7. Runtime WebKitGTK / JavaScriptCore Resolution (Linux)
+Files: `src_c/webkit_loader.h`, `src_c/webkit_loader.cpp`,
+`src_c/webkit_shim.h`, `src_c/webview.h`, `src_c/webview_embed.cpp`,
+`build-linux.sh`, `.github/workflows/build.yml`,
+`.github/workflows/maven-release.yml`, `run-linux-*.sh`
+
+1. Responsibility: ship a **single** `libwebview.so` that loads and
+   works on both WebKitGTK 4.1 hosts (Ubuntu 22.04+) and WebKitGTK
+   4.0 hosts (Ubuntu 20.04) with no packaging matrix and no change
+   to the public Java API or JNI signatures. Achieved by resolving
+   WebKitGTK/JavaScriptCore at **runtime** instead of link time. The
+   loader is Linux-only (guarded by `WEBVIEW_GTK` / `__linux__`);
+   the macOS and Windows code paths and builds are not touched.
+
+2. Loader module (`webkit_loader.h` / `webkit_loader.cpp`): one
+   struct of typed function pointers, one member per WebKitGTK/JSC
+   symbol the wrapper calls, each member's type taken via
+   `decltype(&symbol)` against the real headers (unevaluated —
+   creates no link dependency). A global instance `g_wk` plus a
+   `pthread_once`-guarded initializer resolve the pointers once:
+   - `dlopen` the WebKit library preferring
+     `libwebkit2gtk-4.1.so.0`, falling back to
+     `libwebkit2gtk-4.0.so.37`.
+   - `dlopen` the **matching-generation** JavaScriptCore:
+     `libjavascriptcoregtk-4.1.so.0` when 4.1 WebKit opened, else
+     `libjavascriptcoregtk-4.0.so.18` — never mix generations, so
+     only one libsoup is pulled transitively. Do not link libsoup
+     directly.
+   - Both handles opened `RTLD_NOW | RTLD_GLOBAL`.
+   - Resolve every `webkit_*` symbol from the WebKit handle and
+     every `jsc_*` / JavaScriptCore-C-API symbol from the JSC
+     handle via `dlsym`.
+   - The JS-result symbol subset mirrors `webview.h`'s
+     `WEBKIT_MAJOR_VERSION >= 2 && WEBKIT_MINOR_VERSION >= 22`
+     guard exactly, so the loader references only symbols the
+     compiled call sites reference (the pre-2.22
+     `webkit_javascript_result_get_global_context` / `_get_value`
+     path is absent from modern headers and must stay behind the
+     same `#else`).
+   - On any failure — either library not `dlopen`able, or a
+     required symbol missing — fail with a clear message naming
+     **both** candidate SONAMEs of the library that could not be
+     satisfied. Runs from `JNI_OnLoad`; returning `JNI_ERR` makes
+     `System.load` throw with that message (same load-time failure
+     point as before, now diagnosable on both 4.0 and 4.1 hosts).
+
+3. Call-site routing (`webkit_shim.h`): included by `webview.h` and
+   `webview_embed.cpp` immediately after the WebKit/JSC/GTK headers,
+   inside the GTK-only regions. It `#define`s each resolved symbol
+   name to the corresponding `g_wk` member, so existing call sites
+   compile to function-pointer calls with **no textual edits** (the
+   member token is not re-expanded — self-reference is safe). It
+   also redefines the one GObject cast macro in use, `WEBKIT_WEB_VIEW`,
+   to a plain pointer cast, dropping the implicit
+   `webkit_web_view_get_type` symbol reference (no `WEBKIT_IS_*`
+   checks exist, and all other `WEBKIT_*` tokens are compile-time
+   enum/version constants). `webkit_loader.cpp` does **not** include
+   the shim — it assigns the real struct members and `dlsym`s by
+   string name. GTK/GLib cast macros are unchanged (GTK stays
+   linked).
+
+4. Build: compilation still sees the WebKit headers
+   (`pkg-config --cflags gtk+-3.0 $WEBKIT_PKG`), but the link step
+   no longer adds the WebKit/JSC libraries — link only
+   `pkg-config --libs gtk+-3.0` (GTK/GLib), plus `-lX11 -ldl`, and
+   add `src_c/webkit_loader.cpp` to the sources. Applied uniformly
+   to `build-linux.sh`, the Linux `native` job in `build.yml` and
+   `maven-release.yml`, and every `run-linux-*.sh` developer/demo
+   script (so the demos exercise the same runtime-resolution path).
+
+5. Verification gate: after the Linux native build, `build.yml`
+   runs `readelf -d` on the produced `libwebview.so` and fails the
+   job if any `NEEDED` entry matches `webkit2gtk` or
+   `javascriptcoregtk` — the machine-checked proof the artifact
+   carries no hard WebKit dependency.
+6. README: the "Platform support" preamble documents the Linux
+   runtime requirement as a single portable binary — the bundled
+   `libwebview.so` loads on either WebKitGTK **4.1** (Ubuntu 22.04+)
+   or **4.0** (Ubuntu 20.04) present at load time, with no separate
+   per-version build, alongside the existing Windows WebView2-Runtime
+   note.
 
 ## N · Norms
 - The developer `build-*.sh` scripts must quote every shell
@@ -335,6 +433,15 @@ Files: `.github/workflows/build.yml`,
     are present" step of both workflows,
   - one of the `build-*.sh` scripts (or a new one) for local
     builds on the matching OS/arch.
+- The Linux native resolves WebKitGTK/JavaScriptCore at **runtime**
+  (Operation 7), never via a link-time `-l`. Any newly-used
+  `webkit_*` / `jsc_*` symbol must be added to the `webkit_loader`
+  pointer set **and** the `webkit_shim` redirects in the same
+  change, and must belong to the API subset common to WebKitGTK 4.0
+  and 4.1 (if a symbol is 4.1-only, find the 4.0-compatible
+  equivalent or guard it behind the version `#if`). Never add a
+  WebKit/JSC `-l` flag or `--libs` pkg-config module to any Linux
+  build entry point.
 
 ## S · Safeguards
 - `WebViewNative` swallows `IOException` from the loader and
@@ -359,3 +466,12 @@ Files: `.github/workflows/build.yml`,
   (`natives/`, ``, `META-INF/lib/`) so the JAR layout can
   evolve without breaking existing consumers
   (`NativeLibraryUtil.java:334`).
+- The Linux WebKit loader fails **loudly**, not silently: if
+  neither `libwebkit2gtk-4.1.so.0` nor `libwebkit2gtk-4.0.so.37`
+  (respectively the two JavaScriptCore SONAMEs) can be `dlopen`ed,
+  or a required symbol is missing, `JNI_OnLoad` returns `JNI_ERR`
+  and `System.load` throws `UnsatisfiedLinkError` with a message
+  naming both candidate SONAMEs. This replaces the old
+  dynamic-linker error — which named only the 4.1 SONAME and made a
+  4.0 host look broken — with a message that makes the
+  missing-runtime case obvious on either host.
