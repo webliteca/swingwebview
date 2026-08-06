@@ -2,7 +2,7 @@
 generated_at: 2026-08-06T16:00:00-07:00
 ---
 
-# REASONS Canvas: Popup Adoption Into a Caller-Provided WebViewComponent — Linux (WebKitGTK) Coverage (STORY-005-002)
+# REASONS Canvas: Popup Adoption Into a Caller-Provided WebViewComponent — Linux (WebKitGTK) Coverage — Heavyweight + Lightweight/Offscreen (STORY-005-002)
 
 ## R · Requirements
 
@@ -17,18 +17,39 @@ generated_at: 2026-08-06T16:00:00-07:00
   application supplies** (a Swing tab), instead of the native GTK
   top-level window the engine owns today (Canvas 16).
 
-- **No Java changes.** The entire Java contract — `PopupDisposition`,
-  `WebViewPopupHandler.popupDisposition` / `popupAdoptable`,
-  `WebViewPopupCallback.onPopupDisposition` / `onPopupAdoptable`,
-  `PopupDispatcher` bookkeeping, `WebViewComponent.adoptPopup`,
-  `EmbeddedWebView.adopt` / `discardRetainedPopup`, and the
-  `webview_embed_adopt_popup` / `webview_embed_discard_popup` JNI
-  declarations — was authored platform-agnostically by Canvas 18 and is
-  **reused unchanged**. This canvas conforms to that contract; it does
-  not re-shape the Java side, and touches no `.java` file. The wire
-  contract (disposition ordinals `BLOCK=0` / `NATIVE_WINDOW=1` /
-  `ADOPT=2`, the `onPopupDisposition` / `onPopupAdoptable` JNI
-  signatures) is exactly the one macOS already speaks.
+- **Both Linux engines are covered.** The adoption target is either
+  Linux engine: the **heavyweight** (`EmbeddedWebView` /
+  `WebViewHeavyweightComponent`, on-screen X11-reparented `Engine`) and
+  the **lightweight/offscreen** (`OffscreenWebView` /
+  `WebViewLightweightComponent`, `GtkOffscreenWindow`-hosted `OffEngine`
+  blitted into Swing). This matters because the DEFAULT Linux mode is
+  the lightweight component; adoption that only worked heavyweight would
+  miss the common case. Both targets claim the retained child from the
+  **same** shared `g_gtk_retained_popups` registry, because the opener
+  that raised the popup may itself be heavyweight OR lightweight (both
+  route `create` through the shared `handle_create_web_view`, which
+  retains the child identically on `ADOPT`).
+
+- **Heavyweight is native-only; lightweight adds internal Java.** The
+  heavyweight path reuses the Canvas 18 Java contract verbatim —
+  `PopupDisposition`, `WebViewPopupHandler.popupDisposition` /
+  `popupAdoptable`, `WebViewPopupCallback.onPopupDisposition` /
+  `onPopupAdoptable`, `PopupDispatcher` bookkeeping,
+  `WebViewComponent.adoptPopup`, `EmbeddedWebView.adopt` /
+  `discardRetainedPopup`, and the `webview_embed_adopt_popup` /
+  `webview_embed_discard_popup` JNI declarations — authored
+  platform-agnostically by Canvas 18 and touching no heavyweight `.java`
+  file. The wire contract (disposition ordinals `BLOCK=0` /
+  `NATIVE_WINDOW=1` / `ADOPT=2`, the `onPopupDisposition` /
+  `onPopupAdoptable` JNI signatures) is exactly the one macOS already
+  speaks. The **lightweight** path adds new internal Java plumbing —
+  `OffscreenWebView.adopt` / `discardRetainedPopup`, two
+  `webview_offscreen_adopt_popup` / `webview_offscreen_discard_popup`
+  `WebViewNative` declarations, and real adoption wiring in
+  `WebViewLightweightComponent.addNotify` (replacing its Canvas-19
+  skip-guard). The **public `WebViewComponent` API is unchanged** — the
+  same `adoptPopup(popupId)` factory drives whichever component the app
+  built; only the lightweight component's internals learn to adopt.
 
 - **Why the existing Linux model is insufficient for a tabbed browser.**
   Same rationale as Canvas 18: a tabbed consumer that wants popups as
@@ -51,10 +72,19 @@ generated_at: 2026-08-06T16:00:00-07:00
   under `g_gtk_retained_popups` keyed by an engine-assigned `popup_id`,
   returns the child to WebKit (which drives the original request into
   it), and fires `onPopupAdoptable(popup_id, …)`. Phase 2 (EDT): the
-  application's `WebViewComponent.adoptPopup(popup_id)` peer attach calls
-  `webview_embed_adopt_popup` → `gtk_adopt_popup`, which reparents the
-  retained child into the component's realized X11 surface and returns
-  the engine pointer.
+  application's `WebViewComponent.adoptPopup(popup_id)` peer attach
+  claims the retained child and reuses it. When the adopting component
+  is **heavyweight**, `EmbeddedWebView.adopt` →
+  `webview_embed_adopt_popup` → `gtk_adopt_popup` reparents the retained
+  child into the component's realized X11 surface and returns the
+  heavyweight engine pointer. When it is **lightweight**,
+  `OffscreenWebView.adopt` → `webview_offscreen_adopt_popup` →
+  `gtk_off_adopt_popup` reuses the retained child inside a fresh
+  `GtkOffscreenWindow` (`OffEngine`), so the child renders into the
+  offscreen surface that Java blits — no X11 reparent into an on-screen
+  window is involved. Phase 1 is identical for both targets (the child
+  is retained windowless in the shared registry regardless of which
+  engine the opener was).
 
 - **The disposition decision is synchronous on the GTK main thread.**
   Exactly like the Canvas 16 `onPopupRequested` gate and the
@@ -67,22 +97,33 @@ generated_at: 2026-08-06T16:00:00-07:00
   `PopupDispatcher` marshals `popupAdoptable` to the EDT via
   `invokeLater` itself.
 
-- **Scope: Linux heavyweight (embed) engine only.** The offscreen /
-  lightweight WebKitGTK path (`OffEngine` /
-  `WebViewLightweightComponent`) is **out of scope** — its Canvas-19
-  guard is left as-is; only the heavyweight `Engine` gains adoption. This
-  matches the macOS boundary (no lightweight adopt) and keeps the risky
-  X11-reparent work confined to the one engine that already does
-  XReparentWindow embedding.
+- **Scope: both Linux engines (heavyweight embed + lightweight
+  offscreen).** The heavyweight `Engine` gains adoption via
+  `gtk_adopt_popup` (X11 reparent) and the lightweight `OffEngine` gains
+  adoption via `gtk_off_adopt_popup` (reuse the child inside a
+  `GtkOffscreenWindow`). Both share the single `g_gtk_retained_popups`
+  registry and the single `gtk_discard_popup` reclaim path. macOS
+  remains heavyweight-only (its offscreen engine is a stub); the
+  lightweight adopt is a WebKitGTK-specific capability the offscreen
+  blit pipeline makes cheap (no X11 reparent risk — the child lives in
+  an offscreen toplevel).
 
 - Definition of Done:
   - A handler returning `ADOPT` from `popupDisposition`, plus an app
     that on `popupAdoptable` creates a tab via
     `WebViewComponent.adoptPopup(popupId)`, results in the popup
-    appearing **inside that component** on Linux, with the **POST body
-    preserved** and **opener linkage intact** (`window.opener`
-    non-null, `postMessage`-to-opener works). No native popup window
-    appears at any point on the `ADOPT` path.
+    appearing **inside that component** on Linux — for **either** a
+    heavyweight or a lightweight/offscreen adopting component — with the
+    **POST body preserved** and **opener linkage intact**
+    (`window.opener` non-null, `postMessage`-to-opener works). No native
+    popup window appears at any point on the `ADOPT` path.
+  - For the **lightweight** target specifically: `adoptPopup` on a
+    lightweight `WebViewComponent` makes
+    `WebViewLightweightComponent.addNotify` call `OffscreenWebView.adopt`
+    (not `create`) and **not** navigate `pendingUrl` (the adopted child
+    already carries its in-flight navigation), and the adopted child's
+    pixels blit into the Swing component via the existing snapshot
+    pipeline. The public `WebViewComponent` API is unchanged.
   - A Canvas 16 handler that allows the popup (`popupRequested` →
     `true`, or `DEFAULT`) still opens a native GTK window; a blocking
     handler / `setPopupHandler(null)` still blocks — byte-for-byte the
@@ -93,17 +134,27 @@ generated_at: 2026-08-06T16:00:00-07:00
     `IllegalStateException`; adoption is once-only (claim removes under
     lock).
   - A popup decided `ADOPT` but never adopted is reclaimed via
-    `webview_embed_discard_popup` → `gtk_discard_popup` (opener disposed
-    or grace-period backstop) — native child torn down, `onPopupClosed`
-    fired, inherited refs freed, no orphaned engine.
+    `gtk_discard_popup` (opener disposed or grace-period backstop) —
+    native child torn down, `onPopupClosed` fired, inherited refs freed,
+    no orphaned engine. Both JNI reclaim bridges converge on the **same**
+    `gtk_discard_popup`: heavyweight via `webview_embed_discard_popup`,
+    lightweight via `webview_offscreen_discard_popup` (the retained child
+    is the same `PopupEngine` in the shared registry, so the reclaim is
+    identical and is NOT duplicated).
   - Closing an adopted popup fires `onPopupClosed` correlated by
     `popup_id` and disposes the engine without dereferencing freed
     native state.
 
 - Out of scope (explicit non-goals):
   - **Windows (WebView2) adoption** — Canvas 20 / STORY-005-003.
-  - The **offscreen / lightweight** WebKitGTK engine (`OffEngine`).
-  - Any **Java** change (contract is Canvas 18's, reused verbatim).
+  - **macOS offscreen adoption** — the macOS/Windows offscreen engines
+    are stubs (`webview_offscreen_create` returns 0), so
+    `webview_offscreen_adopt_popup` returns 0 there and adoption is
+    never triggered on those platforms.
+  - Any change to the **public `WebViewComponent` API** — the lightweight
+    Java additions are internal (`OffscreenWebView`, `WebViewNative`,
+    `WebViewLightweightComponent` internals only). The heavyweight Java
+    contract is Canvas 18's, reused verbatim.
   - **swingwebbrowser** consumer wiring — STORY-005-004.
   - Surfacing the HTTP method/body to Java; reparenting an arbitrary
     running component; `window.open` feature strings beyond
@@ -163,10 +214,94 @@ generated_at: 2026-08-06T16:00:00-07:00
     `UnsatisfiedLinkError` (the exact bug already hit and fixed for the
     dialog setters; see the block comment above the bridges).
 
+- **`src_c/webview_embed.cpp`** (modified — GTK offscreen/lightweight
+  region, inside `#ifdef WEBVIEW_GTK`). New offscreen adoption code:
+  - `gtk_off_create_engine` (modified) — gains an optional
+    `GtkWidget *existing_web = nullptr` trailing parameter, mirroring
+    the `gtk_create_engine` refactor. When non-null the offscreen engine
+    **reuses** that web view (skipping `webkit_web_view_new()`) while
+    still building the `GtkOffscreenWindow`, wiring the external
+    message handler / dialogs / popups / IM-disable / focus-synth, and
+    doing `gtk_container_add` + `gtk_widget_show_all`. The single
+    existing caller (`webview_offscreen_create` bridge) passes the old
+    three-arg form and gets the default `nullptr` (fresh view).
+  - `gtk_off_adopt_popup(env, popupId, width, height, debug)
+    -> OffEngine*` — claims the retained `PopupEngine` from the shared
+    `g_gtk_retained_popups` (adopt-once, under
+    `g_gtk_retained_popups_mutex`; `nullptr` if absent), disconnects its
+    PopupEngine-scoped signal handlers
+    (`g_signal_handlers_disconnect_by_data` via `GtkPump` run_sync),
+    calls `gtk_off_create_engine(env, width, height, debug,
+    existing_web=child)` to reuse the child in a `GtkOffscreenWindow`,
+    transfers the inherited popup/dialog global refs to the `OffEngine`,
+    drops the retained `g_object` ref (the offscreen window now holds
+    the child), and deletes the `PopupEngine` shell. On failure it
+    reconnects the PopupEngine handlers and re-retains the child in the
+    registry (exactly like `gtk_adopt_popup`). The GTK counterpart of
+    `gtk_adopt_popup` for the offscreen engine.
+  - `gtk_discard_popup` (**reused unchanged**) — the offscreen reclaim
+    path claims the SAME `PopupEngine` from the SAME shared registry, so
+    the discard is identical and is NOT duplicated for the offscreen
+    engine.
+  - The two new offscreen JNI bridges (see below) live in the
+    `extern "C"` block.
+
+- **`src_c/webview_embed.cpp`** (`extern "C"` block) — two new offscreen
+  JNI bridges added next to `webview_offscreen_set_popup_callback` /
+  `webview_offscreen_set_user_agent`:
+  - `Java_…_webview_1offscreen_1adopt_1popup(env, jclass, jint width,
+    jint height, jlong popupId, jint debug) -> jlong` — `#ifdef
+    WEBVIEW_GTK` returns `(jlong)embed::gtk_off_adopt_popup(env,
+    popupId, width, height, debug)`; `#else` returns `0`
+    (macOS/Windows offscreen is a stub).
+  - `Java_…_webview_1offscreen_1discard_1popup(env, jclass,
+    jlong /*peer*/, jlong popupId) -> void` — `#ifdef WEBVIEW_GTK`
+    calls `embed::gtk_discard_popup(popupId)` (the shared reclaim).
+  - Both **remain inside the `extern "C"` block** — a JNI method outside
+    it gets C++-mangled and fails at runtime with `UnsatisfiedLinkError`
+    (the exact bug already hit and fixed for the dialog setters).
+
+- **`src/ca/weblite/webview/WebViewNative.java`** (modified) — two new
+  `native static` declarations next to the other `webview_offscreen_*`:
+  - `webview_offscreen_adopt_popup(int width, int height, long popupId,
+    int debug) -> long`.
+  - `webview_offscreen_discard_popup(long peer, long popupId) -> void`.
+
+- **`src/ca/weblite/webview/OffscreenWebView.java`** (modified) — the
+  offscreen wrapper's adoption factory + reclaim:
+  - `static adopt(int width, int height, long popupId, boolean debug)
+    -> OffscreenWebView` — mirrors the `create(w, h, debug)` factory:
+    calls `webview_offscreen_adopt_popup`, throws
+    `IllegalStateException` when the returned peer is `0` (no retained
+    popup for that id / unsupported platform), otherwise wraps the peer
+    and installs the same evalAsync / addJavascriptFunction bridges that
+    `create` installs.
+  - `discardRetainedPopup(long popupId) -> OffscreenWebView` — calls
+    `webview_offscreen_discard_popup(peer, popupId)`; the offscreen
+    counterpart of `EmbeddedWebView.discardRetainedPopup`.
+
+- **`src/ca/weblite/webview/swing/WebViewLightweightComponent.java`**
+  (modified) — `addNotify` real adoption:
+  - The Canvas-19 skip-guard (stderr warning + early return when
+    `pendingAdoptPopupId != 0`) is **replaced** by real adoption: when
+    `pendingAdoptPopupId != 0L` the engine is built via
+    `OffscreenWebView.adopt(w, h, pendingAdoptPopupId, debug)` instead of
+    `OffscreenWebView.create(w, h, debug)`.
+  - `pendingUrl` is NOT navigated on the adopt path (the adopted child
+    carries its own in-flight navigation), mirroring the heavyweight
+    component's `if (pendingAdoptPopupId == 0L) navigate` guard.
+  - A reclaim sink is installed like the heavyweight component's:
+    `popupDispatcher.setReclaimSink(...)` whose `discard(popupId)` calls
+    `engine.discardRetainedPopup(popupId)` (best-effort).
+  - The UA-apply-before-navigate and `applyUserAgentToPeer` override are
+    kept intact.
+
 - **`PopupEngine`** (reused unchanged) — its `window` field is now
   `nullptr` for an ADOPT child (windowless); `web`, `jvm`,
   `popup_callback`, `dialog_callback`, `popup_id` carry the retained
-  child's state until adoption or discard.
+  child's state until adoption or discard. The SAME `PopupEngine` is
+  claimed by either `gtk_adopt_popup` (heavyweight) or
+  `gtk_off_adopt_popup` (lightweight), whichever component adopts it.
 
 ```mermaid
 flowchart TB
@@ -177,11 +312,15 @@ flowchart TB
   disp -->|NATIVE_WINDOW 1| win["GtkWindow + ready-to-show + onPopupOpened (Canvas 16)"]
   disp -->|ADOPT 2| adopt["child windowless + g_object_ref_sink\nregister g_gtk_retained_popups\nfire_popup_notify_adoptable"]
   adopt -.EDT.-> java["WebViewComponent.adoptPopup(popupId)"]
-  java --> bridge["webview_embed_adopt_popup (extern C)"]
+  java -->|heavyweight| bridge["webview_embed_adopt_popup (extern C)"]
   bridge --> gadopt["gtk_adopt_popup"]
   gadopt --> reuse["gtk_create_engine(existing_web=child)\nJAWT + XReparentWindow into parent surface"]
   reuse --> engine["Engine* returned to Java peer"]
-  adopt -. unclaimed .-> discard["webview_embed_discard_popup -> gtk_discard_popup"]
+  java -->|lightweight| obridge["webview_offscreen_adopt_popup (extern C)"]
+  obridge --> goadopt["gtk_off_adopt_popup"]
+  goadopt --> oreuse["gtk_off_create_engine(existing_web=child)\nGtkOffscreenWindow, blitted into Swing"]
+  oreuse --> oengine["OffEngine* returned to Java peer"]
+  adopt -. unclaimed .-> discard["webview_embed_discard_popup OR webview_offscreen_discard_popup\n-> shared gtk_discard_popup"]
 ```
 
 ## A · Approach
@@ -194,15 +333,30 @@ flowchart TB
    `gtk_create_engine` already performs. Java never sees or reconstructs
    the request — sidestepping the unavailable-POST-body problem.
 
-2. **Refactor, don't duplicate, the embedding path.**
+2. **Refactor, don't duplicate, the embedding path — both engines.**
    `gtk_create_engine` gains an optional `existing_web` parameter. When
    non-null it skips `webkit_web_view_new()` and reuses the retained
    child, but runs the identical JAWT lock / `XReparentWindow` / window
    realize / software-compositing / frame-clock / engine-scoped signal
    wiring. `gtk_adopt_popup` is thin: claim, disconnect the child's old
    PopupEngine handlers, call the shared path, transfer callbacks, drop
-   the retained ref. This keeps the reparent logic single-sourced, so
-   adoption cannot drift from normal create embedding.
+   the retained ref. The offscreen engine mirrors this exactly:
+   `gtk_off_create_engine` gains the same optional `existing_web`
+   parameter (reuse vs. `webkit_web_view_new()`), and
+   `gtk_off_adopt_popup` is the offscreen twin of `gtk_adopt_popup` —
+   claim from the shared registry, disconnect, call
+   `gtk_off_create_engine(existing_web=child)`, transfer callbacks, drop
+   the retained ref. This keeps the reuse logic single-sourced per
+   engine, so adoption cannot drift from normal create.
+
+2b. **Shared retained registry + shared reclaim.** Phase 1
+   (`handle_create_web_view` ADOPT branch) is untouched and
+   engine-agnostic: whether the opener is heavyweight or lightweight, the
+   child is retained windowless in the single `g_gtk_retained_popups`
+   under `g_gtk_retained_popups_mutex`. Adoption therefore claims from
+   that same map regardless of adopt target, and the discard/reclaim path
+   is the single `gtk_discard_popup` — the offscreen discard JNI bridge
+   calls it directly rather than adding a parallel offscreen teardown.
 
 3. **Disposition switch inside the shared create handler.**
    `handle_create_web_view` is the one inner handler all three GTK create
@@ -257,20 +411,55 @@ flowchart TB
    `ExceptionDescribe` / `ExceptionClear`. Strings are null-coerced to
    empty; sizes are `-1` for unspecified at create time.
 
+9. **Offscreen ownership is simpler than heavyweight.** On the offscreen
+   adopt there is NO `XReparentWindow` into a foreign on-screen X11 tree:
+   the reused child is added to a fresh `GtkOffscreenWindow` via
+   `gtk_container_add`, which takes the container ref. The retained
+   `g_object_ref_sink` ref is then dropped (the offscreen window owns the
+   child), exactly balancing as in the heavyweight adopt. The child's
+   in-flight (POST) navigation continues to render, now into the
+   offscreen surface that Java snapshots and blits.
+
+10. **Lightweight component: adopt instead of create, don't
+    re-navigate.** `WebViewLightweightComponent.addNotify` chooses
+    `OffscreenWebView.adopt(w, h, pendingAdoptPopupId, debug)` when
+    `pendingAdoptPopupId != 0L`, else `OffscreenWebView.create(w, h,
+    debug)`. The adopted child already carries its navigation, so
+    `pendingUrl` is only navigated on the create path (guard
+    `if (pendingAdoptPopupId == 0L)`), mirroring the heavyweight
+    component. All the other addNotify wiring (console/mouse/dialog/popup
+    bridges, pending-config replay, UA-before-navigate, repaint timer,
+    editing-shortcut dispatcher) is shared with the create path. A
+    reclaim sink is registered on the `popupDispatcher` so the component
+    can discard retained-but-unadopted children through
+    `engine.discardRetainedPopup`.
+
 ## S · Structure
 
-### Layered Architecture (native only; layers above are Canvas 18's, unchanged)
+### Layered Architecture
 1. **Native engine layer** (`src_c/webview_embed.cpp`, GTK region):
-   disposition switch in `handle_create_web_view`, the
-   `g_gtk_retained_popups` registry, `fire_popup_disposition` /
-   `fire_popup_notify_adoptable`, `gtk_create_engine`'s `existing_web`
-   reuse, `gtk_adopt_popup` / `gtk_discard_popup`, `on_ready_to_show_popup`
-   windowless guard.
+   - Heavyweight: disposition switch in `handle_create_web_view`, the
+     `g_gtk_retained_popups` registry, `fire_popup_disposition` /
+     `fire_popup_notify_adoptable`, `gtk_create_engine`'s `existing_web`
+     reuse, `gtk_adopt_popup` / `gtk_discard_popup`,
+     `on_ready_to_show_popup` windowless guard.
+   - Lightweight (new): `gtk_off_create_engine`'s `existing_web` reuse,
+     `gtk_off_adopt_popup`, sharing the SAME `g_gtk_retained_popups`
+     registry and the SAME `gtk_discard_popup` reclaim.
 2. **JNI surface** (`extern "C"` bridges): GTK branch of
-   `webview_embed_adopt_popup` / `webview_embed_discard_popup`.
-3. **Everything above** (`WebViewNative`, `EmbeddedWebView`,
-   `PopupDispatcher`, `WebViewComponent`, `WebViewPopupHandler`,
-   `PopupDisposition`, `WebViewPopupCallback`): **Canvas 18, unmodified.**
+   `webview_embed_adopt_popup` / `webview_embed_discard_popup`
+   (heavyweight, Canvas 18); new `webview_offscreen_adopt_popup` /
+   `webview_offscreen_discard_popup` (lightweight).
+3. **Java layer**:
+   - Heavyweight (`EmbeddedWebView`, `PopupDispatcher`,
+     `WebViewComponent`, `WebViewPopupHandler`, `PopupDisposition`,
+     `WebViewPopupCallback`, `WebViewHeavyweightComponent`): **Canvas 18,
+     unmodified.**
+   - Lightweight (new/modified, internal only): `WebViewNative` (two new
+     offscreen decls), `OffscreenWebView` (`adopt` /
+     `discardRetainedPopup`), `WebViewLightweightComponent` (real
+     adoption + reclaim sink in `addNotify`). The public
+     `WebViewComponent` API and `adoptPopup` factory are unchanged.
 
 ### Dependencies
 1. `handle_create_web_view` → `fire_popup_disposition`,
@@ -278,9 +467,21 @@ flowchart TB
 2. `gtk_adopt_popup` → `g_gtk_retained_popups`, `gtk_create_engine`
    (with `existing_web`), `GtkPump`, the PopupEngine signal handlers
    (reconnect on failure).
-3. `gtk_discard_popup` → `g_gtk_retained_popups`, `fire_gtk_popup_closed`,
-   `GtkPump`.
-4. JNI bridges → `embed::gtk_adopt_popup` / `embed::gtk_discard_popup`.
+3. `gtk_off_adopt_popup` → `g_gtk_retained_popups`,
+   `gtk_off_create_engine` (with `existing_web`), `GtkPump`, the
+   PopupEngine signal handlers (reconnect on failure).
+4. `gtk_discard_popup` → `g_gtk_retained_popups`, `fire_gtk_popup_closed`,
+   `GtkPump` (shared by both engines' reclaim bridges).
+5. Heavyweight JNI bridges → `embed::gtk_adopt_popup` /
+   `embed::gtk_discard_popup`.
+6. Offscreen JNI bridges → `embed::gtk_off_adopt_popup` /
+   `embed::gtk_discard_popup`.
+7. `OffscreenWebView.adopt` → `WebViewNative.webview_offscreen_adopt_popup`;
+   `OffscreenWebView.discardRetainedPopup` →
+   `WebViewNative.webview_offscreen_discard_popup`.
+8. `WebViewLightweightComponent.addNotify` → `OffscreenWebView.adopt` /
+   `OffscreenWebView.create`, `popupDispatcher.setReclaimSink` →
+   `OffscreenWebView.discardRetainedPopup`.
 
 ## O · Operations
 
@@ -343,7 +544,7 @@ File: `src_c/webview_embed.cpp` (GTK)
    `g_object_unref(web)`.
 4. Free the inherited global refs; `delete pe`.
 
-### 7. JNI bridges (GTK branch)
+### 7. JNI bridges — heavyweight (GTK branch)
 File: `src_c/webview_embed.cpp` (`extern "C"`)
 1. `webview_embed_adopt_popup`: `#ifdef WEBVIEW_GTK` →
    `embed::gtk_adopt_popup(env, parent, popupId, debug)`; return
@@ -352,11 +553,84 @@ File: `src_c/webview_embed.cpp` (`extern "C"`)
    `embed::gtk_discard_popup(popupId)`.
 3. Both remain inside `extern "C"`.
 
+### 8. `gtk_off_create_engine` reuse parameter
+File: `src_c/webview_embed.cpp` (GTK offscreen)
+1. Add trailing `GtkWidget *existing_web = nullptr` param; inside the
+   run_sync body, `e->web = existing_web ? existing_web :
+   webkit_web_view_new()`. Everything else (offscreen window, external
+   message handler, dialog/popup signals, IM-disable, focus-synth,
+   `gtk_container_add`, `show_all`) is shared. The one existing caller
+   (the `webview_offscreen_create` bridge) is unchanged and gets the
+   default.
+
+### 9. `gtk_off_adopt_popup`
+File: `src_c/webview_embed.cpp` (GTK offscreen)
+1. Claim the `PopupEngine` from the shared `g_gtk_retained_popups` under
+   `g_gtk_retained_popups_mutex` (adopt-once); `nullptr` if absent or if
+   `pe->web` is null.
+2. `g_signal_handlers_disconnect_by_data(pe->web, pe)` on the GTK thread.
+3. `OffEngine *e = gtk_off_create_engine(env, width, height, debug,
+   GTK_WIDGET(pe->web))`. On failure: reconnect the PopupEngine handlers,
+   re-retain in the registry, return `nullptr`.
+4. Transfer `popup_callback` / `dialog_callback` from `pe` to `e` (null
+   them on `pe`).
+5. `g_object_unref(childw)` on the GTK thread (drop the retained ref; the
+   offscreen window now holds a container ref).
+6. `delete pe`; return `e`.
+
+### 10. Offscreen JNI bridges (GTK branch)
+File: `src_c/webview_embed.cpp` (`extern "C"`)
+1. `webview_offscreen_adopt_popup(env, jclass, jint width, jint height,
+   jlong popupId, jint debug) -> jlong`: `#ifdef WEBVIEW_GTK` →
+   `return (jlong)embed::gtk_off_adopt_popup(env, popupId, width, height,
+   debug)`; `#else return 0`.
+2. `webview_offscreen_discard_popup(env, jclass, jlong /*peer*/,
+   jlong popupId) -> void`: `#ifdef WEBVIEW_GTK` →
+   `embed::gtk_discard_popup(popupId)` (shared reclaim).
+3. Both placed inside `extern "C"`, next to
+   `webview_offscreen_set_popup_callback` /
+   `webview_offscreen_set_user_agent`.
+
+### 11. Java: `WebViewNative` declarations
+File: `src/ca/weblite/webview/WebViewNative.java`
+1. Add `native static long webview_offscreen_adopt_popup(int width,
+   int height, long popupId, int debug)` and `native static void
+   webview_offscreen_discard_popup(long peer, long popupId)` next to the
+   other `webview_offscreen_*` decls.
+
+### 12. Java: `OffscreenWebView.adopt` / `discardRetainedPopup`
+File: `src/ca/weblite/webview/OffscreenWebView.java`
+1. `static adopt(int width, int height, long popupId, boolean debug)`:
+   call `webview_offscreen_adopt_popup`; if peer == 0 throw
+   `IllegalStateException` naming the popupId; else construct the wrapper
+   and install the SAME evalAsync + addJavascriptFunction bridges that
+   `create` installs (factor the shared bind sequence so `create` and
+   `adopt` cannot diverge).
+2. `discardRetainedPopup(long popupId)`: call
+   `webview_offscreen_discard_popup(peer, popupId)`; return `this`.
+
+### 13. Java: `WebViewLightweightComponent.addNotify`
+File: `src/ca/weblite/webview/swing/WebViewLightweightComponent.java`
+1. Replace the Canvas-19 skip-guard (stderr warning + early return on
+   `pendingAdoptPopupId != 0`) with: `engine = (pendingAdoptPopupId !=
+   0L) ? OffscreenWebView.adopt(w, h, pendingAdoptPopupId, debug) :
+   OffscreenWebView.create(w, h, debug)`.
+2. Guard the `engine.navigate(pendingUrl)` with `if (pendingAdoptPopupId
+   == 0L)`.
+3. Install `popupDispatcher.setReclaimSink(...)` whose `discard(popupId)`
+   calls `engine.discardRetainedPopup(popupId)` (best-effort, swallow
+   `RuntimeException`).
+4. Keep UA-apply-before-navigate and `applyUserAgentToPeer` intact.
+
 ## N · Norms
 
-- **No Java changes.** This canvas is native-only; the Java contract is
-  Canvas 18's. The wire contract (ordinals, JNI method signatures) is
-  identical to macOS.
+- **No public-API changes; heavyweight Java untouched.** The heavyweight
+  path is native-only (Canvas 18's Java contract, wire ordinals, and JNI
+  signatures reused verbatim). The lightweight path adds INTERNAL Java
+  only (`WebViewNative` decls, `OffscreenWebView.adopt` /
+  `discardRetainedPopup`, `WebViewLightweightComponent` internals); the
+  public `WebViewComponent` API and `adoptPopup` factory do not change.
+  macOS and Windows code is not touched.
 - **Ordinal wire contract.** `onPopupDisposition` returns
   `BLOCK=0/NATIVE_WINDOW=1/ADOPT=2`; never reorder.
 - **Additive-only.** The `NATIVE_WINDOW` / `BLOCK` branches are the
@@ -377,11 +651,26 @@ File: `src_c/webview_embed.cpp` (`extern "C"`)
 - **Single handler set per signal.** `g_signal_handlers_disconnect_by_data`
   removes the PopupEngine-scoped handlers before the engine-scoped ones
   are connected.
-- **Offscreen path untouched.** No change to `OffEngine` /
-  `WebViewLightweightComponent`; the lightweight Canvas-19 guard stays.
+- **Shared registry + shared reclaim, single-sourced.** Both adopt
+  targets claim from the one `g_gtk_retained_popups`; both reclaim
+  bridges converge on the one `gtk_discard_popup`. The offscreen discard
+  MUST NOT duplicate teardown logic.
+- **Offscreen reuse mirrors heavyweight.** `gtk_off_adopt_popup` follows
+  `gtk_adopt_popup` step-for-step (claim → disconnect → reuse-create →
+  transfer refs → drop retained ref → delete shell; failure path
+  reconnects + re-retains). `gtk_off_create_engine`'s `existing_web`
+  reuse mirrors `gtk_create_engine`'s.
+- **Adopt vs. create parity in the lightweight component.** The adopt
+  path shares ALL of `addNotify`'s bridge/replay/UA wiring with the
+  create path; only the engine-construction call and the `pendingUrl`
+  navigate are gated on `pendingAdoptPopupId`.
+- **`OffscreenWebView.adopt` installs the same bridges as `create`.** The
+  adopted wrapper must be indistinguishable from a created one
+  (evalAsync + addJavascriptFunction bridges present).
 - **C++11, no `-Werror`** (`g++ -std=c++11 -Wall -DWEBVIEW_GTK=1`);
-  avoid hard errors. Default parameter on `gtk_create_engine` keeps the
-  existing single call site compiling unchanged.
+  avoid hard errors. Default parameter on `gtk_create_engine` AND
+  `gtk_off_create_engine` keeps the existing single call sites compiling
+  unchanged. The Java side compiles under Java 8 (`javac`).
 
 ## S · Safeguards
 
@@ -402,9 +691,13 @@ File: `src_c/webview_embed.cpp` (`extern "C"`)
   Linux end of the Canvas 18 reclaim contract (opener dispose +
   grace-period backstop, both driven from the unchanged Java side).
 - **JNI bridges inside `extern "C"`.** The GTK-branch edit does not move
-  the bridges; keeping them inside `extern "C"` is mandatory
+  the heavyweight bridges; keeping them inside `extern "C"` is mandatory
   (UnsatisfiedLinkError otherwise — the documented, previously-fixed
-  bug).
+  bug). The two NEW offscreen bridges
+  (`webview_offscreen_adopt_popup` / `webview_offscreen_discard_popup`)
+  MUST also be added INSIDE the `extern "C"` block — a bridge placed
+  outside it gets C++-mangled and fails at runtime with
+  `UnsatisfiedLinkError` (this exact bug was already hit once).
 - **Opener linkage + POST are mandatory.** The adopted child MUST be the
   `webkit_web_view_new_with_related_view` child; creating a fresh view or
   re-navigating from Java is a defect.
@@ -429,15 +722,52 @@ File: `src_c/webview_embed.cpp` (`extern "C"`)
   - the software-compositing / frame-clock repaint pacing on the reused
     view (the Canvas 6/16 virtualized-X11 concerns apply unchanged).
 
+- **Offscreen adoption — ON-DEVICE VALIDATION REQUIRED.** The offscreen
+  adopt is likewise unbuilt/unexercised in this sandbox (no GTK
+  toolchain). Prime candidates for on-device scrutiny on a real
+  WebKitGTK stack:
+  - the ownership/reparent handoff — a child created windowless (held by
+    `g_object_ref_sink`) is `gtk_container_add`-ed into a fresh
+    `GtkOffscreenWindow`, then the retained ref is dropped; verify the
+    refcount stays balanced (offscreen window container ref + WebKit's
+    own ref) with no premature finalization or use-after-destroy;
+  - **blit of a mid-navigation child** — the reused child may be
+    mid-POST-navigation when reparented from windowless into the
+    offscreen window; verify the snapshot/blit pipeline (cairo surface →
+    `BufferedImage`, ~30Hz via the component repaint timer) begins
+    producing correct frames and does not race the reparent (e.g. a
+    snapshot taken before the offscreen window realizes the child);
+  - the `gtk_off_adopt_popup` failure path (re-retain + reconnect the
+    PopupEngine handlers) leaves the child reclaimable exactly like the
+    heavyweight failure path;
+  - focus-synth / IM-disable on the reused view behaves as it does for a
+    freshly-created offscreen engine (the adopted child skipped the
+    `create`-time focus grab until `gtk_off_create_engine` runs it).
+
 ## REASONS-Implements
 
-- `src_c/webview_embed.cpp` (GTK region: `g_gtk_retained_popups` +
-  mutex, `fire_popup_disposition`, `fire_popup_notify_adoptable`,
-  `handle_create_web_view` disposition switch, `on_ready_to_show_popup`
-  windowless guard, `gtk_create_engine` `existing_web` reuse,
-  `gtk_adopt_popup`, `gtk_discard_popup`)
+- `src_c/webview_embed.cpp` (GTK heavyweight region:
+  `g_gtk_retained_popups` + mutex, `fire_popup_disposition`,
+  `fire_popup_notify_adoptable`, `handle_create_web_view` disposition
+  switch, `on_ready_to_show_popup` windowless guard, `gtk_create_engine`
+  `existing_web` reuse, `gtk_adopt_popup`, `gtk_discard_popup`)
+- `src_c/webview_embed.cpp` (GTK offscreen/lightweight region:
+  `gtk_off_create_engine` `existing_web` reuse, `gtk_off_adopt_popup`;
+  offscreen reclaim reuses the shared `gtk_discard_popup`)
 - `src_c/webview_embed.cpp` (`extern "C"`: GTK branch of
   `Java_ca_weblite_webview_WebViewNative_webview_1embed_1adopt_1popup`
-  and `…_webview_1embed_1discard_1popup`)
-- Conforms to the Canvas 18 Java contract
-  ([[popup-adoption-into-webviewcomponent-tab]]) — **no Java changes**.
+  and `…_webview_1embed_1discard_1popup`; and the two new offscreen
+  bridges `…_webview_1offscreen_1adopt_1popup` and
+  `…_webview_1offscreen_1discard_1popup`)
+- `src/ca/weblite/webview/WebViewNative.java` (two new offscreen
+  `native static` decls: `webview_offscreen_adopt_popup`,
+  `webview_offscreen_discard_popup`)
+- `src/ca/weblite/webview/OffscreenWebView.java` (`adopt(int, int, long,
+  boolean)` factory, `discardRetainedPopup(long)`)
+- `src/ca/weblite/webview/swing/WebViewLightweightComponent.java`
+  (`addNotify` real adoption: `OffscreenWebView.adopt` on
+  `pendingAdoptPopupId != 0`, adopt-path navigate guard, reclaim sink)
+- Heavyweight path conforms to the Canvas 18 Java contract
+  ([[popup-adoption-into-webviewcomponent-tab]]) — **no heavyweight Java
+  changes**. Lightweight path adds internal Java only; the public
+  `WebViewComponent` API is unchanged.

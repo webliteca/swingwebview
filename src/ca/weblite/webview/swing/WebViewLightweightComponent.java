@@ -11,6 +11,7 @@ import ca.weblite.webview.EditingCommand;
 import ca.weblite.webview.GdkInput;
 import ca.weblite.webview.JavascriptFunction;
 import ca.weblite.webview.OffscreenWebView;
+import ca.weblite.webview.PopupDispatcher;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewDialogCallback;
 import ca.weblite.webview.WebViewPopupCallback;
@@ -207,25 +208,23 @@ public class WebViewLightweightComponent extends WebViewComponent {
     public void addNotify() {
         super.addNotify();
         if (engine != null) return;
-        if (pendingAdoptPopupId != 0L) {
-            // Popup adoption for the lightweight / offscreen engine lands in
-            // Canvas 19 (STORY-005-002, Linux).  Until then, adopting into an
-            // offscreen component is unsupported: leave the engine null (blank
-            // component) rather than silently creating an unrelated engine.
-            // The retained native child is reclaimed by the opener's grace
-            // backstop.  The reference adoption backend (Canvas 18) is macOS
-            // heavyweight.
-            System.err.println(
-                "[webview] popup adoption is not yet implemented for the "
-                + "lightweight/offscreen engine (Canvas 19); popupId "
-                + pendingAdoptPopupId + " will be reclaimed. Use the "
-                + "heavyweight mode for adoption on the reference (macOS) "
-                + "backend.");
-            return;
-        }
         int w = Math.max(1, getWidth());
         int h = Math.max(1, getHeight());
-        engine = OffscreenWebView.create(w, h, debug);
+        if (pendingAdoptPopupId != 0L) {
+            // Canvas 19 (lightweight/offscreen coverage): adopt the retained
+            // popup child into THIS offscreen component instead of creating a
+            // fresh engine.  The adopted child reuses the opener-linked
+            // WebKitGTK view inside a GtkOffscreenWindow, preserving its
+            // in-flight (POST) navigation + window.opener linkage.  The
+            // retained child lives in the shared native registry, so a popup
+            // raised by either a heavyweight or lightweight opener can be
+            // adopted here.  A 0 native peer (unknown/consumed id or
+            // unsupported platform) surfaces as IllegalStateException from
+            // OffscreenWebView.adopt.
+            engine = OffscreenWebView.adopt(w, h, pendingAdoptPopupId, debug);
+        } else {
+            engine = OffscreenWebView.create(w, h, debug);
+        }
         if (engine == null) {
             // Unsupported platform or native failure -- leave the
             // engine null so subsequent ops are no-ops.  paintComponent
@@ -344,6 +343,22 @@ public class WebViewLightweightComponent extends WebViewComponent {
                 popupDispatcher.dispatchPopupClosed(popupId, targetUrl, pageUrl);
             }
         });
+        // Let the dispatcher discard retained-but-unadopted popup children
+        // (PopupDisposition.ADOPT reclaim) through this offscreen engine.
+        // Mirrors WebViewHeavyweightComponent's reclaim sink; the native side
+        // converges on the same shared gtk_discard_popup.
+        popupDispatcher.setReclaimSink(new PopupDispatcher.ReclaimSink() {
+            @Override
+            public void discard(long popupId) {
+                OffscreenWebView e = engine;
+                if (e == null) return;
+                try {
+                    e.discardRetainedPopup(popupId);
+                } catch (RuntimeException ignored) {
+                    // Reclaim is best-effort; teardown must not fail on it.
+                }
+            }
+        });
         for (String js : pendingInit) {
             engine.addOnBeforeLoad(js);
         }
@@ -362,7 +377,14 @@ public class WebViewLightweightComponent extends WebViewComponent {
         if (pendingUserAgent != null) {
             engine.setUserAgent(pendingUserAgent);
         }
-        engine.navigate(pendingUrl);
+        // An adopted popup already carries the engine's own in-flight
+        // navigation (the original request WebKit drove into the child, POST
+        // body intact); navigating pendingUrl here would clobber it.  Only
+        // navigate for the normal engine-creating path — mirrors
+        // WebViewHeavyweightComponent's adopt guard.
+        if (pendingAdoptPopupId == 0L) {
+            engine.navigate(pendingUrl);
+        }
         repaintTimer = new Timer(REPAINT_INTERVAL_MS, e -> repaint());
         repaintTimer.setRepeats(true);
         repaintTimer.start();

@@ -450,5 +450,25 @@ native static void webview_offscreen_set_popup_callback(long peer, WebViewPopupC
 // throws via JNI.
 native static void webview_offscreen_set_user_agent(long peer, String ua);
 
+// Offscreen counterpart to webview_embed_adopt_popup (Canvas 19).  Adopt a
+// browser-initiated popup child that was retained (not shown) after an ADOPT
+// disposition, reusing it inside a fresh GtkOffscreenWindow (OffEngine) and
+// returning an opaque offscreen peer pointer (as webview_offscreen_create
+// would), or 0 when `popupId` is unknown / already adopted / expired, or on an
+// unsupported platform (macOS / Windows offscreen engines are stubs).  The
+// reused child preserves its in-flight request (POST verb + body) and
+// window.opener linkage.  Claims from the SAME retained-popup registry as the
+// heavyweight webview_embed_adopt_popup.  Never throws via JNI.
+native static long webview_offscreen_adopt_popup(int width, int height,
+                                                 long popupId, int debug);
+
+// Offscreen counterpart to webview_embed_discard_popup (Canvas 19).  Discard a
+// retained-but-unadopted popup child (the ADOPT reclaim path): tear down its
+// native view + child engine without ever showing a window.  Converges on the
+// SAME shared native reclaim (gtk_discard_popup) as the heavyweight bridge, so
+// `peer` is unused (kept for signature symmetry with the heavyweight bridge).
+// Unknown popupId is a silent no-op.  Never throws via JNI.
+native static void webview_offscreen_discard_popup(long peer, long popupId);
+
 
 }

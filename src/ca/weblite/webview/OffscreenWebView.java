@@ -101,6 +101,56 @@ public class OffscreenWebView {
         long p = WebViewNative.webview_offscreen_create(
             Math.max(1, width), Math.max(1, height), debug ? 1 : 0);
         if (p == 0L) return null;
+        return wrapAndInstallBridges(p);
+    }
+
+    /**
+     * Adopt a browser-initiated popup child that the offscreen engine
+     * retained (not shown) after a
+     * {@link ca.weblite.webview.PopupDisposition#ADOPT} decision, reusing it
+     * inside a fresh {@code GtkOffscreenWindow}.  The offscreen counterpart of
+     * {@link EmbeddedWebView#adopt}: instead of creating a fresh engine it
+     * reuses the existing opener-linked child identified by {@code popupId} —
+     * preserving that child's in-flight request (POST verb and body) and
+     * {@code window.opener} linkage — and installs the SAME evalAsync /
+     * addJavascriptFunction bridges as {@link #create}.
+     *
+     * <p>The retained child lives in the SAME native registry regardless of
+     * whether the opener was a heavyweight or lightweight component, so a
+     * popup raised by either can be adopted into a lightweight component.
+     *
+     * @param width   initial offscreen viewport width in pixels
+     * @param height  initial offscreen viewport height in pixels
+     * @param popupId the engine-assigned handle from
+     *                {@link ca.weblite.webview.WebViewPopupHandler#popupAdoptable}
+     * @param debug   enable developer tools where supported
+     * @return the wrapper for the adopted offscreen engine
+     * @throws IllegalStateException if {@code popupId} is unknown, already
+     *         adopted, expired, or adoption is unsupported on this platform
+     *         (the native adopt returned 0 — e.g. macOS / Windows, where the
+     *         offscreen engine is a stub)
+     */
+    public static OffscreenWebView adopt(int width, int height, long popupId,
+                                         boolean debug) {
+        long p = WebViewNative.webview_offscreen_adopt_popup(
+            Math.max(1, width), Math.max(1, height), popupId, debug ? 1 : 0);
+        if (p == 0L) {
+            throw new IllegalStateException(
+                "no retained popup to adopt for popupId " + popupId
+                + "; it is unknown, already adopted, expired, or the "
+                + "offscreen engine is unsupported on this platform.");
+        }
+        return wrapAndInstallBridges(p);
+    }
+
+    /**
+     * Wrap a freshly-obtained offscreen peer (from
+     * {@code webview_offscreen_create} or {@code webview_offscreen_adopt_popup})
+     * and install the evalAsync + addJavascriptFunction bridges.  Shared by
+     * {@link #create} and {@link #adopt} so an adopted wrapper is
+     * indistinguishable from a created one.
+     */
+    private static OffscreenWebView wrapAndInstallBridges(long p) {
         final OffscreenWebView ow = new OffscreenWebView(p);
         // Install the evalAsync bridge BEFORE returning so the SHIM_JS is
         // in place at document-start for every subsequent navigation, and
@@ -130,6 +180,22 @@ public class OffscreenWebView {
         ow.heap.add(fnCb);
         WebViewNative.webview_offscreen_bind(p, FunctionDispatcher.INBOUND_CHANNEL, fnCb, p);
         return ow;
+    }
+
+    /**
+     * Discard a retained-but-unadopted popup child (the ADOPT reclaim path).
+     * The offscreen counterpart of
+     * {@link EmbeddedWebView#discardRetainedPopup}.  A no-op for an unknown
+     * {@code popupId}.  Used by the owning lightweight component's reclaim
+     * sink; does not affect this engine's own page.  The native side converges
+     * on the same shared reclaim as the heavyweight discard.
+     *
+     * @return {@code this} for chaining
+     */
+    public OffscreenWebView discardRetainedPopup(long popupId) {
+        checkAlive();
+        WebViewNative.webview_offscreen_discard_popup(peer, popupId);
+        return this;
     }
 
     /** @return the native peer pointer, or 0 if disposed. */

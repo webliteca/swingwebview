@@ -2218,8 +2218,20 @@ static void off_engine_on_message(OffEngine *e, const char *msg) {
     if (detach) e->jvm->DetachCurrentThread();
 }
 
+// Canvas 19 (lightweight/offscreen coverage): when `existing_web` is non-null
+// (the offscreen popup-adoption path) the engine REUSES that already-created
+// WebKitWebView instead of allocating a fresh one — preserving its in-flight
+// POST navigation + window.opener linkage — while still building the
+// GtkOffscreenWindow and performing the identical external-message / dialog /
+// popup / IM-disable / focus-synth / container / show wiring.  `existing_web`
+// must carry no GTK parent (the ADOPT branch never adds it to a container);
+// gtk_container_add below adopts it into the offscreen window.  Mirrors
+// gtk_create_engine's existing_web reuse.  The caller (gtk_off_adopt_popup)
+// has already disconnected the child's old PopupEngine-scoped signal handlers
+// so the fresh OffEngine-scoped handlers connected below are the only ones.
 static OffEngine *gtk_off_create_engine(JNIEnv *env,
-                                        int width, int height, jint debug) {
+                                        int width, int height, jint debug,
+                                        GtkWidget *existing_web = nullptr) {
     if (width < 1) width = 1;
     if (height < 1) height = 1;
     auto *e = new OffEngine();
@@ -2231,7 +2243,10 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
     bool ok = false;
     GtkPump::instance().run_sync([&] {
         e->window = gtk_offscreen_window_new();
-        e->web = webkit_web_view_new();
+        // Canvas 19: reuse the retained popup child (adoption) or create fresh.
+        // The reused child already carries its opener linkage + in-flight POST
+        // navigation from handle_create_web_view.
+        e->web = existing_web ? existing_web : webkit_web_view_new();
         e->manager =
             webkit_web_view_get_user_content_manager(WEBKIT_WEB_VIEW(e->web));
 
@@ -2457,6 +2472,122 @@ static void gtk_off_set_user_agent(OffEngine *e, const char *ua) {
     if (!e || !e->web) return;
     WebKitSettings *s = webkit_web_view_get_settings(WEBKIT_WEB_VIEW(e->web));
     if (s) webkit_settings_set_user_agent(s, ua);
+}
+
+// ---------------------------------------------------------------------------
+// Canvas 19 (lightweight/offscreen coverage): popup adoption into a
+// caller-supplied lightweight WebViewComponent's offscreen surface.  The
+// offscreen twin of gtk_adopt_popup — same two-phase model, same shared
+// g_gtk_retained_popups registry, same shared gtk_discard_popup reclaim.
+//
+//   Phase 1 (handle_create_web_view ADOPT branch, above): the opener-linked
+//     child WebKitWebView is created windowless, retained under
+//     g_gtk_retained_popups, and onPopupAdoptable is fired.  This is identical
+//     whether the opener was heavyweight (Engine) or lightweight (OffEngine) —
+//     both route `create` through the shared handle_create_web_view.
+//   Phase 2 (here): the application's lightweight WebViewComponent.adoptPopup
+//     peer attach calls webview_offscreen_adopt_popup -> gtk_off_adopt_popup,
+//     which claims the retained child (adopt-once), builds a normal OffEngine
+//     that REUSES the child web view inside a GtkOffscreenWindow (via
+//     gtk_off_create_engine's existing_web parameter), transfers the inherited
+//     callbacks, and frees the PopupEngine shell.
+//
+// ON-DEVICE VALIDATION REQUIRED (no GTK toolchain in the generating sandbox):
+//   * the ownership/reparent handoff — the child, held windowless by
+//     g_object_ref_sink, is gtk_container_add-ed into a fresh
+//     GtkOffscreenWindow (which takes a container ref); the retained ref is
+//     then dropped.  Unlike the heavyweight adopt there is NO XReparentWindow
+//     into a foreign on-screen X11 tree — the child lives in an offscreen
+//     toplevel — but the refcount balance (offscreen window ref + WebKit's own
+//     ref) still needs on-device confirmation (no premature finalization /
+//     use-after-destroy).
+//   * blit of a mid-navigation child — the reused child may be mid-POST
+//     navigation when moved from windowless into the offscreen window; verify
+//     the snapshot/blit pipeline (cairo surface -> BufferedImage at ~30Hz,
+//     driven by the Java component repaint timer) begins producing correct
+//     frames and does not race the reparent.
+//   * the g_signal_handlers_disconnect_by_data handoff (no double `create`
+//     handling, no dangling PopupEngine dereference).
+// ---------------------------------------------------------------------------
+static OffEngine *gtk_off_adopt_popup(JNIEnv *env, jlong popupId,
+                                      jint width, jint height, jint debug) {
+    // Claim the retained child (adopt-once): remove under lock so a second
+    // adopt of the same id finds nothing and returns null (-> JNI 0 -> Java
+    // IllegalStateException).  Shares the SAME registry the heavyweight
+    // gtk_adopt_popup claims from — the opener may have been either engine.
+    PopupEngine *pe = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_gtk_retained_popups_mutex);
+        auto it = g_gtk_retained_popups.find(popupId);
+        if (it == g_gtk_retained_popups.end()) return nullptr;
+        pe = it->second;
+        g_gtk_retained_popups.erase(it);
+    }
+    if (!pe || !pe->web) {
+        // Nothing usable to adopt; drop the empty shell if present.
+        if (pe) delete pe;
+        return nullptr;
+    }
+
+    GtkWidget *childw = GTK_WIDGET(pe->web);
+
+    // Disconnect the child's PopupEngine-scoped signal handlers (create /
+    // script-dialog / run-file-chooser / close — ready-to-show was never
+    // connected for an ADOPT child) BEFORE gtk_off_create_engine reconnects
+    // its own OffEngine-scoped handlers, so each signal has exactly one
+    // handler and none dereferences the PopupEngine we are about to free.
+    GtkPump::instance().run_sync([&] {
+        g_signal_handlers_disconnect_by_data(pe->web, pe);
+    });
+
+    // Build the offscreen engine reusing the retained child web view.  This
+    // creates the GtkOffscreenWindow, wires the external-message / dialog /
+    // popup / IM-disable / focus-synth pipeline, and gtk_container_add-s the
+    // child into the offscreen window (taking a container ref) — identical to
+    // a normal offscreen create except the web view is reused rather than
+    // allocated.
+    OffEngine *e =
+        gtk_off_create_engine(env, (int)width, (int)height, debug, childw);
+    if (!e) {
+        // Create failed.  Reconnect the PopupEngine handlers and re-retain so
+        // the child is reclaimable and not lost; report failure to Java
+        // (0 -> IllegalStateException).  Mirrors gtk_adopt_popup's failure
+        // path exactly.
+        GtkPump::instance().run_sync([&] {
+            g_signal_connect(pe->web, "create",
+                             (GCallback)on_create_web_view_popup, pe);
+            g_signal_connect(pe->web, "script-dialog",
+                             (GCallback)on_script_dialog_popup, pe);
+            g_signal_connect(pe->web, "run-file-chooser",
+                             (GCallback)on_run_file_chooser_popup, pe);
+            g_signal_connect(pe->web, "close",
+                             (GCallback)on_close_popup, pe);
+        });
+        std::lock_guard<std::mutex> lk(g_gtk_retained_popups_mutex);
+        g_gtk_retained_popups[popupId] = pe;
+        return nullptr;
+    }
+
+    // Transfer the inherited popup / dialog callbacks from the shell to the
+    // engine so nested popups + dialogs from the adopted view keep working
+    // immediately.  These are strong JNI global refs; ownership moves to the
+    // OffEngine (nulled on pe so delete pe does not double-free, and freed
+    // later by gtk_off_destroy_engine or overwritten by the component's own
+    // gtk_off_set_popup_callback / gtk_off_set_dialog_callback at attach).
+    e->popup_callback = pe->popup_callback;
+    pe->popup_callback = nullptr;
+    e->dialog_callback = pe->dialog_callback;
+    pe->dialog_callback = nullptr;
+
+    // Drop the retained strong reference taken by the ADOPT branch's
+    // g_object_ref_sink — the offscreen window now holds a container ref on
+    // the child.  Runs on the GTK thread for refcount-thread-safety.
+    GtkPump::instance().run_sync([&] {
+        g_object_unref(childw);
+    });
+
+    delete pe;
+    return e;
 }
 
 static void gtk_off_init_script(OffEngine *e, std::string js) {
@@ -5984,6 +6115,36 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
     (void)peer;
 #endif
     if (ua && s) env->ReleaseStringUTFChars(ua, s);
+}
+
+// Offscreen popup-adoption JNI bridges — Canvas 19 (Linux lightweight
+// coverage).  Must live inside this `extern "C"` block (they are newly-added
+// methods with no generated-header prototype, so C++ name-mangling would
+// otherwise make them unresolvable from the JVM — UnsatisfiedLinkError; the
+// exact bug already hit and fixed for the dialog setters and the heavyweight
+// adopt/discard bridges).  Linux reuses the retained WebKitGTK child inside a
+// GtkOffscreenWindow via gtk_off_adopt_popup; the reclaim path reuses the
+// SHARED gtk_discard_popup (the retained child is the same PopupEngine in the
+// same registry).  macOS / Windows offscreen engines are stubs, so adopt
+// returns 0 (OffscreenWebView.adopt turns 0 into an IllegalStateException) and
+// discard is a no-op.
+JNIEXPORT jlong JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1adopt_1popup
+  (JNIEnv *env, jclass, jint width, jint height, jlong popupId, jint debug) {
+#ifdef WEBVIEW_GTK
+    return (jlong)embed::gtk_off_adopt_popup(env, popupId, width, height, debug);
+#else
+    (void)env; (void)width; (void)height; (void)popupId; (void)debug;
+    return 0;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1discard_1popup
+  (JNIEnv *, jclass, jlong /*peer*/, jlong popupId) {
+#ifdef WEBVIEW_GTK
+    embed::gtk_discard_popup(popupId);
+#else
+    (void)popupId;
+#endif
 }
 
 } // extern "C"
