@@ -122,7 +122,7 @@ NEED_SO=0
 if [ ! -f "$SO" ]; then
     NEED_SO=1
 else
-    for src in src_c/webview.c src_c/webview.h src_c/webview_embed.cpp; do
+    for src in src_c/webview.c src_c/webview.h src_c/webview_embed.cpp src_c/webkit_loader.cpp src_c/webkit_loader.h src_c/webkit_shim.h; do
         if [ "$src" -nt "$SO" ]; then NEED_SO=1; break; fi
     done
 fi
@@ -134,8 +134,8 @@ if [ "$NEED_SO" = "1" ]; then
         -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/linux" \
         -I./src_c \
         $(pkg-config --cflags gtk+-3.0 "$WEBKIT_PKG") \
-        src_c/webview.c src_c/webview_embed.cpp \
-        $(pkg-config --libs gtk+-3.0 "$WEBKIT_PKG") \
+        src_c/webview.c src_c/webview_embed.cpp src_c/webkit_loader.cpp \
+        $(pkg-config --libs gtk+-3.0) \
         -lX11 -ldl \
         -shared -o "$SO"
     echo "Built $SO"

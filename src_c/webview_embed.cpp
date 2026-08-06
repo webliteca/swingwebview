@@ -43,6 +43,9 @@
 #include <gdk/gdk.h>
 #include <gdk/gdkx.h>
 #include <webkit2/webkit2.h>
+// Route WebKitGTK/JSC through the runtime-resolved loader (no hard SONAME dep).
+#include "webkit_loader.h"
+#include "webkit_shim.h"
 #endif
 
 #ifdef WEBVIEW_COCOA

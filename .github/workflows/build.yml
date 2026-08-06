@@ -113,11 +113,21 @@ jobs:
               -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/linux" \
               -I./src_c \
               $(pkg-config --cflags gtk+-3.0 "$WEBKIT_PKG") \
-              src_c/webview.c src_c/webview_embed.cpp \
-              $(pkg-config --libs gtk+-3.0 "$WEBKIT_PKG") \
+              src_c/webview.c src_c/webview_embed.cpp src_c/webkit_loader.cpp \
+              $(pkg-config --libs gtk+-3.0) \
               -lX11 -ldl \
               -shared -o "natives/${{ matrix.native_dir }}/${{ matrix.lib_name }}"
           file "natives/${{ matrix.native_dir }}/${{ matrix.lib_name }}"
+          # Portability gate: the artifact MUST NOT hard-link any WebKitGTK /
+          # JavaScriptCore SONAME — those are dlopen'd at runtime (4.1 or 4.0)
+          # by src_c/webkit_loader.cpp, which is what lets one .so serve both.
+          echo "readelf -d (webkit2gtk/javascriptcoregtk NEEDED must be empty):"
+          if readelf -d "natives/${{ matrix.native_dir }}/${{ matrix.lib_name }}" \
+               | grep -iE 'NEEDED.*(webkit2gtk|javascriptcoregtk)'; then
+            echo "ERROR: libwebview.so carries a hard WebKitGTK/JSC dependency (NEEDED above)." >&2
+            exit 1
+          fi
+          echo "OK: no webkit2gtk/javascriptcoregtk NEEDED entries."
 
       # ---------------- Windows -----------------------------------------------
       - name: Set up MSVC environment

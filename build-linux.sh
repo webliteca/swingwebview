@@ -11,11 +11,14 @@ fi
 JAWT_LIB=(-L"${JAVA_HOME}/lib" -ljawt)
 g++ -I"${JAVA_HOME}/include" -I"${JAVA_HOME}/include/linux" -fPIC -std=c++11 -Wall -Wextra -pedantic -I./src_c -DWEBVIEW_GTK=1 \
     `pkg-config --cflags gtk+-3.0 $WEBKIT_PKG` \
-    src_c/webview.c src_c/webview_embed.cpp \
+    src_c/webview.c src_c/webview_embed.cpp src_c/webkit_loader.cpp \
     $LDFLAGS \
-    `pkg-config --libs gtk+-3.0 $WEBKIT_PKG` \
-    "${JAWT_LIB[@]}" -lX11 \
+    `pkg-config --libs gtk+-3.0` \
+    "${JAWT_LIB[@]}" -lX11 -ldl \
     -shared -o libwebview.so
+# NOTE: WebKitGTK/JavaScriptCore are intentionally NOT linked (only --cflags
+# for the headers). They are dlopen'd at runtime (4.1 preferred, 4.0 fallback)
+# by src_c/webkit_loader.cpp, so this single libwebview.so runs on both.
 mkdir -p natives/linux_64
 mv libwebview.so natives/linux_64/
 mvn -DskipTests package
