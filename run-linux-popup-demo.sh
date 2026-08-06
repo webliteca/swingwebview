@@ -191,7 +191,6 @@ echo "Launching WebViewPopupDemo (mode=$MODE) ..."
 export GDK_BACKEND=x11
 export WEBKIT_DISABLE_DMABUF_RENDERER=1
 export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
-export WEBKIT_FORCE_SANDBOX=0
 
 exec "$JAVA" \
     "-Dca.weblite.webview.mode=$MODE" \

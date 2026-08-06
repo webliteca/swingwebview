@@ -180,7 +180,6 @@ export GDK_BACKEND=x11
 # compatibility with older WebKit builds where it was named differently.
 export WEBKIT_DISABLE_DMABUF_RENDERER=1
 export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
-export WEBKIT_FORCE_SANDBOX=0
 
 # Uncomment to enable verbose paint-pipeline diagnostics inside our
 # embed code (per-frame draw / frame-clock-phase logging and widget
