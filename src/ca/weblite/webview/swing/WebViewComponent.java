@@ -207,6 +207,43 @@ public abstract class WebViewComponent extends JComponent {
     /** @return the current (or pending) URL. */
     public abstract String getUrl();
 
+    /** Custom User-Agent override, or {@code null} for the engine default.
+     *  Survives the native peer's create/destroy cycle so it is applied to
+     *  the first request when the peer attaches. */
+    protected String pendingUserAgent = null;
+
+    /**
+     * Override the embedded WebView's User-Agent.  Unlike a JavaScript
+     * {@code navigator.userAgent} shim, this changes the actual HTTP
+     * {@code User-Agent} request header the server sees.
+     *
+     * <p>Passing {@code null} or the empty string restores the engine
+     * default.  May be called before display (stored and applied to the
+     * first request when the peer attaches) or after (applied live; it
+     * takes effect on the <em>next</em> navigation — engines do not rewrite
+     * the in-flight request for the current page).
+     *
+     * @param ua the User-Agent string, or {@code null} / {@code ""} to reset
+     * @return {@code this} for chaining
+     */
+    public WebViewComponent setUserAgent(String ua) {
+        pendingUserAgent = (ua == null || ua.isEmpty()) ? null : ua;
+        applyUserAgentToPeer(pendingUserAgent);
+        return this;
+    }
+
+    /** @return the custom User-Agent override, or {@code null} when the
+     *  engine default is in force. */
+    public String getUserAgent() {
+        return pendingUserAgent;
+    }
+
+    /** Apply the (possibly {@code null}) User-Agent to the live native peer.
+     *  No-op on the base class and when no peer is attached; subclasses
+     *  forward to their engine wrapper's {@code setUserAgent}. */
+    protected void applyUserAgentToPeer(String ua) {
+    }
+
     /** Toggle developer tools (where supported).  Must be called before display. */
     public abstract WebViewComponent setDebug(boolean debug);
 

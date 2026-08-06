@@ -196,6 +196,14 @@ public class WebViewLightweightComponent extends WebViewComponent {
     }
 
     @Override
+    protected void applyUserAgentToPeer(String ua) {
+        OffscreenWebView e = engine;
+        if (e != null) {
+            e.setUserAgent(ua);
+        }
+    }
+
+    @Override
     public void addNotify() {
         super.addNotify();
         if (engine != null) return;
@@ -349,6 +357,11 @@ public class WebViewLightweightComponent extends WebViewComponent {
             engine.addJavascriptFunction(ent.getKey(), ent.getValue());
         }
         allocateBuffer(w, h);
+        // Apply any custom User-Agent BEFORE the first navigate so the
+        // initial request carries it.
+        if (pendingUserAgent != null) {
+            engine.setUserAgent(pendingUserAgent);
+        }
         engine.navigate(pendingUrl);
         repaintTimer = new Timer(REPAINT_INTERVAL_MS, e -> repaint());
         repaintTimer.setRepeats(true);

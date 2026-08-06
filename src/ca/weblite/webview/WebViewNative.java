@@ -302,6 +302,14 @@ native static void webview_embed_set_dialog_callback(long w, WebViewDialogCallba
 // silent no-op.  Never throws via JNI.
 native static void webview_embed_set_popup_callback(long w, WebViewPopupCallback cb);
 
+// Override the embedded WebView's User-Agent (changes the actual HTTP
+// User-Agent request header).  ua == null (or empty) clears the override and
+// restores the engine default.  Takes effect on the next navigation.  Per
+// platform: macOS -[WKWebView setCustomUserAgent:]; Linux
+// webkit_settings_set_user_agent; Windows ICoreWebView2Settings2::put_UserAgent.
+// Passing 0 for w is a silent no-op.  Never throws via JNI.
+native static void webview_embed_set_user_agent(long w, String ua);
+
 // Adopt a browser-initiated popup child that was retained (not shown) after
 // an ADOPT disposition, reparenting it into `parent`'s realized native
 // surface and returning an opaque engine pointer for it (as
@@ -435,6 +443,12 @@ native static void webview_offscreen_set_dialog_callback(long peer, WebViewDialo
 // Windows native binaries provide a no-op stub (the offscreen engine on
 // those platforms is itself a stub).  Never throws via JNI.
 native static void webview_offscreen_set_popup_callback(long peer, WebViewPopupCallback cb);
+
+// Offscreen counterpart to webview_embed_set_user_agent.  Linux sets the
+// WebKitGTK settings user-agent; macOS / Windows offscreen engines are stubs
+// and this is a native-side no-op.  ua == null clears the override.  Never
+// throws via JNI.
+native static void webview_offscreen_set_user_agent(long peer, String ua);
 
 
 }

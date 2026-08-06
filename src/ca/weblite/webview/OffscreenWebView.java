@@ -397,6 +397,20 @@ public class OffscreenWebView {
         return this;
     }
 
+    /**
+     * Override the WebView's User-Agent (changes the HTTP {@code User-Agent}
+     * header).  {@code null} or empty restores the engine default.  Takes
+     * effect on the next navigation.  Linux only; a native-side no-op where
+     * the offscreen engine is a stub.
+     *
+     * @return {@code this} for chaining
+     */
+    public OffscreenWebView setUserAgent(String ua) {
+        checkAlive();
+        WebViewNative.webview_offscreen_set_user_agent(peer, ua);
+        return this;
+    }
+
     /** Release native resources. */
     public void dispose() {
         if (peer != 0L) {

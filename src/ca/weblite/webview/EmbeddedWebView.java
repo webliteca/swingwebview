@@ -596,6 +596,19 @@ public class EmbeddedWebView {
     }
 
     /**
+     * Override the WebView's User-Agent (changes the HTTP {@code User-Agent}
+     * header).  {@code null} or empty restores the engine default.  Takes
+     * effect on the next navigation.
+     *
+     * @return {@code this} for chaining
+     */
+    public EmbeddedWebView setUserAgent(String ua) {
+        checkAlive();
+        WebViewNative.webview_embed_set_user_agent(peer, ua);
+        return this;
+    }
+
+    /**
      * Windows-only: force Win32 keyboard focus back to the AWT-owned parent
      * HWND, so subsequent keystrokes route to AWT instead of the WebView2
      * child HWND.  Used by the Java-side global focus-owner listener when

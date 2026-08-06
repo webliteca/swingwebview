@@ -475,6 +475,33 @@ wv.setPopupHandler(new WebViewPopupHandler() {
   the existing popup handlers but **must be validated on-device** (no
   native toolchain runs in the code-generation sandbox).
 
+## Custom user agent
+
+Some web apps gate on the `User-Agent`. WKWebView's default UA omits the
+`Version/… Safari/…` tokens, so UA-sniffing sites can reject the embedded
+WebView. Override it with `setUserAgent` — this changes the **actual HTTP
+`User-Agent` request header** (not just the JS-visible
+`navigator.userAgent`):
+
+```java
+WebViewComponent wv = WebViewComponent.create();
+wv.setUserAgent("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    + "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.3 Safari/605.1.15");
+wv.setUrl("https://example.com/");   // first request carries the custom UA
+```
+
+* **Reset.** `setUserAgent(null)` or `setUserAgent("")` restores the engine
+  default. `getUserAgent()` returns the override, or `null` when the default
+  is in force.
+* **Timing.** Called before display, it applies to the first request. Called
+  after display, it applies to the **next** navigation (engines don't rewrite
+  the in-flight request for the current page).
+* **Platform coverage.** macOS `WKWebView.customUserAgent`, Linux WebKitGTK
+  `webkit_settings_set_user_agent`, Windows WebView2
+  `ICoreWebView2Settings2::UserAgent`. The native setters ship
+  pattern-faithful but must be validated on-device (confirm the header via an
+  echo endpoint).
+
 ## Demo
 
 See [`demos/WebViewHeavyweightDemo/`](demos/WebViewHeavyweightDemo/README.md)

@@ -1507,6 +1507,36 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1nav
     });
 }
 
+// Custom User-Agent — Canvas 21.  ua == null / empty restores the engine
+// default.  Applied on the WebView2 UI thread via ICoreWebView2Settings2;
+// no-op on an old runtime lacking the _2 settings interface.  Takes effect on
+// the next navigation.
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1user_1agent
+  (JNIEnv *env, jclass, jlong wv, jstring ua) {
+    auto *e = (Engine *)wv;
+    if (!e) return;
+    std::wstring w;
+    if (ua) {
+        const char *s = env->GetStringUTFChars(ua, nullptr);
+        w = embed_win::utf8_to_wide(s);
+        env->ReleaseStringUTFChars(ua, s);
+    }
+    embed_win::dispatch_to_thread(e, [e, w] {
+        if (!e->webview) return;
+        ICoreWebView2Settings *settings = nullptr;
+        if (SUCCEEDED(e->webview->get_Settings(&settings)) && settings) {
+            ICoreWebView2Settings2 *settings2 = nullptr;
+            if (SUCCEEDED(settings->QueryInterface(
+                    __uuidof(ICoreWebView2Settings2),
+                    reinterpret_cast<void **>(&settings2))) && settings2) {
+                settings2->put_UserAgent(w.c_str()); // empty -> default
+                settings2->Release();
+            }
+            settings->Release();
+        }
+    });
+}
+
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1init
   (JNIEnv *env, jclass, jlong wv, jstring js) {
     auto *e = (Engine *)wv;

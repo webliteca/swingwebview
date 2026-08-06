@@ -1784,6 +1784,15 @@ static void gtk_set_popup_callback(Engine *e, JNIEnv *env, jobject cb) {
     }
 }
 
+// Canvas 21: override the WebKitGTK User-Agent (changes the HTTP header).
+// ua == nullptr restores the engine default.  Takes effect on the next
+// navigation.
+static void gtk_set_user_agent(Engine *e, const char *ua) {
+    if (!e || !e->web) return;
+    WebKitSettings *s = webkit_web_view_get_settings(WEBKIT_WEB_VIEW(e->web));
+    if (s) webkit_settings_set_user_agent(s, ua);
+}
+
 // ===========================================================================
 // Linux / GTK lightweight (offscreen) engine
 //
@@ -2117,6 +2126,13 @@ static void gtk_off_set_popup_callback(OffEngine *e, JNIEnv *env,
     if (cb) {
         e->popup_callback = env->NewGlobalRef(cb);
     }
+}
+
+// Canvas 21: offscreen counterpart to gtk_set_user_agent.
+static void gtk_off_set_user_agent(OffEngine *e, const char *ua) {
+    if (!e || !e->web) return;
+    WebKitSettings *s = webkit_web_view_get_settings(WEBKIT_WEB_VIEW(e->web));
+    if (s) webkit_settings_set_user_agent(s, ua);
 }
 
 static void gtk_off_init_script(OffEngine *e, std::string js) {
@@ -4695,6 +4711,20 @@ static void cocoa_discard_popup(jlong popupId) {
     });
 }
 
+// Canvas 21: override the WKWebView's User-Agent (changes the HTTP header).
+// ua == nullptr clears the override (customUserAgent = nil -> engine default).
+// Runs on the AppKit main thread; takes effect on the next navigation.
+static void cocoa_set_user_agent(Engine *e, const char *ua) {
+    if (!e) return;
+    bool has = (ua != nullptr);
+    std::string s = has ? ua : std::string();
+    cocoa_run_on_main_async([e, s, has] {
+        if (e->destroyed.load() || !e->webview) return;
+        id v = has ? ns_str(s.c_str()) : (id)nullptr;
+        msg<void, id>(e->webview, sel("setCustomUserAgent:"), v);
+    });
+}
+
 // Asynchronous engine destroy.  Returns immediately on the calling
 // thread (typically the EDT) after a small Java-side cleanup; the
 // AppKit teardown, view-hierarchy removal, KVO observer unregister,
@@ -5588,6 +5618,34 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
     // returns null there so this is never reached.
     (void)env; (void)cb;
 #endif
+}
+
+// Custom User-Agent registration — Canvas 21.  ua == null clears the override
+// (engine default).  Takes effect on the next navigation.
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1user_1agent
+  (JNIEnv *env, jclass, jlong wv, jstring ua) {
+    if (wv == 0) return;
+    const char *s = ua ? env->GetStringUTFChars(ua, nullptr) : nullptr;
+#ifdef WEBVIEW_GTK
+    embed::gtk_set_user_agent((embed::Engine *)wv, s);
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_set_user_agent((embed::Engine *)wv, s);
+#else
+    (void)wv;
+#endif
+    if (ua && s) env->ReleaseStringUTFChars(ua, s);
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1user_1agent
+  (JNIEnv *env, jclass, jlong peer, jstring ua) {
+    if (peer == 0) return;
+    const char *s = ua ? env->GetStringUTFChars(ua, nullptr) : nullptr;
+#ifdef WEBVIEW_GTK
+    embed::gtk_off_set_user_agent((embed::OffEngine *)peer, s);
+#else
+    (void)peer;
+#endif
+    if (ua && s) env->ReleaseStringUTFChars(ua, s);
 }
 
 } // extern "C"

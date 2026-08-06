@@ -453,6 +453,14 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         return true;
     }
 
+    @Override
+    protected void applyUserAgentToPeer(String ua) {
+        EmbeddedWebView e = embedded;
+        if (e != null) {
+            e.setUserAgent(ua);
+        }
+    }
+
     private void createPeer() {
         if (embedded != null || !canvas.isDisplayable()) {
             return;
@@ -522,6 +530,11 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         }
         for (Map.Entry<String, AsyncJavascriptFunction> e : pendingAsyncFunctions.entrySet()) {
             embedded.addJavascriptFunction(e.getKey(), e.getValue());
+        }
+        // Apply any custom User-Agent BEFORE the first navigate so the
+        // initial request carries it.
+        if (pendingUserAgent != null) {
+            embedded.setUserAgent(pendingUserAgent);
         }
         // An adopted popup already carries the engine's own in-flight
         // navigation (the original request WebKit drove into the child, POST
