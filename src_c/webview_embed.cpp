@@ -881,6 +881,20 @@ struct PopupEngine {
     jlong popup_id = 0;
 };
 
+// Canvas 19 (popup adoption — Linux/WebKitGTK coverage of the Canvas 18 Java
+// contract): retained-but-unadopted popup child engines, keyed by popup_id.
+// Populated by handle_create_web_view's ADOPT branch (which creates the
+// opener-linked WebKit child but NO GtkWindow and holds an explicit strong
+// reference on the widget), drained by gtk_adopt_popup (reparent into a
+// caller-supplied WebViewComponent's realized X11 surface) or gtk_discard_popup
+// (reclaim an unadopted child).  Guarded by its own mutex; the GTK counterpart
+// of the macOS g_retained_popups map.  ON-DEVICE VALIDATION REQUIRED: this file
+// has no GTK toolchain in the generating sandbox — the reparent + widget
+// ownership handoff below must be exercised on a real WebKitGTK/X11 stack
+// before release (see Canvas 19 Safeguards).
+static std::mutex g_gtk_retained_popups_mutex;
+static std::map<jlong, PopupEngine *> g_gtk_retained_popups;
+
 // Synchronous allow/deny hop into Java on the GTK main thread.  Returns false
 // on null callback, attach failure, or any exception (block-on-error default).
 static bool fire_popup_requested(JavaVM *jvm, jobject cb,
@@ -922,6 +936,54 @@ static bool fire_popup_requested(JavaVM *jvm, jobject cb,
     return allow;
 }
 
+// Canvas 19: synchronous DISPOSITION hop into Java on the GTK main thread.
+// Calls WebViewPopupCallback.onPopupDisposition and returns the
+// PopupDisposition ordinal (0 = BLOCK, 1 = NATIVE_WINDOW, 2 = ADOPT).  Mirrors
+// the macOS fire_popup_disposition and this file's fire_popup_requested; a null
+// callback / attach failure / thrown decision all yield BLOCK (0).  Runs
+// synchronously on the GTK main thread (the `create` handler must return the
+// child before yielding to WebKit) and MUST NOT be marshalled to the EDT.  The
+// default WebViewPopupCallback.onPopupDisposition derives from onPopupRequested,
+// so legacy Canvas 16 boolean handlers still map to BLOCK / NATIVE_WINDOW.
+static int fire_popup_disposition(JavaVM *jvm, jobject cb,
+                                  const char *url, const char *name,
+                                  bool gesture, int w, int h,
+                                  const char *page) {
+    if (!jvm || !cb) return 0; // BLOCK
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return 0;
+        detach = true;
+    }
+    int disposition = 0; // BLOCK
+    jstring ju = env->NewStringUTF(url ? url : "");
+    jstring jn = env->NewStringUTF(name ? name : "");
+    jstring jp = env->NewStringUTF(page ? page : "");
+    jclass cls = env->GetObjectClass(cb);
+    if (cls) {
+        jmethodID mid = env->GetMethodID(cls, "onPopupDisposition",
+            "(Ljava/lang/String;Ljava/lang/String;ZIILjava/lang/String;)I");
+        if (mid) {
+            jint r = env->CallIntMethod(cb, mid, ju, jn,
+                gesture ? JNI_TRUE : JNI_FALSE, (jint)w, (jint)h, jp);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+                r = 0;
+            }
+            disposition = (int)r;
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (ju) env->DeleteLocalRef(ju);
+    if (jn) env->DeleteLocalRef(jn);
+    if (jp) env->DeleteLocalRef(jp);
+    if (detach) jvm->DetachCurrentThread();
+    return disposition;
+}
+
 // Fire onPopupOpened.  CallVoidMethod (fire-and-forget); the Java dispatcher
 // marshals to the EDT via invokeLater so this does not block the GTK main
 // thread.
@@ -943,6 +1005,49 @@ static void fire_gtk_popup_opened(JavaVM *jvm, jobject cb, jlong popup_id,
     jclass cls = env->GetObjectClass(cb);
     if (cls) {
         jmethodID mid = env->GetMethodID(cls, "onPopupOpened",
+            "(JLjava/lang/String;Ljava/lang/String;ZIILjava/lang/String;)V");
+        if (mid) {
+            env->CallVoidMethod(cb, mid, popup_id, ju, jn,
+                gesture ? JNI_TRUE : JNI_FALSE, (jint)w, (jint)h, jp);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (ju) env->DeleteLocalRef(ju);
+    if (jn) env->DeleteLocalRef(jn);
+    if (jp) env->DeleteLocalRef(jp);
+    if (detach) jvm->DetachCurrentThread();
+}
+
+// Canvas 19: notify Java (WebViewPopupCallback.onPopupAdoptable) that a popup
+// child has been retained (windowless) and is ready to adopt into a
+// WebViewComponent.  Unlike the macOS fire_popup_notify_adoptable — which hops
+// onto a detached worker thread because it is invoked while the AppKit main
+// thread is blocked in the create delegate — the GTK create handler already
+// runs OFF the EDT on the GTK main thread, so a direct CallVoidMethod is safe
+// (the Java PopupDispatcher marshals popupAdoptable to the EDT via invokeLater
+// itself).  Same fire-and-forget shape as fire_gtk_popup_opened.
+static void fire_popup_notify_adoptable(JavaVM *jvm, jobject cb, jlong popup_id,
+                                        const char *url, const char *name,
+                                        bool gesture, int w, int h,
+                                        const char *page) {
+    if (!jvm || !cb) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return;
+        detach = true;
+    }
+    jstring ju = env->NewStringUTF(url ? url : "");
+    jstring jn = env->NewStringUTF(name ? name : "");
+    jstring jp = env->NewStringUTF(page ? page : "");
+    jclass cls = env->GetObjectClass(cb);
+    if (cls) {
+        jmethodID mid = env->GetMethodID(cls, "onPopupAdoptable",
             "(JLjava/lang/String;Ljava/lang/String;ZIILjava/lang/String;)V");
         if (mid) {
             env->CallVoidMethod(cb, mid, popup_id, ju, jn,
@@ -1029,29 +1134,58 @@ static GtkWidget *handle_create_web_view(JavaVM *jvm, jobject popup_cb,
     const char *page = opener ? webkit_web_view_get_uri(opener) : nullptr;
     if (!page) page = "";
 
-    // Synchronous allow/deny.  Size is not known until ready-to-show, so pass
-    // -1/-1 here (matching the event contract's "unspecified" sentinel).
-    if (!fire_popup_requested(jvm, popup_cb, uri, "", gesture, -1, -1, page))
-        return NULL;
+    // Canvas 19: synchronous DISPOSITION hop into Java (GTK main -> JNI).
+    // 0 = BLOCK (return NULL), 1 = NATIVE_WINDOW (engine-owned GtkWindow, the
+    // Canvas 16 path), 2 = ADOPT (retain the child windowless, notify Java to
+    // reparent it into a caller-supplied WebViewComponent).  Size is not known
+    // until ready-to-show, so pass -1/-1 (the event contract's "unspecified"
+    // sentinel).  The default WebViewPopupCallback.onPopupDisposition derives
+    // from onPopupRequested, so legacy Canvas 16 boolean handlers still map to
+    // BLOCK / NATIVE_WINDOW.
+    int disposition =
+        fire_popup_disposition(jvm, popup_cb, uri, "", gesture, -1, -1, page);
+    if (disposition == 0)
+        return NULL; // BLOCK
+    const bool adopt = (disposition == 2);
 
     // Create the child LINKED to the opener (window.opener / postMessage).
+    // WebKit drives the ORIGINAL navigation-action request (POST verb + body)
+    // into this child regardless of disposition, preserving POST and
+    // window.opener for both NATIVE_WINDOW and ADOPT.
     GtkWidget *childw = webkit_web_view_new_with_related_view(opener);
     if (!childw) return NULL;
     WebKitWebView *child = WEBKIT_WEB_VIEW(childw);
 
-    // Host it in an engine-owned native top-level window.
-    GtkWidget *win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
-    gtk_window_set_title(GTK_WINDOW(win), "Popup");
-    gtk_container_add(GTK_CONTAINER(win), childw);
+    // NATIVE_WINDOW: host the child in an engine-owned native top-level window
+    // (gtk_container_add sinks the widget's floating reference — the window owns
+    // it).  ADOPT: create NO window; instead take an explicit strong reference
+    // so the child survives with no GTK parent until gtk_adopt_popup reparents
+    // it.  g_object_ref_sink clears the floating flag (if WebKit has not already
+    // done so on the value we return from `create`) and gives us an owning ref
+    // held on behalf of g_gtk_retained_popups; it is balanced by the
+    // g_object_unref in gtk_adopt_popup (once the adopting window has taken its
+    // own container ref) or the gtk_widget_destroy + g_object_unref in
+    // gtk_discard_popup.  ON-DEVICE VALIDATION REQUIRED: this dual ownership
+    // (our ref + WebKit's own reference on the returned child) mirrors the
+    // NATIVE_WINDOW container+WebKit refcounting, but the windowless variant is
+    // unexercised in this sandbox.
+    GtkWidget *win = nullptr;
+    if (!adopt) {
+        win = gtk_window_new(GTK_WINDOW_TOPLEVEL);
+        gtk_window_set_title(GTK_WINDOW(win), "Popup");
+        gtk_container_add(GTK_CONTAINER(win), childw);
+    } else {
+        g_object_ref_sink(childw);
+    }
 
     PopupEngine *pe = new PopupEngine();
-    pe->window = win;
+    pe->window = win;              // nullptr for ADOPT
     pe->web = child;
     pe->jvm = jvm;
     pe->popup_id = (jlong)(intptr_t)pe;
 
     // Inherit fresh global refs so the popup can raise dialogs / nested popups
-    // and notify onPopupClosed even after the opener is gone.
+    // and notify onPopupClosed / onPopupAdoptable even after the opener is gone.
     JNIEnv *env = nullptr;
     bool detach = false;
     if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
@@ -1064,19 +1198,37 @@ static GtkWidget *handle_create_web_view(JavaVM *jvm, jobject popup_cb,
         if (detach) jvm->DetachCurrentThread();
     }
 
-    // Nested popups + dialogs from inside the popup, and the show/close hooks.
+    // Nested popups + dialogs from inside the popup, and the close hook, wire up
+    // for BOTH dispositions.  ready-to-show (which sizes + shows the GtkWindow
+    // and fires onPopupOpened) is connected ONLY for NATIVE_WINDOW — an ADOPT
+    // child must never create/show a window; it surfaces via onPopupAdoptable
+    // and is shown only once reparented into the adopting component.
     g_signal_connect(child, "create",
                      (GCallback)on_create_web_view_popup, pe);
     g_signal_connect(child, "script-dialog",
                      (GCallback)on_script_dialog_popup, pe);
     g_signal_connect(child, "run-file-chooser",
                      (GCallback)on_run_file_chooser_popup, pe);
-    g_signal_connect(child, "ready-to-show",
-                     (GCallback)on_ready_to_show_popup, pe);
     g_signal_connect(child, "close",
                      (GCallback)on_close_popup, pe);
+    if (!adopt) {
+        g_signal_connect(child, "ready-to-show",
+                         (GCallback)on_ready_to_show_popup, pe);
+    } else {
+        // Retain the windowless child and notify Java it is adoptable.  The
+        // dispatcher marshals popupAdoptable to the EDT; the application then
+        // calls WebViewComponent.adoptPopup(popup_id), whose peer attach calls
+        // webview_embed_adopt_popup -> gtk_adopt_popup with this popup_id.
+        {
+            std::lock_guard<std::mutex> lk(g_gtk_retained_popups_mutex);
+            g_gtk_retained_popups[pe->popup_id] = pe;
+        }
+        fire_popup_notify_adoptable(jvm, popup_cb, pe->popup_id, uri, "",
+                                    gesture, -1, -1, page);
+    }
 
-    // WebKit adopts the floating reference on the returned view.
+    // WebKit adopts (refs) the returned view.  For ADOPT we additionally hold
+    // our own ref (above), so the child is not destroyed while windowless.
     return childw;
 }
 
@@ -1085,6 +1237,12 @@ static GtkWidget *handle_create_web_view(JavaVM *jvm, jobject popup_cb,
 static void on_ready_to_show_popup(WebKitWebView *web, gpointer user_data) {
     PopupEngine *pe = static_cast<PopupEngine *>(user_data);
     if (!pe) return;
+    // Canvas 19: an ADOPT child is windowless (pe->window == nullptr) and must
+    // never show a window or fire onPopupOpened — it surfaces via
+    // onPopupAdoptable instead.  handle_create_web_view does not connect this
+    // handler for ADOPT, but guard here belt-and-suspenders in case WebKit
+    // emits ready-to-show through another path.
+    if (!pe->window) return;
     int W = 500, H = 650;
     WebKitWindowProperties *props = webkit_web_view_get_window_properties(web);
     if (props) {
@@ -1198,7 +1356,15 @@ static void engine_on_message(Engine *e, const char *msg) {
     if (detach) e->jvm->DetachCurrentThread();
 }
 
-static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
+// Build a heavyweight engine embedded in `component`'s realized X11 surface.
+// Canvas 19: when `existing_web` is non-null (the popup-adoption path) the
+// engine REUSES that already-created WebKitWebView instead of allocating a
+// fresh one — preserving its in-flight POST navigation + window.opener linkage
+// — while still performing the identical JAWT/XReparent/window/frame-clock/
+// signal wiring.  `existing_web` must carry no GTK parent (the ADOPT branch
+// never adds it to a container); gtk_container_add below adopts it.
+static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug,
+                                 GtkWidget *existing_web = nullptr) {
     JawtLock lock(env, component);
     if (!lock.ok || !lock.dsi->platformInfo) return nullptr;
     auto *info = (JAWT_X11DrawingSurfaceInfo *)lock.dsi->platformInfo;
@@ -1279,7 +1445,16 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug) {
         XReparentWindow(gdkd, child, e->parent_xid, 0, 0);
         XSync(gdkd, False);
 
-        e->web = webkit_web_view_new();
+        // Canvas 19: reuse the retained popup child (adoption) or create fresh.
+        // The reused child already carries its opener linkage + in-flight POST
+        // navigation from handle_create_web_view; the caller (gtk_adopt_popup)
+        // has already disconnected the child's old PopupEngine signal handlers
+        // so the fresh engine-scoped handlers connected below are the only ones.
+        if (existing_web) {
+            e->web = existing_web;
+        } else {
+            e->web = webkit_web_view_new();
+        }
         e->manager =
             webkit_web_view_get_user_content_manager(WEBKIT_WEB_VIEW(e->web));
 
@@ -1791,6 +1966,155 @@ static void gtk_set_user_agent(Engine *e, const char *ua) {
     if (!e || !e->web) return;
     WebKitSettings *s = webkit_web_view_get_settings(WEBKIT_WEB_VIEW(e->web));
     if (s) webkit_settings_set_user_agent(s, ua);
+}
+
+// ---------------------------------------------------------------------------
+// Canvas 19: popup adoption — reparent a retained-but-unadopted popup child
+// into a caller-supplied WebViewComponent's realized X11 surface.
+//
+// Two-phase, mirroring the macOS cocoa_adopt_popup / cocoa_discard_popup:
+//   Phase 1 (handle_create_web_view ADOPT branch, above): the opener-linked
+//     child WebKitWebView is created windowless, retained under
+//     g_gtk_retained_popups, and onPopupAdoptable is fired.
+//   Phase 2 (here): the application's WebViewComponent.adoptPopup peer attach
+//     calls webview_embed_adopt_popup -> gtk_adopt_popup, which claims the
+//     retained child (adopt-once), builds a normal heavyweight Engine for the
+//     new parent that REUSES the child web view (via gtk_create_engine's
+//     existing_web parameter), transfers the inherited callbacks, and frees the
+//     PopupEngine shell.  gtk_discard_popup is the reclaim path for a child that
+//     was decided ADOPT but never adopted.
+//
+// ON-DEVICE VALIDATION REQUIRED (no GTK toolchain in the generating sandbox):
+//   * the X11 XReparentWindow of the reused child under the new AWT canvas
+//     window (performed inside gtk_create_engine);
+//   * the widget ownership handoff — our retained g_object_ref_sink ref, the
+//     new window's container ref, and WebKit's own reference on the child;
+//   * whether the child's in-flight POST navigation continues to render after
+//     being reparented from windowless to the adopting surface.
+// ---------------------------------------------------------------------------
+static Engine *gtk_adopt_popup(JNIEnv *env, jobject parent, jlong popupId,
+                               jint debug) {
+    // Claim the retained child (adopt-once): remove under lock so a second
+    // adopt of the same id finds nothing and returns null (-> JNI 0 -> Java
+    // IllegalStateException).
+    PopupEngine *pe = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_gtk_retained_popups_mutex);
+        auto it = g_gtk_retained_popups.find(popupId);
+        if (it == g_gtk_retained_popups.end()) return nullptr;
+        pe = it->second;
+        g_gtk_retained_popups.erase(it);
+    }
+    if (!pe || !pe->web) {
+        // Nothing usable to adopt; drop the empty shell if present.
+        if (pe) delete pe;
+        return nullptr;
+    }
+
+    GtkWidget *childw = GTK_WIDGET(pe->web);
+
+    // Disconnect the child's PopupEngine-scoped signal handlers (create /
+    // script-dialog / run-file-chooser / close — ready-to-show was never
+    // connected for an ADOPT child) BEFORE the engine reconnects its own
+    // engine-scoped handlers, so each signal has exactly one handler and none
+    // dereferences the PopupEngine we are about to free.
+    GtkPump::instance().run_sync([&] {
+        g_signal_handlers_disconnect_by_data(pe->web, pe);
+    });
+
+    // Build the heavyweight engine reusing the retained child web view.  This
+    // does the JAWT lock, XReparent, window creation, frame-clock, and fresh
+    // engine-scoped signal wiring — identical to a normal create except the web
+    // view is reused rather than allocated.  gtk_create_engine's epilogue
+    // gtk_container_add takes a container ref on the child.
+    Engine *e = gtk_create_engine(env, parent, debug, childw);
+    if (!e) {
+        // Attach failed (e.g. JAWT lock / non-X11 surface).  Reconnect the
+        // PopupEngine handlers and re-retain so the child is reclaimable and
+        // not lost; report failure to Java (0 -> IllegalStateException).
+        GtkPump::instance().run_sync([&] {
+            g_signal_connect(pe->web, "create",
+                             (GCallback)on_create_web_view_popup, pe);
+            g_signal_connect(pe->web, "script-dialog",
+                             (GCallback)on_script_dialog_popup, pe);
+            g_signal_connect(pe->web, "run-file-chooser",
+                             (GCallback)on_run_file_chooser_popup, pe);
+            g_signal_connect(pe->web, "close",
+                             (GCallback)on_close_popup, pe);
+        });
+        std::lock_guard<std::mutex> lk(g_gtk_retained_popups_mutex);
+        g_gtk_retained_popups[popupId] = pe;
+        return nullptr;
+    }
+
+    // Transfer the inherited popup / dialog callbacks from the shell to the
+    // engine so nested popups + dialogs from the adopted view keep working
+    // immediately.  These are strong JNI global refs; ownership moves to the
+    // engine (nulled on pe so delete pe does not double-free, and freed later
+    // by gtk_destroy_engine or overwritten by the component's own
+    // gtk_set_popup_callback / gtk_set_dialog_callback at attach).
+    e->popup_callback = pe->popup_callback;
+    pe->popup_callback = nullptr;
+    e->dialog_callback = pe->dialog_callback;
+    pe->dialog_callback = nullptr;
+
+    // Drop the retained strong reference taken by the ADOPT branch's
+    // g_object_ref_sink — the engine's window now holds a container ref on the
+    // child.  Runs on the GTK thread for refcount-thread-safety.
+    GtkPump::instance().run_sync([&] {
+        g_object_unref(childw);
+    });
+
+    delete pe;
+    return e;
+}
+
+// Canvas 19: discard a retained-but-unadopted popup child (the ADOPT reclaim
+// path — opener disposed or grace period elapsed).  Tears the child down
+// WITHOUT ever showing a window; silent no-op for an unknown popupId.  Mirrors
+// on_close_popup minus the window: notify onPopupClosed, destroy the widget,
+// drop our retained ref, free the inherited global refs, delete the shell.
+static void gtk_discard_popup(jlong popupId) {
+    PopupEngine *pe = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_gtk_retained_popups_mutex);
+        auto it = g_gtk_retained_popups.find(popupId);
+        if (it == g_gtk_retained_popups.end()) return;
+        pe = it->second;
+        g_gtk_retained_popups.erase(it);
+    }
+    if (!pe) return;
+
+    const char *url = pe->web ? webkit_web_view_get_uri(pe->web) : "";
+    fire_gtk_popup_closed(pe->jvm, pe->popup_callback, pe->dialog_callback,
+                          pe->popup_id, url ? url : "", "");
+
+    GtkPump::instance().run_sync([&] {
+        if (pe->web) {
+            // No window owns this child (ADOPT is windowless); disconnect its
+            // handlers, destroy the widget directly, then drop the strong ref
+            // we took via g_object_ref_sink in handle_create_web_view.
+            g_signal_handlers_disconnect_by_data(pe->web, pe);
+            gtk_widget_destroy(GTK_WIDGET(pe->web));
+            g_object_unref(pe->web);
+            pe->web = nullptr;
+        }
+    });
+
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (pe->jvm && pe->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (pe->jvm->AttachCurrentThread((void **)&env, nullptr) == JNI_OK)
+            detach = true;
+    }
+    if (env) {
+        if (pe->popup_callback) env->DeleteGlobalRef(pe->popup_callback);
+        if (pe->dialog_callback) env->DeleteGlobalRef(pe->dialog_callback);
+        if (detach) pe->jvm->DetachCurrentThread();
+    }
+    pe->popup_callback = nullptr;
+    pe->dialog_callback = nullptr;
+    delete pe;
 }
 
 // ===========================================================================
@@ -5600,16 +5924,21 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
 #endif
 }
 
-// Popup-adoption JNI bridges — Canvas 18.  Must live inside this `extern "C"`
-// block (they are newly-added methods with no generated-header prototype, so
-// C++ name-mangling would otherwise make them unresolvable from the JVM —
-// UnsatisfiedLinkError).  macOS reparents the retained WKWebView; Linux
-// (Canvas 19) and Windows (Canvas 20) land their reparent later, so those
-// return 0 (EmbeddedWebView.adopt turns 0 into a documented
+// Popup-adoption JNI bridges — Canvas 18 (macOS) + Canvas 19 (Linux).  Must
+// live inside this `extern "C"` block (they are newly-added methods with no
+// generated-header prototype, so C++ name-mangling would otherwise make them
+// unresolvable from the JVM — UnsatisfiedLinkError; this exact bug was hit and
+// fixed for the dialog setters).  macOS reparents the retained WKWebView via
+// cocoa_adopt_popup; Linux reparents the retained WebKitGTK child via
+// gtk_adopt_popup (Canvas 19).  Windows (Canvas 20) lands its reparent later,
+// so it still returns 0 (EmbeddedWebView.adopt turns 0 into a documented
 // IllegalStateException).
 JNIEXPORT jlong JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1adopt_1popup
   (JNIEnv *env, jclass, jobject parent, jlong popupId, jint debug) {
-#ifdef WEBVIEW_COCOA
+#ifdef WEBVIEW_GTK
+    Engine *e = embed::gtk_adopt_popup(env, parent, popupId, debug);
+    return (jlong)e;
+#elif defined(WEBVIEW_COCOA)
     Engine *e = embed::cocoa_adopt_popup(env, parent, popupId, debug);
     return (jlong)e;
 #else
@@ -5620,7 +5949,9 @@ JNIEXPORT jlong JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1ad
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1discard_1popup
   (JNIEnv *, jclass, jlong /*w*/, jlong popupId) {
-#ifdef WEBVIEW_COCOA
+#ifdef WEBVIEW_GTK
+    embed::gtk_discard_popup(popupId);
+#elif defined(WEBVIEW_COCOA)
     embed::cocoa_discard_popup(popupId);
 #else
     (void)popupId;
