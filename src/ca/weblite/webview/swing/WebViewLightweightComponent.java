@@ -199,6 +199,22 @@ public class WebViewLightweightComponent extends WebViewComponent {
     public void addNotify() {
         super.addNotify();
         if (engine != null) return;
+        if (pendingAdoptPopupId != 0L) {
+            // Popup adoption for the lightweight / offscreen engine lands in
+            // Canvas 19 (STORY-005-002, Linux).  Until then, adopting into an
+            // offscreen component is unsupported: leave the engine null (blank
+            // component) rather than silently creating an unrelated engine.
+            // The retained native child is reclaimed by the opener's grace
+            // backstop.  The reference adoption backend (Canvas 18) is macOS
+            // heavyweight.
+            System.err.println(
+                "[webview] popup adoption is not yet implemented for the "
+                + "lightweight/offscreen engine (Canvas 19); popupId "
+                + pendingAdoptPopupId + " will be reclaimed. Use the "
+                + "heavyweight mode for adoption on the reference (macOS) "
+                + "backend.");
+            return;
+        }
         int w = Math.max(1, getWidth());
         int h = Math.max(1, getHeight());
         engine = OffscreenWebView.create(w, h, debug);
@@ -290,6 +306,21 @@ public class WebViewLightweightComponent extends WebViewComponent {
                                             int height, String pageUrl) {
                 return popupDispatcher.dispatchPopupRequested(
                     targetUrl, targetName, userGesture, width, height, pageUrl);
+            }
+            @Override
+            public int onPopupDisposition(String targetUrl, String targetName,
+                                          boolean userGesture, int width,
+                                          int height, String pageUrl) {
+                return popupDispatcher.dispatchPopupDisposition(
+                    targetUrl, targetName, userGesture, width, height, pageUrl);
+            }
+            @Override
+            public void onPopupAdoptable(long popupId, String targetUrl,
+                                         String targetName, boolean userGesture,
+                                         int width, int height, String pageUrl) {
+                popupDispatcher.dispatchPopupAdoptable(
+                    popupId, targetUrl, targetName, userGesture, width, height,
+                    pageUrl);
             }
             @Override
             public void onPopupOpened(long popupId, String targetUrl,

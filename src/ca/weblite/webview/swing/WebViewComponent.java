@@ -85,6 +85,12 @@ public abstract class WebViewComponent extends JComponent {
      *  methods. */
     protected final PopupDispatcher popupDispatcher = new PopupDispatcher(this);
 
+    /** When non-zero, this component was created via {@link #adoptPopup} and
+     *  its peer, at attach time, adopts the pre-existing native popup child
+     *  with this engine-assigned id rather than creating a fresh engine.
+     *  Zero (the default) means normal, engine-creating construction. */
+    protected long pendingAdoptPopupId = 0L;
+
     /** Implementation mode for {@link #create(Mode)}. */
     public enum Mode {
         /** Native WebView embedded as a heavyweight AWT peer.  Highest
@@ -125,6 +131,38 @@ public abstract class WebViewComponent extends JComponent {
                 throw new IllegalArgumentException(
                     "Unknown WebViewComponent.Mode: " + mode);
         }
+    }
+
+    /**
+     * Create a component that <strong>adopts</strong> a browser-initiated
+     * popup — the opener-linked child web view the engine retained after a
+     * {@link ca.weblite.webview.PopupDisposition#ADOPT} decision — instead of
+     * creating its own engine.  Adoption happens when the returned component's
+     * peer is realized (it is added to a showing container); the child's
+     * in-flight navigation (POST verb and body) and {@code window.opener}
+     * linkage are preserved because the engine's own child is reused.
+     *
+     * <p>Call this on the EDT from {@link
+     * ca.weblite.webview.WebViewPopupHandler#popupAdoptable}, passing the
+     * {@code popupId} it delivered, then add the component to a container
+     * (e.g. a new tab).  Uses the platform-default {@link Mode}.
+     *
+     * <p>Adopting an unknown / already-adopted / expired {@code popupId}
+     * fails when the peer is realized (the native adopt returns no engine),
+     * surfaced as an {@link IllegalStateException} from the attach path.
+     *
+     * @param popupId the engine-assigned handle from {@code popupAdoptable}
+     * @return a component that will adopt the popup on realization
+     */
+    public static WebViewComponent adoptPopup(long popupId) {
+        return adoptPopup(resolveDefaultMode(), popupId);
+    }
+
+    /** {@link #adoptPopup(long)} with an explicit implementation {@link Mode}. */
+    public static WebViewComponent adoptPopup(Mode mode, long popupId) {
+        WebViewComponent c = create(mode);
+        c.pendingAdoptPopupId = popupId;
+        return c;
     }
 
     /**

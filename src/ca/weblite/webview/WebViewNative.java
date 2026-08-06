@@ -302,6 +302,24 @@ native static void webview_embed_set_dialog_callback(long w, WebViewDialogCallba
 // silent no-op.  Never throws via JNI.
 native static void webview_embed_set_popup_callback(long w, WebViewPopupCallback cb);
 
+// Adopt a browser-initiated popup child that was retained (not shown) after
+// an ADOPT disposition, reparenting it into `parent`'s realized native
+// surface and returning an opaque engine pointer for it (as
+// webview_embed_create would), or 0 when `popupId` is unknown / already
+// adopted / expired.  The reused child preserves its in-flight request (POST
+// verb + body) and window.opener linkage.  Delivery per platform: macOS
+// reparents the WKWebView via addSubview: into the parent NSView; Linux
+// (Canvas 19) and Windows (Canvas 20) land their reparent in follow-up
+// canvases (this build returns 0 on those platforms).  Never throws via JNI.
+native static long webview_embed_adopt_popup(java.awt.Component parent,
+                                             long popupId, int debug);
+
+// Discard a retained-but-unadopted popup child (the ADOPT reclaim path):
+// tear down its native view + child engine without ever showing a window.
+// `w` is any live embed peer from the same process (the opener's).  Unknown
+// popupId is a silent no-op.  Never throws via JNI.
+native static void webview_embed_discard_popup(long w, long popupId);
+
 
 // ---------------------------------------------------------------------------
 // Lightweight / offscreen API (currently Linux-only).

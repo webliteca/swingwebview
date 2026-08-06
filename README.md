@@ -420,6 +420,61 @@ wv.setPopupHandler(new WebViewPopupHandler() {
 See [`demos/WebViewPopupDemo/`](demos/WebViewPopupDemo/README.md) for a
 runnable example that exercises the allow / custom / block modes.
 
+### Adopting popups into a component (a tab)
+
+By default an allowed popup opens in a **native window** the engine owns
+(above).  A tabbed browser usually wants the popup to appear as a **new
+tab** instead.  Blocking the native window and re-opening
+`e.targetUrl()` with `setUrl(url)` does *not* work for that: `setUrl`
+issues a **GET**, so a `<form method="post" target="…">` popup loses its
+POST body and the re-opened page is no longer opener-linked.  The POST
+body is not exposed to the popup channel on any engine, so the request
+cannot be replayed from Java.
+
+Instead, **adopt** the engine's own opener-linked child — the view
+WebKit already drove the original request (POST verb + body) into — into
+a `WebViewComponent` you supply:
+
+```java
+wv.setPopupHandler(new WebViewPopupHandler() {
+    // 1. Decide ADOPT on the native UI thread (synchronous, off the EDT).
+    @Override public PopupDisposition popupDisposition(WebViewPopupEvent e) {
+        return PopupDisposition.ADOPT;   // not a native window
+    }
+    // 2. On the EDT, host the retained child in a new tab.
+    @Override public void popupAdoptable(WebViewPopupEvent e, long popupId) {
+        WebViewComponent tab = WebViewComponent.adoptPopup(popupId);
+        myTabbedPane.addTab("Popup", tab);   // realizing it adopts the child
+    }
+});
+```
+
+* **POST + opener preserved.**  The adopted component reuses the engine's
+  child, so `<form method="post">` popups keep their body and
+  `window.opener` / `postMessage` keep working — the same guarantee the
+  native-window path has, now in a tab.
+* **Two-phase, no flash.**  `popupDisposition` returns `ADOPT`
+  synchronously on the native UI thread (same rules as `popupRequested`:
+  fast, thread-safe, no Swing).  The engine creates the child but shows
+  **no window**; it fires `popupAdoptable` on the EDT, where you build the
+  tab and call `WebViewComponent.adoptPopup(popupId)`.  Adoption happens
+  when that component is realized.
+* **Backward compatible.**  `popupDisposition` defaults to deriving from
+  `popupRequested` (`true → NATIVE_WINDOW`, `false → BLOCK`), so existing
+  handlers and `setPopupHandler(null)` are unchanged.
+* **Adopt-once / reclaim.**  A `popupId` may be adopted once; an unknown
+  or already-adopted id throws (`IllegalArgumentException` /
+  `IllegalStateException`).  A child decided `ADOPT` but never adopted is
+  reclaimed when the opener is disposed or after a bounded grace period.
+* **Platform coverage.**  The reference backend is **macOS heavyweight**
+  (WKWebView; the retained child is reparented into the tab's `NSView`).
+  Linux (WebKitGTK) and Windows (WebView2) adoption, and lightweight /
+  offscreen adoption, are follow-up work; on those the native adopt is
+  not yet wired, so `adoptPopup` there fails fast rather than silently
+  losing the popup.  The native adoption code ships pattern-faithful to
+  the existing popup handlers but **must be validated on-device** (no
+  native toolchain runs in the code-generation sandbox).
+
 ## Demo
 
 See [`demos/WebViewHeavyweightDemo/`](demos/WebViewHeavyweightDemo/README.md)

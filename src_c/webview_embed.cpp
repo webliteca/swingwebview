@@ -2640,6 +2640,16 @@ struct Engine {
 static std::mutex g_webview_map_mutex;
 static std::map<id, Engine *> g_webview_map;
 
+// Canvas 18 (popup adoption): retained-but-unadopted popup child engines,
+// keyed by popup_id.  Populated by impl_create_web_view's ADOPT branch (which
+// creates the opener-linked child but NO NSWindow), drained by
+// cocoa_adopt_popup (reparent into a caller surface) or cocoa_discard_popup
+// (reclaim).  Guarded by its own mutex; entries are Engine* also present in
+// g_webview_map.  ON-DEVICE VALIDATION REQUIRED: this file has no native
+// toolchain in the generating sandbox (see Canvas 18 Safeguards).
+static std::mutex g_retained_popups_mutex;
+static std::map<jlong, Engine *> g_retained_popups;
+
 // The EDT↔AppKit-main synchronous bridge has been eliminated.  Per
 // Canvas 6 Norms (the macOS sync EDT→AppKit-main bridge prohibition),
 // every per-engine native operation runs via cocoa_run_on_main_async
@@ -3486,6 +3496,89 @@ static int popup_feature_int(id nsNumber) {
     return (int)msg<int>(nsNumber, sel("intValue"));
 }
 
+// Canvas 18: synchronous disposition gate.  Calls WebViewPopupCallback
+// .onPopupDisposition on the AppKit main thread and returns the
+// PopupDisposition ordinal (0 = BLOCK, 1 = NATIVE_WINDOW, 2 = ADOPT).
+// Mirrors fire_popup_requested; a null callback / attach failure / thrown
+// decision all yield BLOCK (0).  MUST NOT be marshalled to the EDT (the
+// AppKit main thread is blocked awaiting this decision).
+static int fire_popup_disposition(JavaVM *jvm, jobject cb,
+                                  const char *url, const char *name,
+                                  bool gesture, int w, int h,
+                                  const char *page) {
+    if (!jvm || !cb) return 0; // BLOCK
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return 0;
+        detach = true;
+    }
+    int disposition = 0; // BLOCK
+    jstring ju = env->NewStringUTF(url ? url : "");
+    jstring jn = env->NewStringUTF(name ? name : "");
+    jstring jp = env->NewStringUTF(page ? page : "");
+    jclass cls = env->GetObjectClass(cb);
+    if (cls) {
+        jmethodID mid = env->GetMethodID(cls, "onPopupDisposition",
+            "(Ljava/lang/String;Ljava/lang/String;ZIILjava/lang/String;)I");
+        if (mid) {
+            jint r = env->CallIntMethod(cb, mid, ju, jn,
+                gesture ? JNI_TRUE : JNI_FALSE, (jint)w, (jint)h, jp);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+                r = 0;
+            }
+            disposition = (int)r;
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (ju) env->DeleteLocalRef(ju);
+    if (jn) env->DeleteLocalRef(jn);
+    if (jp) env->DeleteLocalRef(jp);
+    if (detach) jvm->DetachCurrentThread();
+    return disposition;
+}
+
+// Canvas 18: async notification that a popup child has been retained and is
+// ready to adopt.  Fire-and-forget on a detached worker thread (the Java
+// dispatcher marshals popupAdoptable to the EDT via invokeLater), mirroring
+// fire_popup_notify_opened.
+static void fire_popup_notify_adoptable(JavaVM *jvm, jobject cb, jlong popup_id,
+                                        std::string url, std::string name,
+                                        bool gesture, int w, int h,
+                                        std::string page) {
+    if (!jvm || !cb) return;
+    std::thread([jvm, cb, popup_id, url, name, gesture, w, h, page]() {
+        JNIEnv *env = nullptr;
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return;
+        jstring ju = env->NewStringUTF(url.c_str());
+        jstring jn = env->NewStringUTF(name.c_str());
+        jstring jp = env->NewStringUTF(page.c_str());
+        jclass cls = env->GetObjectClass(cb);
+        if (cls) {
+            jmethodID mid = env->GetMethodID(cls, "onPopupAdoptable",
+                "(JLjava/lang/String;Ljava/lang/String;ZIILjava/lang/String;)V");
+            if (mid) {
+                env->CallVoidMethod(cb, mid, popup_id, ju, jn,
+                                    gesture ? JNI_TRUE : JNI_FALSE,
+                                    (jint)w, (jint)h, jp);
+                if (env->ExceptionCheck()) {
+                    env->ExceptionDescribe();
+                    env->ExceptionClear();
+                }
+            }
+            env->DeleteLocalRef(cls);
+        }
+        if (ju) env->DeleteLocalRef(ju);
+        if (jn) env->DeleteLocalRef(jn);
+        if (jp) env->DeleteLocalRef(jp);
+        jvm->DetachCurrentThread();
+    }).detach();
+}
+
 // WKUIDelegate createWebViewWithConfiguration:forNavigationAction:windowFeatures:
 // Returns the child WKWebView, or nil to block.
 static id impl_create_web_view(id self, SEL, id webView, id configuration,
@@ -3507,80 +3600,73 @@ static id impl_create_web_view(id self, SEL, id webView, id configuration,
     // window.open in practice requires a user gesture; report true.
     bool gesture = true;
 
-    // Synchronous allow/deny hop into Java (AppKit main -> JNI).
+    // Canvas 18: synchronous DISPOSITION hop into Java (AppKit main -> JNI).
+    // 0 = BLOCK (return nil), 1 = NATIVE_WINDOW (engine-owned window, the
+    // Canvas 15 path), 2 = ADOPT (retain the child, NO window, notify Java to
+    // reparent it into a caller-supplied WebViewComponent).  The default
+    // WebViewPopupCallback.onPopupDisposition derives from onPopupRequested,
+    // so legacy boolean handlers still map to BLOCK / NATIVE_WINDOW.
     JavaVM *jvm = e->jvm;
     jobject cb = e->popup_callback;
-    JNIEnv *env = nullptr;
-    bool attached = false;
-    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
-        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
-            return nullptr;
-        attached = true;
+    int disposition = fire_popup_disposition(
+        jvm, cb, target.c_str(), "", gesture, req_w, req_h, page.c_str());
+    if (disposition == 0) {
+        return nullptr; // BLOCK
     }
-    bool allow = false;
-    {
-        jstring ju = env->NewStringUTF(target.c_str());
-        jstring jn = env->NewStringUTF("");
-        jstring jp = env->NewStringUTF(page.c_str());
-        jclass cls = env->GetObjectClass(cb);
-        if (cls) {
-            jmethodID mid = env->GetMethodID(cls, "onPopupRequested",
-                "(Ljava/lang/String;Ljava/lang/String;ZIILjava/lang/String;)Z");
-            if (mid) {
-                jboolean r = env->CallBooleanMethod(cb, mid, ju, jn,
-                    gesture ? JNI_TRUE : JNI_FALSE, (jint)req_w, (jint)req_h, jp);
-                if (env->ExceptionCheck()) {
-                    env->ExceptionDescribe();
-                    env->ExceptionClear();
-                    r = JNI_FALSE;
-                }
-                allow = (r == JNI_TRUE);
-            }
-            env->DeleteLocalRef(cls);
-        }
-        if (ju) env->DeleteLocalRef(ju);
-        if (jn) env->DeleteLocalRef(jn);
-        if (jp) env->DeleteLocalRef(jp);
-    }
-    // NOTE: keep the thread attached until AFTER the child engine's global
-    // refs are created below — detaching here would invalidate `env`.
-    if (!allow) {
-        if (attached) jvm->DetachCurrentThread();
-        return nullptr;
-    }
+    const bool adopt = (disposition == 2);
 
     // Size the popup: use the requested size, else a typical auth-popup size.
     int W = req_w > 0 ? req_w : 500;
     int H = req_h > 0 ? req_h : 650;
 
     // Create the child WKWebView LINKED to the opener via the passed config.
+    // WebKit drives the ORIGINAL navigation-action request (POST verb + body)
+    // into this child regardless of disposition, which is what preserves POST
+    // and window.opener for both NATIVE_WINDOW and ADOPT.
     id child = msg(objc_cls("WKWebView"), sel("alloc"));
     child = msg<id, CGRect, id>(child, sel("initWithFrame:configuration:"),
                                 CGRectMake(0, 0, W, H), configuration);
     if (!child) {
-        if (attached) jvm->DetachCurrentThread();
         return nullptr;
     }
 
-    // Host it in an engine-owned NSWindow (titled|closable|miniaturizable|
-    // resizable = 1|2|4|8; NSBackingStoreBuffered = 2).
-    id win = msg(objc_cls("NSWindow"), sel("alloc"));
-    win = msg<id, CGRect, unsigned long, unsigned long, BOOL>(
-        win, sel("initWithContentRect:styleMask:backing:defer:"),
-        CGRectMake(0, 0, W, H), (unsigned long)15, (unsigned long)2, NO);
-    msg<void, id>(win, sel("setTitle:"), ns_str("Popup"));
-    msg<void, id>(win, sel("setContentView:"), child);
-    msg<void>(win, sel("center"));
-    msg<void, id>(win, sel("makeKeyAndOrderFront:"), nullptr);
+    // Attach a JNIEnv to create the child engine's inherited global refs.
+    JNIEnv *env = nullptr;
+    bool attached = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env) {
+            msg<void>(child, sel("release"));
+            return nullptr;
+        }
+        attached = true;
+    }
+
+    // NATIVE_WINDOW: host the child in an engine-owned NSWindow (titled|
+    // closable|miniaturizable|resizable = 1|2|4|8; NSBackingStoreBuffered =
+    // 2).  ADOPT: create NO window — the child is retained under
+    // g_retained_popups and reparented later by cocoa_adopt_popup, so nothing
+    // is ever shown until the caller adopts it.
+    id win = nullptr;
+    if (!adopt) {
+        win = msg(objc_cls("NSWindow"), sel("alloc"));
+        win = msg<id, CGRect, unsigned long, unsigned long, BOOL>(
+            win, sel("initWithContentRect:styleMask:backing:defer:"),
+            CGRectMake(0, 0, W, H), (unsigned long)15, (unsigned long)2, NO);
+        msg<void, id>(win, sel("setTitle:"), ns_str("Popup"));
+        msg<void, id>(win, sel("setContentView:"), child);
+        msg<void>(win, sel("center"));
+        msg<void, id>(win, sel("makeKeyAndOrderFront:"), nullptr);
+    }
 
     // Build the child Engine, inheriting the opener's callbacks so the popup
-    // supports dialogs / nested popups and can notify onPopupClosed.
+    // supports dialogs / nested popups and can notify onPopupClosed /
+    // onPopupAdoptable.
     Engine *child_e = new Engine();
     child_e->webview = child;
     child_e->jvm = jvm;
     child_e->config = configuration;
     child_e->manager = msg(configuration, sel("userContentController"));
-    child_e->popup_window = win;
+    child_e->popup_window = win;              // nil for ADOPT
     child_e->popup_id = (jlong)child_e;
     if (env) {
         child_e->popup_callback = env->NewGlobalRef(cb);
@@ -3596,15 +3682,23 @@ static id impl_create_web_view(id self, SEL, id webView, id configuration,
         std::lock_guard<std::mutex> lk(g_webview_map_mutex);
         g_webview_map[child] = child_e;
     }
+    if (adopt) {
+        std::lock_guard<std::mutex> lk(g_retained_popups_mutex);
+        g_retained_popups[child_e->popup_id] = child_e;
+    }
 
     // Global refs are created; safe to detach now if we attached above.
     if (attached) jvm->DetachCurrentThread();
 
-    // Notify the opener's PopupDispatcher (async) that the popup is open.
-    // fire_popup_notify_opened attaches its own worker thread; it does not
-    // use `env`.
-    fire_popup_notify_opened(jvm, cb, child_e->popup_id, target, "",
-                             gesture, W, H, page);
+    // Notify the opener's PopupDispatcher (async).  Both notify helpers attach
+    // their own worker thread and do not use `env`.
+    if (adopt) {
+        fire_popup_notify_adoptable(jvm, cb, child_e->popup_id, target, "",
+                                    gesture, W, H, page);
+    } else {
+        fire_popup_notify_opened(jvm, cb, child_e->popup_id, target, "",
+                                 gesture, W, H, page);
+    }
     return child;
 }
 
@@ -4438,6 +4532,169 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
     return e;
 }
 
+// Canvas 18: reparent a retained popup child (created windowless by
+// impl_create_web_view's ADOPT branch) into parentComponent's realized native
+// surface, promoting it to a normal embedded engine.  Returns the child
+// Engine* (as cocoa_create_engine would) or nullptr when popupId is unknown /
+// already adopted, or the JAWT surface cannot be resolved.  Reuses the exact
+// host-view walk + addSubview + KVO + attach-signal from cocoa_create_engine's
+// epilogue; it deliberately does NOT re-create the WKWebView / config / UI
+// delegate — the retained child already carries them (and its in-flight POST
+// navigation) from impl_create_web_view.  The eval / function bridges are
+// installed by the Java EmbeddedWebView.adopt wrapper (webview_embed_init /
+// _bind) after this returns.
+//
+// ON-DEVICE VALIDATION REQUIRED: the reparent retain/release balance and the
+// first-responder handoff are prime zombie/Instruments candidates (Canvas 18
+// Safeguards); this file has no native toolchain in the generating sandbox.
+static Engine *cocoa_adopt_popup(JNIEnv *env, jobject parentComponent,
+                                 jlong popupId, jint /*debug*/) {
+    // Claim the retained child (adopt-once): remove under lock so a second
+    // adopt of the same id finds nothing and returns 0.
+    Engine *e = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_retained_popups_mutex);
+        auto it = g_retained_popups.find(popupId);
+        if (it == g_retained_popups.end()) return nullptr;
+        e = it->second;
+        g_retained_popups.erase(it);
+    }
+    if (!e) return nullptr;
+
+    // Resolve the JAWT surface layers for the new parent (mirrors the
+    // cocoa_create_engine prologue), then release the surface lock before the
+    // async main-thread epilogue.
+    {
+        JawtLock lock(env, parentComponent);
+        if (!lock.ok) {
+            // Could not attach; put the child back so it is reclaimable and
+            // not lost.
+            std::lock_guard<std::mutex> lk(g_retained_popups_mutex);
+            g_retained_popups[popupId] = e;
+            return nullptr;
+        }
+        if (e->surface_layers) {
+            msg<void>(e->surface_layers, sel("release"));
+            e->surface_layers = nullptr;
+        }
+        e->surface_layers = (id)lock.dsi->platformInfo;
+        if (e->surface_layers) {
+            msg<void>(e->surface_layers, sel("retain"));
+        }
+    }
+
+    // Async epilogue on the AppKit main thread: reparent the retained child's
+    // WKWebView into the resolved host view and finish attach.  The host-view
+    // walk is identical to cocoa_create_engine's.
+    cocoa_run_on_main_async([e] {
+        if (e->destroyed.load()) {
+            cocoa_attach_signal_complete(e, false,
+                "EmbeddedWebView disposed before adopt completed");
+            return;
+        }
+        id ns_view_cls = objc_cls("NSView");
+        SEL is_kind_of_class = sel("isKindOfClass:");
+        id window_layer = e->surface_layers
+            ? msg(e->surface_layers, sel("windowLayer"))
+            : (id)nullptr;
+        id host = nullptr;
+        bool host_is_awt = false;
+        for (id l = window_layer; l; l = msg(l, sel("superlayer"))) {
+            id ld = msg(l, sel("delegate"));
+            if (!ld) continue;
+            if (!msg<BOOL>(ld, is_kind_of_class, ns_view_cls)) continue;
+            Class cls = object_getClass(ld);
+            const char *cls_name = cls ? class_getName(cls) : "<unknown>";
+            if (std::strstr(cls_name, "AWT") != nullptr) {
+                host = ld;
+                host_is_awt = true;
+                break;
+            }
+            if (host == nullptr) {
+                id window = msg(ld, sel("window"));
+                if (window) {
+                    id cv = msg(window, sel("contentView"));
+                    if (cv) host = cv;
+                }
+            }
+        }
+        if (host != nullptr) {
+            msg<void>(host, sel("retain"));
+            e->host_view = host;
+            e->host_is_awt = host_is_awt;
+            msg<void, BOOL>(host, sel("setWantsLayer:"), YES);
+            // Reparent the existing (retained) child WKWebView into the tab's
+            // host view — this is the crux that hosts the popup in the caller's
+            // surface instead of a native window, preserving the in-flight
+            // POST navigation.
+            msg<void, id>(host, sel("addSubview:"), e->webview);
+            // Hide until the first setBounds positions it (as create does).
+            msg<void, CGRect>(e->webview, sel("setFrame:"),
+                              CGRectMake(0, 0, 0, 0));
+        } else if (e->surface_layers) {
+            msg<void, BOOL>(e->webview, sel("setWantsLayer:"), YES);
+            id layer = msg(e->webview, sel("layer"));
+            msg<void, id>(e->surface_layers, sel("setLayer:"), layer);
+            fprintf(stderr,
+                "[webview-embed] WARNING: adopt could not locate a host "
+                "NSView; layer-only fallback (content may not render).\n");
+        }
+        // The child is no longer a windowless popup: it is now a normal
+        // embedded engine hosted in the caller's surface.  Clear popup_window
+        // (already nil for ADOPT) and register KVO / signal attach so the Java
+        // AttachCallback fires (webViewDidClose: still routes onPopupClosed).
+        e->popup_window = nullptr;
+        cocoa_kvo_install(e);
+        cocoa_attach_signal_complete(e, true, "");
+    });
+    return e;
+}
+
+// Canvas 18: discard a retained-but-unadopted popup child (the ADOPT reclaim
+// path).  Tears the child engine down WITHOUT ever showing a window; silent
+// no-op for an unknown popupId.  Mirrors impl_web_view_did_close teardown
+// (minus the window) and transfers ownership of the inherited global refs to
+// the async close-notify worker.
+static void cocoa_discard_popup(jlong popupId) {
+    Engine *e = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_retained_popups_mutex);
+        auto it = g_retained_popups.find(popupId);
+        if (it == g_retained_popups.end()) return;
+        e = it->second;
+        g_retained_popups.erase(it);
+    }
+    if (!e) return;
+    cocoa_run_on_main_async([e] {
+        JavaVM *jvm = e->jvm;
+        jobject popup_cb = e->popup_callback;
+        jobject dialog_cb = e->dialog_callback;
+        jlong pid = e->popup_id;
+        std::string url = page_url_utf8(e->webview);
+        if (e->webview) {
+            msg<void, id>(e->webview, sel("setUIDelegate:"), nullptr);
+        }
+        {
+            std::lock_guard<std::mutex> lk(g_webview_map_mutex);
+            g_webview_map.erase(e->webview);
+        }
+        // Notify Java (onPopupClosed) and transfer ownership of the inherited
+        // refs to the worker, which frees them after the call.
+        fire_popup_notify_closed(jvm, popup_cb, dialog_cb, pid, url, "");
+        e->popup_callback = nullptr;
+        e->dialog_callback = nullptr;
+        if (e->ui_delegate) {
+            msg(e->ui_delegate, sel("release"));
+            e->ui_delegate = nullptr;
+        }
+        if (e->webview) {
+            msg(e->webview, sel("release"));
+            e->webview = nullptr;
+        }
+        delete e;
+    });
+}
+
 // Asynchronous engine destroy.  Returns immediately on the calling
 // thread (typically the EDT) after a small Java-side cleanup; the
 // AppKit teardown, view-hierarchy removal, KVO observer unregister,
@@ -4880,6 +5137,33 @@ JNIEXPORT jlong JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1cr
 #else
     (void)env; (void)component; (void)debug;
     return 0;
+#endif
+}
+
+// Canvas 18: adopt a retained popup child into `parent`'s surface.  macOS
+// reparents the retained WKWebView; Linux (Canvas 19) and Windows (Canvas 20)
+// land their reparent later, so this returns 0 there (EmbeddedWebView.adopt
+// turns 0 into a documented IllegalStateException).
+JNIEXPORT jlong JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1adopt_1popup
+  (JNIEnv *env, jclass, jobject parent, jlong popupId, jint debug) {
+#ifdef WEBVIEW_COCOA
+    Engine *e = embed::cocoa_adopt_popup(env, parent, popupId, debug);
+    return (jlong)e;
+#else
+    (void)env; (void)parent; (void)popupId; (void)debug;
+    return 0;
+#endif
+}
+
+// Canvas 18: discard a retained-but-unadopted popup child (ADOPT reclaim).
+// `w` (any live embed peer from the same process) is unused on macOS because
+// the retained-popup registry is process-global keyed by popupId.
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1discard_1popup
+  (JNIEnv *, jclass, jlong /*w*/, jlong popupId) {
+#ifdef WEBVIEW_COCOA
+    embed::cocoa_discard_popup(popupId);
+#else
+    (void)popupId;
 #endif
 }
 

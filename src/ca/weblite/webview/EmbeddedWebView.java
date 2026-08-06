@@ -176,6 +176,69 @@ public class EmbeddedWebView {
                 "Native webview_embed_create returned 0; could not obtain a " +
                 "native window handle or initialize the embedded WebView.");
         }
+        return wrapAndBind(p);
+    }
+
+    /**
+     * Adopt a browser-initiated popup child that the engine retained (not
+     * shown) after a {@link ca.weblite.webview.PopupDisposition#ADOPT}
+     * decision, reparenting it into {@code parent}'s realized native surface.
+     * Parallels {@link #attach}, but instead of creating a fresh engine it
+     * reuses the existing opener-linked child identified by {@code popupId} —
+     * preserving that child's in-flight request (POST verb and body) and
+     * {@code window.opener} linkage.  The same eval / function / attach
+     * bridges as {@code attach} are installed on the adopted engine.
+     *
+     * @param parent  a displayable heavyweight AWT component (as {@code attach})
+     * @param popupId the engine-assigned handle from
+     *                {@link ca.weblite.webview.WebViewPopupHandler#popupAdoptable}
+     * @param debug   enable developer tools where supported
+     * @return the wrapper for the adopted engine
+     * @throws IllegalStateException if {@code popupId} is unknown, already
+     *         adopted, expired, or adoption is unsupported on this platform
+     *         (the native adopt returned 0)
+     */
+    public static EmbeddedWebView adopt(Component parent, long popupId,
+                                        boolean debug) {
+        if (parent == null) {
+            throw new IllegalArgumentException("parent must not be null");
+        }
+        if (!parent.isDisplayable()) {
+            throw new IllegalStateException(
+                "parent is not displayable; addNotify() has not been called.");
+        }
+        long p = WebViewNative.webview_embed_adopt_popup(
+            parent, popupId, debug ? 1 : 0);
+        if (p == 0L) {
+            throw new IllegalStateException(
+                "Native webview_embed_adopt_popup returned 0 for popupId "
+                + popupId + "; the retained popup is unknown, already "
+                + "adopted, expired, or adoption is unsupported on this "
+                + "platform.");
+        }
+        return wrapAndBind(p);
+    }
+
+    /**
+     * Discard a retained-but-unadopted popup child (the ADOPT reclaim path).
+     * A no-op for an unknown {@code popupId}.  Used by the owning component's
+     * reclaim sink; does not affect this engine's own page.
+     *
+     * @return {@code this} for chaining
+     */
+    public EmbeddedWebView discardRetainedPopup(long popupId) {
+        checkAlive();
+        WebViewNative.webview_embed_discard_popup(peer, popupId);
+        return this;
+    }
+
+    /**
+     * Wrap a freshly-obtained native embed peer (from
+     * {@code webview_embed_create} or {@code webview_embed_adopt_popup}) and
+     * install the attach / eval / function bridges.  Shared by {@link #attach}
+     * and {@link #adopt}.
+     */
+    private static EmbeddedWebView wrapAndBind(long p) {
         final EmbeddedWebView ewv = new EmbeddedWebView(p);
         // Register the attach-completion callback BEFORE installing the
         // eval bridge or returning.  The native side either fires the
