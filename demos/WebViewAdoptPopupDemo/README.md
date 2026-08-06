@@ -48,6 +48,21 @@ and launches the demo.
 
 - The demo sets `JPopupMenu.setDefaultLightWeightPopupEnabled(false)` and the
   tooltip equivalent, required for heavyweight popups.
-- Adoption's reference backend is macOS (WKWebView). Linux (Canvas 19) and
-  Windows (Canvas 20) native adoption are follow-ups; on those the disposition
-  falls back and popups are not yet adopted into tabs.
+## Platform matrix
+
+| Feature | macOS | Linux | Windows |
+|---|---|---|---|
+| **Adopt into tab** | ✅ | ❌ Canvas 19 (`adoptPopup` throws `IllegalStateException`) | ❌ Canvas 20 (same) |
+| **Native window** popup | ✅ | ✅ | ✅ |
+| **Block** popup | ✅ | ✅ | ✅ |
+| **User-Agent** (Set/Reset) | ✅ | ✅ | ✅ |
+
+So on **Linux / Windows**, test with **Native window** or **Block** mode plus
+the **User-Agent** field. **Adopt into tab** is the macOS reference backend
+until the Linux (Canvas 19) and Windows (Canvas 20) native reparenting lands —
+selecting it there raises `IllegalStateException` from `adoptPopup` by design
+(the native adopt bridge returns 0).
+
+Run scripts per platform (each rebuilds the native lib from `src_c/`):
+`./run-mac-adopt-popup-demo.sh`, `./run-linux-adopt-popup-demo.sh`
+(`WEBVIEW_MODE=heavyweight` to force heavyweight), `run-windows-adopt-popup-demo.bat`.
