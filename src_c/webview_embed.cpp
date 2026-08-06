@@ -5170,32 +5170,12 @@ JNIEXPORT jlong JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1cr
 #endif
 }
 
-// Canvas 18: adopt a retained popup child into `parent`'s surface.  macOS
-// reparents the retained WKWebView; Linux (Canvas 19) and Windows (Canvas 20)
-// land their reparent later, so this returns 0 there (EmbeddedWebView.adopt
-// turns 0 into a documented IllegalStateException).
-JNIEXPORT jlong JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1adopt_1popup
-  (JNIEnv *env, jclass, jobject parent, jlong popupId, jint debug) {
-#ifdef WEBVIEW_COCOA
-    Engine *e = embed::cocoa_adopt_popup(env, parent, popupId, debug);
-    return (jlong)e;
-#else
-    (void)env; (void)parent; (void)popupId; (void)debug;
-    return 0;
-#endif
-}
-
-// Canvas 18: discard a retained-but-unadopted popup child (ADOPT reclaim).
-// `w` (any live embed peer from the same process) is unused on macOS because
-// the retained-popup registry is process-global keyed by popupId.
-JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1discard_1popup
-  (JNIEnv *, jclass, jlong /*w*/, jlong popupId) {
-#ifdef WEBVIEW_COCOA
-    embed::cocoa_discard_popup(popupId);
-#else
-    (void)popupId;
-#endif
-}
+// NOTE: the popup-adoption JNI bridges (webview_embed_adopt_popup /
+// webview_embed_discard_popup) are defined INSIDE the `extern "C"` block below
+// (next to webview_embed_set_user_agent), not here.  They are newly-added
+// methods with no prototype in the generated JNI header, so — like the dialog
+// setters — they must be wrapped in `extern "C"` or the JVM can't resolve
+// them (UnsatisfiedLinkError).  See the block comment above that `extern "C"`.
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1destroy
   (JNIEnv *, jclass, jlong wv) {
@@ -5617,6 +5597,33 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
     // macOS / Windows have no offscreen engine; OffscreenWebView.create
     // returns null there so this is never reached.
     (void)env; (void)cb;
+#endif
+}
+
+// Popup-adoption JNI bridges — Canvas 18.  Must live inside this `extern "C"`
+// block (they are newly-added methods with no generated-header prototype, so
+// C++ name-mangling would otherwise make them unresolvable from the JVM —
+// UnsatisfiedLinkError).  macOS reparents the retained WKWebView; Linux
+// (Canvas 19) and Windows (Canvas 20) land their reparent later, so those
+// return 0 (EmbeddedWebView.adopt turns 0 into a documented
+// IllegalStateException).
+JNIEXPORT jlong JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1adopt_1popup
+  (JNIEnv *env, jclass, jobject parent, jlong popupId, jint debug) {
+#ifdef WEBVIEW_COCOA
+    Engine *e = embed::cocoa_adopt_popup(env, parent, popupId, debug);
+    return (jlong)e;
+#else
+    (void)env; (void)parent; (void)popupId; (void)debug;
+    return 0;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1discard_1popup
+  (JNIEnv *, jclass, jlong /*w*/, jlong popupId) {
+#ifdef WEBVIEW_COCOA
+    embed::cocoa_discard_popup(popupId);
+#else
+    (void)popupId;
 #endif
 }
 
