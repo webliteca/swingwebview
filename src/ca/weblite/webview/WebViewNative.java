@@ -302,6 +302,32 @@ native static void webview_embed_set_dialog_callback(long w, WebViewDialogCallba
 // silent no-op.  Never throws via JNI.
 native static void webview_embed_set_popup_callback(long w, WebViewPopupCallback cb);
 
+// Override the embedded WebView's User-Agent (changes the actual HTTP
+// User-Agent request header).  ua == null (or empty) clears the override and
+// restores the engine default.  Takes effect on the next navigation.  Per
+// platform: macOS -[WKWebView setCustomUserAgent:]; Linux
+// webkit_settings_set_user_agent; Windows ICoreWebView2Settings2::put_UserAgent.
+// Passing 0 for w is a silent no-op.  Never throws via JNI.
+native static void webview_embed_set_user_agent(long w, String ua);
+
+// Adopt a browser-initiated popup child that was retained (not shown) after
+// an ADOPT disposition, reparenting it into `parent`'s realized native
+// surface and returning an opaque engine pointer for it (as
+// webview_embed_create would), or 0 when `popupId` is unknown / already
+// adopted / expired.  The reused child preserves its in-flight request (POST
+// verb + body) and window.opener linkage.  Delivery per platform: macOS
+// reparents the WKWebView via addSubview: into the parent NSView; Linux
+// (Canvas 19) and Windows (Canvas 20) land their reparent in follow-up
+// canvases (this build returns 0 on those platforms).  Never throws via JNI.
+native static long webview_embed_adopt_popup(java.awt.Component parent,
+                                             long popupId, int debug);
+
+// Discard a retained-but-unadopted popup child (the ADOPT reclaim path):
+// tear down its native view + child engine without ever showing a window.
+// `w` is any live embed peer from the same process (the opener's).  Unknown
+// popupId is a silent no-op.  Never throws via JNI.
+native static void webview_embed_discard_popup(long w, long popupId);
+
 
 // ---------------------------------------------------------------------------
 // Lightweight / offscreen API (currently Linux-only).
@@ -417,6 +443,32 @@ native static void webview_offscreen_set_dialog_callback(long peer, WebViewDialo
 // Windows native binaries provide a no-op stub (the offscreen engine on
 // those platforms is itself a stub).  Never throws via JNI.
 native static void webview_offscreen_set_popup_callback(long peer, WebViewPopupCallback cb);
+
+// Offscreen counterpart to webview_embed_set_user_agent.  Linux sets the
+// WebKitGTK settings user-agent; macOS / Windows offscreen engines are stubs
+// and this is a native-side no-op.  ua == null clears the override.  Never
+// throws via JNI.
+native static void webview_offscreen_set_user_agent(long peer, String ua);
+
+// Offscreen counterpart to webview_embed_adopt_popup (Canvas 19).  Adopt a
+// browser-initiated popup child that was retained (not shown) after an ADOPT
+// disposition, reusing it inside a fresh GtkOffscreenWindow (OffEngine) and
+// returning an opaque offscreen peer pointer (as webview_offscreen_create
+// would), or 0 when `popupId` is unknown / already adopted / expired, or on an
+// unsupported platform (macOS / Windows offscreen engines are stubs).  The
+// reused child preserves its in-flight request (POST verb + body) and
+// window.opener linkage.  Claims from the SAME retained-popup registry as the
+// heavyweight webview_embed_adopt_popup.  Never throws via JNI.
+native static long webview_offscreen_adopt_popup(int width, int height,
+                                                 long popupId, int debug);
+
+// Offscreen counterpart to webview_embed_discard_popup (Canvas 19).  Discard a
+// retained-but-unadopted popup child (the ADOPT reclaim path): tear down its
+// native view + child engine without ever showing a window.  Converges on the
+// SAME shared native reclaim (gtk_discard_popup) as the heavyweight bridge, so
+// `peer` is unused (kept for signature symmetry with the heavyweight bridge).
+// Unknown popupId is a silent no-op.  Never throws via JNI.
+native static void webview_offscreen_discard_popup(long peer, long popupId);
 
 
 }

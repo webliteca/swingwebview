@@ -46,6 +46,38 @@ public interface WebViewPopupCallback {
                              boolean userGesture, int width, int height,
                              String pageUrl);
 
+    /**
+     * Invoked synchronously when the page requests a popup, to obtain the
+     * enriched disposition.  Returns a {@link PopupDisposition} ordinal —
+     * {@code 0 = BLOCK}, {@code 1 = NATIVE_WINDOW}, {@code 2 = ADOPT} — which
+     * the native side switches on to block, open a native window, or retain
+     * the child for adoption.  Like {@link #onPopupRequested}, the native
+     * side is blocked awaiting the return value and it MUST NOT be marshalled
+     * to the EDT.
+     *
+     * <p>The default derives the disposition from {@link #onPopupRequested}
+     * ({@code true → NATIVE_WINDOW.ordinal()}, {@code false → BLOCK.ordinal()})
+     * so an engine that only calls {@code onPopupRequested} keeps working.
+     */
+    default int onPopupDisposition(String targetUrl, String targetName,
+                                   boolean userGesture, int width, int height,
+                                   String pageUrl) {
+        return onPopupRequested(targetUrl, targetName, userGesture,
+                                width, height, pageUrl)
+            ? PopupDisposition.NATIVE_WINDOW.ordinal()
+            : PopupDisposition.BLOCK.ordinal();
+    }
+
+    /** Invoked (as a notification) after an {@code ADOPT} disposition, once
+     *  the opener-linked child has been created and retained under a hidden
+     *  holder.  {@code popupId} is the engine-assigned handle the application
+     *  passes to {@code WebViewComponent.adoptPopup}.  Default is a no-op so
+     *  engines that have not implemented adoption need not call it. */
+    default void onPopupAdoptable(long popupId, String targetUrl,
+                                  String targetName, boolean userGesture,
+                                  int width, int height, String pageUrl) {
+    }
+
     /** Invoked after the popup's native window has been created and shown.
      *  {@code popupId} is an engine-assigned opaque handle correlating this
      *  open with its later {@link #onPopupClosed}. */

@@ -331,6 +331,197 @@ public class PopupDispatcherTest {
     }
 
     // -----------------------------------------------------------------
+    // Disposition gate (Canvas 18).
+    // -----------------------------------------------------------------
+
+    @Test
+    public void testDispositionDefaultDerivesFromBooleanTrue() {
+        // A legacy handler overriding only popupRequested (true) maps to
+        // NATIVE_WINDOW via the popupDisposition default.
+        dispatcher.setHandler(new WebViewPopupHandler() {
+            @Override public boolean popupRequested(WebViewPopupEvent e) {
+                return true;
+            }
+        });
+        assertEquals(PopupDisposition.NATIVE_WINDOW.ordinal(),
+            dispatcher.dispatchPopupDisposition("u", "n", true, -1, -1, "p"));
+    }
+
+    @Test
+    public void testDispositionDefaultDerivesFromBooleanFalse() {
+        dispatcher.setHandler(new WebViewPopupHandler() {
+            @Override public boolean popupRequested(WebViewPopupEvent e) {
+                return false;
+            }
+        });
+        assertEquals(PopupDisposition.BLOCK.ordinal(),
+            dispatcher.dispatchPopupDisposition("u", "n", true, -1, -1, "p"));
+    }
+
+    @Test
+    public void testDispositionDefaultHandlerIsNativeWindow() {
+        // DEFAULT handler: popupRequested() returns true -> NATIVE_WINDOW.
+        assertEquals(PopupDisposition.NATIVE_WINDOW.ordinal(),
+            dispatcher.dispatchPopupDisposition("u", "n", true, 500, 650, "p"));
+    }
+
+    @Test
+    public void testDispositionDropHandlerBlocks() {
+        dispatcher.setHandler(null); // DROP
+        assertEquals(PopupDisposition.BLOCK.ordinal(),
+            dispatcher.dispatchPopupDisposition("u", "n", true, -1, -1, "p"));
+    }
+
+    @Test
+    public void testDispositionAdoptRunsOffEdtAndReturnsOrdinal() {
+        final AtomicReference<Boolean> onEdt = new AtomicReference<Boolean>();
+        dispatcher.setHandler(new WebViewPopupHandler() {
+            @Override public PopupDisposition popupDisposition(
+                    WebViewPopupEvent e) {
+                onEdt.set(SwingUtilities.isEventDispatchThread());
+                return PopupDisposition.ADOPT;
+            }
+        });
+        int d = dispatcher.dispatchPopupDisposition(
+            "https://e.com/auth", "authwin", true, 520, 640, "https://o.com");
+        assertEquals(PopupDisposition.ADOPT.ordinal(), d);
+        assertEquals("disposition must run off the EDT",
+            Boolean.FALSE, onEdt.get());
+    }
+
+    @Test
+    public void testDispositionNullReturnBlocks() {
+        dispatcher.setHandler(new WebViewPopupHandler() {
+            @Override public PopupDisposition popupDisposition(
+                    WebViewPopupEvent e) {
+                return null;
+            }
+        });
+        assertEquals(PopupDisposition.BLOCK.ordinal(),
+            dispatcher.dispatchPopupDisposition("u", "n", true, -1, -1, "p"));
+    }
+
+    @Test
+    public void testDispositionExceptionBlocksAndIsolated() {
+        dispatcher.setHandler(new WebViewPopupHandler() {
+            @Override public PopupDisposition popupDisposition(
+                    WebViewPopupEvent e) {
+                throw new RuntimeException("boom-disp");
+            }
+        });
+        assertEquals(PopupDisposition.BLOCK.ordinal(),
+            dispatcher.dispatchPopupDisposition("u", "n", true, -1, -1, "p"));
+        waitForUncaught();
+        assertNotNull(uncaught.get());
+        assertEquals("boom-disp", uncaught.get().getMessage());
+    }
+
+    @Test
+    public void testDisposedDispatcherDispositionBlocks() {
+        dispatcher.disposeAll();
+        assertEquals(PopupDisposition.BLOCK.ordinal(),
+            dispatcher.dispatchPopupDisposition("u", "n", true, -1, -1, "p"));
+    }
+
+    // -----------------------------------------------------------------
+    // Adopt notification, claim-once, and reclaim (Canvas 18).
+    // -----------------------------------------------------------------
+
+    @Test
+    public void testAdoptableNotifiedOnEdtAndPending() throws Exception {
+        final AtomicReference<Boolean> onEdt = new AtomicReference<Boolean>();
+        final AtomicReference<Long> gotId = new AtomicReference<Long>();
+        final CountDownLatch latch = new CountDownLatch(1);
+        dispatcher.setHandler(new WebViewPopupHandler() {
+            @Override public void popupAdoptable(WebViewPopupEvent e,
+                                                 long popupId) {
+                onEdt.set(SwingUtilities.isEventDispatchThread());
+                gotId.set(popupId);
+                latch.countDown();
+            }
+        });
+        dispatcher.dispatchPopupAdoptable(
+            77L, "https://e.com", "win", true, 520, 640, "https://o.com");
+        assertTrue("popupAdoptable not delivered",
+            latch.await(2, TimeUnit.SECONDS));
+        assertEquals(Boolean.TRUE, onEdt.get());
+        assertEquals(Long.valueOf(77L), gotId.get());
+        assertEquals(1, dispatcher.pendingAdoptCount());
+    }
+
+    @Test
+    public void testClaimAdoptReturnsStoredEventAndClearsPending() {
+        dispatcher.dispatchPopupAdoptable(
+            5L, "https://e.com", "win", true, 520, 640, "https://o.com");
+        WebViewPopupEvent ev = dispatcher.claimAdopt(5L);
+        assertNotNull(ev);
+        assertSame(source, ev.source());
+        assertEquals("https://e.com", ev.targetUrl());
+        assertEquals(520, ev.width());
+        assertEquals(0, dispatcher.pendingAdoptCount());
+    }
+
+    @Test(expected = IllegalArgumentException.class)
+    public void testClaimAdoptUnknownIdThrowsIAE() {
+        dispatcher.claimAdopt(123456L);
+    }
+
+    @Test(expected = IllegalStateException.class)
+    public void testClaimAdoptTwiceThrowsISE() {
+        dispatcher.dispatchPopupAdoptable(
+            9L, "u", "n", true, -1, -1, "p");
+        dispatcher.claimAdopt(9L);      // first claim ok
+        dispatcher.claimAdopt(9L);      // second claim -> ISE
+    }
+
+    @Test
+    public void testReclaimAdoptsDiscardsViaSinkOnDispose() {
+        final java.util.List<Long> discarded =
+            new java.util.concurrent.CopyOnWriteArrayList<Long>();
+        dispatcher.setReclaimSink(new PopupDispatcher.ReclaimSink() {
+            @Override public void discard(long popupId) {
+                discarded.add(Long.valueOf(popupId));
+            }
+        });
+        dispatcher.dispatchPopupAdoptable(1L, "u", "n", true, -1, -1, "p");
+        dispatcher.dispatchPopupAdoptable(2L, "u", "n", true, -1, -1, "p");
+        assertEquals(2, dispatcher.pendingAdoptCount());
+        dispatcher.disposeAll();
+        assertEquals(0, dispatcher.pendingAdoptCount());
+        assertTrue(discarded.contains(Long.valueOf(1L)));
+        assertTrue(discarded.contains(Long.valueOf(2L)));
+    }
+
+    @Test
+    public void testClaimedAdoptIsNotReclaimed() {
+        final java.util.List<Long> discarded =
+            new java.util.concurrent.CopyOnWriteArrayList<Long>();
+        dispatcher.setReclaimSink(new PopupDispatcher.ReclaimSink() {
+            @Override public void discard(long popupId) {
+                discarded.add(Long.valueOf(popupId));
+            }
+        });
+        dispatcher.dispatchPopupAdoptable(3L, "u", "n", true, -1, -1, "p");
+        dispatcher.claimAdopt(3L);      // claimed -> removed from pending
+        dispatcher.disposeAll();
+        assertFalse("a claimed adoption must not be reclaimed",
+            discarded.contains(Long.valueOf(3L)));
+    }
+
+    @Test
+    public void testDisposedDispatcherAdoptableIsNoOp() {
+        dispatcher.setHandler(new WebViewPopupHandler() {
+            @Override public void popupAdoptable(WebViewPopupEvent e,
+                                                 long popupId) {
+                throw new AssertionError("handler invoked after dispose");
+            }
+        });
+        dispatcher.disposeAll();
+        dispatcher.dispatchPopupAdoptable(1L, "u", "n", true, -1, -1, "p");
+        assertEquals(0, dispatcher.pendingAdoptCount());
+    }
+
+    // -----------------------------------------------------------------
     // Constructor null-checks.
     // -----------------------------------------------------------------
 

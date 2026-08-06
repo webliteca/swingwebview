@@ -159,6 +159,18 @@ struct Engine {
     // environment so the popup is a linked view (window.opener / postMessage
     // work) -- a controller from a different environment is not linked.
     ICoreWebView2Environment *environment = nullptr;
+
+    // Canvas 20 (popup adoption).  An ADOPTED popup engine reuses the OPENER
+    // engine's WebView2 worker thread, because its ICoreWebView2Controller was
+    // created on that thread and WebView2 objects are apartment-bound to their
+    // creating thread (they cannot be moved to a fresh thread).  For such an
+    // engine `thread_id` is the opener's worker thread and this flag is TRUE,
+    // so destroy_engine must NOT post WM_EMBED_QUIT (that would tear down the
+    // opener's message loop and the opener engine with it).  Instead it
+    // synchronously Close()es the controller/webview on that shared thread.
+    // ON-DEVICE-VALIDATION-REQUIRED: shared-worker-thread lifecycle (opener
+    // outliving / being disposed before the adopted child).
+    bool shared_thread = false;
 };
 
 static void fire_focus_callback(Engine *e, bool became) {
@@ -782,6 +794,271 @@ static void fire_popup_closed_win(Engine *e, jlong popup_id, const char *url,
     if (detach) jvm->DetachCurrentThread();
 }
 
+// ---------------------------------------------------------------------------
+// Popup ADOPTION support — Canvas 20 (Windows / WebView2).
+//
+// Mirrors the shipped macOS (Canvas 18) + Linux (Canvas 19) adoption backends
+// against the SAME platform-agnostic Java contract (no Java changes).  On an
+// ADOPT disposition the NewWindowRequested handler builds the linked child
+// controller from the opener's SAME environment against a HIDDEN holder HWND
+// (never shown), returns the child to WebView2 (so it drives the original
+// request -- POST verb+body, window.opener), retains it in
+// g_win_retained_popups keyed by a jlong popupId, and fires onPopupAdoptable.
+// Later webview_embed_adopt_popup reparents the retained controller into the
+// adopting component's realized AWT HWND via put_ParentWindow; an unclaimed
+// child is reclaimed by webview_embed_discard_popup.
+//
+// VALIDATED ON-DEVICE: the core adopt path (retain a POST/opener-linked child,
+// reparent it into a WebViewComponent tab via put_ParentWindow, POST body +
+// window.opener preserved) has been confirmed working on a real WebView2 stack.
+// The remaining ON-DEVICE-VALIDATION markers below flag the teardown / reclaim
+// / race edges that the happy-path confirmation does not fully exercise: the
+// COM ref-counting on the controller/webview/environment handoffs, the
+// apartment-thread (worker-thread) affinity of every ICoreWebView2* call, and
+// the JNI global-ref lifecycle across retain -> adopt/discard remain prime
+// candidates for on-device scrutiny.
+// ---------------------------------------------------------------------------
+
+// Synchronous disposition hop into Java (runs on the JNI worker thread the
+// NewWindowRequested handler spins up), returning the PopupDisposition ordinal
+// (0=BLOCK, 1=NATIVE_WINDOW, 2=ADOPT).  Returns 0 (BLOCK) on null callback,
+// attach failure, or any exception -- the safe block-on-error default.
+// Mirrors fire_popup_requested_win but calls onPopupDisposition (returns int).
+static jint fire_popup_disposition_win(Engine *e, const char *url, bool gesture,
+                                       int w, int h, const char *page) {
+    if (!e || !e->popup_callback || !e->jvm) return 0;  // BLOCK
+    JavaVM *jvm = e->jvm;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return 0;
+        detach = true;
+    }
+    jint disposition = 0;
+    jstring ju = env->NewStringUTF(url ? url : "");
+    jstring jn = env->NewStringUTF("");
+    jstring jp = env->NewStringUTF(page ? page : "");
+    jclass cls = env->GetObjectClass(e->popup_callback);
+    if (cls) {
+        jmethodID mid = env->GetMethodID(cls, "onPopupDisposition",
+            "(Ljava/lang/String;Ljava/lang/String;ZIILjava/lang/String;)I");
+        if (mid) {
+            jint r = env->CallIntMethod(e->popup_callback, mid, ju, jn,
+                gesture ? JNI_TRUE : JNI_FALSE, (jint)w, (jint)h, jp);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+                r = 0;
+            }
+            disposition = r;
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (ju) env->DeleteLocalRef(ju);
+    if (jn) env->DeleteLocalRef(jn);
+    if (jp) env->DeleteLocalRef(jp);
+    if (detach) jvm->DetachCurrentThread();
+    return disposition;
+}
+
+// Fire onPopupAdoptable (fire-and-forget; the Java dispatcher marshals to the
+// EDT via invokeLater).  Runs on the WebView2 worker thread.  Same signature
+// shape as fire_popup_opened_win, different method name.
+static void fire_popup_adoptable_win(Engine *e, jlong popup_id, const char *url,
+                                     bool gesture, int w, int h,
+                                     const char *page) {
+    if (!e || !e->popup_callback || !e->jvm) return;
+    JavaVM *jvm = e->jvm;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return;
+        detach = true;
+    }
+    jstring ju = env->NewStringUTF(url ? url : "");
+    jstring jn = env->NewStringUTF("");
+    jstring jp = env->NewStringUTF(page ? page : "");
+    jclass cls = env->GetObjectClass(e->popup_callback);
+    if (cls) {
+        jmethodID mid = env->GetMethodID(cls, "onPopupAdoptable",
+            "(JLjava/lang/String;Ljava/lang/String;ZIILjava/lang/String;)V");
+        if (mid) {
+            env->CallVoidMethod(e->popup_callback, mid, popup_id, ju, jn,
+                gesture ? JNI_TRUE : JNI_FALSE, (jint)w, (jint)h, jp);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (ju) env->DeleteLocalRef(ju);
+    if (jn) env->DeleteLocalRef(jn);
+    if (jp) env->DeleteLocalRef(jp);
+    if (detach) jvm->DetachCurrentThread();
+}
+
+// A retained-but-unadopted popup child: a linked child WebView2 hosted in a
+// HIDDEN holder HWND (never shown), held until webview_embed_adopt_popup
+// reparents it or webview_embed_discard_popup reclaims it.  The controller /
+// webview / environment are AddRef'd COM references owned by this struct; the
+// popup/dialog callbacks are inherited JNI global refs owned by this struct.
+struct RetainedPopup {
+    ICoreWebView2Controller *controller = nullptr;  // AddRef'd
+    ICoreWebView2 *webview = nullptr;               // AddRef'd
+    ICoreWebView2Environment *environment = nullptr;// AddRef'd (opener's)
+    HWND holder = nullptr;                           // hidden top-level HWND
+    JavaVM *jvm = nullptr;
+    jlong popup_id = 0;
+    std::string url;
+    std::string page;
+    // Worker thread the controller was created on (== opener engine's
+    // thread_id).  Every ICoreWebView2* call on controller/webview MUST run on
+    // this apartment thread.
+    DWORD worker_thread_id = 0;
+    // Inherited callback global refs (new global refs on the opener's, so the
+    // retained child keeps working for nested popups/dialogs until adoption
+    // transfers ownership to the adopted engine).
+    jobject popup_callback = nullptr;
+    jobject dialog_callback = nullptr;
+    // Retained-phase event handler tokens, removed before the adopted engine
+    // registers its own handlers (analogous to Linux's
+    // g_signal_handlers_disconnect_by_data).
+    EventRegistrationToken new_window_token{};
+    EventRegistrationToken script_dialog_token{};
+    EventRegistrationToken close_token{};
+};
+
+// ON-DEVICE-VALIDATION-REQUIRED: the retained-popup registry is the Windows
+// counterpart of the macOS g_retained_popups / Linux g_gtk_retained_popups.
+static std::mutex g_win_retained_popups_mutex;
+static std::map<jlong, RetainedPopup *> g_win_retained_popups;
+
+// Post a fire-and-forget op onto a specific WebView2 worker thread (the
+// apartment that owns a retained child's COM objects).  Falls back to running
+// inline if the thread id is unknown (best effort; wrong apartment).
+static void post_to_worker_thread(DWORD tid, DispatchFn fn) {
+    if (!tid) { fn(); return; }
+    auto *holder = new DispatchFn(std::move(fn));
+    PostThreadMessage(tid, WM_EMBED_DISPATCH, 0, (LPARAM)holder);
+}
+
+// Hidden holder window class for retained popup children.  A plain
+// DefWindowProc window that is NEVER shown; it exists only to give the child
+// controller a valid parent HWND until adoption reparents it.
+static ATOM ensure_popup_holder_class_registered() {
+    static ATOM atom = 0;
+    if (atom != 0) return atom;
+    WNDCLASSEX wc{};
+    wc.cbSize = sizeof(wc);
+    wc.hInstance = GetModuleHandle(nullptr);
+    wc.lpszClassName = "WebViewEmbedPopupHolder";
+    wc.lpfnWndProc = DefWindowProc;
+    wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
+    atom = RegisterClassEx(&wc);
+    return atom;
+}
+
+// Fire onPopupClosed for a retained (never-shown) child, using the inherited
+// jvm + popup_callback stored on the RetainedPopup.  Mirrors
+// fire_popup_closed_win but sources jvm/callback from the shell rather than an
+// Engine (the retained child has no opener-independent Engine yet).
+static void fire_popup_closed_retained(RetainedPopup *rp) {
+    if (!rp || !rp->popup_callback || !rp->jvm) return;
+    JavaVM *jvm = rp->jvm;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return;
+        detach = true;
+    }
+    jstring ju = env->NewStringUTF(rp->url.c_str());
+    jstring jp = env->NewStringUTF(rp->page.c_str());
+    jclass cls = env->GetObjectClass(rp->popup_callback);
+    if (cls) {
+        jmethodID mid = env->GetMethodID(cls, "onPopupClosed",
+            "(JLjava/lang/String;Ljava/lang/String;)V");
+        if (mid) {
+            env->CallVoidMethod(rp->popup_callback, mid, rp->popup_id, ju, jp);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (ju) env->DeleteLocalRef(ju);
+    if (jp) env->DeleteLocalRef(jp);
+    if (detach) jvm->DetachCurrentThread();
+}
+
+// Tear down a retained-but-unadopted child.  MUST run on rp->worker_thread_id
+// (the COM apartment owning controller/webview) -- callers dispatch it there.
+// ON-DEVICE-VALIDATION-REQUIRED: Close/Release ordering + global-ref frees.
+static void free_inherited_refs(JavaVM *jvm, jobject popup_cb,
+                                jobject dialog_cb) {
+    if (!jvm || (!popup_cb && !dialog_cb)) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return;
+        detach = true;
+    }
+    if (env) {
+        if (popup_cb) env->DeleteGlobalRef(popup_cb);
+        if (dialog_cb) env->DeleteGlobalRef(dialog_cb);
+    }
+    if (detach) jvm->DetachCurrentThread();
+}
+
+static void retained_popup_teardown(RetainedPopup *rp, bool fire_closed) {
+    if (!rp) return;
+    if (fire_closed) fire_popup_closed_retained(rp);
+    if (rp->webview) { rp->webview->Release(); rp->webview = nullptr; }
+    if (rp->controller) {
+        rp->controller->Close();
+        rp->controller->Release();
+        rp->controller = nullptr;
+    }
+    if (rp->holder) { DestroyWindow(rp->holder); rp->holder = nullptr; }
+    if (rp->environment) { rp->environment->Release(); rp->environment = nullptr; }
+    free_inherited_refs(rp->jvm, rp->popup_callback, rp->dialog_callback);
+    rp->popup_callback = nullptr;
+    rp->dialog_callback = nullptr;
+    delete rp;
+}
+
+// window.close() raised by a retained child BEFORE it is adopted -> discard it.
+// Runs on the child's WebView2 worker thread (the opener's), so the COM
+// teardown is on the correct apartment.  Claims under the mutex so an adoption
+// racing the close wins-or-loses exactly once (whoever removes from the
+// registry owns the teardown).
+class RetainedPopupCloseHandler : public CallbackBase<
+    ICoreWebView2WindowCloseRequestedEventHandler> {
+public:
+    explicit RetainedPopupCloseHandler(RetainedPopup *rp) : m_rp(rp) {}
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2 *, IUnknown *) override {
+        if (!m_rp) return S_OK;
+        RetainedPopup *rp = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_win_retained_popups_mutex);
+            auto it = g_win_retained_popups.find(m_rp->popup_id);
+            if (it != g_win_retained_popups.end() && it->second == m_rp) {
+                rp = it->second;
+                g_win_retained_popups.erase(it);
+            }
+        }
+        if (rp) retained_popup_teardown(rp, /*fire_closed=*/true);
+        return S_OK;
+    }
+private:
+    RetainedPopup *m_rp;
+};
+
 // window.close() from the popup (or the user closing the native window).
 // Notify onPopupClosed, then DestroyWindow -> PopupWndProc WM_DESTROY frees
 // the controller/webview and deletes the PopupWindow.
@@ -857,17 +1134,186 @@ public:
         Engine *e = m_engine;
         bool gesture = (user_initiated != FALSE);
         std::thread([e, args, deferral, uri, page, gesture, req_w, req_h] {
-            bool allow = fire_popup_requested_win(e, uri.c_str(), gesture,
-                                                  req_w, req_h, page.c_str());
+            // Canvas 20: the disposition switch replaces the Canvas-17 boolean
+            // gate.  0=BLOCK, 1=NATIVE_WINDOW (the unchanged Canvas-17
+            // engine-owned shown-window path), 2=ADOPT (retain a windowless
+            // child for later adoption into a caller-provided component).
+            jint disposition = fire_popup_disposition_win(
+                e, uri.c_str(), gesture, req_w, req_h, page.c_str());
             dispatch_to_thread(e, [e, args, deferral, uri, page, gesture,
-                                   req_w, req_h, allow] {
-                if (!allow) {
+                                   req_w, req_h, disposition] {
+                if (disposition == 0) {   // BLOCK
                     args->put_Handled(TRUE);   // block; window.open -> null
                     deferral->Complete();
                     deferral->Release();
                     args->Release();
                     return;
                 }
+                if (disposition == 2) {   // ADOPT — retain windowless child
+                    // Need the opener's environment to build a LINKED child
+                    // (window.opener / postMessage / POST replay).  Without it
+                    // we cannot honour ADOPT -> block.
+                    if (!e->environment) {
+                        args->put_Handled(TRUE);
+                        deferral->Complete();
+                        deferral->Release();
+                        args->Release();
+                        return;
+                    }
+                    ensure_popup_holder_class_registered();
+                    // Hidden holder top-level window -- NEVER ShowWindow.  The
+                    // child renders offscreen here until adoption reparents it
+                    // via put_ParentWindow.  (WebView2 requires a real parent
+                    // HWND for the controller.)
+                    HWND holder = CreateWindowEx(
+                        0, "WebViewEmbedPopupHolder", "", WS_OVERLAPPEDWINDOW,
+                        CW_USEDEFAULT, CW_USEDEFAULT,
+                        req_w > 0 ? req_w : 500, req_h > 0 ? req_h : 650,
+                        nullptr, nullptr, GetModuleHandle(nullptr), nullptr);
+                    if (!holder) {
+                        args->put_Handled(TRUE);
+                        deferral->Complete();
+                        deferral->Release();
+                        args->Release();
+                        return;
+                    }
+                    // Inherit the opener's popup/dialog callbacks as NEW global
+                    // refs so the retained child keeps working (nested popups +
+                    // dialogs) until adoption transfers them to the adopted
+                    // engine.  ON-DEVICE-VALIDATION-REQUIRED: global-ref
+                    // lifecycle across retain -> adopt/discard.
+                    JavaVM *jvm = e->jvm;
+                    jobject inh_popup = nullptr;
+                    jobject inh_dialog = nullptr;
+                    if (jvm) {
+                        JNIEnv *jenv = nullptr;
+                        bool jdetach = false;
+                        if (jvm->GetEnv((void **)&jenv, JNI_VERSION_1_6)
+                                != JNI_OK) {
+                            jvm->AttachCurrentThread((void **)&jenv, nullptr);
+                            jdetach = true;
+                        }
+                        if (jenv) {
+                            if (e->popup_callback)
+                                inh_popup = jenv->NewGlobalRef(e->popup_callback);
+                            if (e->dialog_callback)
+                                inh_dialog =
+                                    jenv->NewGlobalRef(e->dialog_callback);
+                        }
+                        if (jdetach) jvm->DetachCurrentThread();
+                    }
+
+                    RetainedPopup *rp = new RetainedPopup();
+                    rp->holder = holder;
+                    rp->jvm = jvm;
+                    rp->url = uri;
+                    rp->page = page;
+                    rp->popup_callback = inh_popup;
+                    rp->dialog_callback = inh_dialog;
+                    rp->worker_thread_id = e->thread_id;
+                    rp->environment = e->environment;
+                    rp->environment->AddRef();
+                    rp->popup_id = (jlong)(LONG_PTR)rp;
+
+                    auto *ctrl_handler = new ControllerHandler(
+                        [e, args, deferral, rp, uri, page, gesture,
+                         req_w, req_h]
+                        (HRESULT r2, ICoreWebView2Controller *ctrl) {
+                            if (FAILED(r2) || !ctrl) {
+                                WV_LOG("adopt CreateController completion "
+                                       "failed: 0x%08lx", (unsigned long)r2);
+                                args->put_Handled(TRUE);
+                                deferral->Complete();
+                                deferral->Release();
+                                args->Release();
+                                // rp never entered the registry; tear the
+                                // half-built shell down on THIS (worker) thread.
+                                retained_popup_teardown(rp,
+                                                        /*fire_closed=*/false);
+                                return;
+                            }
+                            ctrl->AddRef();
+                            rp->controller = ctrl;
+                            ICoreWebView2 *child = nullptr;
+                            ctrl->get_CoreWebView2(&child);
+                            if (child) { child->AddRef(); rp->webview = child; }
+
+                            // Return the LINKED child to WebView2 so it drives
+                            // the original request (POST verb+body,
+                            // window.opener) into it.
+                            args->put_NewWindow(child);
+                            args->put_Handled(TRUE);
+                            deferral->Complete();
+
+                            // Keep it HIDDEN: no ShowWindow, controller not
+                            // visible.  It renders offscreen until adoption.
+                            RECT rc;
+                            GetClientRect(rp->holder, &rc);
+                            ctrl->put_Bounds(rc);
+                            ctrl->put_IsVisible(FALSE);
+
+                            if (child) {
+                                // Retained-phase handlers reuse the opener
+                                // engine's callbacks (opener outlives the
+                                // retained child until adoption).  Tokens are
+                                // stored so adoption can remove them before the
+                                // adopted engine wires its own handlers.
+                                auto *nwh = new NewWindowRequestedHandler(e);
+                                child->add_NewWindowRequested(
+                                    nwh, &rp->new_window_token);
+                                nwh->Release();
+
+                                ICoreWebView2Settings *settings = nullptr;
+                                if (SUCCEEDED(child->get_Settings(&settings)) &&
+                                    settings) {
+                                    settings
+                                        ->put_AreDefaultScriptDialogsEnabled(
+                                            FALSE);
+                                    settings->Release();
+                                }
+                                auto *sdh = new ScriptDialogHandler(e);
+                                child->add_ScriptDialogOpening(
+                                    sdh, &rp->script_dialog_token);
+                                sdh->Release();
+
+                                // window.close() before adoption -> discard.
+                                auto *rch = new RetainedPopupCloseHandler(rp);
+                                child->add_WindowCloseRequested(
+                                    rch, &rp->close_token);
+                                rch->Release();
+                            }
+
+                            {
+                                std::lock_guard<std::mutex> lk(
+                                    g_win_retained_popups_mutex);
+                                g_win_retained_popups[rp->popup_id] = rp;
+                            }
+
+                            // Notify Java: child retained + adoptable.  The Java
+                            // dispatcher marshals popupAdoptable to the EDT.
+                            fire_popup_adoptable_win(e, rp->popup_id,
+                                                     uri.c_str(), gesture,
+                                                     req_w, req_h, page.c_str());
+
+                            deferral->Release();
+                            args->Release();
+                        });
+                    HRESULT rc2 = e->environment->CreateCoreWebView2Controller(
+                        rp->holder, ctrl_handler);
+                    ctrl_handler->Release();
+                    if (FAILED(rc2)) {
+                        WV_LOG("adopt CreateCoreWebView2Controller call "
+                               "failed: 0x%08lx", (unsigned long)rc2);
+                        args->put_Handled(TRUE);
+                        deferral->Complete();
+                        deferral->Release();
+                        args->Release();
+                        retained_popup_teardown(rp, /*fire_closed=*/false);
+                    }
+                    return;
+                }
+                // disposition == 1: NATIVE_WINDOW -- the unchanged Canvas-17
+                // engine-owned shown-window path below.
                 int W = req_w > 0 ? req_w : 500;
                 int H = req_h > 0 ? req_h : 650;
                 ensure_popup_class_registered();
@@ -1301,7 +1747,33 @@ static Engine *create_engine(JNIEnv *env, jobject component, int debug) {
 
 static void destroy_engine(Engine *e) {
     if (!e) return;
-    if (e->thread_id) {
+    if (e->shared_thread) {
+        // Canvas 20: an ADOPTED engine shares the opener's WebView2 worker
+        // thread.  Posting WM_EMBED_QUIT here would exit the opener's message
+        // loop and tear the opener down too.  Instead synchronously Close() the
+        // controller/webview and destroy our child HWND on that shared thread,
+        // then fall through to free the global refs + delete e.  The opener's
+        // loop keeps running.  ON-DEVICE-VALIDATION-REQUIRED: apartment-correct
+        // Close/Release on the shared worker thread.
+        std::atomic<bool> done{false};
+        dispatch_to_thread(e, [e, &done] {
+            if (e->controller) {
+                e->controller->Close();
+                e->controller->Release();
+                e->controller = nullptr;
+            }
+            if (e->webview) {
+                e->webview->Release();
+                e->webview = nullptr;
+            }
+            if (e->child) {
+                DestroyWindow(e->child);
+                e->child = nullptr;
+            }
+            done.store(true);
+        });
+        while (!done.load()) Sleep(1);
+    } else if (e->thread_id) {
         PostThreadMessage(e->thread_id, WM_EMBED_QUIT, 0, 0);
     }
     // Release the focus callback global ref BEFORE the WebView2 worker
@@ -1416,6 +1888,120 @@ static std::string wide_to_utf8(LPCWSTR w) {
     WideCharToMultiByte(CP_UTF8, 0, w, -1, &s[0], n, nullptr, nullptr);
     if (!s.empty() && s.back() == '\0') s.pop_back();
     return s;
+}
+
+// Build a normal embedded Engine from a claimed RetainedPopup, reusing its
+// child controller/webview (apartment-bound to the opener's worker thread).
+// The retained COM references + inherited global refs are TRANSFERRED into the
+// returned Engine (rp is a plain shell freed by the dispatched op -- its raw
+// pointers are copied, not re-released, so no double-free).  Returns the Engine
+// (never null here; the caller already validated the claim).  The reparent +
+// handler registration happen asynchronously on the shared worker thread; the
+// Engine is returned immediately with a valid controller/webview so Java gets a
+// usable peer handle.  ON-DEVICE-VALIDATION-REQUIRED: put_ParentWindow reparent
+// of a live (mid-navigation) controller, and the retained->adopted handler
+// handoff.
+static Engine *adopt_retained_popup(JNIEnv *env, HWND parent, RetainedPopup *rp,
+                                    int debug) {
+    Engine *e = new Engine();
+    e->parent = parent;
+    e->debug = debug != 0;
+    e->jvm = rp->jvm;
+    e->shared_thread = true;                 // reuse opener's worker thread
+    e->thread_id = rp->worker_thread_id;
+    e->thread = nullptr;
+    e->controller = rp->controller;          // transferred (already AddRef'd)
+    e->webview = rp->webview;                // transferred (already AddRef'd)
+    e->environment = rp->environment;        // transferred (already AddRef'd)
+    e->popup_callback = rp->popup_callback;  // inherited global refs transferred
+    e->dialog_callback = rp->dialog_callback;
+
+    // Everything below touches WebView2 objects, so it MUST run on the
+    // controller's apartment thread (the opener's worker thread).
+    post_to_worker_thread(rp->worker_thread_id, [e, parent, rp] {
+        ICoreWebView2 *child = e->webview;
+        // Remove the retained-phase handlers (bound to the opener engine)
+        // before wiring the adopted engine's own handlers, so exactly one
+        // handler set survives (analogue of Linux disconnect_by_data).
+        if (child) {
+            child->remove_NewWindowRequested(rp->new_window_token);
+            child->remove_ScriptDialogOpening(rp->script_dialog_token);
+            child->remove_WindowCloseRequested(rp->close_token);
+        }
+
+        // Create the standard child HWND under the adopting AWT canvas HWND,
+        // exactly like a freshly-created engine, so WM_SIZE / WM_PARENTNOTIFY
+        // (the click hook) behave identically.
+        ensure_class_registered();
+        RECT pr;
+        GetClientRect(parent, &pr);
+        int cw = pr.right - pr.left;
+        int chh = pr.bottom - pr.top;
+        if (cw <= 0) cw = 1;
+        if (chh <= 0) chh = 1;
+        e->child = CreateWindowEx(0, "WebViewEmbedChild", "",
+                                  WS_CHILD | WS_VISIBLE, 0, 0, cw, chh,
+                                  parent, nullptr, GetModuleHandle(nullptr),
+                                  nullptr);
+        if (e->child) SetWindowLongPtr(e->child, GWLP_USERDATA, (LONG_PTR)e);
+
+        // Reparent the retained controller into the adopting surface and make
+        // it visible.
+        if (e->controller) {
+            e->controller->put_ParentWindow(e->child ? e->child : parent);
+            RECT rc;
+            GetClientRect(e->child ? e->child : parent, &rc);
+            e->controller->put_Bounds(rc);
+            e->controller->put_IsVisible(TRUE);
+
+            auto *gh = new FocusHandler(e, true);
+            e->controller->add_GotFocus(gh, &e->got_focus_token);
+            gh->Release();
+            auto *lh = new FocusHandler(e, false);
+            e->controller->add_LostFocus(lh, &e->lost_focus_token);
+            lh->Release();
+        }
+
+        if (child) {
+            ICoreWebView2Settings *settings = nullptr;
+            if (SUCCEEDED(child->get_Settings(&settings)) && settings) {
+                settings->put_AreDevToolsEnabled(e->debug ? TRUE : FALSE);
+                settings->put_AreDefaultContextMenusEnabled(TRUE);
+                settings->put_AreDefaultScriptDialogsEnabled(FALSE);
+                settings->Release();
+            }
+            child->AddScriptToExecuteOnDocumentCreated(
+                L"window.external = { invoke: s => "
+                L"window.chrome.webview.postMessage(s) };",
+                nullptr);
+
+            auto *mh = new MsgHandler(e);
+            child->add_WebMessageReceived(mh, &e->message_token);
+            mh->Release();
+
+            auto *sdh = new ScriptDialogHandler(e);
+            child->add_ScriptDialogOpening(sdh, &e->script_dialog_token);
+            sdh->Release();
+
+            auto *nwh = new NewWindowRequestedHandler(e);
+            child->add_NewWindowRequested(nwh, &e->new_window_token);
+            nwh->Release();
+        }
+
+        // The hidden holder top-level window is no longer needed once the
+        // controller has been reparented onto the adopting child HWND above.
+        // Destroy it on this (its creating) worker thread to avoid leaking a
+        // top-level HWND per adopted popup.  retained_popup_teardown does the
+        // same on the discard/close paths.
+        if (rp->holder) { DestroyWindow(rp->holder); rp->holder = nullptr; }
+
+        // Free the retained shell.  Its COM references + global refs were
+        // TRANSFERRED to e (copied, not re-AddRef'd), so DO NOT release them
+        // here; just free the struct.
+        delete rp;
+    });
+
+    return e;
 }
 
 } // namespace embed_win
@@ -1773,6 +2359,106 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
   (JNIEnv *, jclass, jlong, jobject) {
     // Windows has no offscreen engine; stub for link-symmetry across all
     // three native binaries.
+}
+
+JNIEXPORT jlong JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1adopt_1popup
+  (JNIEnv *, jclass, jint, jint, jlong, jint) {
+    // Windows has no offscreen engine (webview_offscreen_create returns 0), so
+    // adoption into a lightweight component is never triggered here; return 0.
+    // Popup adoption on Windows uses the heavyweight webview_embed_adopt_popup
+    // path (Canvas 20).  Stub for link-symmetry (Canvas 19 offscreen bridge).
+    return 0;
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1discard_1popup
+  (JNIEnv *, jclass, jlong, jlong) {
+    // Windows has no offscreen engine; stub for link-symmetry.
+}
+
+// Custom User-Agent — Canvas 21.  ua == null / empty restores the engine
+// default.  Applied on the WebView2 UI thread via ICoreWebView2Settings2;
+// no-op on an old runtime lacking the _2 settings interface.  Takes effect on
+// the next navigation.
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1user_1agent
+  (JNIEnv *env, jclass, jlong wv, jstring ua) {
+    auto *e = (Engine *)wv;
+    if (!e) return;
+    std::wstring w;
+    if (ua) {
+        const char *s = env->GetStringUTFChars(ua, nullptr);
+        w = embed_win::utf8_to_wide(s);
+        env->ReleaseStringUTFChars(ua, s);
+    }
+    embed_win::dispatch_to_thread(e, [e, w] {
+        if (!e->webview) return;
+        ICoreWebView2Settings *settings = nullptr;
+        if (SUCCEEDED(e->webview->get_Settings(&settings)) && settings) {
+            ICoreWebView2Settings2 *settings2 = nullptr;
+            if (SUCCEEDED(settings->QueryInterface(
+                    __uuidof(ICoreWebView2Settings2),
+                    reinterpret_cast<void **>(&settings2))) && settings2) {
+                settings2->put_UserAgent(w.c_str()); // empty -> default
+                settings2->Release();
+            }
+            settings->Release();
+        }
+    });
+}
+
+// Adopt a retained popup child (Canvas 20) into `parent`'s realized AWT HWND.
+// Resolves the parent HWND via the SAME JAWT path as webview_embed_create,
+// claims the RetainedPopup (adopt-once under the mutex; 0 -> Java throws
+// IllegalStateException), and reuses its controller/webview.
+JNIEXPORT jlong JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1adopt_1popup
+  (JNIEnv *env, jclass, jobject component, jlong popupId, jint debug) {
+    // Resolve the parent AWT HWND (same mechanism as create_engine).
+    HWND parent = nullptr;
+    {
+        JawtLock lock(env, component);
+        if (!lock.ok || !lock.dsi->platformInfo) {
+            WV_LOG("adopt_popup: JAWT lock failed");
+            return 0;
+        }
+        auto *info = (JAWT_Win32DrawingSurfaceInfo *)lock.dsi->platformInfo;
+        parent = info->hwnd;
+    }
+    if (!parent) {
+        WV_LOG("adopt_popup: JAWT platform info had no HWND");
+        return 0;
+    }
+    // Claim the retained popup (adopt-once).  0 for unknown/consumed id ->
+    // EmbeddedWebView.adopt turns it into IllegalStateException.
+    embed_win::RetainedPopup *rp = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(embed_win::g_win_retained_popups_mutex);
+        auto it = embed_win::g_win_retained_popups.find(popupId);
+        if (it == embed_win::g_win_retained_popups.end()) return 0;
+        rp = it->second;
+        embed_win::g_win_retained_popups.erase(it);
+    }
+    Engine *e = embed_win::adopt_retained_popup(env, parent, rp, debug);
+    return (jlong)e;
+}
+
+// Discard a retained-but-unadopted popup child (Canvas 20 reclaim path).  `wv`
+// (any live embed peer) is unused on Windows -- the retained child is located
+// by popupId alone.  Unknown id is a silent no-op.  The COM teardown is
+// dispatched onto the child's owning worker thread.
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1discard_1popup
+  (JNIEnv *, jclass, jlong /*wv*/, jlong popupId) {
+    embed_win::RetainedPopup *rp = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(embed_win::g_win_retained_popups_mutex);
+        auto it = embed_win::g_win_retained_popups.find(popupId);
+        if (it == embed_win::g_win_retained_popups.end()) return;
+        rp = it->second;
+        embed_win::g_win_retained_popups.erase(it);
+    }
+    // Tear down on the apartment thread that owns the controller/webview.
+    DWORD tid = rp->worker_thread_id;
+    embed_win::post_to_worker_thread(tid, [rp] {
+        embed_win::retained_popup_teardown(rp, /*fire_closed=*/true);
+    });
 }
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1release_1native_1focus

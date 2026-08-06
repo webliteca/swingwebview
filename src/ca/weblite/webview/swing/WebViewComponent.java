@@ -85,6 +85,12 @@ public abstract class WebViewComponent extends JComponent {
      *  methods. */
     protected final PopupDispatcher popupDispatcher = new PopupDispatcher(this);
 
+    /** When non-zero, this component was created via {@link #adoptPopup} and
+     *  its peer, at attach time, adopts the pre-existing native popup child
+     *  with this engine-assigned id rather than creating a fresh engine.
+     *  Zero (the default) means normal, engine-creating construction. */
+    protected long pendingAdoptPopupId = 0L;
+
     /** Implementation mode for {@link #create(Mode)}. */
     public enum Mode {
         /** Native WebView embedded as a heavyweight AWT peer.  Highest
@@ -128,6 +134,38 @@ public abstract class WebViewComponent extends JComponent {
     }
 
     /**
+     * Create a component that <strong>adopts</strong> a browser-initiated
+     * popup — the opener-linked child web view the engine retained after a
+     * {@link ca.weblite.webview.PopupDisposition#ADOPT} decision — instead of
+     * creating its own engine.  Adoption happens when the returned component's
+     * peer is realized (it is added to a showing container); the child's
+     * in-flight navigation (POST verb and body) and {@code window.opener}
+     * linkage are preserved because the engine's own child is reused.
+     *
+     * <p>Call this on the EDT from {@link
+     * ca.weblite.webview.WebViewPopupHandler#popupAdoptable}, passing the
+     * {@code popupId} it delivered, then add the component to a container
+     * (e.g. a new tab).  Uses the platform-default {@link Mode}.
+     *
+     * <p>Adopting an unknown / already-adopted / expired {@code popupId}
+     * fails when the peer is realized (the native adopt returns no engine),
+     * surfaced as an {@link IllegalStateException} from the attach path.
+     *
+     * @param popupId the engine-assigned handle from {@code popupAdoptable}
+     * @return a component that will adopt the popup on realization
+     */
+    public static WebViewComponent adoptPopup(long popupId) {
+        return adoptPopup(resolveDefaultMode(), popupId);
+    }
+
+    /** {@link #adoptPopup(long)} with an explicit implementation {@link Mode}. */
+    public static WebViewComponent adoptPopup(Mode mode, long popupId) {
+        WebViewComponent c = create(mode);
+        c.pendingAdoptPopupId = popupId;
+        return c;
+    }
+
+    /**
      * @return the mode that {@link #create()} will use right now.  Honors
      *         the {@code ca.weblite.webview.mode} system property if set.
      */
@@ -168,6 +206,43 @@ public abstract class WebViewComponent extends JComponent {
 
     /** @return the current (or pending) URL. */
     public abstract String getUrl();
+
+    /** Custom User-Agent override, or {@code null} for the engine default.
+     *  Survives the native peer's create/destroy cycle so it is applied to
+     *  the first request when the peer attaches. */
+    protected String pendingUserAgent = null;
+
+    /**
+     * Override the embedded WebView's User-Agent.  Unlike a JavaScript
+     * {@code navigator.userAgent} shim, this changes the actual HTTP
+     * {@code User-Agent} request header the server sees.
+     *
+     * <p>Passing {@code null} or the empty string restores the engine
+     * default.  May be called before display (stored and applied to the
+     * first request when the peer attaches) or after (applied live; it
+     * takes effect on the <em>next</em> navigation — engines do not rewrite
+     * the in-flight request for the current page).
+     *
+     * @param ua the User-Agent string, or {@code null} / {@code ""} to reset
+     * @return {@code this} for chaining
+     */
+    public WebViewComponent setUserAgent(String ua) {
+        pendingUserAgent = (ua == null || ua.isEmpty()) ? null : ua;
+        applyUserAgentToPeer(pendingUserAgent);
+        return this;
+    }
+
+    /** @return the custom User-Agent override, or {@code null} when the
+     *  engine default is in force. */
+    public String getUserAgent() {
+        return pendingUserAgent;
+    }
+
+    /** Apply the (possibly {@code null}) User-Agent to the live native peer.
+     *  No-op on the base class and when no peer is attached; subclasses
+     *  forward to their engine wrapper's {@code setUserAgent}. */
+    protected void applyUserAgentToPeer(String ua) {
+    }
 
     /** Toggle developer tools (where supported).  Must be called before display. */
     public abstract WebViewComponent setDebug(boolean debug);

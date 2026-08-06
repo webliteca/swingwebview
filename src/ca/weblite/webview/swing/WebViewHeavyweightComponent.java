@@ -9,6 +9,7 @@ import ca.weblite.webview.AsyncJavascriptFunction;
 import ca.weblite.webview.ConsoleDispatcher;
 import ca.weblite.webview.EditingCommand;
 import ca.weblite.webview.EmbeddedWebView;
+import ca.weblite.webview.PopupDispatcher;
 import ca.weblite.webview.JavascriptFunction;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewClickCallback;
@@ -452,12 +453,27 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         return true;
     }
 
+    @Override
+    protected void applyUserAgentToPeer(String ua) {
+        EmbeddedWebView e = embedded;
+        if (e != null) {
+            e.setUserAgent(ua);
+        }
+    }
+
     private void createPeer() {
         if (embedded != null || !canvas.isDisplayable()) {
             return;
         }
         try {
-            embedded = EmbeddedWebView.attach(canvas, debug);
+            if (pendingAdoptPopupId != 0L) {
+                // Adopt a retained popup child (PopupDisposition.ADOPT) into
+                // this component's surface instead of creating a fresh engine.
+                embedded = EmbeddedWebView.adopt(
+                    canvas, pendingAdoptPopupId, debug);
+            } else {
+                embedded = EmbeddedWebView.attach(canvas, debug);
+            }
         } catch (RuntimeException ex) {
             embedded = null;
             throw ex;
@@ -515,7 +531,18 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         for (Map.Entry<String, AsyncJavascriptFunction> e : pendingAsyncFunctions.entrySet()) {
             embedded.addJavascriptFunction(e.getKey(), e.getValue());
         }
-        embedded.navigate(pendingUrl);
+        // Apply any custom User-Agent BEFORE the first navigate so the
+        // initial request carries it.
+        if (pendingUserAgent != null) {
+            embedded.setUserAgent(pendingUserAgent);
+        }
+        // An adopted popup already carries the engine's own in-flight
+        // navigation (the original request WebKit drove into the child, POST
+        // body intact); navigating pendingUrl here would clobber it.  Only
+        // navigate for the normal engine-creating path.
+        if (pendingAdoptPopupId == 0L) {
+            embedded.navigate(pendingUrl);
+        }
         sizeNative();
         // On macOS the WKWebView attaches asynchronously: the sizeNative()
         // above runs before the native view exists and is a no-op, and a
@@ -612,6 +639,21 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
                     targetUrl, targetName, userGesture, width, height, pageUrl);
             }
             @Override
+            public int onPopupDisposition(String targetUrl, String targetName,
+                                          boolean userGesture, int width,
+                                          int height, String pageUrl) {
+                return popupDispatcher.dispatchPopupDisposition(
+                    targetUrl, targetName, userGesture, width, height, pageUrl);
+            }
+            @Override
+            public void onPopupAdoptable(long popupId, String targetUrl,
+                                         String targetName, boolean userGesture,
+                                         int width, int height, String pageUrl) {
+                popupDispatcher.dispatchPopupAdoptable(
+                    popupId, targetUrl, targetName, userGesture, width, height,
+                    pageUrl);
+            }
+            @Override
             public void onPopupOpened(long popupId, String targetUrl,
                                       String targetName, boolean userGesture,
                                       int width, int height, String pageUrl) {
@@ -623,6 +665,20 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
             public void onPopupClosed(long popupId, String targetUrl,
                                       String pageUrl) {
                 popupDispatcher.dispatchPopupClosed(popupId, targetUrl, pageUrl);
+            }
+        });
+        // Let the dispatcher discard retained-but-unadopted popup children
+        // (PopupDisposition.ADOPT reclaim) through this engine.
+        popupDispatcher.setReclaimSink(new PopupDispatcher.ReclaimSink() {
+            @Override
+            public void discard(long popupId) {
+                EmbeddedWebView e = embedded;
+                if (e == null) return;
+                try {
+                    e.discardRetainedPopup(popupId);
+                } catch (RuntimeException ignored) {
+                    // Reclaim is best-effort; teardown must not fail on it.
+                }
             }
         });
         // Seed the peer's initial visibility from the component's current

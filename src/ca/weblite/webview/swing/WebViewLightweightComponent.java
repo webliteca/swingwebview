@@ -11,6 +11,7 @@ import ca.weblite.webview.EditingCommand;
 import ca.weblite.webview.GdkInput;
 import ca.weblite.webview.JavascriptFunction;
 import ca.weblite.webview.OffscreenWebView;
+import ca.weblite.webview.PopupDispatcher;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewDialogCallback;
 import ca.weblite.webview.WebViewPopupCallback;
@@ -196,12 +197,34 @@ public class WebViewLightweightComponent extends WebViewComponent {
     }
 
     @Override
+    protected void applyUserAgentToPeer(String ua) {
+        OffscreenWebView e = engine;
+        if (e != null) {
+            e.setUserAgent(ua);
+        }
+    }
+
+    @Override
     public void addNotify() {
         super.addNotify();
         if (engine != null) return;
         int w = Math.max(1, getWidth());
         int h = Math.max(1, getHeight());
-        engine = OffscreenWebView.create(w, h, debug);
+        if (pendingAdoptPopupId != 0L) {
+            // Canvas 19 (lightweight/offscreen coverage): adopt the retained
+            // popup child into THIS offscreen component instead of creating a
+            // fresh engine.  The adopted child reuses the opener-linked
+            // WebKitGTK view inside a GtkOffscreenWindow, preserving its
+            // in-flight (POST) navigation + window.opener linkage.  The
+            // retained child lives in the shared native registry, so a popup
+            // raised by either a heavyweight or lightweight opener can be
+            // adopted here.  A 0 native peer (unknown/consumed id or
+            // unsupported platform) surfaces as IllegalStateException from
+            // OffscreenWebView.adopt.
+            engine = OffscreenWebView.adopt(w, h, pendingAdoptPopupId, debug);
+        } else {
+            engine = OffscreenWebView.create(w, h, debug);
+        }
         if (engine == null) {
             // Unsupported platform or native failure -- leave the
             // engine null so subsequent ops are no-ops.  paintComponent
@@ -292,6 +315,21 @@ public class WebViewLightweightComponent extends WebViewComponent {
                     targetUrl, targetName, userGesture, width, height, pageUrl);
             }
             @Override
+            public int onPopupDisposition(String targetUrl, String targetName,
+                                          boolean userGesture, int width,
+                                          int height, String pageUrl) {
+                return popupDispatcher.dispatchPopupDisposition(
+                    targetUrl, targetName, userGesture, width, height, pageUrl);
+            }
+            @Override
+            public void onPopupAdoptable(long popupId, String targetUrl,
+                                         String targetName, boolean userGesture,
+                                         int width, int height, String pageUrl) {
+                popupDispatcher.dispatchPopupAdoptable(
+                    popupId, targetUrl, targetName, userGesture, width, height,
+                    pageUrl);
+            }
+            @Override
             public void onPopupOpened(long popupId, String targetUrl,
                                       String targetName, boolean userGesture,
                                       int width, int height, String pageUrl) {
@@ -303,6 +341,22 @@ public class WebViewLightweightComponent extends WebViewComponent {
             public void onPopupClosed(long popupId, String targetUrl,
                                       String pageUrl) {
                 popupDispatcher.dispatchPopupClosed(popupId, targetUrl, pageUrl);
+            }
+        });
+        // Let the dispatcher discard retained-but-unadopted popup children
+        // (PopupDisposition.ADOPT reclaim) through this offscreen engine.
+        // Mirrors WebViewHeavyweightComponent's reclaim sink; the native side
+        // converges on the same shared gtk_discard_popup.
+        popupDispatcher.setReclaimSink(new PopupDispatcher.ReclaimSink() {
+            @Override
+            public void discard(long popupId) {
+                OffscreenWebView e = engine;
+                if (e == null) return;
+                try {
+                    e.discardRetainedPopup(popupId);
+                } catch (RuntimeException ignored) {
+                    // Reclaim is best-effort; teardown must not fail on it.
+                }
             }
         });
         for (String js : pendingInit) {
@@ -318,7 +372,19 @@ public class WebViewLightweightComponent extends WebViewComponent {
             engine.addJavascriptFunction(ent.getKey(), ent.getValue());
         }
         allocateBuffer(w, h);
-        engine.navigate(pendingUrl);
+        // Apply any custom User-Agent BEFORE the first navigate so the
+        // initial request carries it.
+        if (pendingUserAgent != null) {
+            engine.setUserAgent(pendingUserAgent);
+        }
+        // An adopted popup already carries the engine's own in-flight
+        // navigation (the original request WebKit drove into the child, POST
+        // body intact); navigating pendingUrl here would clobber it.  Only
+        // navigate for the normal engine-creating path — mirrors
+        // WebViewHeavyweightComponent's adopt guard.
+        if (pendingAdoptPopupId == 0L) {
+            engine.navigate(pendingUrl);
+        }
         repaintTimer = new Timer(REPAINT_INTERVAL_MS, e -> repaint());
         repaintTimer.setRepeats(true);
         repaintTimer.start();
