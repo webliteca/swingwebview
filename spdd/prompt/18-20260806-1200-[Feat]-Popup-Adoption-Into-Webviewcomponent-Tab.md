@@ -758,6 +758,8 @@ Files: `README.md`, `test/ca/weblite/webview/PopupDispatcherTest.java`
 - `src/ca/weblite/webview/EmbeddedWebView.java`
 - `src/ca/weblite/webview/WebViewNative.java`
 - `src_c/webview_embed.cpp` (macOS paths)
-- `demos/WebViewAdoptPopupDemo/…`
+- `demos/WebViewAdoptPopupDemo/…` (adopt / native-window / block modes +
+  POST form; also carries the Canvas 21 User-Agent controls)
+- `run-mac-adopt-popup-demo.sh`
 - `test/ca/weblite/webview/PopupDispatcherTest.java`
 - `README.md`

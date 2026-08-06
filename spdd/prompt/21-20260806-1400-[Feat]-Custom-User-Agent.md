@@ -46,6 +46,10 @@ generated_at: 2026-08-06T14:00:00-07:00
   - A headless `WebViewComponentUserAgentTest` verifies the Java
     store/reset/get contract without a native peer.
   - README gains a "Custom user agent" subsection.
+  - On-device: `WebViewAdoptPopupDemo` (shared with Canvas 18) grows a
+    User-Agent field + Set/Reset so the real HTTP header change is
+    verifiable via an httpbin echo; run with
+    `./run-mac-adopt-popup-demo.sh`.
 
 - Out of scope: per-request UA switching; UA-Client-Hints
   (`Sec-CH-UA`) customisation; spoofing `navigator.userAgent` from
@@ -278,4 +282,6 @@ File: `windows/webview_embed.cc`
 - `src_c/webview_embed.cpp` (macOS + Linux)
 - `windows/webview_embed.cc` (Windows)
 - `test/ca/weblite/webview/WebViewComponentUserAgentTest.java`
+- `demos/WebViewAdoptPopupDemo/…` (UA field; shared with Canvas 18)
+- `run-mac-adopt-popup-demo.sh`
 - `README.md`
