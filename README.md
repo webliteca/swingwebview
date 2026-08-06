@@ -13,7 +13,7 @@ Add the dependency to your `pom.xml`:
 <dependency>
     <groupId>ca.weblite</groupId>
     <artifactId>webview</artifactId>
-    <version>1.0.10</version>
+    <version>1.1.0</version>
 </dependency>
 ```
 
@@ -457,7 +457,7 @@ cd swingwebview
 mvn -DskipTests package
 ```
 
-This produces `target/webview-1.0-SNAPSHOT.jar`.  The build targets
+This produces `target/webview-1.1.0.jar`.  The build targets
 Java 8 bytecode (`maven.compiler.source` / `maven.compiler.target` =
 `1.8` in `pom.xml`); it works on JDK 8 and any newer LTS.  Pass
 `-Dmaven.compiler.release=8` if you want strict Java 8 API checking
