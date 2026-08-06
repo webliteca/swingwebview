@@ -482,12 +482,17 @@ File: `windows/webview_embed.cc`
   ordering (opener dispose runs `reclaimAdopts` before the opener engine is
   destroyed) is what keeps this safe.
 
-- **Native coverage status — ON-DEVICE VALIDATION REQUIRED.** The generating
-  sandbox has **no MSVC / WebView2 SDK toolchain**, so this native code is
-  pattern-faithful to the shipped Canvas 17 popup handler and the Canvas 18
-  macOS / Canvas 19 Linux adopt/discard, but is **unbuilt and unexercised
-  here**. Windows CI compiles `windows/webview_embed.cc` with `cl /std:c++17
-  /EHsc` against the WebView2 SDK headers + `jawt.lib`. Prime candidates for
+- **Native coverage status — CORE PATH VALIDATED ON-DEVICE.** The generating
+  sandbox has **no MSVC / WebView2 SDK toolchain**, so this native code was
+  authored pattern-faithful to the shipped Canvas 17 popup handler and the
+  Canvas 18 macOS / Canvas 19 Linux adopt/discard. The **core adopt path has
+  since been confirmed working on a real WebView2 stack**: a POST/opener-linked
+  popup decided `ADOPT` is retained, reparented into a `WebViewComponent` tab
+  via `put_ParentWindow`, and renders with the POST body + `window.opener`
+  preserved and no native window flash. Windows CI compiles
+  `windows/webview_embed.cc` with `cl /std:c++17 /EHsc` against the WebView2 SDK
+  headers + `jawt.lib`. The happy-path confirmation does **not** fully exercise
+  the teardown / reclaim / race edges, which remain prime candidates for
   on-device scrutiny on a real WebView2 stack:
   - the `put_ParentWindow` reparent of a **live, mid-navigation** controller
     from the hidden holder HWND into the adopting AWT canvas child HWND —

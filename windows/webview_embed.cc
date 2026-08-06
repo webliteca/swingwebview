@@ -808,12 +808,15 @@ static void fire_popup_closed_win(Engine *e, jlong popup_id, const char *url,
 // adopting component's realized AWT HWND via put_ParentWindow; an unclaimed
 // child is reclaimed by webview_embed_discard_popup.
 //
-// ON-DEVICE-VALIDATION-REQUIRED throughout: this file cannot be compiled in
-// the generating sandbox (no MSVC / WebView2 SDK).  The COM ref-counting on
-// the controller/webview/environment handoffs, the apartment-thread
-// (worker-thread) affinity of every ICoreWebView2* call, and the JNI
-// global-ref lifecycle across retain -> adopt/discard are prime candidates for
-// on-device scrutiny.
+// VALIDATED ON-DEVICE: the core adopt path (retain a POST/opener-linked child,
+// reparent it into a WebViewComponent tab via put_ParentWindow, POST body +
+// window.opener preserved) has been confirmed working on a real WebView2 stack.
+// The remaining ON-DEVICE-VALIDATION markers below flag the teardown / reclaim
+// / race edges that the happy-path confirmation does not fully exercise: the
+// COM ref-counting on the controller/webview/environment handoffs, the
+// apartment-thread (worker-thread) affinity of every ICoreWebView2* call, and
+// the JNI global-ref lifecycle across retain -> adopt/discard remain prime
+// candidates for on-device scrutiny.
 // ---------------------------------------------------------------------------
 
 // Synchronous disposition hop into Java (runs on the JNI worker thread the
