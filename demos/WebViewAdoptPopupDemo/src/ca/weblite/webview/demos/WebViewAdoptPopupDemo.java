@@ -43,6 +43,14 @@ import javax.swing.ToolTipManager;
  *       WebViewComponent#setUserAgent(String)} on the opener and reloads, so
  *       both the JS-visible UA and the HTTP header (visible in the httpbin
  *       echo) change.</li>
+ *   <li><b>Popup UA inheritance</b> (Canvas 21) — after Set UA, click
+ *       {@code window.open &rarr; popup} (or submit the POST form): the popup
+ *       opens {@code https://httpbin.org/user-agent}, which echoes the UA the
+ *       popup's <em>first</em> request carried.  With the fix the popup echoes
+ *       the opener's custom UA (not the engine default) in both Adopt and
+ *       Native-window modes; with Reset UA it echoes the engine default.  This
+ *       verifies the opener's override is applied to the popup child before its
+ *       in-flight initial navigation.</li>
  * </ul>
  *
  * <p>The POST/echo checks hit {@code https://httpbin.org/post}, so they need
