@@ -1287,12 +1287,36 @@ static void on_ready_to_show_popup(WebKitWebView *web, gpointer user_data) {
 static void on_close_popup(WebKitWebView *web, gpointer user_data) {
     PopupEngine *pe = static_cast<PopupEngine *>(user_data);
     if (!pe) return;
+    // If this child is still registered as a retained-but-unadopted ADOPT
+    // popup (window.close() raced adoption), claim it from the registry
+    // under the mutex so a later gtk_adopt_popup / gtk_discard_popup cannot
+    // find and re-tear-down the same freed shell.  Whoever removes the id
+    // owns the single teardown (mirrors the macOS g_retained_popups claim
+    // rule and the Windows RetainedPopupCloseHandler).
+    {
+        std::lock_guard<std::mutex> lk(g_gtk_retained_popups_mutex);
+        auto it = g_gtk_retained_popups.find(pe->popup_id);
+        if (it != g_gtk_retained_popups.end() && it->second == pe) {
+            g_gtk_retained_popups.erase(it);
+        }
+    }
     const char *url = webkit_web_view_get_uri(web);
     fire_gtk_popup_closed(pe->jvm, pe->popup_callback, pe->dialog_callback,
                           pe->popup_id, url ? url : "", "");
     if (pe->window) {
+        // NATIVE_WINDOW popup: destroying the window destroys its child.
         gtk_widget_destroy(pe->window);
         pe->window = nullptr;
+        pe->web = nullptr;
+    } else if (pe->web) {
+        // Windowless ADOPT child closed BEFORE adoption: no window owns it,
+        // so disconnect its handlers, destroy the widget directly, and drop
+        // the g_object_ref_sink reference taken in handle_create_web_view
+        // (parity with gtk_discard_popup) instead of leaking the child and
+        // its ref.
+        g_signal_handlers_disconnect_by_data(pe->web, pe);
+        gtk_widget_destroy(GTK_WIDGET(pe->web));
+        g_object_unref(pe->web);
         pe->web = nullptr;
     }
     JNIEnv *env = nullptr;
@@ -3136,6 +3160,18 @@ struct Engine {
     // onPopupOpened / onPopupClosed pair.  nullptr / 0 on a normal engine.
     id popup_window = nullptr;
     jlong popup_id = 0;
+
+    // True when a Java EmbeddedWebView owns this engine's lifecycle -- i.e.
+    // Java calls webview_embed_destroy -> cocoa_destroy_engine exactly once
+    // for it.  Set for every cocoa_create_engine engine and for any popup
+    // child promoted to a real embedded engine by cocoa_adopt_popup.  A
+    // browser-initiated window.close() (impl_web_view_did_close) MUST NOT
+    // free a java_owned engine -- doing so double-frees it against the
+    // Java-driven destroy (the objc_msgSend use-after-free observed on app
+    // quit).  Left false for engine-owned native-window popups and
+    // retained-but-unadopted popup children, whose sole owner is their
+    // native close / discard path.
+    bool java_owned = false;
 };
 
 // Process-global map from WKWebView (id) to its owning Engine*.  Populated
@@ -4232,16 +4268,57 @@ static void impl_web_view_did_close(id self, SEL, id webView) {
     if (!e) return;
     std::string url = page_url_utf8(webView);
     JavaVM *jvm = e->jvm;
-    jobject popup_cb = e->popup_callback;
-    jobject dialog_cb = e->dialog_callback;
     jlong pid = e->popup_id;
 
-    // Detach the delegate and drop from the map BEFORE releasing so no
-    // in-flight selector dereferences a freed engine.
+    // A browser-initiated window.close() must NEVER free an engine whose
+    // lifecycle Java owns (a normal embedded engine, or a popup already
+    // promoted by cocoa_adopt_popup).  That engine is freed exactly once by
+    // cocoa_destroy_engine (EmbeddedWebView.dispose(), which is idempotent);
+    // deleting it here too double-frees it -- the objc_msgSend
+    // use-after-free observed on app quit when the destroy main-queue block
+    // messaged the already-freed objects during -[NSApplication terminate:].
+    // Fire onPopupClosed (for a real popup) using COPIES of the inherited
+    // global refs so the async worker never frees the engine's own refs,
+    // then return without touching native objects or the engine.
+    if (e->java_owned) {
+        if (pid != 0 && e->popup_callback) {
+            JNIEnv *env = nullptr;
+            bool detach = false;
+            if (jvm && jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+                jvm->AttachCurrentThread((void **)&env, nullptr);
+                detach = true;
+            }
+            jobject pc = nullptr, dc = nullptr;
+            if (env) {
+                pc = env->NewGlobalRef(e->popup_callback);
+                if (e->dialog_callback) dc = env->NewGlobalRef(e->dialog_callback);
+            }
+            if (detach && jvm) jvm->DetachCurrentThread();
+            fire_popup_notify_closed(jvm, pc, dc, pid, url, "");
+        }
+        return;
+    }
+
+    // Non-Java-owned: an engine-owned native-window popup, or a
+    // retained-but-unadopted child.  We are its sole owner; tear it down.
+    jobject popup_cb = e->popup_callback;
+    jobject dialog_cb = e->dialog_callback;
+
+    // Detach the delegate, drop its unretained "eng" back-pointer, and drop
+    // from BOTH registries BEFORE releasing so no in-flight selector -- and
+    // no later cocoa_adopt_popup / cocoa_discard_popup lookup -- can recover
+    // and dereference a freed engine.  Erasing g_retained_popups closes the
+    // close-before-adopt race (a windowless ADOPT child whose page closes
+    // before the app adopts it would otherwise leave a dangling entry).
+    objc_setAssociatedObject(self, "eng", (id)nullptr, OBJC_ASSOCIATION_ASSIGN);
     msg<void, id>(webView, sel("setUIDelegate:"), nullptr);
     {
         std::lock_guard<std::mutex> lk(g_webview_map_mutex);
         g_webview_map.erase(webView);
+    }
+    if (pid != 0) {
+        std::lock_guard<std::mutex> lk(g_retained_popups_mutex);
+        g_retained_popups.erase(pid);
     }
     if (e->popup_window) {
         msg<void>(e->popup_window, sel("close"));
@@ -4817,6 +4894,10 @@ static void cocoa_set_click_callback(Engine *e, JNIEnv *env, jobject cb) {
 static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
                                    jlong /*display*/, jint debug) {
     auto *e = new Engine();
+    // Java owns this engine's lifecycle: EmbeddedWebView.dispose() ->
+    // webview_embed_destroy -> cocoa_destroy_engine frees it exactly once.
+    // A page-initiated window.close() must never free it out from under Java.
+    e->java_owned = true;
     env->GetJavaVM(&e->jvm);
     e->debug = debug != 0;
 
@@ -5080,6 +5161,12 @@ static Engine *cocoa_adopt_popup(JNIEnv *env, jobject parentComponent,
     }
     if (!e) return nullptr;
 
+    // Adoption transfers lifecycle ownership to the adopting Java
+    // EmbeddedWebView: from here the child is freed exactly once, by
+    // cocoa_destroy_engine (dispose()).  A later window.close() on the
+    // adopted child (impl_web_view_did_close) MUST NOT free it.
+    e->java_owned = true;
+
     // Resolve the JAWT surface layers for the new parent (mirrors the
     // cocoa_create_engine prologue), then release the surface lock before the
     // async main-thread epilogue.
@@ -5203,6 +5290,11 @@ static void cocoa_discard_popup(jlong popupId) {
         e->popup_callback = nullptr;
         e->dialog_callback = nullptr;
         if (e->ui_delegate) {
+            // Drop the delegate's unretained "eng" back-pointer before
+            // releasing it, so a late WKUIDelegate selector cannot recover
+            // and message this freed engine (mirrors cocoa_destroy_engine).
+            objc_setAssociatedObject(e->ui_delegate, "eng", (id)nullptr,
+                                     OBJC_ASSOCIATION_ASSIGN);
             msg(e->ui_delegate, sel("release"));
             e->ui_delegate = nullptr;
         }
@@ -5361,6 +5453,18 @@ static void cocoa_destroy_engine(Engine *e) {
         cocoa_kvo_teardown(e);
 
 
+        // Neutralise the external-message WKScriptMessageHandler BEFORE
+        // releasing config/webview.  That handler carries an unretained
+        // "eng" back-pointer (OBJC_ASSOCIATION_ASSIGN) to this engine; if
+        // a didReceiveScriptMessage: drained during
+        // -[NSApplication terminate:] after the engine is freed it would
+        // dereference freed memory.  Removing the handler drops the
+        // userContentController's strong ref so it deallocates (taking its
+        // association with it).
+        if (e->manager) {
+            msg<void, id>(e->manager, sel("removeScriptMessageHandlerForName:"),
+                          ns_str("external"));
+        }
         if (e->webview) {
             // Clear the WKWebView's uiDelegate BEFORE releasing the
             // WKWebView so any in-flight delegate selector observes
@@ -5372,6 +5476,15 @@ static void cocoa_destroy_engine(Engine *e) {
             msg<void>(e->webview, sel("removeFromSuperview"));
         }
         if (e->ui_delegate) {
+            // Drop the delegate's unretained "eng" back-pointer BEFORE
+            // releasing it.  The WKUIDelegate selectors (webViewDidClose:,
+            // the dialog panels) recover the engine from this association;
+            // clearing it means a selector that the main dispatch queue
+            // drains during -[NSApplication terminate:], after this engine
+            // is freed, recovers nil and returns without messaging freed
+            // memory -- the objc_msgSend use-after-free this fix closes.
+            objc_setAssociatedObject(e->ui_delegate, "eng", (id)nullptr,
+                                     OBJC_ASSOCIATION_ASSIGN);
             msg<void>(e->ui_delegate, sel("release"));
             e->ui_delegate = nullptr;
         }

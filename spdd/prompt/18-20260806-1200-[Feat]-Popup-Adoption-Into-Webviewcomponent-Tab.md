@@ -585,6 +585,10 @@ File: `src_c/webview_embed.cpp` (Cocoa)
    parent bounds; promote `child_e` to a normal embedded engine keyed
    by `parentEngine`'s peer (re-point `popup_callback`/`dialog_callback`
    to the parent's, register in `g_webview_map`, keep the UI delegate);
+   set `child_e->java_owned = true` (Canvas 6) so the promoted engine
+   is now owned by the adopting `EmbeddedWebView` and is freed exactly
+   once by `cocoa_destroy_engine` — a later `window.close()`
+   (`webViewDidClose:`) on the adopted child MUST NOT free it;
    remove from `g_retained_popups`; return the child engine handle.
 4. `cocoa_discard_popup(jlong popupId)`: look up + remove from
    `g_retained_popups`; `setUIDelegate:nil`; delete inherited global
@@ -710,12 +714,30 @@ Files: `README.md`, `test/ca/weblite/webview/PopupDispatcherTest.java`
   sweep per pending id, cancelled on claim) elapses — whichever comes
   first — with a logged diagnostic. No busy-wait; no silent drop.
 - **Child-engine teardown ordering.** `cocoa_adopt_popup` and
-  `cocoa_discard_popup` MUST clear the UI delegate and update
+  `cocoa_discard_popup` MUST clear the UI delegate (and remove the
+  delegate's `"eng"` associated-object back-pointer) and update
   `g_webview_map` / `g_retained_popups` before releasing native
   objects, and manage the inherited `popup_callback`/`dialog_callback`
   global refs with the delete-old / new-global-ref lifecycle — no
   double-free, no dereference of a freed engine (mirrors
   `impl_web_view_did_close`).
+- **An adopted child is freed exactly once (crash-safe on quit).**
+  Adoption transfers lifecycle ownership to the Java
+  `EmbeddedWebView`: `cocoa_adopt_popup` sets `java_owned = true`
+  (Canvas 6). From that point the child is torn down **only** by
+  `cocoa_destroy_engine` (Java `dispose()`), which is idempotent
+  (`peer` nulled before the native call). A browser-initiated
+  `window.close()` on the adopted child routes through
+  `webViewDidClose:`, which — seeing `java_owned` — fires
+  `onPopupClosed` and returns WITHOUT `delete e`. This closes the
+  observed use-after-free where an adopted-then-closed popup was
+  freed by `webViewDidClose:` and then messaged again by the
+  `cocoa_destroy_engine` main-queue block during
+  `-[NSApplication terminate:]` (`objc_msgSend` SIGSEGV on quit).
+  Symmetrically, `cocoa_destroy_engine` clears the delegate and its
+  `"eng"` association before freeing, so a `window.close()` that
+  drains after the engine is gone recovers `nil` and no-ops. The
+  two paths are mutually exclusive on `delete`, never racing it.
 - **Opener linkage + POST are mandatory (AC1/AC2).** The adopted child
   MUST be the WebKit-created child from the passed configuration;
   creating a fresh view or re-navigating from Java is a defect.
