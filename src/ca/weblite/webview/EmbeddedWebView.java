@@ -609,6 +609,20 @@ public class EmbeddedWebView {
     }
 
     /**
+     * Purge the engine's HTTP resource cache (disk + memory), keeping cookies
+     * and other site data so an active login survives.  The purge runs on the
+     * engine UI thread; trigger a navigation afterwards to refetch from the
+     * network.
+     *
+     * @return {@code this} for chaining
+     */
+    public EmbeddedWebView clearCache() {
+        checkAlive();
+        WebViewNative.webview_embed_clear_cache(peer);
+        return this;
+    }
+
+    /**
      * Windows-only: force Win32 keyboard focus back to the AWT-owned parent
      * HWND, so subsequent keystrokes route to AWT instead of the WebView2
      * child HWND.  Used by the Java-side global focus-owner listener when

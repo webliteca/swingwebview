@@ -477,6 +477,19 @@ public class OffscreenWebView {
         return this;
     }
 
+    /**
+     * Purge the offscreen engine's HTTP resource cache (disk + memory),
+     * keeping cookies and other site data.  Runs on the engine UI thread;
+     * trigger a navigation afterwards to refetch from the network.
+     *
+     * @return {@code this} for chaining
+     */
+    public OffscreenWebView clearCache() {
+        checkAlive();
+        WebViewNative.webview_offscreen_clear_cache(peer);
+        return this;
+    }
+
     /** Release native resources. */
     public void dispose() {
         if (peer != 0L) {
