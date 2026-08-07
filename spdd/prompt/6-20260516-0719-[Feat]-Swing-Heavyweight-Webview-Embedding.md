@@ -487,6 +487,18 @@ generated_at: 2026-05-16T07:19:13-07:00
     against. Used by destroy / window-change to call
     `removeObserver:forKeyPath:` against the right target;
     never `release`d (it's an unowned back-pointer).
+  - `java_owned: bool` — default `false`. Set `true` for any
+    engine whose lifecycle is owned by a Java `EmbeddedWebView`
+    wrapper (i.e. Java will call `webview_embed_destroy` →
+    `cocoa_destroy_engine` exactly once for it): every engine
+    created via `cocoa_create_engine`, and any popup child
+    promoted to a real embedded engine by `cocoa_adopt_popup`
+    (Canvas 18). A browser-initiated `window.close()`
+    (`webViewDidClose:`) MUST NOT free a `java_owned` engine —
+    doing so would double-free it against the Java-driven
+    destroy. Left `false` for engine-owned popup windows and
+    retained-but-unadopted popup children, whose sole owner is
+    their native close / discard path.
 
 ## A · Approach
 - **Heavyweight peer hosts the native view.** AWT/JAWT exposes a
@@ -2261,14 +2273,22 @@ Files:
      KVO firstResponder observer from
      `e->observed_window` (if any) and the
      `window`-keypath observer from `e->webview`; clear
-     `e->kvo_observer` / `e->observed_window`; call
+     `e->kvo_observer` / `e->observed_window`; clear
+     `e->webview`'s `uiDelegate` (`setUIDelegate:nil`)
+     and remove the `"eng"` associated-object
+     back-pointer from `e->ui_delegate` (set it to `nil`
+     with `OBJC_ASSOCIATION_ASSIGN`) BEFORE the delegate
+     or the WKWebView is released — so a `webViewDidClose:`
+     that the main queue drains during
+     `NSApplication terminate:` recovers a `nil` engine
+     and returns without messaging any freed object; call
      `[e->webview removeFromSuperview]`; release
-     `e->host_view` / `e->surface_layers` /
-     `e->webview` / `e->config`; walk `e->bindings`
-     releasing each Java global ref (the JNI attach /
-     detach pattern existing destroy uses); `delete e`.
-     The JNI entry returns immediately after enqueueing
-     the lambda.
+     `e->ui_delegate` / `e->host_view` /
+     `e->surface_layers` / `e->webview` / `e->config`;
+     walk `e->bindings` releasing each Java global ref
+     (the JNI attach / detach pattern existing destroy
+     uses); `delete e`. The JNI entry returns immediately
+     after enqueueing the lambda.
    - Every other async-on-main lambda
      (`cocoa_navigate` / `cocoa_eval` /
      `cocoa_init_script` / `cocoa_set_bounds` /
@@ -2720,6 +2740,20 @@ Files:
   window, registered against the new window) if the
   WKWebView's `window` property changes at runtime; the atomic
   cache MUST be recomputed immediately after the move.
+- **Both unretained `"eng"` back-pointers MUST be neutralised
+  before the engine is freed.** The engine is reachable from
+  two `OBJC_ASSOCIATION_ASSIGN` associations: the WKUIDelegate's
+  `"eng"` (used by the dialog / popup selectors and
+  `webViewDidClose:`) and the external-message
+  `WKScriptMessageHandler`'s `"eng"`. The destroy lambda MUST
+  clear the delegate association (set `"eng"` to `nil`) and MUST
+  drop the script-message handler
+  (`removeScriptMessageHandlerForName:` for the `external` name
+  on `e->manager`) before releasing the delegate / config /
+  WKWebView — so neither a `webViewDidClose:` nor a late
+  `didReceiveScriptMessage:` draining during
+  `-[NSApplication terminate:]` can recover and message a freed
+  `Engine`.
 - The `Engine.destroyed: std::atomic<bool>` MUST be set to
   `true` as the FIRST action inside the destroy lambda,
   before any AppKit teardown runs. Every other
@@ -2734,6 +2768,32 @@ Files:
   (b) future code changes that violate the
   EDT-only-enqueue invariant, and (c) the `cocoa_eval`
   late-completion path that needs a clean signalling channel.
+- **Termination-time teardown is crash-safe (no message to a
+  freed object).** The destroy lambda MUST clear the WKWebView's
+  `uiDelegate` (`setUIDelegate:nil`) and MUST remove the
+  `"eng"` associated-object back-pointer from `e->ui_delegate`
+  (`objc_setAssociatedObject(ui, "eng", nil,
+  OBJC_ASSOCIATION_ASSIGN)`) BEFORE releasing the delegate or
+  the WKWebView. The `"eng"` back-pointer is unretained
+  (`OBJC_ASSOCIATION_ASSIGN`), so a `webViewDidClose:` (or any
+  WKUIDelegate selector) that the main dispatch queue drains
+  during `-[NSApplication terminate:]` — after the engine is
+  freed — MUST recover a `nil` engine and return without
+  dereferencing or messaging freed memory. Clearing the
+  association and the delegate is the enforcement point; the
+  `objc_msgSend` crash this prevents is a real observed
+  use-after-free on app quit.
+- **`java_owned` engines are freed exactly once, by the
+  Java-driven destroy.** An engine flagged `java_owned` (every
+  `cocoa_create_engine` engine; any `cocoa_adopt_popup`-promoted
+  child) is destroyed only through `EmbeddedWebView.dispose()` →
+  `webview_embed_destroy` → `cocoa_destroy_engine`, which the
+  Java side already makes idempotent (`peer` is nulled before
+  the native call). A browser-initiated `window.close()`
+  (`webViewDidClose:`) MUST NOT `delete` a `java_owned` engine;
+  it may fire the close notification and neutralise state, but
+  the single `delete e` belongs to `cocoa_destroy_engine`.
+  Freeing from both paths is the double-free this rule forbids.
 - `EmbeddedWebView.dispose()` ordering (Java-side) MUST be
   preserved under async destroy: drain the `EvalDispatcher`
   first, clear focus / click callbacks (try/catch),

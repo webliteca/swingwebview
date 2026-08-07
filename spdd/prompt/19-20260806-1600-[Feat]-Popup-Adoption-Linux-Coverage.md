@@ -515,6 +515,18 @@ File: `src_c/webview_embed.cpp` (GTK)
    run-file-chooser/close (NOT ready-to-show); register in
    `g_gtk_retained_popups`; `fire_popup_notify_adoptable`.
 4. `on_ready_to_show_popup`: early-return when `pe->window == nullptr`.
+5. `on_close_popup` MUST be crash-safe when a `window.close()` races an
+   unadopted ADOPT child (a windowless `pe` still in the registry): it
+   first claims `pe` from `g_gtk_retained_popups` under
+   `g_gtk_retained_popups_mutex` (remove-if-present), so no later
+   `gtk_adopt_popup` / `gtk_discard_popup` can find and re-tear-down the
+   same shell. For a windowless child (`pe->window == nullptr` but
+   `pe->web != nullptr`) it disconnects the child's handlers,
+   `gtk_widget_destroy`s the child, and drops the `g_object_ref_sink`
+   reference (`g_object_unref`) — mirroring `gtk_discard_popup`'s
+   windowless teardown — instead of leaking the child and its ref. The
+   NATIVE_WINDOW path (`pe->window != nullptr`) is unchanged. `delete
+   pe` happens exactly once, after the notify + teardown.
 
 ### 4. `gtk_create_engine` reuse parameter
 File: `src_c/webview_embed.cpp` (GTK)
@@ -690,6 +702,19 @@ File: `src/ca/weblite/webview/swing/WebViewLightweightComponent.java`
   the child down, frees the inherited refs, and deletes the shell — the
   Linux end of the Canvas 18 reclaim contract (opener dispose +
   grace-period backstop, both driven from the unchanged Java side).
+- **Close-before-adopt is claim-guarded (no dangling registry entry,
+  no leak).** A `window.close()` on an ADOPT child that has not yet been
+  adopted invokes `on_close_popup` while the shell is still registered
+  in `g_gtk_retained_popups`. `on_close_popup` MUST claim (remove) the
+  shell from the registry under `g_gtk_retained_popups_mutex` before
+  freeing it, so a subsequent `gtk_adopt_popup` / `gtk_discard_popup`
+  cannot dereference a freed `PopupEngine`; and for the windowless
+  child it MUST destroy the widget and drop the `g_object_ref_sink`
+  reference (parity with `gtk_discard_popup`) rather than skipping the
+  `pe->window`-gated teardown and leaking. Whoever removes the id from
+  the registry owns the single teardown (mirrors the macOS
+  `g_retained_popups` claim rule and the Windows
+  `RetainedPopupCloseHandler`).
 - **JNI bridges inside `extern "C"`.** The GTK-branch edit does not move
   the heavyweight bridges; keeping them inside `extern "C"` is mandatory
   (UnsatisfiedLinkError otherwise — the documented, previously-fixed

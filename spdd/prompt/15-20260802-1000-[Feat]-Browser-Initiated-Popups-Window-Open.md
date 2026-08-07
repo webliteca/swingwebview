@@ -698,7 +698,22 @@ File: `src_c/webview_embed.cpp` (Cocoa)
    `onPopupRequested` inline on AppKit main. Every path either returns
    a valid child or `nil`; a child engine's `dialog_callback` and
    `popup_callback` are inherited so the popup itself supports dialogs
-   and nested popups.
+   and nested popups. `impl_web_view_did_close` recovers the engine
+   from the delegate's `"eng"` associated object and, before any
+   release, clears that association (`objc_setAssociatedObject(self,
+   "eng", nil, OBJC_ASSOCIATION_ASSIGN)`), calls
+   `setUIDelegate:nil`, and removes the child from **both**
+   `g_webview_map` and (if present) `g_retained_popups` under their
+   mutexes — so a close arriving before adoption cannot leave a
+   dangling registry entry. It then frees the engine (`delete e`)
+   **only when the engine is not `java_owned`** (an engine-owned
+   native-window popup, or a retained-but-unadopted child): a
+   `java_owned` engine — a normal embedded engine, or a popup already
+   promoted by `cocoa_adopt_popup` — is owned by the Java
+   `EmbeddedWebView` and is freed exactly once by
+   `cocoa_destroy_engine`, so `impl_web_view_did_close` fires
+   `onPopupClosed` (when `popup_id != 0`) and returns without
+   deleting it, leaving the single free to the Java-driven destroy.
 5. JNI bridges `Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1popup_1callback`
    and `…_webview_1offscreen_1set_1popup_1callback` in the existing
    `extern "C"` block (`:4544`), `#ifdef`-dispatching to
@@ -858,10 +873,22 @@ File: `test/ca/weblite/webview/PopupDispatcherTest.java`
   Never return a half-constructed child web view.
 - **Child-engine teardown ordering.** `webViewDidClose:` /
   `close` / `WindowCloseRequested` MUST clear the child's UI delegate
-  (`setUIDelegate:nil` etc.) before releasing the delegate and
-  window, and remove the child from `g_webview_map`, so no in-flight
-  selector dereferences a freed engine. Delete the inherited
-  `popup_callback` / `dialog_callback` global refs on teardown.
+  (`setUIDelegate:nil` etc.) and remove the delegate's `"eng"`
+  associated-object back-pointer before releasing the delegate and
+  window, and remove the child from `g_webview_map` (and, on macOS,
+  from `g_retained_popups` when a close races an unadopted child), so
+  no in-flight selector dereferences a freed engine. Delete the
+  inherited `popup_callback` / `dialog_callback` global refs on
+  teardown.
+- **A browser `window.close()` never frees a Java-owned engine.**
+  `impl_web_view_did_close` MUST NOT `delete` an engine flagged
+  `java_owned` (a normal embedded engine, or a popup already promoted
+  by `cocoa_adopt_popup`); that engine's single free is the
+  Java-driven `cocoa_destroy_engine`. Deleting from both the close
+  path and the dispose path is a double-free (observed as an
+  `objc_msgSend` crash on app quit). Only an engine-owned
+  native-window popup or a retained-but-unadopted child — neither of
+  which Java wraps — is freed by its close/discard path.
 - **`popupId` correlation is best-effort.** `dispatchPopupClosed`
   tolerates a missing map entry (builds a minimal event); a close
   without a prior open never NPEs.
