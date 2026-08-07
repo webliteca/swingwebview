@@ -461,6 +461,14 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         }
     }
 
+    @Override
+    protected void clearCacheOnPeer() {
+        EmbeddedWebView e = embedded;
+        if (e != null) {
+            e.clearCache();
+        }
+    }
+
     private void createPeer() {
         if (embedded != null || !canvas.isDisplayable()) {
             return;

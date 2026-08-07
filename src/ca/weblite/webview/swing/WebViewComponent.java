@@ -244,6 +244,38 @@ public abstract class WebViewComponent extends JComponent {
     protected void applyUserAgentToPeer(String ua) {
     }
 
+    /**
+     * Purge the embedded WebView's <b>HTTP resource cache</b> (the network
+     * process's on-disk + in-memory cache) so the next navigation — a fresh
+     * {@link #setUrl(String)} or an {@code eval("location.reload()")} — re-fetches
+     * its resources from the network instead of replaying a stale (possibly
+     * poisoned) cached response.
+     *
+     * <p>This clears the resource cache <em>only</em>: cookies, local storage,
+     * IndexedDB, and service-worker registrations are left intact, so a user
+     * who reached a site through a logged-in link stays logged in.  It reaches
+     * a cache that page JavaScript ({@code caches.delete()} /
+     * service-worker unregister) cannot.
+     *
+     * <p>The native purge is asynchronous and runs on the engine's UI thread;
+     * trigger a navigation after it (re-{@code setUrl} or
+     * {@code eval("location.reload()")}) to force the refetch.  A no-op when no
+     * native peer is attached (a fresh engine has no cache) — safe to call
+     * headless.
+     *
+     * @return {@code this} for chaining
+     */
+    public WebViewComponent clearCache() {
+        clearCacheOnPeer();
+        return this;
+    }
+
+    /** Purge the live native peer's HTTP resource cache.  No-op on the base
+     *  class and when no peer is attached; subclasses forward to their engine
+     *  wrapper's {@code clearCache}. */
+    protected void clearCacheOnPeer() {
+    }
+
     /** Toggle developer tools (where supported).  Must be called before display. */
     public abstract WebViewComponent setDebug(boolean debug);
 

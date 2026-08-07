@@ -445,6 +445,19 @@ private:
     Cb m_cb;
 };
 
+// Canvas 22: completed-handler for ICoreWebView2Profile2::ClearBrowsingDataAsync.
+// Guarded on the SDK macro so an older pinned WebView2.h (no Profile2) still
+// compiles; the purge JNI bridge is guarded on the same macro.
+#ifdef __ICoreWebView2Profile2_INTERFACE_DEFINED__
+class ClearCacheHandler : public CallbackBase<
+    ICoreWebView2ClearBrowsingDataCompletedHandler> {
+public:
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT /*errorCode*/) override {
+        return S_OK;
+    }
+};
+#endif
+
 // Forward declarations.
 static void engine_on_message(Engine *e, LPCWSTR msg);
 static std::wstring utf8_to_wide(const char *s);
@@ -2403,6 +2416,51 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
             settings->Release();
         }
     });
+}
+
+// Clear the embedded WebView's HTTP resource cache — Canvas 22.  Purges the
+// DISK_CACHE browsing-data kind via ICoreWebView2Profile2 on the WebView2 UI
+// thread; cookies / storage survive.  Compile-time guarded on the SDK header
+// macros (older WebView2.h without Profile2 → no-op); runtime QueryInterface
+// failure on an old runtime is also a silent no-op.  Never throws via JNI.
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1clear_1cache
+  (JNIEnv *, jclass, jlong wv) {
+    auto *e = (Engine *)wv;
+    if (!e) return;
+#if defined(__ICoreWebView2_13_INTERFACE_DEFINED__) && \
+    defined(__ICoreWebView2Profile2_INTERFACE_DEFINED__)
+    embed_win::dispatch_to_thread(e, [e] {
+        if (!e->webview) return;
+        ICoreWebView2_13 *wv13 = nullptr;
+        if (FAILED(e->webview->QueryInterface(
+                __uuidof(ICoreWebView2_13),
+                reinterpret_cast<void **>(&wv13))) || !wv13) {
+            return;
+        }
+        ICoreWebView2Profile *profile = nullptr;
+        if (SUCCEEDED(wv13->get_Profile(&profile)) && profile) {
+            ICoreWebView2Profile2 *profile2 = nullptr;
+            if (SUCCEEDED(profile->QueryInterface(
+                    __uuidof(ICoreWebView2Profile2),
+                    reinterpret_cast<void **>(&profile2))) && profile2) {
+                profile2->ClearBrowsingDataAsync(
+                    COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE,
+                    new embed_win::ClearCacheHandler());
+                profile2->Release();
+            }
+            profile->Release();
+        }
+        wv13->Release();
+    });
+#else
+    (void)e;  // WebView2 SDK too old for Profile2; clearCache is a no-op.
+#endif
+}
+
+// Offscreen cache purge — Windows has no offscreen engine; stub for
+// link-symmetry with the JNI declaration.
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1clear_1cache
+  (JNIEnv *, jclass, jlong) {
 }
 
 // Adopt a retained popup child (Canvas 20) into `parent`'s realized AWT HWND.

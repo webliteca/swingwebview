@@ -502,6 +502,36 @@ wv.setUrl("https://example.com/");   // first request carries the custom UA
   pattern-faithful but must be validated on-device (confirm the header via an
   echo endpoint).
 
+## Clear cache
+
+When a site renders blank because a stale (or poisoned) cached resource is
+replayed on every load — the classic symptom where the Web Inspector's
+"Disable Caches" makes it work — purge the engine's **HTTP resource cache**
+with `clearCache()`, then reload:
+
+```java
+WebViewComponent wv = WebViewComponent.create();
+// … after the page has loaded blank from cache …
+wv.clearCache();
+wv.eval("location.reload()");   // refetch from the network
+```
+
+* **Resource cache only — login survives.** `clearCache()` drops the disk +
+  memory HTTP cache and nothing else: cookies, local storage, IndexedDB, and
+  service-worker registrations are left intact, so a session reached through a
+  logged-in link stays logged in. It reaches a cache that page JavaScript
+  (`caches.delete()` / unregistering a service worker) cannot.
+* **Timing.** The native purge is asynchronous and runs on the engine's UI
+  thread; trigger a navigation after it (re-`setUrl` or an
+  `eval("location.reload()")`) to force the refetch. A no-op when no native
+  peer is attached — safe to call headless.
+* **Platform coverage.** macOS `WKWebsiteDataStore` disk+memory cache types,
+  Linux WebKitGTK `webkit_web_context_clear_cache`, Windows WebView2
+  `ICoreWebView2Profile2::ClearBrowsingDataAsync(DISK_CACHE)` (SDK-guarded;
+  a no-op on a WebView2 SDK older than `ICoreWebView2Profile2`). The native
+  purges ship pattern-faithful but must be validated on-device (confirm a
+  previously-cached resource is re-requested, and cookies/login survive).
+
 ## Demo
 
 See [`demos/WebViewHeavyweightDemo/`](demos/WebViewHeavyweightDemo/README.md)

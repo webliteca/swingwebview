@@ -1968,6 +1968,15 @@ static void gtk_set_user_agent(Engine *e, const char *ua) {
     if (s) webkit_settings_set_user_agent(s, ua);
 }
 
+// Canvas 22: purge the WebKitGTK HTTP resource cache (memory + disk) for the
+// view's web context.  Clears the resource cache only -- the cookie manager
+// is untouched, so an active login survives.
+static void gtk_clear_cache(Engine *e) {
+    if (!e || !e->web) return;
+    WebKitWebContext *ctx = webkit_web_view_get_context(WEBKIT_WEB_VIEW(e->web));
+    if (ctx) webkit_web_context_clear_cache(ctx);
+}
+
 // ---------------------------------------------------------------------------
 // Canvas 19: popup adoption — reparent a retained-but-unadopted popup child
 // into a caller-supplied WebViewComponent's realized X11 surface.
@@ -2472,6 +2481,13 @@ static void gtk_off_set_user_agent(OffEngine *e, const char *ua) {
     if (!e || !e->web) return;
     WebKitSettings *s = webkit_web_view_get_settings(WEBKIT_WEB_VIEW(e->web));
     if (s) webkit_settings_set_user_agent(s, ua);
+}
+
+// Canvas 22: offscreen counterpart to gtk_clear_cache.
+static void gtk_off_clear_cache(OffEngine *e) {
+    if (!e || !e->web) return;
+    WebKitWebContext *ctx = webkit_web_view_get_context(WEBKIT_WEB_VIEW(e->web));
+    if (ctx) webkit_web_context_clear_cache(ctx);
 }
 
 // ---------------------------------------------------------------------------
@@ -5180,6 +5196,39 @@ static void cocoa_set_user_agent(Engine *e, const char *ua) {
     });
 }
 
+// Canvas 22: purge the WKWebView's HTTP resource cache (disk + memory) via its
+// configuration's WKWebsiteDataStore.  Only the cache data types are removed,
+// so cookies / local storage / service workers survive (an active login is
+// retained).  Runs on the AppKit main thread; the removal is asynchronous.
+// The WKWebsiteDataType* constants are WebKit NSString* globals resolved via
+// dlsym (this translation unit has no WebKit headers, matching the JAWT dlsym
+// idiom).
+static void cocoa_clear_cache(Engine *e) {
+    if (!e) return;
+    cocoa_run_on_main_async([e] {
+        if (e->destroyed.load() || !e->webview) return;
+        id config = msg<id>(e->webview, sel("configuration"));
+        if (!config) return;
+        id store = msg<id>(config, sel("websiteDataStore"));
+        if (!store) return;
+        // Resolve the disk + memory cache type constants at runtime.
+        id diskCache = nullptr, memCache = nullptr;
+        void *pd = dlsym(RTLD_DEFAULT, "WKWebsiteDataTypeDiskCache");
+        void *pm = dlsym(RTLD_DEFAULT, "WKWebsiteDataTypeMemoryCache");
+        if (pd) diskCache = *(id *)pd;
+        if (pm) memCache = *(id *)pm;
+        id types = msg<id>(msg<id>(objc_cls("NSMutableSet"), sel("alloc")),
+                           sel("init"));
+        if (diskCache) msg<void, id>(types, sel("addObject:"), diskCache);
+        if (memCache) msg<void, id>(types, sel("addObject:"), memCache);
+        id past = msg<id>(objc_cls("NSDate"), sel("distantPast"));
+        msg<void, id, id, void (^)(void)>(
+            store, sel("removeDataOfTypes:modifiedSince:completionHandler:"),
+            types, past, ^{});
+        msg<void>(types, sel("release"));
+    });
+}
+
 // Asynchronous engine destroy.  Returns immediately on the calling
 // thread (typically the EDT) after a small Java-side cleanup; the
 // AppKit teardown, view-hierarchy removal, KVO observer unregister,
@@ -6115,6 +6164,30 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
     (void)peer;
 #endif
     if (ua && s) env->ReleaseStringUTFChars(ua, s);
+}
+
+// Clear the embedded WebView's HTTP resource cache — Canvas 22.  Resource
+// cache only (cookies survive).  Runs on the engine UI thread; asynchronous.
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1clear_1cache
+  (JNIEnv *, jclass, jlong wv) {
+    if (wv == 0) return;
+#ifdef WEBVIEW_GTK
+    embed::gtk_clear_cache((embed::Engine *)wv);
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_clear_cache((embed::Engine *)wv);
+#else
+    (void)wv;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1clear_1cache
+  (JNIEnv *, jclass, jlong peer) {
+    if (peer == 0) return;
+#ifdef WEBVIEW_GTK
+    embed::gtk_off_clear_cache((embed::OffEngine *)peer);
+#else
+    (void)peer;
+#endif
 }
 
 // Offscreen popup-adoption JNI bridges — Canvas 19 (Linux lightweight

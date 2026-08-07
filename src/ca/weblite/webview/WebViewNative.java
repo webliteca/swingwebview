@@ -310,6 +310,17 @@ native static void webview_embed_set_popup_callback(long w, WebViewPopupCallback
 // Passing 0 for w is a silent no-op.  Never throws via JNI.
 native static void webview_embed_set_user_agent(long w, String ua);
 
+// Purge the embedded WebView's HTTP resource cache (disk + memory) so the
+// next navigation re-fetches from the network.  Clears the resource cache
+// ONLY: cookies, local storage, and service-worker registrations are left
+// intact (an active login survives).  Per platform: macOS
+// -[WKWebsiteDataStore removeDataOfTypes:modifiedSince:completionHandler:]
+// for the disk+memory cache types; Linux webkit_web_context_clear_cache;
+// Windows ICoreWebView2Profile2::ClearBrowsingDataAsync(DISK_CACHE).  Runs on
+// the engine UI thread; the purge is asynchronous.  Passing 0 for w is a
+// silent no-op.  Never throws via JNI.
+native static void webview_embed_clear_cache(long w);
+
 // Adopt a browser-initiated popup child that was retained (not shown) after
 // an ADOPT disposition, reparenting it into `parent`'s realized native
 // surface and returning an opaque engine pointer for it (as
@@ -449,6 +460,12 @@ native static void webview_offscreen_set_popup_callback(long peer, WebViewPopupC
 // and this is a native-side no-op.  ua == null clears the override.  Never
 // throws via JNI.
 native static void webview_offscreen_set_user_agent(long peer, String ua);
+
+// Offscreen counterpart to webview_embed_clear_cache.  Linux purges the
+// WebKitGTK context's HTTP resource cache; macOS / Windows offscreen engines
+// are stubs and this is a native-side no-op.  Passing 0 for peer is a silent
+// no-op.  Never throws via JNI.
+native static void webview_offscreen_clear_cache(long peer);
 
 // Offscreen counterpart to webview_embed_adopt_popup (Canvas 19).  Adopt a
 // browser-initiated popup child that was retained (not shown) after an ADOPT

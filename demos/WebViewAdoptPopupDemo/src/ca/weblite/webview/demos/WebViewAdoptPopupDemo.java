@@ -134,6 +134,14 @@ public final class WebViewAdoptPopupDemo {
             opener.setUrl(openerPage());
         });
         bar.add(resetUa);
+        JButton clearCache = new JButton("Clear cache");
+        clearCache.addActionListener(e -> {
+            // Canvas 22: purge the HTTP resource cache, then reload so the
+            // page re-fetches from the network (cookies/login are retained).
+            opener.clearCache();
+            opener.eval("location.reload()");
+        });
+        bar.add(clearCache);
         return bar;
     }
 

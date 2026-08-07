@@ -205,6 +205,14 @@ public class WebViewLightweightComponent extends WebViewComponent {
     }
 
     @Override
+    protected void clearCacheOnPeer() {
+        OffscreenWebView e = engine;
+        if (e != null) {
+            e.clearCache();
+        }
+    }
+
+    @Override
     public void addNotify() {
         super.addNotify();
         if (engine != null) return;
