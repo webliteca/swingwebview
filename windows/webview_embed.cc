@@ -171,6 +171,15 @@ struct Engine {
     // ON-DEVICE-VALIDATION-REQUIRED: shared-worker-thread lifecycle (opener
     // outliving / being disposed before the adopted child).
     bool shared_thread = false;
+
+    // Canvas 21 (popup UA inheritance).  The last NON-empty custom User-Agent
+    // passed to webview_embed_set_user_agent, tracked so the
+    // NewWindowRequested handler can propagate the opener's override to a
+    // popup child before its in-flight initial navigation.  Empty means "no
+    // override" (engine default) — ICoreWebView2Settings2::get_UserAgent
+    // cannot distinguish an override from the default, so we cache it here.
+    // Written / read on this engine's WebView2 worker thread only.
+    std::wstring user_agent;
 };
 
 static void fire_focus_callback(Engine *e, bool became) {
@@ -1089,6 +1098,28 @@ private:
     PopupWindow *m_pw;
 };
 
+// Canvas 21: propagate the opener's tracked custom User-Agent to a popup child
+// BEFORE its in-flight initial navigation (i.e. before deferral->Complete()).
+// No-op when the opener has no override (empty tracked value -> child keeps the
+// engine default) or on an old runtime lacking the ICoreWebView2Settings2
+// interface (mirrors the embed setter's tolerance).  Nested popups reuse the
+// opener engine, so they inherit the same override.  Covers BOTH the ADOPT and
+// NATIVE_WINDOW dispositions.
+static void propagate_popup_user_agent(Engine *opener, ICoreWebView2 *child) {
+    if (!opener || !child || opener->user_agent.empty()) return;
+    ICoreWebView2Settings *settings = nullptr;
+    if (SUCCEEDED(child->get_Settings(&settings)) && settings) {
+        ICoreWebView2Settings2 *settings2 = nullptr;
+        if (SUCCEEDED(settings->QueryInterface(
+                __uuidof(ICoreWebView2Settings2),
+                reinterpret_cast<void **>(&settings2))) && settings2) {
+            settings2->put_UserAgent(opener->user_agent.c_str());
+            settings2->Release();
+        }
+        settings->Release();
+    }
+}
+
 // NewWindowRequested -> allow/deny via Java, then create the linked child in an
 // engine-owned top-level window.  Deferral pattern; see the block comment.
 class NewWindowRequestedHandler : public CallbackBase<
@@ -1250,6 +1281,10 @@ public:
                             ctrl->get_CoreWebView2(&child);
                             if (child) { child->AddRef(); rp->webview = child; }
 
+                            // Canvas 21: inherit the opener's custom UA before
+                            // the child's in-flight initial navigation.
+                            propagate_popup_user_agent(e, child);
+
                             // Return the LINKED child to WebView2 so it drives
                             // the original request (POST verb+body,
                             // window.opener) into it.
@@ -1366,6 +1401,10 @@ public:
                         ICoreWebView2 *child = nullptr;
                         ctrl->get_CoreWebView2(&child);
                         if (child) { child->AddRef(); pw->webview = child; }
+
+                        // Canvas 21: inherit the opener's custom UA before the
+                        // child's in-flight initial navigation.
+                        propagate_popup_user_agent(e, child);
 
                         args->put_NewWindow(child);   // LINKED to opener
                         args->put_Handled(TRUE);
@@ -2402,6 +2441,10 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
         env->ReleaseStringUTFChars(ua, s);
     }
     embed_win::dispatch_to_thread(e, [e, w] {
+        // Canvas 21: track the override so the NewWindowRequested handler can
+        // propagate it to popup children (empty == engine default).  Recorded
+        // on the worker thread, where the popup handler also reads it.
+        e->user_agent = w;
         if (!e->webview) return;
         ICoreWebView2Settings *settings = nullptr;
         if (SUCCEEDED(e->webview->get_Settings(&settings)) && settings) {

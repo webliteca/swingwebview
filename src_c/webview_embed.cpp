@@ -1156,6 +1156,25 @@ static GtkWidget *handle_create_web_view(JavaVM *jvm, jobject popup_cb,
     if (!childw) return NULL;
     WebKitWebView *child = WEBKIT_WEB_VIEW(childw);
 
+    // Canvas 21: propagate the opener's User-Agent to the popup child BEFORE
+    // its in-flight initial navigation.  A child from
+    // webkit_web_view_new_with_related_view gets fresh default settings, so
+    // copy the opener view's user-agent onto the child's WebKitSettings.  The
+    // GTK getter returns the effective UA (it cannot signal "no override"), but
+    // copying an unset opener's default UA onto a same-engine child is byte-
+    // identical to the child's own default, so the no-override case still
+    // yields the engine default.  Composes for nested popups: a popup's child
+    // reads the popup view's already-propagated UA.  Covers BOTH the ADOPT and
+    // NATIVE_WINDOW dispositions.
+    if (opener) {
+        WebKitSettings *os = webkit_web_view_get_settings(opener);
+        WebKitSettings *cs = webkit_web_view_get_settings(child);
+        if (os && cs) {
+            const char *oua = webkit_settings_get_user_agent(os);
+            if (oua) webkit_settings_set_user_agent(cs, oua);
+        }
+    }
+
     // NATIVE_WINDOW: host the child in an engine-owned native top-level window
     // (gtk_container_add sinks the widget's floating reference — the window owns
     // it).  ADOPT: create NO window; instead take an explicit strong reference
@@ -4115,6 +4134,19 @@ static id impl_create_web_view(id self, SEL, id webView, id configuration,
                                 CGRectMake(0, 0, W, H), configuration);
     if (!child) {
         return nullptr;
+    }
+
+    // Canvas 21: propagate the opener's custom User-Agent to the popup child
+    // BEFORE its in-flight initial navigation.  customUserAgent is a per-
+    // WKWebView INSTANCE property (NOT part of WKWebViewConfiguration), so the
+    // child does not inherit it from the shared config.  Reading it back from
+    // the opener returns nil when no override is set, so an engine-default
+    // opener correctly leaves the child at the engine default.  Applied here
+    // (before the `if (!adopt)` window setup) so it covers BOTH the ADOPT and
+    // NATIVE_WINDOW dispositions.
+    id openerUA = e ? msg(e->webview, sel("customUserAgent")) : nullptr;
+    if (openerUA) {
+        msg<void, id>(child, sel("setCustomUserAgent:"), openerUA);
     }
 
     // Attach a JNIEnv to create the child engine's inherited global refs.

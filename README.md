@@ -496,6 +496,11 @@ wv.setUrl("https://example.com/");   // first request carries the custom UA
 * **Timing.** Called before display, it applies to the first request. Called
   after display, it applies to the **next** navigation (engines don't rewrite
   the in-flight request for the current page).
+* **Popups inherit it.** A browser-initiated popup (`window.open`,
+  `target="_blank"`, or a POST that targets a new window) — whether adopted
+  into a `WebViewComponent` tab or opened in a native window — carries the
+  opener's custom UA on its **first** request. When the opener has no override,
+  the popup uses the engine default.
 * **Platform coverage.** macOS `WKWebView.customUserAgent`, Linux WebKitGTK
   `webkit_settings_set_user_agent`, Windows WebView2
   `ICoreWebView2Settings2::UserAgent`. The native setters ship
