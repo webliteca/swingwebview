@@ -47,9 +47,9 @@ generated_at: 2026-08-07T15:00:00-07:00
 
 - Definition of Done:
   - `wv.clearCache()` on a live view purges the HTTP resource cache on
-    **macOS + Linux** (Windows deferred — see Op 7), so a subsequent
-    `reload()` re-fetches previously cached resources from the network;
-    cookies (and thus an active login) are retained.
+    all three engines (macOS, Linux, Windows), so a subsequent `reload()`
+    re-fetches previously cached resources from the network; cookies (and
+    thus an active login) are retained.
   - `clearCache()` before display is a silent no-op.
   - `clearCache()` returns `this`.
   - A headless `WebViewComponentClearCacheTest` verifies the Java
@@ -141,9 +141,12 @@ OffscreenWebView ..> WebViewNative : JNI
        webkit_web_view_get_context(WEBKIT_WEB_VIEW(web)))`
      — clears the context's memory + disk resource cache; does not touch
      the cookie manager.
-   - Windows WebView2: **deferred** (Op 7) — the pinned SDK does not
-     expose `ICoreWebView2Profile2::ClearBrowsingDataAsync`; the JNI
-     bridge is a documented no-op pending a follow-up canvas.
+   - Windows WebView2: `ICoreWebView2Profile2::ClearBrowsingData(
+     COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE, handler)` (reached via
+     `ICoreWebView2_13::get_Profile`); the raw COM method is
+     `ClearBrowsingData` (the docs' `…Async` is the WinRT/C# projection
+     name). No-op if the runtime lacks the interfaces (mirrors the UA
+     `_2`-interface tolerance).
 
 3. **Runs on the engine thread.** Each purge is dispatched on the
    engine's UI/main thread (macOS via `cocoa_run_on_main_async`, exactly
@@ -244,23 +247,27 @@ File: `src_c/webview_embed.cpp`
    per `#ifdef` (`WEBVIEW_GTK` → gtk, `WEBVIEW_COCOA` → cocoa), no string
    handling.
 
-### 7. Windows native — DEFERRED (documented no-op)
+### 7. Windows native
 File: `windows/webview_embed.cc`
-- The natural Windows purge is
-  `ICoreWebView2Profile2::ClearBrowsingDataAsync(DISK_CACHE)`, but the
-  **pinned WebView2 SDK the build uses (`Microsoft.Web.WebView2.1.0.2592.51`)
-  does not expose `ClearBrowsingDataAsync` on its `ICoreWebView2Profile2`**
-  (CI: `error C2039: 'ClearBrowsingDataAsync' is not a member of
-  'ICoreWebView2Profile2'`). Rather than pin the exact interface blind,
-  Windows coverage is **deferred to a follow-up canvas** (mirroring the
-  per-platform staging of Canvas 18/19/20, and the existing Windows
-  offscreen stubs).
-- The JNI bridge
-  `Java_..._webview_1embed_1clear_1cache` is kept as a **no-op body**
-  (`(void)wv;`) so `EmbeddedWebView.clearCache()` still links on Windows
-  (no `UnsatisfiedLinkError`); it simply does nothing until the follow-up
-  canvas bumps the SDK / pins the correct interface. The offscreen bridge
-  is a stub (Windows has no offscreen engine).
+1. A `ClearCacheHandler : CallbackBase<
+   ICoreWebView2ClearBrowsingDataCompletedHandler>` whose `Invoke(HRESULT)`
+   returns `S_OK` (the base's `Release` deletes it), beside the other
+   completed-handlers.
+2. JNI bridge `Java_..._webview_1embed_1clear_1cache` (guard `wv == 0`), on
+   the WebView2 UI thread (`embed_win::dispatch_to_thread`, like the UA
+   setter): `QueryInterface` the engine's `ICoreWebView2` for
+   `ICoreWebView2_13`; `get_Profile(&profile)`; `QueryInterface` the profile
+   for `ICoreWebView2Profile2`; call
+   `ClearBrowsingData(COREWEBVIEW2_BROWSING_DATA_KINDS_DISK_CACHE,
+   new embed_win::ClearCacheHandler())`; `Release` each interface; `return`
+   early (no-op) if any query fails (runtime too old). **Note the raw COM
+   method is `ClearBrowsingData`** — the WebView2 docs' `ClearBrowsingDataAsync`
+   name is only the WinRT/C# projection; the C++ `ICoreWebView2Profile2`
+   vtable method is `ClearBrowsingData`. `DISK_CACHE` is the resource-cache
+   kind, so cookies / DOM storage survive. Runtime-tolerant via the same
+   QueryInterface no-op pattern as the UA setter — no compile-time guard
+   (the build pins a WebView2 SDK that has these interfaces).
+3. The offscreen bridge is a stub (Windows has no offscreen engine).
 
 ### 8. Test + README + demo
 1. `test/ca/weblite/webview/WebViewComponentClearCacheTest.java`
@@ -302,12 +309,14 @@ File: `windows/webview_embed.cc`
   untouched, so an active session survives.
 - **Headless-safe:** `clearCache()` before the peer exists only calls a
   no-op hook; no `HeadlessException`, no throw.
-- **Windows deferred, not broken:** the Windows JNI bridge is a
-  documented no-op (the pinned WebView2 SDK lacks
-  `ICoreWebView2Profile2::ClearBrowsingDataAsync`), so
-  `clearCache()` links and runs on Windows but purges nothing until a
-  follow-up canvas lands real coverage (per-platform staging, as with
-  Canvas 18/19/20). macOS + Linux are the delivered purges here.
+- **Windows runtime tolerance:** the purge uses
+  `ICoreWebView2Profile2::ClearBrowsingData` (the raw COM name; the docs'
+  `…Async` is the WinRT projection). A runtime whose
+  `QueryInterface`/`get_Profile` fails no-ops rather than crashing —
+  mirroring the UA setter's `ICoreWebView2Settings2` tolerance.
+- **Three-platform parity:** macOS, Linux, and Windows all implement the
+  resource-cache purge; the CI cross-platform native build compiles and
+  links all three.
 - **Async timing:** the native purge may complete just after the call
   returns; callers that need a fresh fetch call `reload()`/`navigate`
   afterward (documented). It does not rewrite the in-flight request for
