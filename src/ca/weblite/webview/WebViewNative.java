@@ -316,9 +316,10 @@ native static void webview_embed_set_user_agent(long w, String ua);
 // intact (an active login survives).  Per platform: macOS
 // -[WKWebsiteDataStore removeDataOfTypes:modifiedSince:completionHandler:]
 // for the disk+memory cache types; Linux webkit_web_context_clear_cache;
-// Windows ICoreWebView2Profile2::ClearBrowsingDataAsync(DISK_CACHE).  Runs on
-// the engine UI thread; the purge is asynchronous.  Passing 0 for w is a
-// silent no-op.  Never throws via JNI.
+// Windows is a documented no-op for now (the pinned WebView2 SDK lacks
+// ICoreWebView2Profile2::ClearBrowsingDataAsync — deferred to a follow-up
+// canvas).  Runs on the engine UI thread; the purge is asynchronous.  Passing
+// 0 for w is a silent no-op.  Never throws via JNI.
 native static void webview_embed_clear_cache(long w);
 
 // Adopt a browser-initiated popup child that was retained (not shown) after

@@ -525,12 +525,14 @@ wv.eval("location.reload()");   // refetch from the network
   thread; trigger a navigation after it (re-`setUrl` or an
   `eval("location.reload()")`) to force the refetch. A no-op when no native
   peer is attached — safe to call headless.
-* **Platform coverage.** macOS `WKWebsiteDataStore` disk+memory cache types,
-  Linux WebKitGTK `webkit_web_context_clear_cache`, Windows WebView2
-  `ICoreWebView2Profile2::ClearBrowsingDataAsync(DISK_CACHE)` (SDK-guarded;
-  a no-op on a WebView2 SDK older than `ICoreWebView2Profile2`). The native
-  purges ship pattern-faithful but must be validated on-device (confirm a
-  previously-cached resource is re-requested, and cookies/login survive).
+* **Platform coverage.** macOS `WKWebsiteDataStore` disk+memory cache types
+  and Linux WebKitGTK `webkit_web_context_clear_cache` are implemented
+  (validated by CI's cross-platform native build). **Windows is a documented
+  no-op for now** — the pinned WebView2 SDK does not expose
+  `ICoreWebView2Profile2::ClearBrowsingDataAsync`, so `clearCache()` links and
+  runs but purges nothing there, pending a follow-up. The macOS/Linux purges
+  should still be spot-checked on-device (confirm a previously-cached resource
+  is re-requested, and cookies/login survive).
 
 ## Demo
 
