@@ -573,11 +573,22 @@ File: `src_c/webview_embed.cpp` (Cocoa)
    - `NATIVE_WINDOW` (1): exactly today's window path (create child,
      `NSWindow`, `makeKeyAndOrderFront:`, register child engine, fire
      `onPopupOpened`).
-   - `ADOPT` (2): create child from `configuration`; build a child
-     `Engine` with `popup_window = nil`; `popup_id = (jlong)child_e`;
-     inherit callbacks as global refs; put in `g_retained_popups`;
-     fire `onPopupAdoptable(popup_id, …)` async; **do not** create an
-     `NSWindow`; return `child`.
+   - `ADOPT` (2): **isolate the child's script world first** — before
+     `initWithFrame:configuration:`, replace the passed
+     `configuration`'s `userContentController` with a **fresh, empty
+     `WKUserContentController`** so the child does not share the
+     opener's controller (see the "Adopted child owns its script world"
+     safeguard). Then create the child from `configuration`; build a
+     child `Engine` with `popup_window = nil`; `popup_id =
+     (jlong)child_e`; inherit callbacks as global refs; **install the
+     child's own `"external"` script-message handler (bound to the child
+     `Engine`) plus the `external.invoke` shim user script on the fresh
+     controller**, exactly as `cocoa_create_engine` does for a normal
+     engine, so the child's bridge messages route to the child engine's
+     bindings and never the opener's; put in `g_retained_popups`; fire
+     `onPopupAdoptable(popup_id, …)` async; **do not** create an
+     `NSWindow`; return `child`. (`NATIVE_WINDOW` is engine-owned and
+     unbridged, so its controller is left as WebKit provided it.)
 3. `cocoa_adopt_popup(Engine* parentEngine, jlong popupId)`: look up
    the retained child `Engine`; `id childView = child_e->webview`;
    `id parentView = <parentEngine's content NSView>`;
@@ -741,6 +752,26 @@ Files: `README.md`, `test/ca/weblite/webview/PopupDispatcherTest.java`
 - **Opener linkage + POST are mandatory (AC1/AC2).** The adopted child
   MUST be the WebKit-created child from the passed configuration;
   creating a fresh view or re-navigating from Java is a defect.
+- **Adopted child owns its script world (no opener cross-talk).** The
+  `configuration` WebKit hands the popup-create delegate shares the
+  **opener's `WKUserContentController`**, so without intervention the
+  opener's injected user scripts and its single `"external"`
+  script-message handler are shared with the child. An adopted child
+  cannot register its own `"external"` handler on that shared
+  controller (`addScriptMessageHandler:` throws on a duplicate name),
+  so its bound-function/eval bridge traffic was delivered to the
+  **opener** engine's handler — cross-wiring the two views (observed as
+  an adopted browser tab and its opener tab swapping/stealing each
+  other's address-bar URL). The `ADOPT` branch therefore swaps in a
+  **fresh `WKUserContentController`** before `initWithFrame:
+  configuration:` and installs the child's own `"external"` bridge +
+  shim on it. This isolates only the **script world**: `processPool`
+  and `websiteDataStore` remain on the rest of the configuration, so
+  `window.opener` and the in-flight POST (the AC1/AC2 guarantee above)
+  are preserved. macOS-only and scoped to `ADOPT`. **On-device build +
+  validation required** (the Linux CI sandbox has no macOS toolchain):
+  confirm `window.opener` and the POST still reach the adopted child
+  after the controller swap.
 - **`popupId` correlation is best-effort on close.** `popupClosed`
   tolerates a missing map entry; a close racing adoption never NPEs.
 - **Disposed dispatcher is inert.** After `disposeAll()`, the

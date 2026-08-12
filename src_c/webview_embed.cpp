@@ -4161,6 +4161,34 @@ static id impl_create_web_view(id self, SEL, id webView, id configuration,
     int W = req_w > 0 ? req_w : 500;
     int H = req_h > 0 ? req_h : 650;
 
+    // Isolate an ADOPT child's script world from the opener's.  The
+    // configuration WebKit hands us for a browser-initiated popup shares the
+    // opener's WKUserContentController, so the opener's injected user scripts
+    // and its single "external" script-message handler are shared with the
+    // child.  An adopted child never installs its own "external" handler
+    // (addScriptMessageHandler: with a name already present on the SAME
+    // controller throws), so its aaf* bridge messages -- including the address
+    // bar's location reporter -- were delivered to the OPENER engine's handler
+    // instead: the observed bug where an adopted tab (e.g. an Okta-launched
+    // Slack tab) drove the opener tab's URL field and vice-versa.  Swap in a
+    // fresh, empty controller BEFORE init so the child gets its own script
+    // world; the shared processPool / websiteDataStore (and therefore
+    // window.opener and the in-flight POST) live on the rest of the
+    // configuration and are untouched.  Scoped to ADOPT: a NATIVE_WINDOW popup
+    // is engine-owned and unbridged, so its controller is left as-is.
+    //
+    // ON-DEVICE VALIDATION REQUIRED (macOS): confirm window.opener + the
+    // in-flight POST still reach the adopted child after the controller swap.
+    if (adopt) {
+        id freshUCC = msg(objc_cls("WKUserContentController"), sel("alloc"));
+        freshUCC = msg(freshUCC, sel("init"));
+        if (freshUCC) {
+            msg<void, id>(configuration, sel("setUserContentController:"),
+                          freshUCC);
+            msg<void>(freshUCC, sel("release")); // configuration now owns it
+        }
+    }
+
     // Create the child WKWebView LINKED to the opener via the passed config.
     // WebKit drives the ORIGINAL navigation-action request (POST verb + body)
     // into this child regardless of disposition, which is what preserves POST
@@ -4237,6 +4265,33 @@ static id impl_create_web_view(id self, SEL, id webView, id configuration,
         std::lock_guard<std::mutex> lk(g_webview_map_mutex);
         g_webview_map[child] = child_e;
     }
+
+    // An ADOPT child was given its own (empty) WKUserContentController above,
+    // so install the child's OWN "external" script-message bridge + invoke
+    // shim on it -- bound to the CHILD engine -- exactly as cocoa_create_engine
+    // does for a normal engine.  Without this the isolated child would have no
+    // "external" handler at all and its aaf* bridge traffic would go nowhere;
+    // with it, the child's messages route to child_e's bindings (registered by
+    // the adopting Java EmbeddedWebView), never the opener's.  engine_on_message
+    // safely drops any message that arrives before those bindings exist.
+    if (adopt) {
+        Class mh_cls = get_webview_embed_delegate_cls();
+        id mh = msg((id)mh_cls, sel("new"));
+        objc_setAssociatedObject(mh, "eng", (id)child_e,
+                                 OBJC_ASSOCIATION_ASSIGN);
+        msg<void, id, id>(child_e->manager,
+                          sel("addScriptMessageHandler:name:"), mh,
+                          ns_str("external"));
+        id shim = msg(objc_cls("WKUserScript"), sel("alloc"));
+        shim = msg<id, id, long, BOOL>(
+            shim, sel("initWithSource:injectionTime:forMainFrameOnly:"),
+            ns_str("window.external={invoke:function(s){"
+                   "window.webkit.messageHandlers.external.postMessage(s);}};"),
+            (long)0 /* WKUserScriptInjectionTimeAtDocumentStart */,
+            YES);
+        msg<void, id>(child_e->manager, sel("addUserScript:"), shim);
+    }
+
     if (adopt) {
         std::lock_guard<std::mutex> lk(g_retained_popups_mutex);
         g_retained_popups[child_e->popup_id] = child_e;
