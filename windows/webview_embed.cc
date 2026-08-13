@@ -139,6 +139,11 @@ struct Engine {
     // invoked for the file-picker event kind on Windows.
     jobject dialog_callback = nullptr;
 
+    // JNI global ref to the registered WebViewPasswordCallback, or nullptr.
+    // Stored here on Windows (Canvas 23); Canvas 25 wires the __webview_pw__
+    // branch of the WebMessageReceived handler off this field.
+    jobject password_callback = nullptr;
+
     // JNI global ref to the registered WebViewPopupCallback, or nullptr —
     // Canvas 15.  Stored here on Windows; the follow-up Windows coverage
     // canvas wires ICoreWebView2::add_NewWindowRequested off this field
@@ -2387,6 +2392,53 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
     // Windows has no offscreen engine; OffscreenWebView.create returns
     // null on Windows so this JNI bridge should never be reached.
     // Stub it for link-symmetry across all three native binaries.
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1password_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    // Canvas 23 ships the callback storage on Windows; Canvas 25 wires the
+    // __webview_pw__ branch of the WebMessageReceived handler off this
+    // field plus the Credential Manager store.  Until then storing the ref
+    // is a harmless no-op.
+    auto *e = (Engine *)wv;
+    if (!e) return;
+    if (e->password_callback) {
+        env->DeleteGlobalRef(e->password_callback);
+        e->password_callback = nullptr;
+    }
+    if (cb) {
+        e->password_callback = env->NewGlobalRef(cb);
+    }
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1password_1callback
+  (JNIEnv *, jclass, jlong, jobject) {
+    // Windows has no offscreen engine; stub for link-symmetry.
+}
+
+// Credential store primitives — Canvas 25 implements these against the
+// Windows Credential Manager (CredWrite/CredRead/CredEnumerate/CredDelete).
+// Until then they are graceful stubs; NativeCredentialStore treats a false /
+// empty result as "unavailable" and degrades to a no-op.
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1cred_1store_1save
+  (JNIEnv *, jclass, jstring, jstring, jstring, jstring, jlong) {
+    return JNI_FALSE;
+}
+
+JNIEXPORT jobjectArray JNICALL Java_ca_weblite_webview_WebViewNative_webview_1cred_1store_1find
+  (JNIEnv *env, jclass, jstring, jstring) {
+    jclass strCls = env->FindClass("java/lang/String");
+    return env->NewObjectArray(0, strCls, nullptr);
+}
+
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1cred_1store_1delete
+  (JNIEnv *, jclass, jstring, jstring, jstring) {
+    return JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1cred_1store_1available
+  (JNIEnv *, jclass) {
+    return JNI_FALSE;
 }
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1popup_1callback

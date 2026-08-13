@@ -50,6 +50,8 @@
 
 #ifdef WEBVIEW_COCOA
 #include <CoreGraphics/CoreGraphics.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <Security/Security.h>
 #include <dispatch/dispatch.h>
 #include <objc/objc-runtime.h>
 #include <objc/runtime.h>
@@ -420,6 +422,14 @@ struct Engine {
     // Canvas 16.  A child (popup) web view inherits this ref via its own
     // PopupEngine so nested popups work.
     jobject popup_callback = nullptr;
+
+    // JNI global ref to the registered WebViewPasswordCallback, or
+    // nullptr.  Set by cocoa_set_password_callback / gtk_set_password_callback
+    // and cleared on engine destroy.  Invoked by the __webview_pw__
+    // script-message handler (login submission / autofill request) that
+    // the injected PasswordDispatcher.SHIM_JS posts to (Canvas 23 macOS;
+    // Canvas 24 Linux).
+    jobject password_callback = nullptr;
 
     Engine() {}
     ~Engine() {}
@@ -3141,6 +3151,12 @@ struct Engine {
     // field instead of a freed ref.
     jobject dialog_callback = nullptr;
 
+    // JNI global ref to the registered WebViewPasswordCallback, or
+    // nullptr.  Read by the __webview_pw__ WKScriptMessageHandler on each
+    // login-submission / fill-request message.  Set by
+    // cocoa_set_password_callback; cleared in cocoa_destroy_engine.
+    jobject password_callback = nullptr;
+
     // Per-engine WKUIDelegate instance assigned to e->webview via
     // setUIDelegate:.  Retained by us (we hold the only strong ref);
     // released in cocoa_destroy_engine after we clear the WKWebView's
@@ -4470,6 +4486,162 @@ static void cocoa_set_dialog_callback(Engine *e, JNIEnv *env, jobject cb) {
 }
 
 // ---------------------------------------------------------------------------
+// Password-manager bridge (Canvas 23).
+//
+// The injected PasswordDispatcher.SHIM_JS posts to the reserved
+// "__webview_pw__" script-message channel:
+//   "S|<b64user>|<b64pass>"  a login form was submitted
+//   "F"                      the page is ready and requests autofill
+// A dedicated WKScriptMessageHandler reads the committed frame URL
+// natively (message.frameInfo / webView.URL) -- the trusted origin source,
+// never a value from the JS payload -- and invokes the Java
+// WebViewPasswordCallback.  The callback is void (non-blocking): the Java
+// PasswordDispatcher marshals the save prompt to the EDT and runs store
+// I/O on a worker, so AppKit main is not parked.
+//
+// The two fire helpers use pure JNI (no Cocoa/GLib) and mirror
+// fire_dialog_alert's shape: defensive attach + detach-if-attached,
+// per-call GetMethodID, ExceptionCheck/Clear after Call*Method.
+// ---------------------------------------------------------------------------
+
+static void fire_password_submitted(JavaVM *jvm, jobject callback,
+                                    const char *frameUrl,
+                                    const char *b64User,
+                                    const char *b64Pass) {
+    if (!jvm || !callback) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env) {
+            return;
+        }
+        detach = true;
+    }
+    if (!env) { if (detach) jvm->DetachCurrentThread(); return; }
+    jstring jurl = env->NewStringUTF(frameUrl ? frameUrl : "");
+    jstring juser = env->NewStringUTF(b64User ? b64User : "");
+    jstring jpass = env->NewStringUTF(b64Pass ? b64Pass : "");
+    jclass cls = env->GetObjectClass(callback);
+    if (cls) {
+        jmethodID m = env->GetMethodID(
+            cls, "onLoginSubmitted",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+        if (m) {
+            env->CallVoidMethod(callback, m, jurl, juser, jpass);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (jurl) env->DeleteLocalRef(jurl);
+    if (juser) env->DeleteLocalRef(juser);
+    if (jpass) env->DeleteLocalRef(jpass);
+    if (detach) jvm->DetachCurrentThread();
+}
+
+static void fire_password_fill_requested(JavaVM *jvm, jobject callback,
+                                         const char *frameUrl) {
+    if (!jvm || !callback) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env) {
+            return;
+        }
+        detach = true;
+    }
+    if (!env) { if (detach) jvm->DetachCurrentThread(); return; }
+    jstring jurl = env->NewStringUTF(frameUrl ? frameUrl : "");
+    jclass cls = env->GetObjectClass(callback);
+    if (cls) {
+        jmethodID m = env->GetMethodID(cls, "onFillRequested",
+                                       "(Ljava/lang/String;)V");
+        if (m) {
+            env->CallVoidMethod(callback, m, jurl);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (jurl) env->DeleteLocalRef(jurl);
+    if (detach) jvm->DetachCurrentThread();
+}
+
+// Parse a "__webview_pw__" payload and fire the matching callback.  The
+// origin comes from frameUrl (native-stamped), never the payload.
+static void handle_password_message(Engine *e, const std::string &payload,
+                                    const std::string &frameUrl) {
+    if (!e || !e->password_callback) return;
+    if (payload.empty()) return;
+    if (payload[0] == 'F') {
+        fire_password_fill_requested(e->jvm, e->password_callback,
+                                     frameUrl.c_str());
+        return;
+    }
+    if (payload.size() >= 2 && payload[0] == 'S' && payload[1] == '|') {
+        size_t p1 = 2;
+        size_t p2 = payload.find('|', p1);
+        std::string b64user = (p2 == std::string::npos)
+            ? payload.substr(p1) : payload.substr(p1, p2 - p1);
+        std::string b64pass = (p2 == std::string::npos)
+            ? std::string() : payload.substr(p2 + 1);
+        fire_password_submitted(e->jvm, e->password_callback,
+                                frameUrl.c_str(), b64user.c_str(),
+                                b64pass.c_str());
+    }
+}
+
+static std::once_flag g_webview_pw_delegate_once;
+static Class g_webview_pw_delegate_cls = nil;
+
+// Dedicated WKScriptMessageHandler for the "__webview_pw__" channel.  Reads
+// the committed frame URL natively (frameInfo.request.URL, falling back to
+// webView.URL) and hands it to Java as the trusted origin.
+static Class get_webview_pw_delegate_cls() {
+    std::call_once(g_webview_pw_delegate_once, [] {
+        Class c = objc_allocateClassPair((Class)objc_cls("NSObject"),
+                                         "WebviewPwDelegate", 0);
+        class_addProtocol(c, objc_getProtocol("WKScriptMessageHandler"));
+        class_addMethod(
+            c,
+            sel("userContentController:didReceiveScriptMessage:"),
+            (IMP)(+[](id self, SEL, id, id m) {
+                Engine *eng = (Engine *)objc_getAssociatedObject(self, "eng");
+                if (!eng) return;
+                id body = msg(m, sel("body"));
+                if (!body) return;
+                const char *s = msg<const char *>(body, sel("UTF8String"));
+                if (!s) return;
+                std::string payload(s);
+                std::string frameUrl = frame_url_utf8(
+                    msg(m, sel("frameInfo")), msg(m, sel("webView")));
+                handle_password_message(eng, payload, frameUrl);
+            }),
+            "v@:@@");
+        objc_registerClassPair(c);
+        g_webview_pw_delegate_cls = c;
+    });
+    return g_webview_pw_delegate_cls;
+}
+
+// Register (or clear, when cb is null) the Java WebViewPasswordCallback for
+// this engine.  Mirrors cocoa_set_dialog_callback.
+static void cocoa_set_password_callback(Engine *e, JNIEnv *env, jobject cb) {
+    if (!e) return;
+    if (e->password_callback) {
+        env->DeleteGlobalRef(e->password_callback);
+        e->password_callback = nullptr;
+    }
+    if (cb) {
+        e->password_callback = env->NewGlobalRef(cb);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Mouse-down hook on WKWebView.
 //
 // We swizzle -[WKWebView mouseDown:], -[WKWebView rightMouseDown:], and
@@ -5121,6 +5293,19 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
                           sel("addScriptMessageHandler:name:"), delegate,
                           ns_str("external"));
 
+        // Password-manager bridge: a dedicated script-message handler for
+        // the "__webview_pw__" channel that the injected
+        // PasswordDispatcher.SHIM_JS posts login-submission / fill-request
+        // messages to.  Reads the committed frame URL natively (the trusted
+        // origin).  Removed in cocoa_destroy_engine alongside "external".
+        Class pw_delegate_cls = get_webview_pw_delegate_cls();
+        id pw_delegate = msg((id)pw_delegate_cls, sel("new"));
+        objc_setAssociatedObject(pw_delegate, "eng", (id)e,
+                                 OBJC_ASSOCIATION_ASSIGN);
+        msg<void, id, id>(e->manager,
+                          sel("addScriptMessageHandler:name:"), pw_delegate,
+                          ns_str("__webview_pw__"));
+
         // Browser-dialog bridge: install a WKUIDelegate so JS-initiated
         // alert / confirm / prompt and <input type=file> requests flow
         // through Java (DialogDispatcher → WebViewDialogHandler) instead
@@ -5495,6 +5680,17 @@ static void cocoa_destroy_engine(Engine *e) {
         e->dialog_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
+    if (e->password_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->password_callback);
+        e->password_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     cocoa_run_on_main_async([e] {
         // Mark destroyed FIRST.  Any LATER-firing lambdas that read this
         // flag short-circuit; FIFO ordering on the main queue makes
@@ -5519,6 +5715,8 @@ static void cocoa_destroy_engine(Engine *e) {
         if (e->manager) {
             msg<void, id>(e->manager, sel("removeScriptMessageHandlerForName:"),
                           ns_str("external"));
+            msg<void, id>(e->manager, sel("removeScriptMessageHandlerForName:"),
+                          ns_str("__webview_pw__"));
         }
         if (e->webview) {
             // Clear the WKWebView's uiDelegate BEFORE releasing the
@@ -6273,6 +6471,197 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
     // OffscreenWebView.setDialogCallback never gets here because
     // OffscreenWebView.create returns null on those platforms.
     (void)env; (void)cb;
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// Password-manager callback registration + credential store (Canvas 23
+// macOS; Canvas 24 Linux).  Must live inside this extern "C" block so the
+// JVM can resolve them (UnsatisfiedLinkError otherwise).
+// ---------------------------------------------------------------------------
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1password_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    if (wv == 0) return;
+#if defined(WEBVIEW_COCOA)
+    embed::cocoa_set_password_callback((embed::Engine *)wv, env, cb);
+#else
+    // Linux GTK password channel wired in Canvas 24.
+    (void)env; (void)cb;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1password_1callback
+  (JNIEnv *env, jclass, jlong peer, jobject cb) {
+    // Linux lightweight wired in Canvas 24; macOS/Windows offscreen is a stub.
+    (void)peer; (void)env; (void)cb;
+}
+
+#if defined(WEBVIEW_COCOA)
+// Build a CFString from a UTF-8 C string (caller CFRelease's).
+static CFStringRef pw_cf(const char *s) {
+    return CFStringCreateWithCString(kCFAllocatorDefault, s ? s : "",
+                                     kCFStringEncodingUTF8);
+}
+#endif
+
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1cred_1store_1save
+  (JNIEnv *env, jclass, jstring jservice, jstring jorigin, jstring juser,
+   jstring jpass, jlong millis) {
+#if defined(WEBVIEW_COCOA)
+    const char *service = env->GetStringUTFChars(jservice, nullptr);
+    const char *origin = env->GetStringUTFChars(jorigin, nullptr);
+    const char *user = env->GetStringUTFChars(juser, nullptr);
+    const char *pass = env->GetStringUTFChars(jpass, nullptr);
+    std::string svc = std::string(service ? service : "") + ":"
+        + (origin ? origin : "");
+    std::string value = std::to_string((long long)millis) + "\n"
+        + (pass ? pass : "");
+    CFStringRef cfSvc = pw_cf(svc.c_str());
+    CFStringRef cfAcct = pw_cf(user ? user : "");
+    CFDataRef cfVal = CFDataCreate(kCFAllocatorDefault,
+        (const UInt8 *)value.data(), (CFIndex)value.size());
+    const void *qk[] = { kSecClass, kSecAttrService, kSecAttrAccount };
+    const void *qv[] = { kSecClassGenericPassword, cfSvc, cfAcct };
+    CFDictionaryRef query = CFDictionaryCreate(kCFAllocatorDefault, qk, qv, 3,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    jboolean ok = JNI_FALSE;
+    if (SecItemCopyMatching(query, nullptr) == errSecSuccess) {
+        const void *uk[] = { kSecValueData };
+        const void *uv[] = { cfVal };
+        CFDictionaryRef upd = CFDictionaryCreate(kCFAllocatorDefault, uk, uv, 1,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        ok = (SecItemUpdate(query, upd) == errSecSuccess) ? JNI_TRUE : JNI_FALSE;
+        CFRelease(upd);
+    } else {
+        const void *ak[] = { kSecClass, kSecAttrService, kSecAttrAccount,
+                             kSecValueData, kSecAttrSynchronizable };
+        const void *av[] = { kSecClassGenericPassword, cfSvc, cfAcct,
+                             cfVal, kCFBooleanFalse };
+        CFDictionaryRef add = CFDictionaryCreate(kCFAllocatorDefault, ak, av, 5,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        ok = (SecItemAdd(add, nullptr) == errSecSuccess) ? JNI_TRUE : JNI_FALSE;
+        CFRelease(add);
+    }
+    CFRelease(query); CFRelease(cfSvc); CFRelease(cfAcct); CFRelease(cfVal);
+    if (service) env->ReleaseStringUTFChars(jservice, service);
+    if (origin) env->ReleaseStringUTFChars(jorigin, origin);
+    if (user) env->ReleaseStringUTFChars(juser, user);
+    if (pass) env->ReleaseStringUTFChars(jpass, pass);
+    return ok;
+#else
+    (void)env; (void)jservice; (void)jorigin; (void)juser; (void)jpass;
+    (void)millis;
+    return JNI_FALSE;
+#endif
+}
+
+JNIEXPORT jobjectArray JNICALL Java_ca_weblite_webview_WebViewNative_webview_1cred_1store_1find
+  (JNIEnv *env, jclass, jstring jservice, jstring jorigin) {
+    jclass strCls = env->FindClass("java/lang/String");
+#if defined(WEBVIEW_COCOA)
+    const char *service = env->GetStringUTFChars(jservice, nullptr);
+    const char *origin = env->GetStringUTFChars(jorigin, nullptr);
+    std::string svc = std::string(service ? service : "") + ":"
+        + (origin ? origin : "");
+    CFStringRef cfSvc = pw_cf(svc.c_str());
+    const void *qk[] = { kSecClass, kSecAttrService, kSecMatchLimit,
+                         kSecReturnAttributes, kSecReturnData };
+    const void *qv[] = { kSecClassGenericPassword, cfSvc, kSecMatchLimitAll,
+                         kCFBooleanTrue, kCFBooleanTrue };
+    CFDictionaryRef query = CFDictionaryCreate(kCFAllocatorDefault, qk, qv, 5,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFTypeRef result = nullptr;
+    OSStatus st = SecItemCopyMatching(query, &result);
+    std::vector<std::string> triples;
+    if (st == errSecSuccess && result) {
+        CFArrayRef arr = (CFArrayRef)result;
+        CFIndex n = CFArrayGetCount(arr);
+        for (CFIndex i = 0; i < n; i++) {
+            CFDictionaryRef item =
+                (CFDictionaryRef)CFArrayGetValueAtIndex(arr, i);
+            CFStringRef acct =
+                (CFStringRef)CFDictionaryGetValue(item, kSecAttrAccount);
+            CFDataRef data =
+                (CFDataRef)CFDictionaryGetValue(item, kSecValueData);
+            std::string username, millisStr = "0", password;
+            if (acct) {
+                CFIndex maxlen = CFStringGetMaximumSizeForEncoding(
+                    CFStringGetLength(acct), kCFStringEncodingUTF8) + 1;
+                std::vector<char> buf((size_t)maxlen);
+                if (CFStringGetCString(acct, buf.data(), maxlen,
+                                       kCFStringEncodingUTF8)) {
+                    username = buf.data();
+                }
+            }
+            if (data) {
+                const UInt8 *bytes = CFDataGetBytePtr(data);
+                CFIndex len = CFDataGetLength(data);
+                std::string blob((const char *)bytes, (size_t)len);
+                size_t nl = blob.find('\n');
+                if (nl != std::string::npos) {
+                    millisStr = blob.substr(0, nl);
+                    password = blob.substr(nl + 1);
+                } else {
+                    password = blob;
+                }
+            }
+            triples.push_back(username);
+            triples.push_back(millisStr);
+            triples.push_back(password);
+        }
+    }
+    if (result) CFRelease(result);
+    CFRelease(query); CFRelease(cfSvc);
+    if (service) env->ReleaseStringUTFChars(jservice, service);
+    if (origin) env->ReleaseStringUTFChars(jorigin, origin);
+    jobjectArray out =
+        env->NewObjectArray((jsize)triples.size(), strCls, nullptr);
+    for (size_t i = 0; i < triples.size(); i++) {
+        jstring js = env->NewStringUTF(triples[i].c_str());
+        env->SetObjectArrayElement(out, (jsize)i, js);
+        env->DeleteLocalRef(js);
+    }
+    return out;
+#else
+    (void)jservice; (void)jorigin;
+    return env->NewObjectArray(0, strCls, nullptr);
+#endif
+}
+
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1cred_1store_1delete
+  (JNIEnv *env, jclass, jstring jservice, jstring jorigin, jstring juser) {
+#if defined(WEBVIEW_COCOA)
+    const char *service = env->GetStringUTFChars(jservice, nullptr);
+    const char *origin = env->GetStringUTFChars(jorigin, nullptr);
+    const char *user = env->GetStringUTFChars(juser, nullptr);
+    std::string svc = std::string(service ? service : "") + ":"
+        + (origin ? origin : "");
+    CFStringRef cfSvc = pw_cf(svc.c_str());
+    CFStringRef cfAcct = pw_cf(user ? user : "");
+    const void *qk[] = { kSecClass, kSecAttrService, kSecAttrAccount };
+    const void *qv[] = { kSecClassGenericPassword, cfSvc, cfAcct };
+    CFDictionaryRef query = CFDictionaryCreate(kCFAllocatorDefault, qk, qv, 3,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    OSStatus st = SecItemDelete(query);
+    CFRelease(query); CFRelease(cfSvc); CFRelease(cfAcct);
+    if (service) env->ReleaseStringUTFChars(jservice, service);
+    if (origin) env->ReleaseStringUTFChars(jorigin, origin);
+    if (user) env->ReleaseStringUTFChars(juser, user);
+    return (st == errSecSuccess) ? JNI_TRUE : JNI_FALSE;
+#else
+    (void)env; (void)jservice; (void)jorigin; (void)juser;
+    return JNI_FALSE;
+#endif
+}
+
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1cred_1store_1available
+  (JNIEnv *env, jclass) {
+    (void)env;
+#if defined(WEBVIEW_COCOA)
+    return JNI_TRUE;
+#else
+    return JNI_FALSE;
 #endif
 }
 

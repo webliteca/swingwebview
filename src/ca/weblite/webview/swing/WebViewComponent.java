@@ -8,15 +8,21 @@ package ca.weblite.webview.swing;
 import ca.weblite.webview.ConsoleDispatcher;
 import ca.weblite.webview.ConsoleListener;
 import ca.weblite.webview.DialogDispatcher;
+import ca.weblite.webview.PasswordDispatcher;
 import ca.weblite.webview.PopupDispatcher;
 import ca.weblite.webview.JavaScriptEvalException;
 import ca.weblite.webview.WebView;
+import ca.weblite.webview.WebViewCredential;
+import ca.weblite.webview.WebViewCredentialStore;
 import ca.weblite.webview.WebViewDialogHandler;
 import ca.weblite.webview.WebViewPopupHandler;
 import ca.weblite.webview.WebViewMouseDispatcher;
 import ca.weblite.webview.WebViewMouseListener;
+import ca.weblite.webview.WebViewSavePasswordHandler;
 
 import java.io.PrintStream;
+import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import javax.swing.JComponent;
 
@@ -84,6 +90,13 @@ public abstract class WebViewComponent extends JComponent {
      *  peer-attach time that delegates to this dispatcher's {@code dispatch*}
      *  methods. */
     protected final PopupDispatcher popupDispatcher = new PopupDispatcher(this);
+
+    /** Per-component hub for the password manager (login-submission
+     *  capture + autofill + credential store).  Subclasses inject
+     *  {@link PasswordDispatcher#SHIM_JS} and install a
+     *  {@link ca.weblite.webview.WebViewPasswordCallback} on their native
+     *  peer at peer-attach time that delegates to this dispatcher. */
+    protected final PasswordDispatcher passwordDispatcher = new PasswordDispatcher(this);
 
     /** When non-zero, this component was created via {@link #adoptPopup} and
      *  its peer, at attach time, adopts the pre-existing native popup child
@@ -655,5 +668,102 @@ public abstract class WebViewComponent extends JComponent {
      */
     public final WebViewPopupHandler getPopupHandler() {
         return popupDispatcher.getHandler();
+    }
+
+    // ---------------------------------------------------------------------
+    // Password manager (Canvas 23+).  The manager auto-detects login
+    // submissions and offers to save them, and auto-fills a stored
+    // credential on page load.  Credentials are keyed by page origin
+    // (scheme+host+port) and matched exact-origin only.  Passwords live
+    // only in the OS-native secret store (Keychain on macOS this
+    // iteration; libsecret / Credential Manager to follow).  This
+    // iteration wires the capture/fill on macOS heavyweight; on Linux /
+    // Windows the API works but automatic capture/fill activate in the
+    // follow-up canvases.
+    // ---------------------------------------------------------------------
+
+    /**
+     * Enable or disable the automatic save-prompt and autofill.  Enabled
+     * by default.  When disabled, no prompt appears and no autofill fires,
+     * but the programmatic methods below still work.
+     *
+     * @return {@code this} for chaining
+     */
+    public final WebViewComponent setPasswordManagerEnabled(boolean enabled) {
+        passwordDispatcher.setEnabled(enabled);
+        return this;
+    }
+
+    /** @return whether the automatic password manager is enabled. */
+    public final boolean isPasswordManagerEnabled() {
+        return passwordDispatcher.isEnabled();
+    }
+
+    /**
+     * Replace the credential store.  Passing {@code null} reinstalls the
+     * default {@link ca.weblite.webview.NativeCredentialStore} (the OS
+     * secret store).
+     *
+     * @return {@code this} for chaining
+     */
+    public final WebViewComponent setCredentialStore(WebViewCredentialStore store) {
+        passwordDispatcher.setStore(store);
+        return this;
+    }
+
+    /** @return the active credential store; never {@code null}. */
+    public final WebViewCredentialStore getCredentialStore() {
+        return passwordDispatcher.getStore();
+    }
+
+    /**
+     * Replace the save-password policy.  Passing {@code null} reinstalls
+     * the default {@link WebViewSavePasswordHandler#DEFAULT} (the Swing
+     * "Save password?" prompt).
+     *
+     * @return {@code this} for chaining
+     */
+    public final WebViewComponent setSavePasswordHandler(WebViewSavePasswordHandler handler) {
+        passwordDispatcher.setHandler(handler);
+        return this;
+    }
+
+    /** @return the active save-password policy; never {@code null}. */
+    public final WebViewSavePasswordHandler getSavePasswordHandler() {
+        return passwordDispatcher.getHandler();
+    }
+
+    /**
+     * Programmatically store a credential (bypasses the save prompt).
+     * Overwrites any existing password for the same {@code {origin,
+     * username}}.
+     */
+    public final void saveCredential(WebViewCredential credential) {
+        passwordDispatcher.saveCredential(credential);
+    }
+
+    /**
+     * @return the most-recently-saved credential for {@code origin}, or
+     *         empty if none is stored.
+     */
+    public final Optional<WebViewCredential> getCredential(String origin) {
+        return passwordDispatcher.getCredential(origin);
+    }
+
+    /**
+     * @return every credential stored for {@code origin},
+     *         most-recently-saved first (empty when none).
+     */
+    public final List<WebViewCredential> getCredentials(String origin) {
+        return passwordDispatcher.getCredentials(origin);
+    }
+
+    /**
+     * Delete the stored credential for {@code {origin, username}}.
+     *
+     * @return whether a credential was actually removed
+     */
+    public final boolean deleteCredential(String origin, String username) {
+        return passwordDispatcher.deleteCredential(origin, username);
     }
 }
