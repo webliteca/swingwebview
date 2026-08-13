@@ -438,6 +438,24 @@ public class OffscreenWebView {
     }
 
     /**
+     * Register the password-manager callback (login-submission / autofill)
+     * on the offscreen engine.  Anchored in {@link #heap} so the JVM does
+     * not collect it while the native side holds a global ref, mirroring
+     * {@link #setDialogCallback}.  On macOS / Windows, where the offscreen
+     * engine is a stub, this has no effect; Linux lightweight wires the GTK
+     * script-message handler in Canvas 24.  {@code cb == null} clears the
+     * registration.
+     */
+    public OffscreenWebView setPasswordCallback(WebViewPasswordCallback cb) {
+        checkAlive();
+        if (cb != null) {
+            heap.add(cb);
+        }
+        WebViewNative.webview_offscreen_set_password_callback(peer, cb);
+        return this;
+    }
+
+    /**
      * Offscreen counterpart to
      * {@link EmbeddedWebView#setPopupCallback} — bridges
      * {@code window.open} popup requests in the offscreen engine to the

@@ -573,6 +573,25 @@ public class EmbeddedWebView {
     }
 
     /**
+     * Register the password-manager callback invoked when the embedded
+     * page's injected detection/fill script reports a login submission or
+     * requests autofill.  Anchored in {@link #heap} so the JVM does not
+     * collect it while the native side holds a global ref, mirroring
+     * {@link #setDialogCallback}.  {@code cb == null} clears the
+     * registration.  On macOS the native side is a dedicated
+     * {@code __webview_pw__} script-message handler (Canvas 23); Linux and
+     * Windows wire theirs in the follow-up canvases.
+     */
+    public EmbeddedWebView setPasswordCallback(WebViewPasswordCallback cb) {
+        checkAlive();
+        if (cb != null) {
+            heap.add(cb);
+        }
+        WebViewNative.webview_embed_set_password_callback(peer, cb);
+        return this;
+    }
+
+    /**
      * Register the popup callback for browser-initiated popups
      * ({@code window.open}, {@code target="_blank"}).  Anchors {@code cb} in
      * {@link #heap} so the JVM does not collect the adapter while the native

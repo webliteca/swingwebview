@@ -11,7 +11,9 @@ import ca.weblite.webview.EditingCommand;
 import ca.weblite.webview.GdkInput;
 import ca.weblite.webview.JavascriptFunction;
 import ca.weblite.webview.OffscreenWebView;
+import ca.weblite.webview.PasswordDispatcher;
 import ca.weblite.webview.PopupDispatcher;
+import ca.weblite.webview.WebViewPasswordCallback;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewDialogCallback;
 import ca.weblite.webview.WebViewPopupCallback;
@@ -310,6 +312,24 @@ public class WebViewLightweightComponent extends WebViewComponent {
                     multiple, mimeTypes, extensions, pageUrl, frameUrl);
             }
         });
+        // Install the password-manager bridge: inject the shared
+        // detection/fill script and route native login-submission /
+        // fill-request messages to the PasswordDispatcher.  Canvas 24 wires
+        // the native WebKitGTK __webview_pw__ script-message handler on the
+        // offscreen engine; until then this setPasswordCallback call is a
+        // native-side no-op.
+        engine.addOnBeforeLoad(PasswordDispatcher.SHIM_JS);
+        engine.setPasswordCallback(new WebViewPasswordCallback() {
+            @Override
+            public void onLoginSubmitted(String frameUrl, String b64User,
+                                         String b64Pass) {
+                passwordDispatcher.dispatchLoginSubmitted(frameUrl, b64User, b64Pass);
+            }
+            @Override
+            public void onFillRequested(String frameUrl) {
+                passwordDispatcher.dispatchFillRequested(frameUrl);
+            }
+        });
         // Install the popup bridge (window.open) on the offscreen engine.
         // Linux dispatches via the WebKitGTK create signal; on macOS /
         // Windows the offscreen engine is a stub and this call is a
@@ -417,6 +437,7 @@ public class WebViewLightweightComponent extends WebViewComponent {
         // invoking the handler against a half-disposed component.
         dialogDispatcher.disposeAll();
         popupDispatcher.disposeAll();
+        passwordDispatcher.disposeAll();
         if (engine != null) {
             OffscreenWebView ow = engine;
             engine = null;

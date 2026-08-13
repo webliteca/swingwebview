@@ -284,6 +284,24 @@ native static void webview_embed_set_attach_callback(long w, Object cb);
 native static void webview_embed_set_dialog_callback(long w, WebViewDialogCallback cb);
 
 // Register (or clear, by passing null) a callback invoked when the
+// embedded page's injected password-manager script reports a login
+// submission or requests autofill.  The callback's frameUrl argument is
+// the committed frame URL read natively from the engine (the trusted
+// origin source); the username/password are base64url strings decoded in
+// Java.  The callback methods are void (non-blocking): the library
+// marshals the save prompt to the EDT via invokeLater and runs store I/O
+// on a worker.  Per-platform delivery:
+//   - macOS:   a dedicated WKScriptMessageHandler named "__webview_pw__"
+//              on the WKUserContentController (Canvas 23).
+//   - Linux:   script-message-received::__webview_pw__ on the
+//              WebKitUserContentManager (Canvas 24).
+//   - Windows: the __webview_pw__: branch of the WebView2
+//              WebMessageReceived handler (Canvas 25).
+// cb may be null to clear the registration.  Passing 0 for w is a
+// silent no-op.  Never throws via JNI.
+native static void webview_embed_set_password_callback(long w, WebViewPasswordCallback cb);
+
+// Register (or clear, by passing null) a callback invoked when the
 // embedded page requests a popup (window.open / target=_blank).  The
 // callback's onPopupRequested returns the allow/deny decision
 // synchronously on the native UI thread; onPopupOpened / onPopupClosed
@@ -448,6 +466,12 @@ native static void webview_offscreen_execute_editing_command(long peer, int cmdI
 // engine on those platforms is itself a stub).  Never throws via JNI.
 native static void webview_offscreen_set_dialog_callback(long peer, WebViewDialogCallback cb);
 
+// Offscreen counterpart to webview_embed_set_password_callback.  A native
+// no-op stub on macOS / Windows (offscreen is itself a stub there); Linux
+// lightweight wires the GTK script-message handler in Canvas 24.  cb may
+// be null to clear.  Never throws via JNI.
+native static void webview_offscreen_set_password_callback(long peer, WebViewPasswordCallback cb);
+
 // Offscreen counterpart to webview_embed_set_popup_callback.  Used by
 // WebViewLightweightComponent on Linux to bridge window.open requests in
 // the offscreen engine to the per-component PopupDispatcher.  macOS /
@@ -486,6 +510,41 @@ native static long webview_offscreen_adopt_popup(int width, int height,
 // `peer` is unused (kept for signature symmetry with the heavyweight bridge).
 // Unknown popupId is a silent no-op.  Never throws via JNI.
 native static void webview_offscreen_discard_popup(long peer, long popupId);
+
+
+// ---------------------------------------------------------------------------
+// Process-global credential store (password manager, Canvas 23+).
+//
+// These primitives are NOT tied to a WebView engine — the OS-native secret
+// store is process-global.  `service` is the library namespace constant
+// isolating these items; `origin` is the canonical scheme+host+port key.
+// The stored value blob encodes `savedAtMillis + "\n" + password` so recency
+// ordering is uniform across platforms regardless of native metadata.
+// Per platform: macOS Keychain (SecItem*, Canvas 23); Linux libsecret
+// (Canvas 24); Windows Credential Manager (Canvas 25).  On a platform whose
+// backend is not yet wired, these return false / an empty array (graceful).
+// Never throw via JNI.
+// ---------------------------------------------------------------------------
+
+// Insert or overwrite the credential for {service, origin, username}.
+// Returns whether the write succeeded.
+native static boolean webview_cred_store_save(String service, String origin,
+                                              String username, String password,
+                                              long savedAtMillis);
+
+// Return every credential for {service, origin} as flat triples
+// [username, savedAtMillisString, password, ...], most-recently-saved first
+// (Java re-sorts regardless).  Empty array when none / unavailable.
+native static String[] webview_cred_store_find(String service, String origin);
+
+// Remove the credential for {service, origin, username}.  Returns whether a
+// credential was actually removed.
+native static boolean webview_cred_store_delete(String service, String origin,
+                                                String username);
+
+// Whether the platform secret store is usable (always true on macOS /
+// Windows; meaningful on Linux where the Secret Service may be absent).
+native static boolean webview_cred_store_available();
 
 
 }
