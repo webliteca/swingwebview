@@ -3686,6 +3686,10 @@ struct Engine {
     bool java_owned = false;
 };
 
+// Defined with the rest of the download machinery further down; declared here
+// because the popup-close path calls it from above that block (Canvas 23).
+static void cocoa_download_drop_engine(Engine *e);
+
 // Process-global map from WKWebView (id) to its owning Engine*.  Populated
 // in cocoa_create_engine after WKWebView alloc; cleared in
 // cocoa_destroy_engine.  Guarded by g_webview_map_mutex because the
@@ -4986,7 +4990,7 @@ static void cocoa_set_popup_callback(Engine *e, JNIEnv *env, jobject cb) {
 // point, and OBJC_ASSOCIATION_ASSIGN frees nothing.
 struct DownloadCtx {
     Engine *e = nullptr;
-    long long id = 0;
+    long long download_id = 0;   // NOT `id`: that shadows the ObjC ::id typedef
     std::atomic<long long> written{0};
     std::atomic<bool> terminal{false};
     id observer = nullptr;   // WebviewEmbedDownloadObserver, retained
@@ -5143,7 +5147,7 @@ static void download_kvo_observe_impl(id self, SEL /*_cmd*/, id /*keyPath*/,
     long long done = msg<long long>(progress, sel("completedUnitCount"));
     long long total = msg<long long>(progress, sel("totalUnitCount"));
     ctx->written.store(done);
-    fire_download_progress(e, ctx->id, done, total > 0 ? total : -1);
+    fire_download_progress(e, ctx->download_id, done, total > 0 ? total : -1);
 }
 
 static void ensure_download_observer_class() {
@@ -5247,7 +5251,7 @@ static void cocoa_adopt_download(id self, id download) {
     msg<void, id>(download, sel("setDelegate:"), self);
     DownloadCtx *ctx = new DownloadCtx();
     ctx->e = e;
-    ctx->id = e->next_download_id.fetch_add(1);
+    ctx->download_id = e->next_download_id.fetch_add(1);
     {
         std::lock_guard<std::mutex> lock(g_download_mutex);
         g_download_map[download] = ctx;
@@ -5307,7 +5311,7 @@ static void impl_download_decide_destination(
 
     JavaVM *jvm = e->jvm;
     jobject cb = e->download_callback;
-    long long id_val = ctx->id;
+    long long id_val = ctx->download_id;
     id dl = download;
 
     std::thread([jvm, cb, id_val, url, suggested, mime, total, page_url,
@@ -5359,7 +5363,7 @@ static void impl_download_did_finish(id self, SEL, id download) {
     if (!ctx) return;
     Engine *e = ctx->e;
     if (e && !e->destroyed.load()) {
-        fire_download_completed(e, ctx->id, true, std::string(),
+        fire_download_completed(e, ctx->download_id, true, std::string(),
                                 ctx->written.load());
     }
     delete ctx;
@@ -5377,7 +5381,7 @@ static void impl_download_did_fail(id self, SEL, id download, id error,
             reason = ns_string_to_utf8(msg(error, sel("localizedDescription")));
         }
         if (reason.empty()) reason = "Download failed";
-        fire_download_completed(e, ctx->id, false, reason,
+        fire_download_completed(e, ctx->download_id, false, reason,
                                 ctx->written.load());
     }
     delete ctx;

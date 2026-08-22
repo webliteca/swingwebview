@@ -274,9 +274,20 @@ Public surface: `setHandler`, `getHandler`, `disposeAll`, `isDisposed`,
 - `Engine::download_callback` — JNI global ref, `nullptr` when unset.
   Cleared before view teardown, as `click_callback` already is.
 - `Engine::next_download_id` — `long long`, monotonic per engine.
-- A `DownloadCtx` heap struct per in-flight `WKDownload`, associated
-  with the download object, holding the engine pointer, the id, and the
-  bytes-written counter.
+- A `DownloadCtx` heap struct per in-flight `WKDownload`, holding the
+  engine pointer, the identity, and the bytes-written counter.  Its
+  identity field is named **`download_id`, not `id`** — inside a class
+  scope in this translation unit a member called `id` shadows the
+  Objective-C `::id` typedef, so the later `id observer` / `id progress`
+  members fail to compile with "unknown type name 'id'".  A one-word
+  naming constraint that only exists on this platform, and one clang
+  reports at the *second* member rather than the first, so it is worth
+  stating rather than rediscovering.
+- `cocoa_download_drop_engine` is **forward-declared** immediately after
+  the cocoa `Engine` struct.  The popup-close path calls it from well
+  above the download block it is defined in, and this file's convention
+  is a forward declaration rather than moving the definition (as
+  `on_close_popup` and `cocoa_kvo_register_on_window` already are).
 - New selectors on the existing per-engine delegate object (the class
   that already carries the `WKUIDelegate` selectors and the `"eng"`
   associated object): the response-policy method, the two
@@ -682,9 +693,13 @@ File: `src_c/webview_embed.cpp` (`WEBVIEW_COCOA` section)
 4. Add `webView:navigationAction:didBecomeDownload:` and
    `webView:navigationResponse:didBecomeDownload:`; each sets the
    delegate object as the `WKDownload`'s `delegate` and allocates a
-   `DownloadCtx { Engine *e; long long id; long long written; }` with
-   `id = e->next_download_id++`, associated with the download via
-   `objc_setAssociatedObject` so it is released with the download.
+   `DownloadCtx { Engine *e; long long download_id; ... }` with
+   `download_id = e->next_download_id.fetch_add(1)`, registered in
+   `g_download_map` keyed by the `WKDownload` so it can be freed at a
+   definite point.  The field is `download_id` and **must not** be
+   `id`: see the Entities note — a member named `id` shadows the ObjC
+   `::id` typedef and breaks the `id observer` / `id progress` members
+   below it.
 5. Add `download:decideDestinationUsingResponse:suggestedFilename:completionHandler:`,
    following `impl_run_alert`'s deferral shape exactly:
    a. Copy the completion-handler block with `-copy` so it survives the
@@ -736,7 +751,11 @@ File: `src_c/webview_embed.cpp` (`WEBVIEW_COCOA` section)
    `nullptr`, mirroring `gtk_set_dialog_callback`.
 10. In `cocoa_destroy_engine`, delete and null `download_callback`
     **before** the web view is torn down, matching the ordering
-    documented for `click_callback`.
+    documented for `click_callback`, and call
+    `cocoa_download_drop_engine(e)` on AppKit main before anything is
+    released.  Forward-declare `cocoa_download_drop_engine` just after
+    the cocoa `Engine` struct — the popup-close path calls it from above
+    its definition.
 11. Two `JNIEXPORT` bridges at the bottom of the file, following the
     `set_dialog_callback` / `set_popup_callback` pattern, with the
     `#ifdef WEBVIEW_GTK` branch left as a no-op **plus a `(void)`
@@ -843,6 +862,13 @@ File: `test/ca/weblite/webview/DownloadDispatcherTest.java`
 10. **No new reserved JS binding.** Downloads originate from native
     engine callbacks; the `__webview_` prefix convention is not
     involved.
+11. **Never name a struct or class member `id` in the `WEBVIEW_COCOA`
+    section.** It shadows the Objective-C `::id` typedef for every
+    member declared after it, and clang reports the error at those
+    later members rather than at the shadowing one — a confusing
+    diagnostic for a trivial cause. Use a qualified name
+    (`download_id`, `popup_id`, …), as the rest of that section
+    already does.
 
 ## S · Safeguards
 
