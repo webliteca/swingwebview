@@ -371,6 +371,99 @@ See [`demos/WebViewDialogDemo/`](demos/WebViewDialogDemo/README.md)
 for a runnable example that exercises all four dialog kinds in each
 of the three handler modes (default, custom, drop).
 
+## Browser-initiated downloads
+
+When the page starts a file transfer — a click on `<a href="…" download>`,
+a navigation whose response carries `Content-Disposition: attachment`, or
+a navigation to a body the engine will not render inline —
+`WebViewComponent.setDownloadHandler` lets the host decide where the bytes
+land and watch the transfer through.
+
+```java
+wv.setDownloadHandler(new WebViewDownloadHandler() {
+    @Override
+    public File downloadRequested(WebViewDownloadEvent e) {
+        // e.suggestedFileName() is already a safe leaf name.
+        return new File(myDownloadsDir, e.suggestedFileName());
+    }
+    @Override
+    public void downloadProgress(WebViewDownloadProgressEvent e) {
+        bar.setValue(e.sizeKnown() ? (int) (e.fraction() * 100) : 0);
+        bar.setIndeterminate(!e.sizeKnown());
+    }
+    @Override
+    public void downloadCompleted(WebViewDownloadCompleteEvent e) {
+        if (e.success()) notifyUser("Saved " + e.destination());
+        else notifyUser("Download failed: " + e.failureReason());
+    }
+});
+```
+
+* **The engine writes; you choose where.**  The handler answers one
+  question — *which file* — and then observes.  Java is never handed a
+  stream: the engine already holds the connection, the cookie jar, and
+  the authentication state needed to finish the transfer.
+* **Default behaviour.**  With no handler installed, `downloadRequested`
+  shows a `JFileChooser` save dialog anchored on the host `JFrame` and
+  pre-filled with the server-suggested name, confirming before it
+  replaces an existing file.  The two notification methods do nothing.
+* **Returning `null` refuses the download.**  Nothing is written
+  anywhere — including into the platform's own default downloads folder,
+  which is the behaviour this channel exists to take over.
+* **`setDownloadHandler(null)` is NOT a reset.**  It installs a drop
+  handler that refuses every download with no UI — the headless-test and
+  explicit-opt-out path.  Pass `WebViewDownloadHandler.DEFAULT`
+  explicitly to restore the save dialog.  Reading `null` as "reset to the
+  default" would ship an app that silently refuses every download.
+* **Threading.**  All three methods run on the EDT, but
+  `downloadRequested` is *synchronous* (`invokeAndWait`, with the
+  engine's thread waiting) while progress and completion are
+  fire-and-forget (`invokeLater`).  As with
+  `WebViewDialogHandler`, calling `wv.evalAsync(js).get()` from inside
+  `downloadRequested` **deadlocks**.
+* **Progress is lossy; completion is not.**  Progress events are
+  coalesced so at most one per download is queued on the EDT at a time —
+  a 100 MB transfer reporting every 8 KB would otherwise queue ~12,800
+  EDT tasks — so a handler sees the latest counts rather than every
+  chunk, and must not do expensive work there.  `downloadCompleted` is
+  delivered **exactly once** per download, whatever the backend emits.
+* **Unknown size is `-1`, never `0`.**  Use `sizeKnown()` rather than
+  testing for a magic value, so a progress bar can tell "no bytes yet,
+  10 MB expected" from "some bytes, size unknown".
+* **Filenames are sanitised for you.**
+  `WebViewDownloadEvent.suggestedFileName()` arrives off the wire and is
+  attacker-controlled, so it reaches the handler already reduced to a
+  bare leaf name: no separators of either flavour, no `..`, no control
+  characters, no characters illegal on Windows, no trailing dots or
+  spaces, no reserved Windows device name (`CON`, `NUL`, `LPT1`…),
+  bounded to 255 characters, and never empty.  A handler may join it
+  onto a directory of its own choosing, but must not join it onto a
+  parent path the page can influence.
+* **Several downloads at once.**  Every event carries an `id()` that is
+  stable from the destination decision through to the terminal report,
+  so progress can be attributed to the download that produced it.  The
+  destination `File` is not a usable key: it is unknown at request time
+  and can repeat across sequential downloads.
+* **Platform coverage (current).**  macOS routes downloads through the
+  handler by adopting `WKDownloadDelegate` and answering
+  `WKNavigationResponsePolicyDownload` (Canvas 23) — **requires macOS
+  11.3+**; on older systems `WKDownload` does not exist, downloads
+  behave as they did before, and the handler is not invoked.  Linux
+  WebKitGTK routes them in both heavyweight and lightweight modes, and
+  in popups, via the web context's `download-started` signal (Canvas
+  24).  Windows WebView2 routes them via
+  `ICoreWebView2_4::add_DownloadStarting` and suppresses the download
+  flyout (Canvas 25) — **requires a runtime exposing
+  `ICoreWebView2_4`**; on an older runtime WebView2 keeps its built-in
+  handling and the handler is not invoked.
+* **Not covered.**  Pausing, resuming, or cancelling a download after it
+  has started; a built-in downloads list or history; resuming
+  interrupted transfers across process restarts.
+
+See [`demos/WebViewDownloadDemo/`](demos/WebViewDownloadDemo/README.md)
+for a runnable example that serves five download shapes from a loopback
+server and exercises all three handler modes.
+
 ## Browser-initiated popups (`window.open`)
 
 Pages can call `window.open(url, name, features)` or click a link / form

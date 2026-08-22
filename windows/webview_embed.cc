@@ -139,6 +139,35 @@ struct Engine {
     // invoked for the file-picker event kind on Windows.
     jobject dialog_callback = nullptr;
 
+    // JNI global ref to the registered WebViewDownloadCallback, or
+    // nullptr — Canvas 25.  The DownloadStarting handler fires off this
+    // field.  A download can outlive the page and the navigation that
+    // started it, so it is cleared in destroy_engine before the
+    // controller is released.
+    jobject download_callback = nullptr;
+
+    // EventRegistrationToken for the DownloadStarting handler, removed in
+    // destroy_engine.  Only meaningful when downloads_available is true.
+    EventRegistrationToken download_starting_token{};
+
+    // True when the runtime exposed ICoreWebView2_4 and the
+    // DownloadStarting handler was actually registered.  On an older
+    // runtime this stays false and WebView2 keeps its built-in download
+    // handling — a supported configuration, not an error.
+    bool downloads_available = false;
+
+    // Monotonic per-engine download identity.  Several downloads may be
+    // in flight at once and the destination is neither known at request
+    // time nor unique across sequential downloads.
+    long long next_download_id = 1;
+
+    // In-flight downloads, keyed by the raw operation pointer.  Entries
+    // are erased on the terminal transition and the whole map is cleared
+    // at teardown; a stale key reused by a later allocation would
+    // misattribute events.
+    std::mutex downloads_mutex;
+    std::map<ICoreWebView2DownloadOperation *, struct WinDownloadCtx *> downloads;
+
     // JNI global ref to the registered WebViewPopupCallback, or nullptr —
     // Canvas 15.  Stored here on Windows; the follow-up Windows coverage
     // canvas wires ICoreWebView2::add_NewWindowRequested off this field
@@ -638,6 +667,463 @@ public:
 private:
     Engine *m_engine;
 };
+
+// ---------------------------------------------------------------------------
+// Browser-initiated file downloads — Canvas 25 (Windows / WebView2).
+//
+// WebView2 handles downloads itself by default: a download flyout rendered
+// inside the embedded view, writing to a path under the user's Downloads
+// folder.  Both halves are wrong in a Swing application — the host has no
+// say in the destination and no report of the outcome, and the flyout is
+// browser chrome appearing inside what is meant to be a native desktop
+// window.  ICoreWebView2_4::add_DownloadStarting lets us take both over.
+//
+// Threading, as for ScriptDialogHandler: Invoke runs on the WebView2 worker
+// thread and every ICoreWebView2* method is apartment-bound to it, but the
+// Java handler runs on the Swing EDT (and the stock one opens a modal
+// JFileChooser).  Blocking the worker would deadlock, and dispatch_to_thread
+// from inside the worker would self-deadlock.  So: GetDeferral, AddRef, hop
+// to Java on a short-lived worker, then dispatch_to_thread back to apply the
+// outcome and Complete the deferral exactly once.
+//
+// Runtime tolerance: add_DownloadStarting needs ICoreWebView2_4.  On an older
+// runtime the QueryInterface fails, nothing is registered, and WebView2 keeps
+// its built-in handling.  A half-registered state — Handled set but never
+// answered — would hang every download, which is worse than not intercepting
+// at all.
+// ---------------------------------------------------------------------------
+
+// One in-flight download.  Held in Engine::downloads keyed by the operation
+// pointer so the event tokens can be removed and the entry erased when the
+// download reaches a terminal state.
+struct WinDownloadCtx {
+    Engine *engine = nullptr;
+    long long id = 0;
+    long long received = 0;
+    long long total = -1;
+    EventRegistrationToken bytes_token{};
+    EventRegistrationToken state_token{};
+    bool terminal = false;
+};
+
+// Invoke WebViewDownloadCallback.onDownloadRequested; copy the returned
+// absolute path into *out_path.  Returns false when there is no callback,
+// the method is missing, or Java refused (null return).  Runs on the
+// short-lived worker thread, never on the WebView2 worker.
+static bool fire_win_download_requested(JavaVM *jvm, jobject cb, long long id,
+                                        const std::string &url,
+                                        const std::string &suggested,
+                                        const std::string &mime,
+                                        long long total,
+                                        const std::string &page_url,
+                                        std::string *out_path) {
+    if (!jvm || !cb || !out_path) return false;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK) {
+            return false;
+        }
+        detach = true;
+    }
+    bool got = false;
+    if (env) {
+        jclass cls = env->GetObjectClass(cb);
+        if (cls) {
+            jmethodID m = env->GetMethodID(
+                cls, "onDownloadRequested",
+                "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;J"
+                "Ljava/lang/String;)Ljava/lang/String;");
+            if (m) {
+                jstring jurl = env->NewStringUTF(url.c_str());
+                jstring jname = env->NewStringUTF(suggested.c_str());
+                jstring jmime = env->NewStringUTF(mime.c_str());
+                jstring jpage = env->NewStringUTF(page_url.c_str());
+                jobject res = env->CallObjectMethod(
+                    cb, m, (jlong)id, jurl, jname, jmime, (jlong)total, jpage);
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                    res = nullptr;
+                }
+                if (res) {
+                    const char *c =
+                        env->GetStringUTFChars((jstring)res, nullptr);
+                    if (c) {
+                        out_path->assign(c);
+                        env->ReleaseStringUTFChars((jstring)res, c);
+                        got = !out_path->empty();
+                    }
+                    env->DeleteLocalRef(res);
+                }
+                if (jurl) env->DeleteLocalRef(jurl);
+                if (jname) env->DeleteLocalRef(jname);
+                if (jmime) env->DeleteLocalRef(jmime);
+                if (jpage) env->DeleteLocalRef(jpage);
+            }
+            env->DeleteLocalRef(cls);
+        }
+    }
+    if (detach) jvm->DetachCurrentThread();
+    return got;
+}
+
+static void fire_win_download_progress(Engine *e, long long id,
+                                       long long received, long long total) {
+    if (!e || !e->download_callback || !e->jvm) return;
+    JavaVM *jvm = e->jvm;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK) return;
+        detach = true;
+    }
+    if (env) {
+        jclass cls = env->GetObjectClass(e->download_callback);
+        if (cls) {
+            jmethodID m = env->GetMethodID(cls, "onDownloadProgress", "(JJJ)V");
+            if (m) {
+                env->CallVoidMethod(e->download_callback, m, (jlong)id,
+                                    (jlong)received, (jlong)total);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+            }
+            env->DeleteLocalRef(cls);
+        }
+    }
+    if (detach) jvm->DetachCurrentThread();
+}
+
+static void fire_win_download_completed(Engine *e, long long id, bool success,
+                                        const std::string &reason,
+                                        long long received) {
+    if (!e || !e->download_callback || !e->jvm) return;
+    JavaVM *jvm = e->jvm;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK) return;
+        detach = true;
+    }
+    if (env) {
+        jclass cls = env->GetObjectClass(e->download_callback);
+        if (cls) {
+            jmethodID m = env->GetMethodID(
+                cls, "onDownloadCompleted", "(JZLjava/lang/String;J)V");
+            if (m) {
+                jstring jreason = env->NewStringUTF(reason.c_str());
+                env->CallVoidMethod(e->download_callback, m, (jlong)id,
+                                    (jboolean)(success ? JNI_TRUE : JNI_FALSE),
+                                    jreason, (jlong)received);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                if (jreason) env->DeleteLocalRef(jreason);
+            }
+            env->DeleteLocalRef(cls);
+        }
+    }
+    if (detach) jvm->DetachCurrentThread();
+}
+
+// Human-readable text for a COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON.  The
+// default arm keeps the numeric value so an unmapped future reason still
+// produces a usable message rather than an empty string.
+static std::string win_download_interrupt_reason(
+        COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON r) {
+    switch (r) {
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_NONE:
+            return "Download interrupted";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_FILE_FAILED:
+            return "Could not write the file";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_FILE_ACCESS_DENIED:
+            return "Access to the destination was denied";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_FILE_NO_SPACE:
+            return "Not enough disk space";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_FILE_NAME_TOO_LONG:
+            return "The file name is too long";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_FILE_TOO_LARGE:
+            return "The file is too large";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_FILE_MALICIOUS:
+            return "The file was flagged as malicious";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_FILE_TRANSIENT_ERROR:
+            return "A temporary problem writing the file";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_FILE_BLOCKED_BY_POLICY:
+            return "Blocked by policy";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_FILE_SECURITY_CHECK_FAILED:
+            return "A security check failed";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_FILE_TOO_SHORT:
+            return "The file ended before it was complete";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_FILE_HASH_MISMATCH:
+            return "The file hash did not match";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_NETWORK_FAILED:
+            return "The network connection failed";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_NETWORK_TIMEOUT:
+            return "The network connection timed out";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_NETWORK_DISCONNECTED:
+            return "The network connection was lost";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_NETWORK_SERVER_DOWN:
+            return "The server is unavailable";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_NETWORK_INVALID_REQUEST:
+            return "The server rejected the request";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_SERVER_FAILED:
+            return "The server failed";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_SERVER_NO_RANGE:
+            return "The server does not support resuming";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_SERVER_BAD_CONTENT:
+            return "The server sent no usable content";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_SERVER_UNAUTHORIZED:
+            return "Not authorized to download this file";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_SERVER_CERTIFICATE_PROBLEM:
+            return "The server's certificate was rejected";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_SERVER_FORBIDDEN:
+            return "The server refused the request";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_SERVER_UNEXPECTED_RESPONSE:
+            return "The server sent an unexpected response";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_CANCELED:
+            return "The download was cancelled";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_SHUTDOWN:
+            return "The application shut down";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_USER_PAUSED:
+            return "The download was paused";
+        case COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_DOWNLOAD_PROCESS_CRASHED:
+            return "The download process stopped";
+        default: {
+            char buf[64];
+            snprintf(buf, sizeof(buf), "Download interrupted (reason %d)",
+                     (int)r);
+            return std::string(buf);
+        }
+    }
+}
+
+// Look up (without removing) the context for an operation.  Caller MUST hold
+// the engine's download mutex or be on the WebView2 worker thread.
+static WinDownloadCtx *win_download_ctx(Engine *e,
+                                        ICoreWebView2DownloadOperation *op) {
+    if (!e || !op) return nullptr;
+    std::lock_guard<std::mutex> lk(e->downloads_mutex);
+    auto it = e->downloads.find(op);
+    return it == e->downloads.end() ? nullptr : it->second;
+}
+
+class DownloadBytesReceivedHandler : public CallbackBase<
+    ICoreWebView2BytesReceivedChangedEventHandler> {
+public:
+    explicit DownloadBytesReceivedHandler(Engine *e) : m_engine(e) {}
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2DownloadOperation *op,
+                                     IUnknown *) override {
+        WinDownloadCtx *ctx = win_download_ctx(m_engine, op);
+        if (!ctx || ctx->terminal) return S_OK;
+        INT64 received = 0;
+        if (SUCCEEDED(op->get_BytesReceived(&received))) {
+            ctx->received = (long long)received;
+        }
+        // No native throttling: the Java dispatcher coalesces progress,
+        // and throttling here would make the last reported value lag the
+        // terminal event.
+        fire_win_download_progress(m_engine, ctx->id, ctx->received,
+                                   ctx->total);
+        return S_OK;
+    }
+private:
+    Engine *m_engine;
+};
+
+class DownloadStateChangedHandler : public CallbackBase<
+    ICoreWebView2StateChangedEventHandler> {
+public:
+    explicit DownloadStateChangedHandler(Engine *e) : m_engine(e) {}
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2DownloadOperation *op,
+                                     IUnknown *) override {
+        Engine *e = m_engine;
+        if (!e || !op) return S_OK;
+        COREWEBVIEW2_DOWNLOAD_STATE state =
+            COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS;
+        if (FAILED(op->get_State(&state))) return S_OK;
+        if (state == COREWEBVIEW2_DOWNLOAD_STATE_IN_PROGRESS) return S_OK;
+
+        // Claim the terminal report and detach the entry in one step so a
+        // second transition finds nothing.
+        WinDownloadCtx *ctx = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(e->downloads_mutex);
+            auto it = e->downloads.find(op);
+            if (it == e->downloads.end()) return S_OK;
+            ctx = it->second;
+            if (!ctx || ctx->terminal) return S_OK;
+            ctx->terminal = true;
+            e->downloads.erase(it);
+        }
+
+        INT64 received = 0;
+        if (SUCCEEDED(op->get_BytesReceived(&received))) {
+            ctx->received = (long long)received;
+        }
+
+        if (state == COREWEBVIEW2_DOWNLOAD_STATE_COMPLETED) {
+            fire_win_download_completed(e, ctx->id, true, std::string(),
+                                        ctx->received);
+        } else {
+            COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON reason =
+                COREWEBVIEW2_DOWNLOAD_INTERRUPT_REASON_NONE;
+            op->get_InterruptReason(&reason);
+            fire_win_download_completed(
+                e, ctx->id, false, win_download_interrupt_reason(reason),
+                ctx->received);
+        }
+
+        op->remove_BytesReceivedChanged(ctx->bytes_token);
+        op->remove_StateChanged(ctx->state_token);
+        delete ctx;
+        op->Release();   // balances the AddRef taken in DownloadStartingHandler
+        return S_OK;
+    }
+private:
+    Engine *m_engine;
+};
+
+class DownloadStartingHandler : public CallbackBase<
+    ICoreWebView2DownloadStartingEventHandler> {
+public:
+    explicit DownloadStartingHandler(Engine *e) : m_engine(e) {}
+    HRESULT STDMETHODCALLTYPE Invoke(
+        ICoreWebView2 *sender,
+        ICoreWebView2DownloadStartingEventArgs *args) override {
+        Engine *e = m_engine;
+        if (!args || !e) return S_OK;
+
+        ICoreWebView2DownloadOperation *op = nullptr;
+        if (FAILED(args->get_DownloadOperation(&op)) || !op) return S_OK;
+
+        // Read everything while still on the WebView2 worker thread.
+        LPWSTR uri_w = nullptr;
+        LPWSTR mime_w = nullptr;
+        LPWSTR path_w = nullptr;
+        LPWSTR page_w = nullptr;
+        INT64 total64 = 0;
+        op->get_Uri(&uri_w);
+        op->get_MimeType(&mime_w);
+        op->get_TotalBytesToReceive(&total64);
+        args->get_ResultFilePath(&path_w);
+        if (sender) sender->get_Source(&page_w);
+
+        std::string url = wide_to_utf8(uri_w);
+        std::string mime = wide_to_utf8(mime_w);
+        std::string default_path = wide_to_utf8(path_w);
+        std::string page_url = wide_to_utf8(page_w);
+        if (uri_w) CoTaskMemFree(uri_w);
+        if (mime_w) CoTaskMemFree(mime_w);
+        if (path_w) CoTaskMemFree(path_w);
+        if (page_w) CoTaskMemFree(page_w);
+
+        // WebView2 exposes no bare suggested name, only a full default
+        // path under the Downloads folder.  Its leaf is the suggestion;
+        // the Java dispatcher sanitises it unconditionally, so nothing
+        // Windows-specific is needed here.
+        std::string suggested = default_path;
+        size_t cut = suggested.find_last_of("\\/");
+        if (cut != std::string::npos) suggested = suggested.substr(cut + 1);
+
+        long long total = (total64 <= 0) ? -1 : (long long)total64;
+        long long id = e->next_download_id++;
+
+        ICoreWebView2Deferral *deferral = nullptr;
+        HRESULT hr = args->GetDeferral(&deferral);
+        if (FAILED(hr) || !deferral) {
+            // The SDK refused a deferral, so we have no way to answer
+            // later.  Do NOT set Handled -- WebView2's own flow taking
+            // over is far better than a download that hangs unanswered.
+            WV_LOG("Download GetDeferral failed: HRESULT=0x%08lx",
+                   (unsigned long)hr);
+            op->Release();
+            return S_OK;
+        }
+        args->AddRef();
+
+        std::thread([e, args, deferral, op, id, url, suggested, mime, total,
+                     page_url] {
+            jobject cb = e ? e->download_callback : nullptr;
+            JavaVM *jvm = e ? e->jvm : nullptr;
+            std::string path;
+            bool accepted = fire_win_download_requested(
+                jvm, cb, id, url, suggested, mime, total, page_url, &path);
+
+            // Every ICoreWebView2* method is apartment-bound to the
+            // engine's worker thread, so the outcome must be applied
+            // there, not on this Java worker.
+            dispatch_to_thread(e, [e, args, deferral, op, id, total, accepted,
+                                   path] {
+                // Suppress the download flyout either way -- a refused
+                // download must not flash browser chrome inside the Swing
+                // window either.
+                args->put_Handled(TRUE);
+                if (accepted) {
+                    std::wstring w = utf8_to_wide(path.c_str());
+                    args->put_ResultFilePath(w.c_str());
+
+                    auto *ctx = new WinDownloadCtx();
+                    ctx->engine = e;
+                    ctx->id = id;
+                    ctx->total = total;
+                    ctx->received = 0;
+                    ctx->terminal = false;
+
+                    // Subscribe BEFORE completing the deferral: a tiny or
+                    // already-failed download can transition immediately,
+                    // and subscribing afterwards can miss it entirely.
+                    auto *bh = new DownloadBytesReceivedHandler(e);
+                    op->add_BytesReceivedChanged(bh, &ctx->bytes_token);
+                    bh->Release();
+                    auto *sh = new DownloadStateChangedHandler(e);
+                    op->add_StateChanged(sh, &ctx->state_token);
+                    sh->Release();
+
+                    {
+                        std::lock_guard<std::mutex> lk(e->downloads_mutex);
+                        e->downloads[op] = ctx;
+                    }
+                    // op's AddRef (from get_DownloadOperation) is handed to
+                    // the ctx; DownloadStateChangedHandler releases it.
+                } else {
+                    // Refusal is put_Cancel, NOT merely an unset path --
+                    // leaving ResultFilePath alone lets WebView2 write its
+                    // own default under Downloads, which is exactly the
+                    // behaviour this canvas removes.
+                    args->put_Cancel(TRUE);
+                    op->Release();
+                }
+                deferral->Complete();
+                deferral->Release();
+                args->Release();
+            });
+        }).detach();
+
+        return S_OK;
+    }
+private:
+    Engine *m_engine;
+};
+
+// Abandon every download still in flight for `e`.  Called from the engine
+// teardown path on the WebView2 worker thread, before the controller is
+// released, so no stale operation pointer survives to misattribute events.
+static void win_download_drop_engine(Engine *e) {
+    if (!e) return;
+    std::vector<std::pair<ICoreWebView2DownloadOperation *,
+                          WinDownloadCtx *>> mine;
+    {
+        std::lock_guard<std::mutex> lk(e->downloads_mutex);
+        for (auto &kv : e->downloads) mine.push_back(kv);
+        e->downloads.clear();
+    }
+    for (auto &kv : mine) {
+        ICoreWebView2DownloadOperation *op = kv.first;
+        WinDownloadCtx *ctx = kv.second;
+        if (op && ctx) {
+            op->remove_BytesReceivedChanged(ctx->bytes_token);
+            op->remove_StateChanged(ctx->state_token);
+            op->Release();
+        }
+        delete ctx;
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Popup (window.open) support — Canvas 17 (Windows / WebView2).
@@ -1660,6 +2146,27 @@ static void engine_thread(Engine *e, HWND /*parent*/, int width, int height,
                         sdh, &e->script_dialog_token);
                     sdh->Release();
 
+                    // Browser-initiated downloads -- Canvas 25.  Gated on
+                    // ICoreWebView2_4; on an older runtime nothing is
+                    // registered and WebView2 keeps its own flyout and
+                    // Downloads-folder destination.  Refusing to build the
+                    // engine over a missing download API would break every
+                    // application that never downloads anything.
+                    {
+                        ICoreWebView2_4 *wv4 = nullptr;
+                        if (SUCCEEDED(e->webview->QueryInterface(
+                                __uuidof(ICoreWebView2_4),
+                                reinterpret_cast<void **>(&wv4))) && wv4) {
+                            auto *dsh = new DownloadStartingHandler(e);
+                            if (SUCCEEDED(wv4->add_DownloadStarting(
+                                    dsh, &e->download_starting_token))) {
+                                e->downloads_available = true;
+                            }
+                            dsh->Release();
+                            wv4->Release();
+                        }
+                    }
+
                     // Hook GotFocus / LostFocus on the controller so the
                     // Java side can suppress and restore the previously-
                     // focused JTextComponent's caret while WebView2 holds
@@ -1872,6 +2379,33 @@ static void destroy_engine(Engine *e) {
         }
         if (env) env->DeleteGlobalRef(e->dialog_callback);
         e->dialog_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
+    // Symmetric cleanup for the download callback global ref (Canvas 25),
+    // plus every download still in flight.  A download can outlive the
+    // page and the navigation, so both go before the worker thread tears
+    // down -- a late fire into a freed ref is an access violation, not an
+    // exception.
+    win_download_drop_engine(e);
+    if (e->downloads_available && e->webview) {
+        ICoreWebView2_4 *wv4 = nullptr;
+        if (SUCCEEDED(e->webview->QueryInterface(
+                __uuidof(ICoreWebView2_4),
+                reinterpret_cast<void **>(&wv4))) && wv4) {
+            wv4->remove_DownloadStarting(e->download_starting_token);
+            wv4->Release();
+        }
+        e->downloads_available = false;
+    }
+    if (e->download_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->download_callback);
+        e->download_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
     // Symmetric cleanup for the popup callback global ref (Canvas 17).  The
@@ -2383,6 +2917,29 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
 }
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1dialog_1callback
+  (JNIEnv *, jclass, jlong, jobject) {
+    // Windows has no offscreen engine; OffscreenWebView.create returns
+    // null on Windows so this JNI bridge should never be reached.
+    // Stub it for link-symmetry across all three native binaries.
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1download_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    // Canvas 25: the DownloadStarting handler reads this field on every
+    // download, so installing the global ref here is the single place that
+    // wires the Java handler into the WebView2 event path.
+    auto *e = (Engine *)wv;
+    if (!e) return;
+    if (e->download_callback) {
+        env->DeleteGlobalRef(e->download_callback);
+        e->download_callback = nullptr;
+    }
+    if (cb) {
+        e->download_callback = env->NewGlobalRef(cb);
+    }
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1download_1callback
   (JNIEnv *, jclass, jlong, jobject) {
     // Windows has no offscreen engine; OffscreenWebView.create returns
     // null on Windows so this JNI bridge should never be reached.

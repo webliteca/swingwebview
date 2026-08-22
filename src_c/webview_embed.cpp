@@ -412,6 +412,14 @@ struct Engine {
     // the global ref without dropping the canvas-004-002 changes.
     jobject dialog_callback = nullptr;
 
+    // JNI global ref to the registered WebViewDownloadCallback, or
+    // nullptr.  Populated by gtk_set_download_callback (which also
+    // installs the view's DownloadSink and connects `download-started`
+    // on the shared WebKitWebContext); cleared in gtk_destroy_engine
+    // BEFORE the widget is destroyed, because a download can outlive
+    // the page and the navigation that started it -- Canvas 24.
+    jobject download_callback = nullptr;
+
     // JNI global ref to the registered WebViewPopupCallback, or nullptr.
     // Populated by gtk_set_popup_callback; cleared in gtk_destroy_engine.
     // The `create` signal handler wired in gtk_create_engine invokes it
@@ -871,6 +879,39 @@ static gboolean on_run_file_chooser_engine(WebKitWebView *web,
 // A child popup's native state: a standalone on-screen GTK toplevel hosting a
 // WebKit-related child web view.  Distinct from Engine / OffEngine — no AWT
 // reparenting, no offscreen blitting.  The inherited popup_callback /
+// Per-view record mapping a WebKitWebView back to the Java dispatcher
+// that owns it.  Attached to the view with g_object_set_data_full so its
+// lifetime is the view's -- a global registry would have to be kept in
+// step with view destruction by hand, and getting that wrong is the
+// use-after-free this design avoids.
+struct DownloadSink {
+    JavaVM *jvm = nullptr;
+    jobject download_callback = nullptr;   // global ref, may be null
+    long long next_id = 1;
+};
+
+// One in-flight WebKitDownload.  Attached to the download object with
+// g_object_set_data_full so it dies with the transfer.
+struct GtkDownloadCtx {
+    DownloadSink *sink;
+    long long id;
+    guint64 received;
+    gint64 total;
+    gboolean terminal;
+};
+
+static const char *DOWNLOAD_SINK_KEY = "weblite-download-sink";
+static const char *DOWNLOAD_CTX_KEY = "weblite-download-ctx";
+static const char *DOWNLOAD_CONNECTED_KEY = "weblite-download-connected";
+
+// Defined further down, next to the rest of the download machinery; declared
+// here because gtk_destroy_engine and handle_create_web_view both sit above
+// that block and need them.
+static void free_download_sink(gpointer p);
+static void gtk_install_download_sink(GtkWidget *web, JavaVM *jvm,
+                                      JNIEnv *env, jobject cb);
+static void gtk_clear_download_sink(GtkWidget *web, JNIEnv *env);
+
 // dialog_callback global refs are freed in on_close_popup.
 struct PopupEngine {
     GtkWidget *window = nullptr;        // GTK_WINDOW_TOPLEVEL
@@ -878,6 +919,7 @@ struct PopupEngine {
     JavaVM *jvm = nullptr;
     jobject popup_callback = nullptr;   // inherited global ref
     jobject dialog_callback = nullptr;  // inherited global ref, may be null
+    jobject download_callback = nullptr; // inherited global ref, may be null
     jlong popup_id = 0;
 };
 
@@ -1214,6 +1256,22 @@ static GtkWidget *handle_create_web_view(JavaVM *jvm, jobject popup_cb,
     if (env) {
         pe->popup_callback = env->NewGlobalRef(popup_cb);
         if (dialog_cb) pe->dialog_callback = env->NewGlobalRef(dialog_cb);
+        // Downloads started in a popup belong to the OPENER's handler --
+        // a transfer is the user's, not a property of which view began
+        // it (Canvas 24).  The opener's DownloadSink is the source of
+        // truth here rather than a threaded-through parameter, so a
+        // nested popup inherits transitively and an adopted popup keeps
+        // the sink it was created with instead of changing owner
+        // mid-transfer.
+        DownloadSink *osink = opener
+            ? (DownloadSink *)g_object_get_data(G_OBJECT(opener),
+                                                DOWNLOAD_SINK_KEY)
+            : nullptr;
+        if (osink && osink->download_callback) {
+            pe->download_callback = env->NewGlobalRef(osink->download_callback);
+            gtk_install_download_sink(childw, jvm, env,
+                                      osink->download_callback);
+        }
         if (detach) jvm->DetachCurrentThread();
     }
 
@@ -1328,10 +1386,16 @@ static void on_close_popup(WebKitWebView *web, gpointer user_data) {
     if (env) {
         if (pe->popup_callback) env->DeleteGlobalRef(pe->popup_callback);
         if (pe->dialog_callback) env->DeleteGlobalRef(pe->dialog_callback);
+        // Clear the child view's DownloadSink before its inherited ref
+        // goes, so an in-flight download stops firing into Java
+        // (Canvas 24).
+        if (pe->web) gtk_clear_download_sink(GTK_WIDGET(pe->web), env);
+        if (pe->download_callback) env->DeleteGlobalRef(pe->download_callback);
         if (detach) pe->jvm->DetachCurrentThread();
     }
     pe->popup_callback = nullptr;
     pe->dialog_callback = nullptr;
+    pe->download_callback = nullptr;
     delete pe;
 }
 
@@ -1830,6 +1894,24 @@ static void gtk_destroy_engine(Engine *e) {
         e->popup_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
+    // Same treatment for the download-callback global ref, plus the
+    // view's DownloadSink (Canvas 24).  A download can outlive the page
+    // and the navigation, so both go BEFORE the widget is destroyed --
+    // a late fire into a freed ref is a SIGSEGV, not an exception.
+    if (e->download_callback || e->web) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm && e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) {
+            gtk_clear_download_sink(e->web, env);
+            if (e->download_callback) env->DeleteGlobalRef(e->download_callback);
+        }
+        e->download_callback = nullptr;
+        if (detach && e->jvm) e->jvm->DetachCurrentThread();
+    }
     GtkPump::instance().run_sync([&] {
         if (e->redraw_timer_id) {
             g_source_remove(e->redraw_timer_id);
@@ -1971,6 +2053,359 @@ static void gtk_set_click_callback(Engine *e, JNIEnv *env, jobject cb) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Browser-initiated file downloads for WebKitGTK (Canvas 24).
+//
+// Three things about this backend shape the code below:
+//
+//   1. `download-started` is emitted on the WebKitWebContext, NOT on the
+//      web view, and one context is shared by every view created against
+//      it.  Every download therefore has to be mapped back to the view
+//      that started it (webkit_download_get_web_view) before a Java
+//      dispatcher can be chosen.  Getting this wrong sends one
+//      component's downloads to another component's handler.  A download
+//      whose view we do not recognise is left entirely alone, so
+//      WebKitGTK keeps its built-in behaviour for anything this library
+//      did not create.
+//
+//   2. Refusing a download means CANCELLING it.  Returning TRUE from
+//      `decide-destination` without setting a destination is not enough
+//      -- WebKitGTK may still fall back to the user's download
+//      directory, which is exactly the behaviour this canvas removes.
+//
+//   3. webkit_download_set_destination changed meaning at WebKitGTK
+//      2.40: a file:// URI before, a plain path from then on.  One
+//      libwebview.so serves both 4.0 and 4.1 hosts, so the form is
+//      chosen at runtime.
+// ---------------------------------------------------------------------------
+
+static void free_download_sink(gpointer p) {
+    DownloadSink *sink = (DownloadSink *)p;
+    if (!sink) return;
+    if (sink->download_callback && sink->jvm) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (sink->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            sink->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(sink->download_callback);
+        if (detach) sink->jvm->DetachCurrentThread();
+    }
+    sink->download_callback = nullptr;
+    g_free(sink);
+}
+
+// Invoke WebViewDownloadCallback.onDownloadRequested; copy the returned
+// absolute path into *out_path.  Returns false when there is no
+// callback, the method is missing, or Java refused (null return).
+// Shape mirrors fire_click_callback exactly.
+static bool fire_download_requested(DownloadSink *sink, long long id,
+                                    const char *url, const char *suggested,
+                                    const char *mime, gint64 total,
+                                    const char *page_url,
+                                    std::string *out_path) {
+    if (!sink || !sink->download_callback || !sink->jvm || !out_path) {
+        return false;
+    }
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (sink->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        sink->jvm->AttachCurrentThread((void **)&env, nullptr);
+        detach = true;
+    }
+    bool got = false;
+    if (env) {
+        jclass cls = env->GetObjectClass(sink->download_callback);
+        if (cls) {
+            jmethodID m = env->GetMethodID(
+                cls, "onDownloadRequested",
+                "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;J"
+                "Ljava/lang/String;)Ljava/lang/String;");
+            if (m) {
+                jstring jurl = env->NewStringUTF(url ? url : "");
+                jstring jname = env->NewStringUTF(suggested ? suggested : "");
+                jstring jmime = env->NewStringUTF(mime ? mime : "");
+                jstring jpage = env->NewStringUTF(page_url ? page_url : "");
+                jobject res = env->CallObjectMethod(
+                    sink->download_callback, m, (jlong)id, jurl, jname, jmime,
+                    (jlong)total, jpage);
+                if (env->ExceptionCheck()) {
+                    env->ExceptionClear();
+                    res = nullptr;
+                }
+                if (res) {
+                    const char *c =
+                        env->GetStringUTFChars((jstring)res, nullptr);
+                    if (c) {
+                        out_path->assign(c);
+                        env->ReleaseStringUTFChars((jstring)res, c);
+                        got = !out_path->empty();
+                    }
+                    env->DeleteLocalRef(res);
+                }
+                if (jurl) env->DeleteLocalRef(jurl);
+                if (jname) env->DeleteLocalRef(jname);
+                if (jmime) env->DeleteLocalRef(jmime);
+                if (jpage) env->DeleteLocalRef(jpage);
+            }
+            env->DeleteLocalRef(cls);
+        }
+    }
+    if (detach) sink->jvm->DetachCurrentThread();
+    return got;
+}
+
+static void fire_download_progress(DownloadSink *sink, long long id,
+                                   guint64 received, gint64 total) {
+    if (!sink || !sink->download_callback || !sink->jvm) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (sink->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        sink->jvm->AttachCurrentThread((void **)&env, nullptr);
+        detach = true;
+    }
+    if (env) {
+        jclass cls = env->GetObjectClass(sink->download_callback);
+        if (cls) {
+            jmethodID m = env->GetMethodID(cls, "onDownloadProgress", "(JJJ)V");
+            if (m) {
+                env->CallVoidMethod(sink->download_callback, m, (jlong)id,
+                                    (jlong)received, (jlong)total);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+            }
+            env->DeleteLocalRef(cls);
+        }
+    }
+    if (detach) sink->jvm->DetachCurrentThread();
+}
+
+static void fire_download_completed(DownloadSink *sink, long long id,
+                                    gboolean success, const char *reason,
+                                    guint64 received) {
+    if (!sink || !sink->download_callback || !sink->jvm) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (sink->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        sink->jvm->AttachCurrentThread((void **)&env, nullptr);
+        detach = true;
+    }
+    if (env) {
+        jclass cls = env->GetObjectClass(sink->download_callback);
+        if (cls) {
+            jmethodID m = env->GetMethodID(
+                cls, "onDownloadCompleted", "(JZLjava/lang/String;J)V");
+            if (m) {
+                jstring jreason = env->NewStringUTF(reason ? reason : "");
+                env->CallVoidMethod(sink->download_callback, m, (jlong)id,
+                                    (jboolean)(success ? JNI_TRUE : JNI_FALSE),
+                                    jreason, (jlong)received);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                if (jreason) env->DeleteLocalRef(jreason);
+            }
+            env->DeleteLocalRef(cls);
+        }
+    }
+    if (detach) sink->jvm->DetachCurrentThread();
+}
+
+// webkit_download_set_destination takes a file:// URI before WebKitGTK
+// 2.40 and a plain filesystem path from 2.40 onward.  One libwebview.so
+// serves both, so pick at runtime.  Caller g_free's the result.
+static gchar *gtk_download_destination_arg(const char *abs_path) {
+    if (!abs_path) return nullptr;
+    guint major = webkit_get_major_version();
+    guint minor = webkit_get_minor_version();
+    if (major > 2 || (major == 2 && minor >= 40)) {
+        return g_strdup(abs_path);
+    }
+    // Pre-2.40 wants a URI.  g_filename_to_uri percent-encodes, which
+    // hand-concatenating "file://" would not -- a path containing a
+    // space, '#' or '?' has to survive.
+    gchar *uri = g_filename_to_uri(abs_path, nullptr, nullptr);
+    return uri ? uri : g_strdup(abs_path);
+}
+
+// `decide-destination`: returning TRUE means "handled, stop emission",
+// which is what suppresses WebKitGTK's own destination choice.
+static gboolean on_download_decide_destination(WebKitDownload *d,
+                                               const gchar *suggested,
+                                               gpointer user_data) {
+    GtkDownloadCtx *ctx = (GtkDownloadCtx *)user_data;
+    if (!ctx || !ctx->sink) return FALSE;
+
+    const char *url = nullptr;
+    const char *mime = nullptr;
+    gint64 total = -1;
+
+    WebKitURIResponse *resp = webkit_download_get_response(d);
+    if (resp) {
+        guint64 len = webkit_uri_response_get_content_length(resp);
+        total = (len == 0) ? -1 : (gint64)len;
+        mime = webkit_uri_response_get_mime_type(resp);
+        url = webkit_uri_response_get_uri(resp);
+    }
+    if (!url) {
+        WebKitURIRequest *req = webkit_download_get_request(d);
+        if (req) url = webkit_uri_request_get_uri(req);
+    }
+    ctx->total = total;
+
+    const char *page_url = nullptr;
+    WebKitWebView *view = webkit_download_get_web_view(d);
+    if (view) page_url = webkit_web_view_get_uri(view);
+
+    std::string path;
+    if (!fire_download_requested(ctx->sink, ctx->id, url, suggested, mime,
+                                 total, page_url, &path)) {
+        // Refused.  Cancel -- returning TRUE alone would let WebKitGTK
+        // fall back to the user's download directory.
+        webkit_download_cancel(d);
+        return TRUE;
+    }
+
+    // The destination was chosen deliberately (by the user through the
+    // stock save dialog's overwrite confirmation, or by an application
+    // handler); leaving overwrite disabled would make WebKitGTK rename
+    // or fail a download the host already approved.
+    webkit_download_set_allow_overwrite(d, TRUE);
+    gchar *arg = gtk_download_destination_arg(path.c_str());
+    if (arg) {
+        webkit_download_set_destination(d, arg);
+        g_free(arg);
+    }
+    return TRUE;
+}
+
+static void on_download_received_data(WebKitDownload *d, guint64 length,
+                                      gpointer user_data) {
+    (void)d;
+    GtkDownloadCtx *ctx = (GtkDownloadCtx *)user_data;
+    if (!ctx || !ctx->sink || ctx->terminal) return;
+    ctx->received += length;
+    // No native throttling: the Java dispatcher coalesces progress, and
+    // throttling here would make the last reported value lag the
+    // terminal event.
+    fire_download_progress(ctx->sink, ctx->id, ctx->received, ctx->total);
+}
+
+static void on_download_finished(WebKitDownload *d, gpointer user_data) {
+    GtkDownloadCtx *ctx = (GtkDownloadCtx *)user_data;
+    if (!ctx || !ctx->sink || ctx->terminal) return;
+    ctx->terminal = TRUE;
+    guint64 got = webkit_download_get_received_data_length(d);
+    if (got > ctx->received) ctx->received = got;
+    fire_download_completed(ctx->sink, ctx->id, TRUE, "", ctx->received);
+}
+
+static void on_download_failed(WebKitDownload *d, GError *error,
+                               gpointer user_data) {
+    (void)d;
+    GtkDownloadCtx *ctx = (GtkDownloadCtx *)user_data;
+    if (!ctx || !ctx->sink || ctx->terminal) return;
+    ctx->terminal = TRUE;
+    // A refusal arrives here as WEBKIT_DOWNLOAD_ERROR_CANCELLED_BY_USER
+    // and needs no special case: the dispatcher already reported the
+    // refusal and latched the id, so this second report is dropped
+    // Java-side.
+    const char *reason = (error && error->message) ? error->message
+                                                   : "Download failed";
+    fire_download_completed(ctx->sink, ctx->id, FALSE, reason, ctx->received);
+}
+
+// `download-started` on the shared WebKitWebContext.
+static void on_context_download_started(WebKitWebContext *context,
+                                        WebKitDownload *d,
+                                        gpointer user_data) {
+    (void)context;
+    (void)user_data;
+    if (!d) return;
+    WebKitWebView *view = webkit_download_get_web_view(d);
+    if (!view) return;
+    DownloadSink *sink = (DownloadSink *)g_object_get_data(G_OBJECT(view),
+                                                           DOWNLOAD_SINK_KEY);
+    // Not one of ours, or no handler installed: leave the download
+    // entirely alone so WebKitGTK's built-in handling still applies.
+    if (!sink || !sink->download_callback) return;
+
+    GtkDownloadCtx *ctx = g_new0(GtkDownloadCtx, 1);
+    ctx->sink = sink;
+    ctx->id = sink->next_id++;
+    ctx->total = -1;
+    ctx->received = 0;
+    ctx->terminal = FALSE;
+    g_object_set_data_full(G_OBJECT(d), DOWNLOAD_CTX_KEY, ctx, g_free);
+
+    g_signal_connect(d, "decide-destination",
+                     (GCallback)on_download_decide_destination, ctx);
+    g_signal_connect(d, "received-data",
+                     (GCallback)on_download_received_data, ctx);
+    g_signal_connect(d, "finished",
+                     (GCallback)on_download_finished, ctx);
+    g_signal_connect(d, "failed",
+                     (GCallback)on_download_failed, ctx);
+}
+
+// Install (or refresh) the per-view DownloadSink and make sure
+// `download-started` is connected on the view's context EXACTLY ONCE.
+// Two engines on one context would otherwise both handle every download.
+static void gtk_install_download_sink(GtkWidget *web, JavaVM *jvm,
+                                      JNIEnv *env, jobject cb) {
+    if (!web) return;
+    DownloadSink *sink =
+        (DownloadSink *)g_object_get_data(G_OBJECT(web), DOWNLOAD_SINK_KEY);
+    if (!sink) {
+        sink = g_new0(DownloadSink, 1);
+        sink->next_id = 1;
+        g_object_set_data_full(G_OBJECT(web), DOWNLOAD_SINK_KEY, sink,
+                               free_download_sink);
+    }
+    sink->jvm = jvm;
+    if (sink->download_callback && env) {
+        env->DeleteGlobalRef(sink->download_callback);
+    }
+    sink->download_callback = (cb && env) ? env->NewGlobalRef(cb) : nullptr;
+
+    WebKitWebContext *wctx = webkit_web_view_get_context(WEBKIT_WEB_VIEW(web));
+    if (!wctx) return;
+    if (g_object_get_data(G_OBJECT(wctx), DOWNLOAD_CONNECTED_KEY)) return;
+    g_object_set_data(G_OBJECT(wctx), DOWNLOAD_CONNECTED_KEY,
+                      GINT_TO_POINTER(1));
+    g_signal_connect(wctx, "download-started",
+                     (GCallback)on_context_download_started, nullptr);
+}
+
+// Clear the per-view DownloadSink's callback so an in-flight download
+// stops firing into Java.  Called from the engine destroy paths BEFORE
+// the widget is destroyed.
+static void gtk_clear_download_sink(GtkWidget *web, JNIEnv *env) {
+    if (!web) return;
+    DownloadSink *sink =
+        (DownloadSink *)g_object_get_data(G_OBJECT(web), DOWNLOAD_SINK_KEY);
+    if (!sink) return;
+    if (sink->download_callback && env) {
+        env->DeleteGlobalRef(sink->download_callback);
+    }
+    sink->download_callback = nullptr;
+}
+
+// Register (or clear, when cb is null) the Java WebViewDownloadCallback
+// for a heavyweight engine.  Mirrors gtk_set_dialog_callback, and
+// additionally installs the view's DownloadSink and the one-time
+// context-level `download-started` connection.
+static void gtk_set_download_callback(Engine *e, JNIEnv *env, jobject cb) {
+    if (!e) return;
+    if (e->download_callback) {
+        env->DeleteGlobalRef(e->download_callback);
+        e->download_callback = nullptr;
+    }
+    if (cb) {
+        e->download_callback = env->NewGlobalRef(cb);
+    }
+    gtk_install_download_sink(e->web, e->jvm, env, cb);
+}
+
+
 // Register (or clear, when cb is null) the Java WebViewDialogCallback
 // for this engine.  STORY-004-001 stores the global ref but does NOT
 // install the WebKitWebView script-dialog / run-file-chooser signal
@@ -2109,6 +2544,14 @@ static Engine *gtk_adopt_popup(JNIEnv *env, jobject parent, jlong popupId,
     pe->popup_callback = nullptr;
     e->dialog_callback = pe->dialog_callback;
     pe->dialog_callback = nullptr;
+    // The adopted child keeps the DownloadSink it was created with, so an
+    // in-flight download keeps reporting to the handler that approved it
+    // rather than silently changing owner mid-transfer (Canvas 24).  The
+    // inherited ref moves onto the engine here so its teardown frees it;
+    // the component's own gtk_set_download_callback at attach replaces
+    // both it and the sink's.
+    e->download_callback = pe->download_callback;
+    pe->download_callback = nullptr;
 
     // Drop the retained strong reference taken by the ADOPT branch's
     // g_object_ref_sink — the engine's window now holds a container ref on the
@@ -2162,10 +2605,16 @@ static void gtk_discard_popup(jlong popupId) {
     if (env) {
         if (pe->popup_callback) env->DeleteGlobalRef(pe->popup_callback);
         if (pe->dialog_callback) env->DeleteGlobalRef(pe->dialog_callback);
+        // Clear the child view's DownloadSink before its inherited ref
+        // goes, so an in-flight download stops firing into Java
+        // (Canvas 24).
+        if (pe->web) gtk_clear_download_sink(GTK_WIDGET(pe->web), env);
+        if (pe->download_callback) env->DeleteGlobalRef(pe->download_callback);
         if (detach) pe->jvm->DetachCurrentThread();
     }
     pe->popup_callback = nullptr;
     pe->dialog_callback = nullptr;
+    pe->download_callback = nullptr;
     delete pe;
 }
 
@@ -2196,6 +2645,12 @@ struct OffEngine {
     // handle_script_dialog / handle_run_file_chooser inner functions
     // declared in the heavyweight engine block above.
     jobject dialog_callback = nullptr;
+
+    // JNI global ref to the registered WebViewDownloadCallback, or
+    // nullptr.  Set by gtk_off_set_download_callback; cleared in
+    // gtk_off_destroy_engine.  Same contract as the heavyweight
+    // engine's -- Canvas 24.
+    jobject download_callback = nullptr;
 
     // JNI global ref to the registered WebViewPopupCallback, or nullptr.
     // Set by gtk_off_set_popup_callback; cleared in gtk_off_destroy_engine.
@@ -2439,6 +2894,23 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
 
 static void gtk_off_destroy_engine(OffEngine *e) {
     if (!e) return;
+    // Drop the download-callback global ref and the view's DownloadSink
+    // BEFORE the widget is destroyed (Canvas 24) -- same ordering rule
+    // as the heavyweight engine.
+    if (e->download_callback || e->web) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm && e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) {
+            gtk_clear_download_sink(e->web, env);
+            if (e->download_callback) env->DeleteGlobalRef(e->download_callback);
+        }
+        e->download_callback = nullptr;
+        if (detach && e->jvm) e->jvm->DetachCurrentThread();
+    }
     GtkPump::instance().run_sync([&] {
         if (e->window) {
             gtk_widget_destroy(e->window);
@@ -2493,6 +2965,23 @@ static void gtk_off_destroy_engine(OffEngine *e) {
 // does NOT install the WebKitGTK signal handlers; STORY-004-002 wires
 // the script-dialog + run-file-chooser handlers on the offscreen
 // WebKitWebView.
+// Register (or clear, when cb is null) the Java WebViewDownloadCallback
+// for an offscreen engine (Canvas 24).  Mirrors gtk_set_download_callback:
+// the GTK signal model is identical in both modes, so both converge on the
+// same DownloadSink + context-level `download-started` machinery.
+static void gtk_off_set_download_callback(OffEngine *e, JNIEnv *env,
+                                          jobject cb) {
+    if (!e) return;
+    if (e->download_callback) {
+        env->DeleteGlobalRef(e->download_callback);
+        e->download_callback = nullptr;
+    }
+    if (cb) {
+        e->download_callback = env->NewGlobalRef(cb);
+    }
+    gtk_install_download_sink(e->web, e->jvm, env, cb);
+}
+
 static void gtk_off_set_dialog_callback(OffEngine *e, JNIEnv *env,
                                         jobject cb) {
     if (!e) return;
@@ -2637,6 +3126,14 @@ static OffEngine *gtk_off_adopt_popup(JNIEnv *env, jlong popupId,
     pe->popup_callback = nullptr;
     e->dialog_callback = pe->dialog_callback;
     pe->dialog_callback = nullptr;
+    // The adopted child keeps the DownloadSink it was created with, so an
+    // in-flight download keeps reporting to the handler that approved it
+    // rather than silently changing owner mid-transfer (Canvas 24).  The
+    // inherited ref moves onto the engine here so its teardown frees it;
+    // the component's own gtk_set_download_callback at attach replaces
+    // both it and the sink's.
+    e->download_callback = pe->download_callback;
+    pe->download_callback = nullptr;
 
     // Drop the retained strong reference taken by the ADOPT branch's
     // g_object_ref_sink — the offscreen window now holds a container ref on
@@ -3160,6 +3657,21 @@ struct Engine {
     // onPopupOpened / onPopupClosed pair.  nullptr / 0 on a normal engine.
     id popup_window = nullptr;
     jlong popup_id = 0;
+
+    // JNI global ref to the registered WebViewDownloadCallback, or
+    // nullptr.  Read by the WKDownloadDelegate selectors and by the
+    // NSProgress KVO observer for each in-flight download.  A download
+    // can outlive the page, the navigation, and plausibly the
+    // component, so this is cleared in cocoa_destroy_engine BEFORE the
+    // delegate is released -- a late event firing into a freed ref is
+    // a SIGSEGV, not an exception.
+    jobject download_callback = nullptr;
+
+    // Monotonic per-engine download identity.  Several downloads may be
+    // in flight at once and the destination file is neither known at
+    // request time nor unique across sequential downloads, so identity
+    // has to be minted here rather than derived from the path.
+    std::atomic<long long> next_download_id{1};
 
     // True when a Java EmbeddedWebView owns this engine's lifecycle -- i.e.
     // Java calls webview_embed_destroy -> cocoa_destroy_engine exactly once
@@ -4255,11 +4767,19 @@ static id impl_create_web_view(id self, SEL, id webView, id configuration,
         child_e->popup_callback = env->NewGlobalRef(cb);
         if (e->dialog_callback)
             child_e->dialog_callback = env->NewGlobalRef(e->dialog_callback);
+        // A download started in a popup must reach the OPENER's handler
+        // -- the transfer belongs to the user, not to which view began
+        // it (Canvas 23).
+        if (e->download_callback)
+            child_e->download_callback = env->NewGlobalRef(e->download_callback);
     }
     Class uicls = get_webview_embed_ui_delegate_cls();
     id ui = msg((id)uicls, sel("new"));
     objc_setAssociatedObject(ui, "eng", (id)child_e, OBJC_ASSOCIATION_ASSIGN);
     msg<void, id>(child, sel("setUIDelegate:"), ui);
+    // Downloads started in a popup reach the opener's handler through
+    // the child engine's inherited download_callback (Canvas 23).
+    msg<void, id>(child, sel("setNavigationDelegate:"), ui);
     child_e->ui_delegate = ui;
     {
         std::lock_guard<std::mutex> lk(g_webview_map_mutex);
@@ -4367,6 +4887,7 @@ static void impl_web_view_did_close(id self, SEL, id webView) {
     // before the app adopts it would otherwise leave a dangling entry).
     objc_setAssociatedObject(self, "eng", (id)nullptr, OBJC_ASSOCIATION_ASSIGN);
     msg<void, id>(webView, sel("setUIDelegate:"), nullptr);
+    msg<void, id>(webView, sel("setNavigationDelegate:"), (id)nullptr);
     {
         std::lock_guard<std::mutex> lk(g_webview_map_mutex);
         g_webview_map.erase(webView);
@@ -4381,6 +4902,22 @@ static void impl_web_view_did_close(id self, SEL, id webView) {
 
     // Notify Java and transfer ownership of the two inherited global refs.
     fire_popup_notify_closed(jvm, popup_cb, dialog_cb, pid, url, "");
+
+    // Abandon the popup's in-flight downloads (removing their NSProgress
+    // KVO observers) and drop its inherited download-callback ref before
+    // anything below is released.
+    cocoa_download_drop_engine(e);
+    if (e->download_callback) {
+        JNIEnv *denv = nullptr;
+        bool ddetach = false;
+        if (jvm && jvm->GetEnv((void **)&denv, JNI_VERSION_1_6) != JNI_OK) {
+            jvm->AttachCurrentThread((void **)&denv, nullptr);
+            ddetach = true;
+        }
+        if (denv) denv->DeleteGlobalRef(e->download_callback);
+        e->download_callback = nullptr;
+        if (ddetach && jvm) jvm->DetachCurrentThread();
+    }
 
     // Release native objects and free the engine.  The refs are now owned by
     // the worker, so we must not touch them here.
@@ -4408,6 +4945,477 @@ static void cocoa_set_popup_callback(Engine *e, JNIEnv *env, jobject cb) {
     }
     if (cb) {
         e->popup_callback = env->NewGlobalRef(cb);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Browser-initiated file downloads (Canvas 23).
+//
+// WKWebView produces a WKDownload only when the navigation-response
+// policy says so, so impl_decide_policy_for_navigation_response answers
+// WKNavigationResponsePolicyDownload for a response the engine cannot
+// render or that carries Content-Disposition: attachment.  The two
+// didBecomeDownload: callbacks then adopt the download and this file
+// drives it to completion.
+//
+// Three things about this platform shape the code below:
+//
+//   1. WKDownloadDelegate has NO byte-count callback.  The only
+//      progress WKDownload exposes is its `progress` property, an
+//      NSProgress, so progress is observed with KVO on
+//      completedUnitCount -- the same objc_allocateClassPair +
+//      associated-object pattern the engine already uses for
+//      NSWindow.firstResponder.
+//
+//   2. The destination decision MUST NOT block AppKit main.  The Java
+//      handler runs on the Swing EDT and the stock one opens a modal
+//      JFileChooser, which needs AppKit main itself; waiting for it
+//      from AppKit main deadlocks on the first download.  We use the
+//      deferral shape impl_run_alert already established: copy the
+//      completion block, return immediately, do the JNI hop on a
+//      detached worker thread, dispatch_async back to main to answer.
+//
+//   3. WKDownload is macOS 11.3+.  The selectors are always added (an
+//      unused selector costs nothing) but the policy method only ever
+//      answers Download when the class exists at runtime, so an older
+//      system keeps exactly its current behaviour.
+// ---------------------------------------------------------------------------
+
+// One in-flight download.  Held in g_download_map rather than as an
+// associated object because the context must be *freed* at a definite
+// point, and OBJC_ASSOCIATION_ASSIGN frees nothing.
+struct DownloadCtx {
+    Engine *e = nullptr;
+    long long id = 0;
+    std::atomic<long long> written{0};
+    std::atomic<bool> terminal{false};
+    id observer = nullptr;   // WebviewEmbedDownloadObserver, retained
+    id progress = nullptr;   // the observed NSProgress, retained
+};
+
+static std::mutex g_download_mutex;
+static std::map<id, DownloadCtx *> g_download_map;   // WKDownload -> ctx
+
+static std::once_flag g_download_observer_once;
+static Class g_download_observer_cls = nil;
+static const char DOWNLOAD_CTX_KEY[] = "dlctx";
+static int kvo_ctx_download_progress = 0;
+
+// True when the running system has WKDownload (macOS 11.3+).  Computed
+// once; the policy selector is the only reader.
+static bool cocoa_downloads_available() {
+    static bool available =
+        (objc_getClass("WKDownload") != nullptr);
+    return available;
+}
+
+// Invoke WebViewDownloadCallback.onDownloadRequested and copy the
+// returned absolute path into *out_path.  Returns false when there is
+// no callback, the method is missing, or Java refused (null return).
+//
+// Called from a detached worker thread (see impl_download_decide_
+// destination), so it always attaches; the defensive
+// GetEnv/AttachCurrentThread shape matches fire_click_callback.
+static bool fire_download_requested(JavaVM *jvm, jobject cb, long long id,
+                                    const std::string &url,
+                                    const std::string &suggested,
+                                    const std::string &mime,
+                                    long long total,
+                                    const std::string &page_url,
+                                    std::string *out_path) {
+    if (!jvm || !cb || !out_path) return false;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK) {
+            return false;
+        }
+        detach = true;
+    }
+    if (!env) return false;
+    bool got = false;
+    jclass cls = env->GetObjectClass(cb);
+    if (cls) {
+        jmethodID m = env->GetMethodID(
+            cls, "onDownloadRequested",
+            "(JLjava/lang/String;Ljava/lang/String;Ljava/lang/String;J"
+            "Ljava/lang/String;)Ljava/lang/String;");
+        if (m) {
+            jstring jurl = env->NewStringUTF(url.c_str());
+            jstring jname = env->NewStringUTF(suggested.c_str());
+            jstring jmime = env->NewStringUTF(mime.c_str());
+            jstring jpage = env->NewStringUTF(page_url.c_str());
+            jobject res = env->CallObjectMethod(
+                cb, m, (jlong)id, jurl, jname, jmime, (jlong)total, jpage);
+            if (env->ExceptionCheck()) {
+                env->ExceptionClear();
+                res = nullptr;
+            }
+            if (res) {
+                const char *c = env->GetStringUTFChars((jstring)res, nullptr);
+                if (c) {
+                    out_path->assign(c);
+                    env->ReleaseStringUTFChars((jstring)res, c);
+                    got = !out_path->empty();
+                }
+                env->DeleteLocalRef(res);
+            }
+            if (jurl) env->DeleteLocalRef(jurl);
+            if (jname) env->DeleteLocalRef(jname);
+            if (jmime) env->DeleteLocalRef(jmime);
+            if (jpage) env->DeleteLocalRef(jpage);
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (detach) jvm->DetachCurrentThread();
+    return got;
+}
+
+static void fire_download_progress(Engine *e, long long id,
+                                   long long received, long long total) {
+    if (!e || !e->download_callback) return;
+    JavaVM *jvm = e->jvm;
+    if (!jvm) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK) return;
+        detach = true;
+    }
+    if (env) {
+        jclass cls = env->GetObjectClass(e->download_callback);
+        if (cls) {
+            jmethodID m = env->GetMethodID(cls, "onDownloadProgress", "(JJJ)V");
+            if (m) {
+                env->CallVoidMethod(e->download_callback, m, (jlong)id,
+                                    (jlong)received, (jlong)total);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+            }
+            env->DeleteLocalRef(cls);
+        }
+    }
+    if (detach) jvm->DetachCurrentThread();
+}
+
+static void fire_download_completed(Engine *e, long long id, bool success,
+                                    const std::string &reason,
+                                    long long received) {
+    if (!e || !e->download_callback) return;
+    JavaVM *jvm = e->jvm;
+    if (!jvm) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK) return;
+        detach = true;
+    }
+    if (env) {
+        jclass cls = env->GetObjectClass(e->download_callback);
+        if (cls) {
+            jmethodID m = env->GetMethodID(
+                cls, "onDownloadCompleted", "(JZLjava/lang/String;J)V");
+            if (m) {
+                jstring jreason = env->NewStringUTF(reason.c_str());
+                env->CallVoidMethod(e->download_callback, m, (jlong)id,
+                                    (jboolean)(success ? JNI_TRUE : JNI_FALSE),
+                                    jreason, (jlong)received);
+                if (env->ExceptionCheck()) env->ExceptionClear();
+                if (jreason) env->DeleteLocalRef(jreason);
+            }
+            env->DeleteLocalRef(cls);
+        }
+    }
+    if (detach) jvm->DetachCurrentThread();
+}
+
+// KVO callback on the download's NSProgress.completedUnitCount.
+static void download_kvo_observe_impl(id self, SEL /*_cmd*/, id /*keyPath*/,
+                                      id /*object*/, id /*change*/,
+                                      void *context) {
+    if (context != &kvo_ctx_download_progress) return;
+    auto *ctx = (DownloadCtx *)objc_getAssociatedObject(self,
+                                                        DOWNLOAD_CTX_KEY);
+    if (!ctx || ctx->terminal.load()) return;
+    Engine *e = ctx->e;
+    if (!e || e->destroyed.load()) return;
+    id progress = ctx->progress;
+    if (!progress) return;
+    long long done = msg<long long>(progress, sel("completedUnitCount"));
+    long long total = msg<long long>(progress, sel("totalUnitCount"));
+    ctx->written.store(done);
+    fire_download_progress(e, ctx->id, done, total > 0 ? total : -1);
+}
+
+static void ensure_download_observer_class() {
+    std::call_once(g_download_observer_once, [] {
+        Class c = objc_allocateClassPair((Class)objc_cls("NSObject"),
+                                         "WebviewEmbedDownloadObserver", 0);
+        class_addMethod(
+            c,
+            sel("observeValueForKeyPath:ofObject:change:context:"),
+            (IMP)download_kvo_observe_impl,
+            "v@:@@@^v");
+        objc_registerClassPair(c);
+        g_download_observer_cls = c;
+    });
+}
+
+// Stop observing and release the observer + progress.  Caller MUST be on
+// AppKit main.  Idempotent.  An NSProgress released while still observed
+// is an AppKit hard error, so this always runs before the download goes
+// away and again at engine teardown for anything still in flight.
+static void cocoa_download_stop_observing(DownloadCtx *ctx) {
+    if (!ctx) return;
+    if (ctx->progress && ctx->observer) {
+        msg<void, id, id, void *>(
+            ctx->progress, sel("removeObserver:forKeyPath:context:"),
+            ctx->observer, ns_str("completedUnitCount"),
+            &kvo_ctx_download_progress);
+    }
+    if (ctx->progress) { msg(ctx->progress, sel("release")); ctx->progress = nullptr; }
+    if (ctx->observer) { msg(ctx->observer, sel("release")); ctx->observer = nullptr; }
+}
+
+// Look up (without removing) the context for a WKDownload.
+static DownloadCtx *cocoa_download_ctx(id download) {
+    std::lock_guard<std::mutex> lock(g_download_mutex);
+    auto it = g_download_map.find(download);
+    return it == g_download_map.end() ? nullptr : it->second;
+}
+
+// Claim the terminal report for `download`, detach its context from the
+// map, stop observing, and return the context so the caller can report
+// and free it.  Returns nullptr when some other path already claimed it.
+static DownloadCtx *cocoa_download_claim_terminal(id download) {
+    DownloadCtx *ctx = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_download_mutex);
+        auto it = g_download_map.find(download);
+        if (it == g_download_map.end()) return nullptr;
+        ctx = it->second;
+        if (!ctx || ctx->terminal.exchange(true)) return nullptr;
+        g_download_map.erase(it);
+    }
+    cocoa_download_stop_observing(ctx);
+    return ctx;
+}
+
+// WKNavigationDelegate:
+//   -webView:decidePolicyForNavigationResponse:decisionHandler:
+// Answers Download (2) for a response the engine will not render or that
+// carries an attachment disposition, Allow (1) otherwise.  On a system
+// without WKDownload this always answers Allow, which is exactly the
+// pre-feature behaviour.
+static void impl_decide_policy_for_navigation_response(
+        id self, SEL, id /*webView*/, id navigationResponse,
+        id decisionHandler) {
+    Engine *e = (Engine *)objc_getAssociatedObject(self, "eng");
+    long policy = 1;  // WKNavigationResponsePolicyAllow
+
+    if (e && e->download_callback && cocoa_downloads_available()
+            && navigationResponse) {
+        BOOL can_show = msg<BOOL>(navigationResponse, sel("canShowMIMEType"));
+        bool as_download = (can_show == NO);
+        if (!as_download) {
+            id response = msg(navigationResponse, sel("response"));
+            if (response
+                    && msg<BOOL, SEL>(response, sel("respondsToSelector:"),
+                                      sel("valueForHTTPHeaderField:")) == YES) {
+                id disp = msg<id, id>(response,
+                                      sel("valueForHTTPHeaderField:"),
+                                      ns_str("Content-Disposition"));
+                std::string d = ns_string_to_utf8(disp);
+                size_t first = d.find_first_not_of(" \t");
+                if (first != std::string::npos) d = d.substr(first);
+                for (size_t i = 0; i < d.size(); i++) {
+                    d[i] = (char)tolower((unsigned char)d[i]);
+                }
+                if (d.compare(0, 10, "attachment") == 0) as_download = true;
+            }
+        }
+        if (as_download) policy = 2;  // WKNavigationResponsePolicyDownload
+    }
+    ((void (^)(long))decisionHandler)(policy);
+}
+
+// Shared tail of the two didBecomeDownload: callbacks: adopt the
+// download, mint its id, and register the context.
+static void cocoa_adopt_download(id self, id download) {
+    if (!download) return;
+    Engine *e = (Engine *)objc_getAssociatedObject(self, "eng");
+    if (!e || e->destroyed.load()) return;
+    msg<void, id>(download, sel("setDelegate:"), self);
+    DownloadCtx *ctx = new DownloadCtx();
+    ctx->e = e;
+    ctx->id = e->next_download_id.fetch_add(1);
+    {
+        std::lock_guard<std::mutex> lock(g_download_mutex);
+        g_download_map[download] = ctx;
+    }
+}
+
+static void impl_navigation_action_did_become_download(
+        id self, SEL, id /*webView*/, id /*navigationAction*/, id download) {
+    cocoa_adopt_download(self, download);
+}
+
+static void impl_navigation_response_did_become_download(
+        id self, SEL, id /*webView*/, id /*navigationResponse*/, id download) {
+    cocoa_adopt_download(self, download);
+}
+
+// WKDownloadDelegate:
+//   -download:decideDestinationUsingResponse:suggestedFilename:
+//    completionHandler:
+//
+// Deferral shape mirrors impl_run_alert: copy the block, capture the
+// inputs as std::string while still on AppKit main, return immediately,
+// run the JNI hop on a detached worker thread, and dispatch_async back
+// to main to answer.  Blocking AppKit main here would deadlock against
+// the stock handler's modal JFileChooser.
+static void impl_download_decide_destination(
+        id self, SEL, id download, id response, id suggestedFilename,
+        id completionHandler) {
+    (void)self;
+    id ch = msg(completionHandler, sel("copy"));
+    DownloadCtx *ctx = cocoa_download_ctx(download);
+    Engine *e = ctx ? ctx->e : nullptr;
+
+    if (!ctx || !e || e->destroyed.load() || !e->download_callback) {
+        // Nothing to ask.  Cancel the transfer rather than letting
+        // WebKit pick a destination of its own.
+        ((void (^)(id))ch)(nullptr);
+        msg(ch, sel("release"));
+        return;
+    }
+
+    std::string suggested = ns_string_to_utf8(suggestedFilename);
+    std::string mime;
+    long long total = -1;
+    if (response) {
+        mime = ns_string_to_utf8(msg(response, sel("MIMEType")));
+        long long len = msg<long long>(response, sel("expectedContentLength"));
+        total = (len < 0) ? -1 : len;
+    }
+    std::string url;
+    id req = msg(download, sel("originalRequest"));
+    if (req) {
+        id u = msg(req, sel("URL"));
+        if (u) url = ns_string_to_utf8(msg(u, sel("absoluteString")));
+    }
+    std::string page_url = page_url_utf8(msg(download, sel("webView")));
+
+    JavaVM *jvm = e->jvm;
+    jobject cb = e->download_callback;
+    long long id_val = ctx->id;
+    id dl = download;
+
+    std::thread([jvm, cb, id_val, url, suggested, mime, total, page_url,
+                 ch, dl, ctx, e]() {
+        std::string path;
+        bool accepted = fire_download_requested(
+            jvm, cb, id_val, url, suggested, mime, total, page_url, &path);
+        std::string chosen = accepted ? path : std::string();
+        dispatch_async(dispatch_get_main_queue(), ^{
+            if (!chosen.empty() && !e->destroyed.load()) {
+                // Observe the NSProgress for byte counts -- WKDownload
+                // reports none through its delegate.
+                id progress = msg(dl, sel("progress"));
+                if (progress) {
+                    ensure_download_observer_class();
+                    id observer = msg((id)g_download_observer_cls, sel("new"));
+                    if (observer) {
+                        objc_setAssociatedObject(observer, DOWNLOAD_CTX_KEY,
+                                                 (id)ctx,
+                                                 OBJC_ASSOCIATION_ASSIGN);
+                        ctx->observer = observer;
+                        ctx->progress = msg(progress, sel("retain"));
+                        msg<void, id, id, unsigned long, void *>(
+                            progress,
+                            sel("addObserver:forKeyPath:options:context:"),
+                            observer, ns_str("completedUnitCount"),
+                            (unsigned long)0, &kvo_ctx_download_progress);
+                    }
+                }
+                id nsurl = msg<id, id>(objc_cls("NSURL"),
+                                       sel("fileURLWithPath:"),
+                                       ns_str(chosen.c_str()));
+                ((void (^)(id))ch)(nsurl);
+            } else {
+                // Refused (or the engine went away): cancel.  Java has
+                // already reported the single terminal event for this
+                // id and latched it, so the cancellation WebKit reports
+                // back through didFailWithError: is dropped there.
+                ((void (^)(id))ch)(nullptr);
+            }
+            msg(ch, sel("release"));
+        });
+    }).detach();
+}
+
+static void impl_download_did_finish(id self, SEL, id download) {
+    (void)self;
+    DownloadCtx *ctx = cocoa_download_claim_terminal(download);
+    if (!ctx) return;
+    Engine *e = ctx->e;
+    if (e && !e->destroyed.load()) {
+        fire_download_completed(e, ctx->id, true, std::string(),
+                                ctx->written.load());
+    }
+    delete ctx;
+}
+
+static void impl_download_did_fail(id self, SEL, id download, id error,
+                                   id /*resumeData*/) {
+    (void)self;
+    DownloadCtx *ctx = cocoa_download_claim_terminal(download);
+    if (!ctx) return;
+    Engine *e = ctx->e;
+    if (e && !e->destroyed.load()) {
+        std::string reason;
+        if (error) {
+            reason = ns_string_to_utf8(msg(error, sel("localizedDescription")));
+        }
+        if (reason.empty()) reason = "Download failed";
+        fire_download_completed(e, ctx->id, false, reason,
+                                ctx->written.load());
+    }
+    delete ctx;
+}
+
+// Drop every download belonging to `e`.  Called from cocoa_destroy_engine
+// on AppKit main, before anything is released, so no KVO observer
+// outlives its NSProgress and no late callback reaches a freed engine.
+static void cocoa_download_drop_engine(Engine *e) {
+    std::vector<DownloadCtx *> mine;
+    {
+        std::lock_guard<std::mutex> lock(g_download_mutex);
+        for (auto it = g_download_map.begin(); it != g_download_map.end(); ) {
+            if (it->second && it->second->e == e) {
+                it->second->terminal.store(true);
+                mine.push_back(it->second);
+                it = g_download_map.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (size_t i = 0; i < mine.size(); i++) {
+        cocoa_download_stop_observing(mine[i]);
+        delete mine[i];
+    }
+}
+
+// Register (or clear, when cb is null) the Java WebViewDownloadCallback
+// for this engine.  Mirrors cocoa_set_dialog_callback.
+static void cocoa_set_download_callback(Engine *e, JNIEnv *env, jobject cb) {
+    if (!e) return;
+    if (e->download_callback) {
+        env->DeleteGlobalRef(e->download_callback);
+        e->download_callback = nullptr;
+    }
+    if (cb) {
+        e->download_callback = env->NewGlobalRef(cb);
     }
 }
 
@@ -4446,6 +5454,45 @@ static Class get_webview_embed_ui_delegate_cls() {
             c,
             sel("webViewDidClose:"),
             (IMP)impl_web_view_did_close, "v@:@");
+        // Download support -- Canvas 23.  The same object serves as the
+        // WKNavigationDelegate and the WKDownloadDelegate: it already
+        // carries the per-engine "eng" associated object every selector
+        // needs, and the WKWebView's navigationDelegate was nil.
+        // Protocols missing on an older SDK/runtime resolve to nullptr;
+        // class_addProtocol tolerates that and the selectors are simply
+        // never called.
+        {
+            Protocol *nav = objc_getProtocol("WKNavigationDelegate");
+            if (nav) class_addProtocol(c, nav);
+            Protocol *dl = objc_getProtocol("WKDownloadDelegate");
+            if (dl) class_addProtocol(c, dl);
+        }
+        class_addMethod(
+            c,
+            sel("webView:decidePolicyForNavigationResponse:"
+                "decisionHandler:"),
+            (IMP)impl_decide_policy_for_navigation_response, "v@:@@@");
+        class_addMethod(
+            c,
+            sel("webView:navigationAction:didBecomeDownload:"),
+            (IMP)impl_navigation_action_did_become_download, "v@:@@@");
+        class_addMethod(
+            c,
+            sel("webView:navigationResponse:didBecomeDownload:"),
+            (IMP)impl_navigation_response_did_become_download, "v@:@@@");
+        class_addMethod(
+            c,
+            sel("download:decideDestinationUsingResponse:"
+                "suggestedFilename:completionHandler:"),
+            (IMP)impl_download_decide_destination, "v@:@@@@");
+        class_addMethod(
+            c,
+            sel("downloadDidFinish:"),
+            (IMP)impl_download_did_finish, "v@:@");
+        class_addMethod(
+            c,
+            sel("download:didFailWithError:resumeData:"),
+            (IMP)impl_download_did_fail, "v@:@@@");
         objc_registerClassPair(c);
         g_webview_embed_ui_delegate_cls = c;
     });
@@ -5134,6 +6181,11 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
         objc_setAssociatedObject(
             ui_delegate, "eng", (id)e, OBJC_ASSOCIATION_ASSIGN);
         msg<void, id>(e->webview, sel("setUIDelegate:"), ui_delegate);
+        // Download bridge -- Canvas 23.  The same object also serves as
+        // the navigationDelegate (previously nil): WKWebView only
+        // produces a WKDownload when the navigation-response policy
+        // says so, and that policy method lives on WKNavigationDelegate.
+        msg<void, id>(e->webview, sel("setNavigationDelegate:"), ui_delegate);
         // We hold the only strong ref to the delegate (the WKWebView's
         // uiDelegate is a weak reference per WebKit convention).  Stash
         // it on the engine so cocoa_destroy_engine can release it.
@@ -5334,6 +6386,7 @@ static void cocoa_discard_popup(jlong popupId) {
         std::string url = page_url_utf8(e->webview);
         if (e->webview) {
             msg<void, id>(e->webview, sel("setUIDelegate:"), nullptr);
+            msg<void, id>(e->webview, sel("setNavigationDelegate:"), (id)nullptr);
         }
         {
             std::lock_guard<std::mutex> lk(g_webview_map_mutex);
@@ -5463,6 +6516,21 @@ static void cocoa_destroy_engine(Engine *e) {
         e->focus_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
+    // Same treatment for the download-callback global ref.  A download
+    // can outlive the page, the navigation, and the component, so this
+    // must be gone before any teardown -- a late fire into a freed ref
+    // is a SIGSEGV, not an exception.
+    if (e->download_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->download_callback);
+        e->download_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     // Same treatment for the click-callback global ref.  Cleared after
     // the webview map entry above so the swizzled mouseDown: hooks read
     // a null field instead of a freed ref if they race against destroy.
@@ -5520,12 +6588,18 @@ static void cocoa_destroy_engine(Engine *e) {
             msg<void, id>(e->manager, sel("removeScriptMessageHandlerForName:"),
                           ns_str("external"));
         }
+        // Abandon every download still in flight for this engine and
+        // remove its NSProgress KVO observer.  An NSProgress released
+        // while still observed is an AppKit hard error, not a warning,
+        // so this runs before anything below is released.
+        cocoa_download_drop_engine(e);
         if (e->webview) {
             // Clear the WKWebView's uiDelegate BEFORE releasing the
             // WKWebView so any in-flight delegate selector observes
             // the cleared field (WKWebView holds a weak reference to
             // uiDelegate per Apple's convention).
             msg<void, id>(e->webview, sel("setUIDelegate:"), (id)nullptr);
+            msg<void, id>(e->webview, sel("setNavigationDelegate:"), (id)nullptr);
             // If we added the WKWebView as a subview, remove it before
             // releasing so AppKit unwinds the view hierarchy cleanly.
             msg<void>(e->webview, sel("removeFromSuperview"));
@@ -6288,6 +7362,30 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
 #elif defined(WEBVIEW_COCOA)
     embed::cocoa_set_popup_callback((embed::Engine *)wv, env, cb);
 #else
+    (void)env; (void)cb;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1download_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    if (wv == 0) return;
+#ifdef WEBVIEW_GTK
+    embed::gtk_set_download_callback((embed::Engine *)wv, env, cb);
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_set_download_callback((embed::Engine *)wv, env, cb);
+#else
+    (void)env; (void)cb;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1download_1callback
+  (JNIEnv *env, jclass, jlong peer, jobject cb) {
+    if (peer == 0) return;
+#ifdef WEBVIEW_GTK
+    embed::gtk_off_set_download_callback((embed::OffEngine *)peer, env, cb);
+#else
+    // No offscreen engine on macOS or Windows -- same shape as the
+    // dialog and popup offscreen bridges.
     (void)env; (void)cb;
 #endif
 }
