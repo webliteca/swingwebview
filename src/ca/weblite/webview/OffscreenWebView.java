@@ -464,6 +464,38 @@ public class OffscreenWebView {
     }
 
     /**
+     * Register the download callback for browser-initiated file
+     * downloads.  Anchors {@code cb} in {@link #heap} so the JVM does not
+     * collect the adapter while the native side holds a global ref — a
+     * download can outlive the page and the navigation that started it,
+     * so this anchoring matters more here than for any other callback.
+     *
+     * <p>Delivery is per-platform: macOS adopts {@code WKDownloadDelegate}
+     * and answers {@code WKNavigationResponsePolicyDownload}; Linux
+     * connects WebKitGTK's {@code download-started} on the web context and
+     * then {@code decide-destination} / {@code received-data} /
+     * {@code finished} / {@code failed} on the download; Windows registers
+     * {@code ICoreWebView2_4::add_DownloadStarting} and the operation's
+     * {@code add_BytesReceivedChanged} / {@code add_StateChanged}.
+     *
+     * <p>{@code onDownloadRequested} is answered synchronously — the
+     * native engine's thread is blocked awaiting the destination — while
+     * {@code onDownloadProgress} and {@code onDownloadCompleted} are
+     * fire-and-forget.  Application code should install a
+     * {@link WebViewDownloadHandler} via
+     * {@link ca.weblite.webview.swing.WebViewComponent#setDownloadHandler}
+     * rather than calling this directly.
+     */
+    public OffscreenWebView setDownloadCallback(WebViewDownloadCallback cb) {
+        checkAlive();
+        if (cb != null) {
+            heap.add(cb);
+        }
+        WebViewNative.webview_offscreen_set_download_callback(peer, cb);
+        return this;
+    }
+
+    /**
      * Override the WebView's User-Agent (changes the HTTP {@code User-Agent}
      * header).  {@code null} or empty restores the engine default.  Takes
      * effect on the next navigation.  Linux only; a native-side no-op where

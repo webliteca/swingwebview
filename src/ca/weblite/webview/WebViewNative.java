@@ -302,6 +302,36 @@ native static void webview_embed_set_dialog_callback(long w, WebViewDialogCallba
 // silent no-op.  Never throws via JNI.
 native static void webview_embed_set_popup_callback(long w, WebViewPopupCallback cb);
 
+// Register (or clear, by passing null) a callback invoked when the embedded
+// page starts a file download -- an <a download> click, a navigation whose
+// response carries Content-Disposition: attachment, or a navigation to a body
+// the engine will not render inline.
+//
+// onDownloadRequested returns the absolute destination path SYNCHRONOUSLY on
+// the native UI thread; the engine's thread is blocked awaiting it and the
+// native side MUST NOT marshal it to the EDT itself (the library's
+// DownloadDispatcher does that with SwingUtilities.invokeAndWait).  Returning
+// null refuses the download, and the native side must then CANCEL the
+// transfer rather than falling back to the platform's own default
+// destination.  onDownloadProgress and onDownloadCompleted are async
+// notifications the library marshals to the EDT via invokeLater.
+//
+// Per-platform delivery:
+//   - macOS:   WKDownloadDelegate (decideDestinationUsingResponse: /
+//              didWriteData: / downloadDidFinish: / didFailWithError:),
+//              reached by answering WKNavigationResponsePolicyDownload.
+//              Requires macOS 11.3+; a no-op on older systems.
+//   - Linux:   download-started on the WebKitWebContext, then
+//              decide-destination / received-data / finished / failed on the
+//              WebKitDownload.  Covers heavyweight, offscreen, and popups.
+//   - Windows: ICoreWebView2_4::add_DownloadStarting plus the operation's
+//              add_BytesReceivedChanged / add_StateChanged.  Requires a
+//              runtime exposing ICoreWebView2_4; a no-op on older runtimes.
+//
+// cb may be null to clear the registration.  Passing 0 for w is a silent
+// no-op.  Never throws via JNI.
+native static void webview_embed_set_download_callback(long w, WebViewDownloadCallback cb);
+
 // Override the embedded WebView's User-Agent (changes the actual HTTP
 // User-Agent request header).  ua == null (or empty) clears the override and
 // restores the engine default.  Takes effect on the next navigation.  Per
@@ -454,6 +484,11 @@ native static void webview_offscreen_set_dialog_callback(long peer, WebViewDialo
 // Windows native binaries provide a no-op stub (the offscreen engine on
 // those platforms is itself a stub).  Never throws via JNI.
 native static void webview_offscreen_set_popup_callback(long peer, WebViewPopupCallback cb);
+
+// Offscreen (lightweight) twin of webview_embed_set_download_callback.  Same
+// contract; Linux-only in practice, since the offscreen engine exists only on
+// the GTK backend.  Passing 0 for peer is a silent no-op.
+native static void webview_offscreen_set_download_callback(long peer, WebViewDownloadCallback cb);
 
 // Offscreen counterpart to webview_embed_set_user_agent.  Linux sets the
 // WebKitGTK settings user-agent; macOS / Windows offscreen engines are stubs

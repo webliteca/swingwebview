@@ -10,6 +10,7 @@ import ca.weblite.webview.ConsoleDispatcher;
 import ca.weblite.webview.EditingCommand;
 import ca.weblite.webview.EmbeddedWebView;
 import ca.weblite.webview.PopupDispatcher;
+import ca.weblite.webview.WebViewDownloadCallback;
 import ca.weblite.webview.JavascriptFunction;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewClickCallback;
@@ -240,6 +241,7 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         // a half-disposed component.
         dialogDispatcher.disposeAll();
         popupDispatcher.disposeAll();
+        downloadDispatcher.disposeAll();
         if (embedded != null) {
             EmbeddedWebView e = embedded;
             embedded = null;
@@ -673,6 +675,36 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
             public void onPopupClosed(long popupId, String targetUrl,
                                       String pageUrl) {
                 popupDispatcher.dispatchPopupClosed(popupId, targetUrl, pageUrl);
+            }
+        });
+        // Install the download bridge so a page-initiated download routes to
+        // the per-component WebViewDownloadHandler.  onDownloadRequested is
+        // answered synchronously (the dispatcher does the EDT hop with
+        // invokeAndWait and hands the destination back to the native engine,
+        // which is blocked waiting for it); onDownloadProgress and
+        // onDownloadCompleted are async notifications the dispatcher
+        // coalesces and marshals to the EDT via invokeLater.
+        embedded.setDownloadCallback(new WebViewDownloadCallback() {
+            @Override
+            public String onDownloadRequested(long id, String url,
+                                              String suggestedFileName,
+                                              String mimeType, long totalBytes,
+                                              String pageUrl) {
+                return downloadDispatcher.dispatchDownloadRequested(
+                    id, url, suggestedFileName, mimeType, totalBytes, pageUrl);
+            }
+            @Override
+            public void onDownloadProgress(long id, long receivedBytes,
+                                           long totalBytes) {
+                downloadDispatcher.dispatchDownloadProgress(
+                    id, receivedBytes, totalBytes);
+            }
+            @Override
+            public void onDownloadCompleted(long id, boolean success,
+                                            String failureReason,
+                                            long receivedBytes) {
+                downloadDispatcher.dispatchDownloadCompleted(
+                    id, success, failureReason, receivedBytes);
             }
         });
         // Let the dispatcher discard retained-but-unadopted popup children

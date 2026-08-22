@@ -12,6 +12,7 @@ import ca.weblite.webview.GdkInput;
 import ca.weblite.webview.JavascriptFunction;
 import ca.weblite.webview.OffscreenWebView;
 import ca.weblite.webview.PopupDispatcher;
+import ca.weblite.webview.WebViewDownloadCallback;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewDialogCallback;
 import ca.weblite.webview.WebViewPopupCallback;
@@ -351,6 +352,36 @@ public class WebViewLightweightComponent extends WebViewComponent {
                 popupDispatcher.dispatchPopupClosed(popupId, targetUrl, pageUrl);
             }
         });
+        // Install the download bridge on the offscreen engine.  Linux
+        // dispatches via WebKitGTK's download-started signal on the shared web
+        // context; on macOS / Windows the offscreen engine is a stub and this
+        // call is a native-side no-op.  onDownloadRequested is answered
+        // synchronously (the dispatcher does the EDT hop with invokeAndWait);
+        // onDownloadProgress and onDownloadCompleted are async notifications
+        // the dispatcher coalesces and marshals via invokeLater.
+        engine.setDownloadCallback(new WebViewDownloadCallback() {
+            @Override
+            public String onDownloadRequested(long id, String url,
+                                              String suggestedFileName,
+                                              String mimeType, long totalBytes,
+                                              String pageUrl) {
+                return downloadDispatcher.dispatchDownloadRequested(
+                    id, url, suggestedFileName, mimeType, totalBytes, pageUrl);
+            }
+            @Override
+            public void onDownloadProgress(long id, long receivedBytes,
+                                           long totalBytes) {
+                downloadDispatcher.dispatchDownloadProgress(
+                    id, receivedBytes, totalBytes);
+            }
+            @Override
+            public void onDownloadCompleted(long id, boolean success,
+                                            String failureReason,
+                                            long receivedBytes) {
+                downloadDispatcher.dispatchDownloadCompleted(
+                    id, success, failureReason, receivedBytes);
+            }
+        });
         // Let the dispatcher discard retained-but-unadopted popup children
         // (PopupDisposition.ADOPT reclaim) through this offscreen engine.
         // Mirrors WebViewHeavyweightComponent's reclaim sink; the native side
@@ -417,6 +448,7 @@ public class WebViewLightweightComponent extends WebViewComponent {
         // invoking the handler against a half-disposed component.
         dialogDispatcher.disposeAll();
         popupDispatcher.disposeAll();
+        downloadDispatcher.disposeAll();
         if (engine != null) {
             OffscreenWebView ow = engine;
             engine = null;

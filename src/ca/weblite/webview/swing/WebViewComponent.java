@@ -8,10 +8,12 @@ package ca.weblite.webview.swing;
 import ca.weblite.webview.ConsoleDispatcher;
 import ca.weblite.webview.ConsoleListener;
 import ca.weblite.webview.DialogDispatcher;
+import ca.weblite.webview.DownloadDispatcher;
 import ca.weblite.webview.PopupDispatcher;
 import ca.weblite.webview.JavaScriptEvalException;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewDialogHandler;
+import ca.weblite.webview.WebViewDownloadHandler;
 import ca.weblite.webview.WebViewPopupHandler;
 import ca.weblite.webview.WebViewMouseDispatcher;
 import ca.weblite.webview.WebViewMouseListener;
@@ -84,6 +86,17 @@ public abstract class WebViewComponent extends JComponent {
      *  peer-attach time that delegates to this dispatcher's {@code dispatch*}
      *  methods. */
     protected final PopupDispatcher popupDispatcher = new PopupDispatcher(this);
+
+    /** Per-component fan-out hub for browser-initiated file downloads
+     *  ({@code <a download>}, a {@code Content-Disposition: attachment}
+     *  response, or a body the engine will not render inline).  Holds the
+     *  active {@link WebViewDownloadHandler}, marshals the destination
+     *  decision onto the EDT synchronously, coalesces progress, and
+     *  guarantees exactly one terminal event per download.  Subclasses
+     *  install a {@link ca.weblite.webview.WebViewDownloadCallback} on their
+     *  native peer at peer-attach time that delegates to this dispatcher's
+     *  {@code dispatch*} methods. */
+    protected final DownloadDispatcher downloadDispatcher = new DownloadDispatcher(this);
 
     /** When non-zero, this component was created via {@link #adoptPopup} and
      *  its peer, at attach time, adopts the pre-existing native popup child
@@ -655,5 +668,73 @@ public abstract class WebViewComponent extends JComponent {
      */
     public final WebViewPopupHandler getPopupHandler() {
         return popupDispatcher.getHandler();
+    }
+
+    // ---------------------------------------------------------------------
+    // Browser-initiated download handler API.
+    //
+    // The handler covers downloads the page starts: a click on
+    // `<a href="..." download>`, a navigation whose response carries
+    // `Content-Disposition: attachment`, and a navigation to a body the
+    // engine will not render inline.  Default behaviour shows a Swing
+    // save dialog anchored on the host JFrame; the two notification
+    // methods do nothing.  Callers replace the handler wholesale via
+    // setDownloadHandler; passing null installs an internal drop handler
+    // that refuses every download without UI (useful for headless
+    // tests).  See WebViewDownloadHandler for the full contract.
+    //
+    // Concrete (not abstract) on the base class -- the dispatcher does
+    // not depend on subclass state.  Subclasses install a
+    // WebViewDownloadCallback adapter on their native peer at
+    // peer-attach time that bridges native download events into this
+    // dispatcher's dispatch* methods.
+    //
+    // Platform coverage:
+    //   - macOS heavyweight and lightweight (WKDownload): wired.
+    //     Requires macOS 11.3+; on older systems the engine keeps its
+    //     current behaviour and the handler is not invoked.
+    //   - Linux WebKitGTK, heavyweight, lightweight, and popups: wired.
+    //   - Windows WebView2: wired.  Requires a runtime exposing
+    //     ICoreWebView2_4; on an older runtime the engine keeps its
+    //     built-in download handling and the handler is not invoked.
+    // ---------------------------------------------------------------------
+
+    /**
+     * Install (or replace) the {@link WebViewDownloadHandler} that
+     * decides where a browser-initiated download is written and
+     * observes its progress and outcome.  Passing {@code null} does NOT
+     * reset to the framework default — it installs an internal drop
+     * handler that refuses every download with no UI and no file.  To
+     * reset to the stock save dialog, pass
+     * {@link WebViewDownloadHandler#DEFAULT} explicitly.
+     *
+     * <p>Safe to call before the component is displayed.  Safe to call
+     * from any thread.  Replacement is atomic; the next dispatch picks
+     * up the new handler.
+     *
+     * <p>See {@link WebViewDownloadHandler} for the full contract,
+     * including the EDT threading split (the destination decision
+     * blocks the engine; progress and completion do not), the
+     * {@code evalAsync(...).get()} self-deadlock hazard, the
+     * coalesced-progress and exactly-once-completion guarantees, and
+     * the filename-sanitisation guarantee.
+     *
+     * @return {@code this} for chaining
+     */
+    public final WebViewComponent setDownloadHandler(
+            WebViewDownloadHandler handler) {
+        downloadDispatcher.setHandler(handler);
+        return this;
+    }
+
+    /**
+     * @return the active {@link WebViewDownloadHandler}.  Never returns
+     * {@code null} — returns {@link WebViewDownloadHandler#DEFAULT} when
+     * no caller has installed one, and returns the internal drop
+     * singleton when caller passed {@code null} to
+     * {@link #setDownloadHandler}.
+     */
+    public final WebViewDownloadHandler getDownloadHandler() {
+        return downloadDispatcher.getHandler();
     }
 }
