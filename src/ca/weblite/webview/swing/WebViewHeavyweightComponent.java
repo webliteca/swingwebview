@@ -264,6 +264,41 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         return d;
     }
 
+    /**
+     * A web view has no intrinsic minimum size -- it renders at
+     * whatever size it is given -- so this reports an empty one.
+     *
+     * <p>Without the override the answer comes from the embedded
+     * {@link Canvas}: a peered AWT canvas reports its <em>current</em>
+     * size as its minimum size on every platform
+     * ({@code LWCanvasPeer.getMinimumSize} on macOS,
+     * {@code WComponentPeer.getMinimumSize} on Windows,
+     * {@code XComponentPeer.getMinimumSize} on X11), and this
+     * component's {@code BorderLayout} passes that on as its own.  The
+     * component then claims it can never be narrower or shorter than it
+     * happens to be, which is untrue and which breaks callers that
+     * consult minimum sizes.  The sharpest case: a {@code JSplitPane}
+     * computes its divider's drag range from its children's minimums,
+     * once, when the drag begins -- so with such a child on each side
+     * the range collapses onto the divider's current position and the
+     * split cannot be resized by dragging at all, however faithfully
+     * the mouse events arrive.
+     *
+     * <p>An explicit {@code setMinimumSize} by the application still
+     * wins; only the peer's accidental answer is shadowed.  Preferred
+     * sizing is deliberately left alone, so ordinary layout is
+     * unaffected -- this changes only how far the component says it may
+     * be shrunk.  {@link WebViewLightweightComponent} hosts no canvas
+     * and already answers this way, so the two modes now agree.
+     */
+    @Override
+    public Dimension getMinimumSize() {
+        if (isMinimumSizeSet()) {
+            return super.getMinimumSize();
+        }
+        return new Dimension(0, 0);
+    }
+
     @Override
     public void addNotify() {
         super.addNotify();
