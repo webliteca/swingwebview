@@ -13,6 +13,22 @@ generated_at: 2026-05-16T07:19:13-07:00
 - The component must:
   - Be a `JComponent` subclass that callers add to any Swing
     container (`WebViewHeavyweightComponent.java:49`).
+  - Report **no intrinsic minimum size**, so a layout that
+    consults minimum sizes may shrink the component freely. A
+    web view renders at whatever size it is given, so it has no
+    honest minimum — but the AWT canvas peer this component
+    wraps answers `getMinimumSize()` with the canvas's
+    **current** size (`LWCanvasPeer.getMinimumSize` on macOS,
+    `WComponentPeer.getMinimumSize` on Windows,
+    `XComponentPeer.getMinimumSize` on X11), which the
+    component's `BorderLayout` then reports as its own. Left
+    alone, that makes the component claim "I can never be
+    narrower or shorter than I am right now", which is false and
+    which breaks callers: a `JSplitPane` with such a child
+    computes its divider's drag range from the children's
+    minimums and pins the divider where it already sits, so the
+    split cannot be resized by dragging at all. Operation 7b
+    states the honest answer instead.
   - Create the native peer lazily on first display
     (`addNotify`/first `paint`), and tear it down on
     `removeNotify` (`WebViewHeavyweightComponent.java:142`,
@@ -1373,6 +1389,30 @@ File: `src/ca/weblite/webview/swing/WebViewHeavyweightComponent.java`
        return `new Dimension(800, 600)`
        (`WebViewHeavyweightComponent.java:134`).
 
+### 7b. Minimum Size — getMinimumSize
+File: `src/ca/weblite/webview/swing/WebViewHeavyweightComponent.java`
+
+1. Responsibility: report that the component has no intrinsic
+   minimum size, shadowing the AWT canvas peer's "my minimum is
+   my current size" answer that the component's `BorderLayout`
+   would otherwise pass on.
+2. Methods:
+   - `getMinimumSize(): Dimension`
+     - Logic: if the caller has set an explicit minimum
+       (`isMinimumSizeSet()`), defer to `super.getMinimumSize()`
+       so an application-supplied floor still wins; otherwise
+       return `new Dimension(0, 0)`.
+3. Constraints / Invariants:
+   - Preferred sizing is untouched: operation 7 keeps returning
+     the super/fallback preferred size, so nothing about normal
+     layout changes — only the claim about how far the component
+     may be *shrunk*.
+   - The lightweight sibling (`WebViewLightweightComponent`,
+     canvas 7) already answers with an empty minimum, since it
+     hosts no canvas; this brings the heavyweight component to
+     the same contract, so the two modes no longer disagree on a
+     standard Swing question.
+
 ### 8. Open Native DevTools — webview_embed_open_devtools
 Files: `src/ca/weblite/webview/WebViewNative.java`,
 `src_c/webview_embed.cpp`, `windows/webview_embed.cc`
@@ -2597,6 +2637,13 @@ Files:
 - `sizeNative()` no-ops on non-positive dimensions so a
   collapsed split-pane region doesn't drive negative bounds
   into the native side (`WebViewHeavyweightComponent.java:167`).
+- `getMinimumSize()` (operation 7b) must check
+  `isMinimumSizeSet()` before returning the empty minimum, so a
+  caller's explicit `setMinimumSize` is never silently
+  discarded. Removing the override altogether reinstates the
+  canvas peer's "minimum == current size" answer and with it the
+  pinned-`JSplitPane`-divider failure, which no compilation or
+  test failure would reveal — the split simply stops resizing.
 - HierarchyListener only acts on `SHOWING_CHANGED` events to
   avoid running the visibility/resize logic on unrelated
   hierarchy changes (`WebViewHeavyweightComponent.java:211`).
