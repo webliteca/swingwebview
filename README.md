@@ -31,6 +31,45 @@ web engine:
   hard-linked), so a single jar runs on both.
 * **macOS** needs nothing extra — WKWebView ships with the OS.
 
+### Early access via GitHub Packages
+
+Every tagged release is published to GitHub Packages *before* Maven
+Central, and is resolvable there the moment the release build finishes —
+useful when a downstream project needs to build against a new version
+without waiting for Central to sync.
+
+GitHub Packages requires an authenticated read even for public packages,
+so this channel is only practical for first-party projects and CI that
+already hold a token.  **Maven Central is the canonical channel; external
+consumers should use the coordinates above.**
+
+Add the repository to your `pom.xml`:
+
+```xml
+<repositories>
+    <repository>
+        <id>github-webliteca</id>
+        <url>https://maven.pkg.github.com/webliteca/swingwebview</url>
+    </repository>
+</repositories>
+```
+
+and a matching server entry in `~/.m2/settings.xml`, where the password is
+a personal access token with the `read:packages` scope (in GitHub Actions,
+use `${{ github.actor }}` and the built-in `GITHUB_TOKEN` instead):
+
+```xml
+<server>
+    <id>github-webliteca</id>
+    <username>YOUR_GITHUB_USERNAME</username>
+    <password>YOUR_PAT_WITH_READ_PACKAGES</password>
+</server>
+```
+
+The `<id>` values must match.  Once Maven Central has synced the same
+version, the repository entry can be dropped again — the artifacts are
+identical.
+
 ## Platform support
 
 | Platform | Heavyweight | Lightweight |

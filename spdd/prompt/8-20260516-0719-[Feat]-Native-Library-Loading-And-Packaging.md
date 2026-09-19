@@ -32,6 +32,17 @@ generated_at: 2026-05-16T07:19:13-07:00
   `.github/workflows/build.yml:171`). The system Microsoft Edge
   WebView2 Runtime provides the actual Chromium binaries
   (`README.md ("Platform support" section)`).
+- Publish each tagged release of the assembled six-platform jar
+  to **two** repositories: GitHub Packages first, then Maven
+  Central. Both receive the same coordinates and the same
+  tag-derived version. Maven Central's post-publish sync delay
+  blocks downstream first-party projects from building against a
+  freshly released version; GitHub Packages is readable the moment
+  the deploy returns, so it serves as a fast lane while Central
+  propagates. Publication remains gated on `v*` tags — there is no
+  snapshot channel and no publication from `master`
+  (`.github/workflows/maven-release.yml`, `pom.xml` profiles
+  `github-deploy` and `central-deploy`).
 - Definition of Done: indirectly validated by every other feature
   in this repo — if the native loader is broken, nothing else
   works. No standalone unit tests; smoke tested by the demos
@@ -106,6 +117,23 @@ generated_at: 2026-05-16T07:19:13-07:00
   gitignored; its contents are produced by `build-*.sh` locally or
   the per-platform CI matrix on release. At runtime, the extractor
   maps `Architecture.LINUX_64` → `linux_64/libwebview.so`, etc.
+- **One deploy target per Maven profile, because the Central
+  plugin owns the deploy lifecycle.**
+  `central-publishing-maven-plugin` is declared with build
+  extensions enabled, which *replaces* the standard deploy goal in
+  the `jar` packaging lifecycle. While it is active unconditionally,
+  `mvn deploy` can reach Maven Central and nothing else — adding a
+  `<distributionManagement>` repository has no effect. The dual
+  target is therefore expressed as two mutually exclusive profiles:
+  `central-deploy` carries the Central publishing plugin,
+  `github-deploy` carries a `<distributionManagement>` entry for the
+  GitHub Packages endpoint and the ordinary deploy plugin. The
+  release job runs `mvn deploy` twice over one already-assembled
+  tree, once per profile. With neither profile active there is no
+  deploy target at all, which is the intended outcome: a bare
+  `mvn deploy` must not silently publish anywhere, while
+  `mvn package` and `mvn install` are untouched for local
+  developers.
 - **Leftover cleanup, not pinning.** Extracted native files live
   in the OS temp directory and are deleted if older than 5
   minutes when the next process starts
@@ -147,6 +175,17 @@ generated_at: 2026-05-16T07:19:13-07:00
   via `webkit_shim.h`. GTK3/GLib remain normally linked. macOS
   (WKWebView) and Windows (WebView2) builds are untouched — the
   loader compiles only under `WEBVIEW_GTK` / `__linux__`.
+- `README.md` ("Installation" section) — the consumer-facing
+  record of both channels: the Maven Central coordinates every
+  adopter uses, plus the GitHub Packages repository and the
+  authenticated `settings.xml` server entry a first-party
+  consumer needs to resolve a release before Central has synced.
+- `pom.xml` profiles `github-deploy` and `central-deploy` — the
+  two release targets (Operation 9). Exactly one is activated per
+  `mvn deploy` invocation; neither is active by default. The
+  pre-existing `sign-artifacts` profile is orthogonal and supplies
+  the sources jar, javadoc jar and GPG signatures required by
+  Central.
 - `pom.xml:65-75` — Maven resource entries that copy each
   per-architecture directory from `natives/<arch>/` into
   `target/classes/<arch>/` at JAR-build time, so they land at the
@@ -167,7 +206,8 @@ generated_at: 2026-05-16T07:19:13-07:00
   uploads one artifact; an assembly/deploy job downloads all six,
   lays them into `natives/<arch>/`, asserts all six are present,
   and runs `mvn package`/`deploy`. This is the only path that
-  produces the cross-platform fat jar shipped to Maven Central.
+  produces the cross-platform fat jar shipped to GitHub Packages
+  and Maven Central.
 
 ## O · Operations
 
@@ -291,8 +331,9 @@ File: `pom.xml`
 Files: `.github/workflows/build.yml`,
 `.github/workflows/maven-release.yml`
 
-1. Responsibility: produce a single Maven-Central-ready jar that
-   contains all six platform+arch native libraries. Each native
+1. Responsibility: produce a single release-ready jar that
+   contains all six platform+arch native libraries, and hand it to
+   the two publication targets of Operation 9. Each native
    must be compiled on a runner of its matching OS/arch — there
    is no cross-compilation path.
 2. Logic (two-phase, identical structure in both workflows):
@@ -310,8 +351,8 @@ Files: `.github/workflows/build.yml`,
      artifact, copies each into `natives/<arch>/`, then runs a
      **6-platform-presence assertion** that fails the job if
      any of the six expected directories is empty
-     (`maven-release.yml:234-249`). Only then does
-     `mvn deploy` run.
+     (`maven-release.yml:234-249`). Only then does either
+     `mvn deploy` invocation run.
 3. Constraints / Invariants:
    - The presence assertion's `required=(...)` array is the
      authoritative list of platforms shipped. It must stay in
@@ -327,8 +368,15 @@ Files: `.github/workflows/build.yml`,
      so the published jar carries only `webview.dll`, no
      `WebView2Loader.dll` (`build.yml:171`).
    - `build.yml` runs on every push/PR to `master`, producing
-     a downloadable jar artifact but not publishing. Only
-     `maven-release.yml` publishes, gated on `v*` tag pushes.
+     a downloadable jar artifact but not publishing — to any
+     repository, including GitHub Packages. Only
+     `maven-release.yml` publishes, gated on `v*` tag pushes
+     (plus manual `workflow_dispatch`). There is no snapshot
+     channel.
+   - The six-platform presence assertion gates **both** deploys.
+     A release missing any platform publishes to neither target,
+     so the two repositories can never disagree about what a
+     given version contains.
    - The Linux `native` job asserts, via `readelf -d` on the
      built `libwebview.so`, that it has **no** `NEEDED` entry
      matching `webkit2gtk` or `javascriptcoregtk` (4.0 or 4.1)
@@ -461,6 +509,51 @@ Files: `build-mac.sh`, `build-linux.sh`
    corrected in `build-linux.sh`; `build-windows.sh` is untouched
    (it links no JAWT and delegates to `windows/script/build.bat`).
 
+### 9. Dual-Target Release Publication
+Files: `pom.xml`, `.github/workflows/maven-release.yml`
+
+1. Responsibility: publish one tagged release to GitHub Packages
+   and to Maven Central, in that order, from the single
+   fully-assembled jar produced by Operation 6.
+2. Logic:
+   - `pom.xml` defines two deploy profiles, neither active by
+     default. `github-deploy` declares a
+     `<distributionManagement>` repository with id `github`
+     pointing at the repository's GitHub Packages Maven endpoint,
+     and relies on the standard deploy plugin. `central-deploy`
+     declares `central-publishing-maven-plugin` with build
+     extensions enabled and the pre-existing `central` server id
+     and auto-publish setting. The Central plugin must live
+     **inside** its profile — see the Approach note on lifecycle
+     ownership.
+   - The deploy job authenticates two servers in one Maven
+     settings file: `github`, with the workflow's built-in
+     repository token, and `central`, with the portal API token
+     credentials. The job requests `packages: write` permission
+     in addition to `contents: read`.
+   - After the version is set from the tag, the job deploys twice
+     over the same tree: first `github-deploy`, then
+     `central-deploy` with the `sign-artifacts` profile and the
+     GPG passphrase. GitHub Packages goes first so the fast lane
+     opens before the slower Central publication begins.
+3. Constraints / Invariants:
+   - Ordering is load-bearing, not cosmetic: the whole point of
+     the second target is to shorten the wait, so a failure in
+     the Central leg must still leave the GitHub Packages
+     artifact published and usable.
+   - GPG signing is required for Central and unnecessary for
+     GitHub Packages. The `github-deploy` leg therefore runs
+     without `sign-artifacts`, which also keeps the private key
+     out of the first deploy entirely.
+   - Both legs publish identical coordinates and version. Never
+     let the two diverge — a consumer resolving
+     `ca.weblite:webview:<v>` must get the same artifact
+     whichever repository answers first.
+   - A given version can be published to each repository only
+     once; neither target accepts a redeploy of an existing
+     release version. Re-running a release therefore requires a
+     new tag, not a retry of the old one.
+
 ## N · Norms
 - The developer `build-*.sh` scripts must quote every shell
   expansion that carries a filesystem path — `"${JAVA_HOME}"`
@@ -495,6 +588,15 @@ Files: `build-mac.sh`, `build-linux.sh`
     are present" step of both workflows,
   - one of the `build-*.sh` scripts (or a new one) for local
     builds on the matching OS/arch.
+- **Maven Central is the canonical public distribution channel.**
+  GitHub Packages requires authentication for *reads* even when
+  the repository and package are public, so a consumer must hold a
+  token with package-read scope to resolve from it. That is fine
+  for first-party projects and for CI inside the owning
+  organisation, which have such a token already, and unusable for
+  external adopters. Document Central coordinates in `README.md`
+  for external users; treat GitHub Packages as an internal fast
+  lane and never as a replacement for the Central release.
 - The Linux native resolves WebKitGTK/JavaScriptCore at **runtime**
   (Operation 7), never via a link-time `-l`. Any newly-used
   `webkit_*` / `jsc_*` symbol must be added to the `webkit_loader`
@@ -527,6 +629,19 @@ Files: `build-mac.sh`, `build-linux.sh`
   diverge, the script is wrong, not CI — CI builds the artifact that
   ships, so a local smoke test against a differently-linked library
   proves nothing about the release.
+- **A release publishes to both targets or to neither.** The
+  six-platform presence assertion runs before either deploy, so a
+  jar missing a platform never reaches GitHub Packages or Maven
+  Central. Do not move a deploy step ahead of that assertion, and
+  do not add a deploy step to `build.yml` — publication belongs to
+  tag-triggered releases only.
+- **Deploy targets stay inside their profiles (never-relax).**
+  Moving `central-publishing-maven-plugin` back into the top-level
+  build silently re-breaks the GitHub Packages leg: with its
+  extensions active unconditionally it replaces the deploy goal for
+  every invocation, so the `github-deploy` profile deploys to
+  Central instead, or not at all. A bare `mvn deploy` having no
+  target is the intended behaviour, not an oversight to fix.
 - The extractor cleans up leftover libraries older than 5
   minutes (`BaseJniExtractor.java:66`), bounded by the
   `org.scijava.nativelib.leftoverMinAgeMs` system property.
