@@ -59,7 +59,10 @@ generated_at: 2026-05-16T07:19:13-07:00
     (caret blink, character display) is unreliable — see
     `README.md ("Platform support" section)`.
   - **Windows** (WebView2): full fidelity on Windows 11 with the
-    Edge WebView2 Runtime installed.
+    Edge WebView2 Runtime installed. The native environment MUST use a
+    writable per-user data folder so packaged applications installed in
+    protected locations such as `Program Files` can start WebView2 without
+    requiring administrator rights.
 - Implement the developer-visibility surface declared in
   [[swing-webview-component-mode-selection]]:
   - `openDevTools(): boolean` — when `debug=true` was set
@@ -387,6 +390,14 @@ generated_at: 2026-05-16T07:19:13-07:00
     runs, symmetric with the existing `setFocusCallback(null)`
     cleanup, so a late native click event during teardown
     cannot fire into a freed global ref.
+- **Windows WebView2 user-data folder** (`windows/webview_embed.cc`) —
+  resolved once for each environment creation. An explicit non-empty
+  `WEBVIEW2_USER_DATA_FOLDER` environment variable wins. Otherwise the
+  folder is rooted under the current user's `LOCALAPPDATA`, grouped under
+  `SwingWebView`, and identified by the host executable filename plus a
+  deterministic hash of its absolute path. The path hash keeps identically
+  named executables from different installations separate while preserving
+  stable cookies/cache across launches from the same installation.
 - **WebViewClickCallback** (new public functional interface,
   `src/ca/weblite/webview/WebViewClickCallback.java`). Single
   method `void invoke()` — fired once per native mouse-button
@@ -531,6 +542,16 @@ generated_at: 2026-05-16T07:19:13-07:00
   returns. Hooking peer creation into the first `paint()` gives
   both the EDT tree and the AppKit NSView a chance to exist
   before JAWT is locked (`WebViewHeavyweightComponent.java:243`).
+- **Windows WebView2 state lives outside the installation directory.**
+  Passing a null user-data-folder to WebView2 makes it derive
+  `{Executable File Name}.WebView2` beside the host executable. That fails
+  with access denied when a packaged application runs from `Program Files`.
+  The Windows native layer therefore resolves a writable per-user folder
+  before `CreateCoreWebView2EnvironmentWithOptions`, creates the required
+  parent directories, and passes the absolute path explicitly. It first
+  honors `WEBVIEW2_USER_DATA_FOLDER`; absent an override it prefers
+  `LOCALAPPDATA` and falls back to the Windows temporary directory only when
+  the Local AppData path cannot be created.
 - **Coordinate translation for macOS.** The native side parents
   the WKWebView onto `NSWindow.contentView`, so positioning
   inside Swing requires converting the canvas's location to the
@@ -1003,6 +1024,9 @@ generated_at: 2026-05-16T07:19:13-07:00
   `mouseDown:`/`rightMouseDown:`/`otherMouseDown:` swizzle on
   macOS, `WM_PARENTNOTIFY` on Windows) reads that ref and
   invokes the Java callback's `invoke()` method.
+  The Windows file also owns WebView2 user-data-folder resolution and passes
+  a writable absolute per-user path into environment creation instead of
+  accepting WebView2's executable-adjacent default.
   macOS-specific structural changes for the sync-deadlock
   elimination work (see Operation 14): the
   `cocoa_run_on_main` synchronous helper, the
@@ -2453,6 +2477,36 @@ Files:
      by this Operation, except for the immediate-fire
      attach-completion callback in step 6.
 
+### 15. Use a Writable WebView2 User-Data Folder on Windows
+File: `windows/webview_embed.cc`
+
+1. Before creating the WebView2 environment, read the non-empty
+   `WEBVIEW2_USER_DATA_FOLDER` environment variable. When present, pass its
+   value through unchanged so application and deployment configuration keeps
+   precedence.
+2. Without an override, obtain the host executable's absolute path with the
+   Unicode Win32 API. Derive a stable directory name from its filename plus
+   a deterministic 64-bit hash of the full executable path; do not use a
+   randomized or implementation-defined hash whose output may change between
+   builds.
+3. Prefer `<LOCALAPPDATA>\SwingWebView\<host-id>.WebView2`. Create both the
+   `SwingWebView` parent and application directory before environment
+   creation. Treat an existing directory as success, but never accept an
+   existing non-directory at either path.
+4. If Local AppData is unavailable or its directories cannot be created,
+   repeat the same directory construction below the path returned by
+   `GetTempPathW`. If both writable roots fail, log the Win32 failure and pass
+   null as the final compatibility fallback; environment creation will then
+   report its normal HRESULT.
+5. Pass the resolved path to
+   `CreateCoreWebView2EnvironmentWithOptions` and keep the string alive until
+   that call returns. Do not change browser-runtime discovery, controller
+   creation, worker-thread ownership, or any Java/JNI signature.
+6. Document the new default and the environment-variable override in the
+   Windows platform notes in `README.md`.
+7. Verify with a Windows native build and an embedded WebView startup from a
+   host whose executable directory is not the selected user-data location.
+
 ## N · Norms
 - All AWT/JAWT interaction must respect the rule that the
   native peer is only valid while the host AWT Component is
@@ -2484,6 +2538,11 @@ Files:
   bounded wait; Linux dispatches to the GTK pump thread.
   Native bugs that would block must be diagnosed and fixed,
   not worked around with timeouts in Java.
+- Windows WebView2 environment creation MUST NOT rely on the SDK's
+  executable-adjacent default user-data folder. The default chosen by this
+  library must be writable without elevation, stable for one host executable
+  installation, use Unicode Win32 paths end-to-end, and remain overridable by
+  `WEBVIEW2_USER_DATA_FOLDER`.
 - The editing-shortcut `KeyEventDispatcher` MUST return
   `true` for every event it forwards to
   `EmbeddedWebView.executeEditingCommand`, so AWT does not
@@ -2626,6 +2685,11 @@ Files:
   `parent.isDisplayable()` AND
   `webview_embed_create` returned a non-zero pointer
   (`EmbeddedWebView.java:50`).
+- Windows user-data-folder setup must validate that every reused path is a
+  directory. Failure to create the Local AppData path must fall back to a
+  writable temporary-root path; it must not silently retry the protected
+  executable directory. A final fallback to WebView2's legacy default is
+  permitted only after both per-user roots fail and must emit a diagnostic.
 - `WebViewHeavyweightComponent.setDebug` throws
   `IllegalStateException` if called after display
   (`WebViewHeavyweightComponent.java:90`) — the native peer

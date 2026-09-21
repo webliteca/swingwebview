@@ -700,6 +700,38 @@ public class EmbeddedWebView {
     }
 
     /**
+     * Read all cookies applicable to {@code url} from the native browser cookie
+     * store, including cookies marked {@code HttpOnly}. The returned string is
+     * formatted for use as an HTTP {@code Cookie} request header.
+     *
+     * <p>Completion is delivered on the Swing event-dispatch thread.
+     */
+    public CompletableFuture<String> getCookies(String url) {
+        checkAlive();
+        if (url == null) throw new NullPointerException("url");
+        final CompletableFuture<String> future = new CompletableFuture<String>();
+        WebViewNative.webview_embed_get_cookies(peer, url,
+            new WebViewCookieCallback() {
+                @Override
+                public void completed(final String cookieHeader,
+                                      final String error) {
+                    javax.swing.SwingUtilities.invokeLater(new Runnable() {
+                        @Override public void run() {
+                            if (error != null && !error.isEmpty()) {
+                                future.completeExceptionally(
+                                    new IllegalStateException(error));
+                            } else {
+                                future.complete(cookieHeader == null
+                                    ? "" : cookieHeader);
+                            }
+                        }
+                    });
+                }
+            });
+        return future;
+    }
+
+    /**
      * Windows-only: force Win32 keyboard focus back to the AWT-owned parent
      * HWND, so subsequent keystrokes route to AWT instead of the WebView2
      * child HWND.  Used by the Java-side global focus-owner listener when

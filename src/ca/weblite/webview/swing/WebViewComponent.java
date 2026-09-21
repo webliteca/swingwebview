@@ -401,6 +401,21 @@ public abstract class WebViewComponent extends JComponent {
         return this;
     }
 
+    /**
+     * Read all cookies applicable to {@code url} from the platform browser,
+     * including HttpOnly cookies. The result uses HTTP {@code Cookie} header
+     * syntax and completes on the Swing event-dispatch thread.
+     *
+     * <p>Subclasses backed by a live native engine override this method. The
+     * base implementation returns an already-failed future.
+     */
+    public CompletableFuture<String> getCookies(String url) {
+        CompletableFuture<String> f = new CompletableFuture<String>();
+        f.completeExceptionally(
+            new IllegalStateException("WebViewComponent not displayed"));
+        return f;
+    }
+
     /** Purge the live native peer's HTTP resource cache.  No-op on the base
      *  class and when no peer is attached; subclasses forward to their engine
      *  wrapper's {@code clearCache}. */

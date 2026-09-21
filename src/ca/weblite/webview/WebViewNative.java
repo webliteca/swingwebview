@@ -381,6 +381,13 @@ native static void webview_embed_set_user_agent_resolver(long w, Object resolver
 // no-op.  Never throws via JNI.
 native static void webview_embed_clear_cache(long w);
 
+// Read every cookie applicable to url, including HttpOnly cookies, from the
+// native engine's cookie store. Completion is asynchronous on all platforms;
+// callback.completed receives an HTTP Cookie-header value and null error on
+// success. Passing a dead peer or invalid URL completes with an error.
+native static void webview_embed_get_cookies(long w, String url,
+                                             WebViewCookieCallback callback);
+
 // Adopt a browser-initiated popup child that was retained (not shown) after
 // an ADOPT disposition, reparenting it into `parent`'s realized native
 // surface and returning an opaque engine pointer for it (as
@@ -542,6 +549,11 @@ native static void webview_offscreen_set_user_agent_resolver(long peer, Object r
 // are stubs and this is a native-side no-op.  Passing 0 for peer is a silent
 // no-op.  Never throws via JNI.
 native static void webview_offscreen_clear_cache(long peer);
+
+// Offscreen counterpart to webview_embed_get_cookies. Linux only in practice;
+// unsupported platform stubs complete with an error rather than hanging.
+native static void webview_offscreen_get_cookies(long peer, String url,
+                                                 WebViewCookieCallback callback);
 
 // Offscreen counterpart to webview_embed_adopt_popup (Canvas 19).  Adopt a
 // browser-initiated popup child that was retained (not shown) after an ADOPT

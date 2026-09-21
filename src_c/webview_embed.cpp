@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <atomic>
 #include <condition_variable>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -260,6 +261,59 @@ struct Binding {
 };
 
 using DispatchFn = std::function<void()>;
+
+// One-shot JNI completion for cookie queries. The native browser APIs are
+// asynchronous on every platform, so the callback is held as a global ref
+// until exactly one success/error result has been delivered.
+struct CookieCompletion {
+    JavaVM *jvm = nullptr;
+    jobject callback = nullptr;
+};
+
+static CookieCompletion *new_cookie_completion(JNIEnv *env, jobject callback) {
+    if (!env || !callback) return nullptr;
+    CookieCompletion *c = new CookieCompletion();
+    env->GetJavaVM(&c->jvm);
+    c->callback = env->NewGlobalRef(callback);
+    if (!c->jvm || !c->callback) {
+        if (c->callback) env->DeleteGlobalRef(c->callback);
+        delete c;
+        return nullptr;
+    }
+    return c;
+}
+
+static void complete_cookie_query(CookieCompletion *c,
+                                  const std::string &header,
+                                  const char *error) {
+    if (!c) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (c->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (c->jvm->AttachCurrentThread((void **)&env, nullptr) == JNI_OK) {
+            detach = true;
+        }
+    }
+    if (env) {
+        jclass cls = env->GetObjectClass(c->callback);
+        jmethodID method = cls ? env->GetMethodID(
+            cls, "completed", "(Ljava/lang/String;Ljava/lang/String;)V")
+            : nullptr;
+        jstring jheader = env->NewStringUTF(header.c_str());
+        jstring jerror = error ? env->NewStringUTF(error) : nullptr;
+        if (method) env->CallVoidMethod(c->callback, method, jheader, jerror);
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+        }
+        if (jerror) env->DeleteLocalRef(jerror);
+        if (jheader) env->DeleteLocalRef(jheader);
+        if (cls) env->DeleteLocalRef(cls);
+        env->DeleteGlobalRef(c->callback);
+    }
+    if (detach) c->jvm->DetachCurrentThread();
+    delete c;
+}
 
 #ifdef WEBVIEW_GTK
 // =========================================================================
@@ -2709,6 +2763,61 @@ static void gtk_clear_cache(Engine *e) {
     if (!e || !e->web) return;
     WebKitWebContext *ctx = webkit_web_view_get_context(WEBKIT_WEB_VIEW(e->web));
     if (ctx) webkit_web_context_clear_cache(ctx);
+}
+
+struct GtkCookieQuery {
+    WebKitCookieManager *manager = nullptr;
+    CookieCompletion *completion = nullptr;
+};
+
+static void gtk_cookies_ready(GObject *, GAsyncResult *result,
+                              gpointer user_data) {
+    GtkCookieQuery *query = static_cast<GtkCookieQuery *>(user_data);
+    GError *error = nullptr;
+    GList *cookies = webkit_cookie_manager_get_cookies_finish(
+        query->manager, result, &error);
+    std::string header;
+    if (!error) {
+        for (GList *it = cookies; it; it = it->next) {
+            SoupCookie *cookie = static_cast<SoupCookie *>(it->data);
+            const char *name = soup_cookie_get_name(cookie);
+            const char *value = soup_cookie_get_value(cookie);
+            if (!name || !value) continue;
+            if (!header.empty()) header += "; ";
+            header += name;
+            header += '=';
+            header += value;
+        }
+    }
+    const char *message = error ? error->message : nullptr;
+    complete_cookie_query(query->completion, header, message);
+    if (cookies) g_list_free_full(cookies, (GDestroyNotify)soup_cookie_free);
+    if (error) g_error_free(error);
+    delete query;
+}
+
+static void gtk_get_cookies(GtkWidget *web, const std::string &url,
+                            CookieCompletion *completion) {
+    if (!web) {
+        complete_cookie_query(completion, "", "WebView is not available");
+        return;
+    }
+    GtkPump::instance().run_async([web, url, completion] {
+        WebKitWebContext *context = webkit_web_view_get_context(
+            WEBKIT_WEB_VIEW(web));
+        WebKitCookieManager *manager = context
+            ? webkit_web_context_get_cookie_manager(context) : nullptr;
+        if (!manager) {
+            complete_cookie_query(completion, "",
+                                  "WebKit cookie manager is not available");
+            return;
+        }
+        GtkCookieQuery *query = new GtkCookieQuery();
+        query->manager = manager;
+        query->completion = completion;
+        webkit_cookie_manager_get_cookies(manager, url.c_str(), nullptr,
+                                          gtk_cookies_ready, query);
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -7054,6 +7163,102 @@ static void cocoa_clear_cache(Engine *e) {
     });
 }
 
+static std::string ascii_lower(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return (char)std::tolower(c); });
+    return value;
+}
+
+static bool cocoa_cookie_matches_url(id cookie, id url) {
+    if (!cookie || !url) return false;
+    std::string host = ascii_lower(ns_string_to_utf8(
+        msg<id>(url, sel("host"))));
+    std::string domain = ascii_lower(ns_string_to_utf8(
+        msg<id>(cookie, sel("domain"))));
+    if (host.empty() || domain.empty()) return false;
+    if (domain[0] == '.') domain.erase(0, 1);
+    bool domain_ok = host == domain;
+    if (!domain_ok && host.size() > domain.size()
+            && host.compare(host.size() - domain.size(), domain.size(), domain) == 0
+            && host[host.size() - domain.size() - 1] == '.') {
+        domain_ok = true;
+    }
+    if (!domain_ok) return false;
+
+    std::string request_path = ns_string_to_utf8(msg<id>(url, sel("path")));
+    if (request_path.empty()) request_path = "/";
+    std::string cookie_path = ns_string_to_utf8(
+        msg<id>(cookie, sel("path")));
+    if (cookie_path.empty()) cookie_path = "/";
+    if (request_path.compare(0, cookie_path.size(), cookie_path) != 0) {
+        return false;
+    }
+    if (cookie_path.back() != '/' && request_path.size() > cookie_path.size()
+            && request_path[cookie_path.size()] != '/') {
+        return false;
+    }
+
+    BOOL secure = msg<BOOL>(cookie, sel("isSecure"));
+    std::string scheme = ascii_lower(ns_string_to_utf8(
+        msg<id>(url, sel("scheme"))));
+    if (secure && scheme != "https") return false;
+
+    id expires = msg<id>(cookie, sel("expiresDate"));
+    if (expires && msg<double>(expires, sel("timeIntervalSinceNow")) <= 0.0) {
+        return false;
+    }
+    return true;
+}
+
+// Query WKHTTPCookieStore rather than document.cookie so HttpOnly login
+// credentials are included. WKHTTPCookieStore returns the whole data-store
+// jar; filter it with normal domain/path/secure/expiry rules for the requested
+// URL before formatting an HTTP Cookie header.
+static void cocoa_get_cookies(Engine *e, const std::string &url_string,
+                              CookieCompletion *completion) {
+    if (!e) {
+        complete_cookie_query(completion, "", "WebView is not available");
+        return;
+    }
+    cocoa_run_on_main_async([e, url_string, completion] {
+        if (e->destroyed.load() || !e->webview) {
+            complete_cookie_query(completion, "", "WebView is not available");
+            return;
+        }
+        id url = msg<id>(objc_cls("NSURL"), sel("URLWithString:"),
+                         ns_str(url_string.c_str()));
+        id config = msg<id>(e->webview, sel("configuration"));
+        id store = config ? msg<id>(config, sel("websiteDataStore")) : nullptr;
+        id cookie_store = store ? msg<id>(store, sel("httpCookieStore")) : nullptr;
+        if (!url || !cookie_store) {
+            complete_cookie_query(completion, "",
+                                  "WKHTTPCookieStore is not available");
+            return;
+        }
+        msg<void, void (^)(id)>(cookie_store, sel("getAllCookies:"),
+            ^(id cookies) {
+                std::string header;
+                unsigned long count = cookies
+                    ? msg<unsigned long>(cookies, sel("count")) : 0;
+                for (unsigned long i = 0; i < count; ++i) {
+                    id cookie = msg<id, unsigned long>(
+                        cookies, sel("objectAtIndex:"), i);
+                    if (!cocoa_cookie_matches_url(cookie, url)) continue;
+                    std::string name = ns_string_to_utf8(
+                        msg<id>(cookie, sel("name")));
+                    std::string value = ns_string_to_utf8(
+                        msg<id>(cookie, sel("value")));
+                    if (name.empty()) continue;
+                    if (!header.empty()) header += "; ";
+                    header += name;
+                    header += '=';
+                    header += value;
+                }
+                complete_cookie_query(completion, header, nullptr);
+            });
+    });
+}
+
 // Asynchronous engine destroy.  Returns immediately on the calling
 // thread (typically the EDT) after a small Java-side cleanup; the
 // AppKit teardown, view-hierarchy removal, KVO observer unregister,
@@ -8745,6 +8950,46 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
     embed::gtk_off_clear_cache((embed::OffEngine *)peer);
 #else
     (void)peer;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1get_1cookies
+  (JNIEnv *env, jclass, jlong wv, jstring url, jobject callback) {
+    embed::CookieCompletion *completion =
+        embed::new_cookie_completion(env, callback);
+    if (!completion) return;
+    if (wv == 0 || !url) {
+        embed::complete_cookie_query(completion, "", "WebView is not available");
+        return;
+    }
+    const char *chars = env->GetStringUTFChars(url, nullptr);
+    std::string value = chars ? chars : "";
+    if (chars) env->ReleaseStringUTFChars(url, chars);
+#ifdef WEBVIEW_GTK
+    embed::gtk_get_cookies(((embed::Engine *)wv)->web, value, completion);
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_get_cookies((embed::Engine *)wv, value, completion);
+#else
+    embed::complete_cookie_query(completion, "", "Cookie queries are unsupported");
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1get_1cookies
+  (JNIEnv *env, jclass, jlong peer, jstring url, jobject callback) {
+    embed::CookieCompletion *completion =
+        embed::new_cookie_completion(env, callback);
+    if (!completion) return;
+    if (peer == 0 || !url) {
+        embed::complete_cookie_query(completion, "", "WebView is not available");
+        return;
+    }
+    const char *chars = env->GetStringUTFChars(url, nullptr);
+    std::string value = chars ? chars : "";
+    if (chars) env->ReleaseStringUTFChars(url, chars);
+#ifdef WEBVIEW_GTK
+    embed::gtk_get_cookies(((embed::OffEngine *)peer)->web, value, completion);
+#else
+    embed::complete_cookie_query(completion, "", "Offscreen cookie queries are unsupported");
 #endif
 }
 

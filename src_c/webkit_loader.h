@@ -38,6 +38,8 @@
   X(webkit_file_chooser_request_get_mime_types)                  \
   X(webkit_file_chooser_request_get_select_multiple)             \
   X(webkit_file_chooser_request_select_files)                    \
+  X(webkit_cookie_manager_get_cookies)                           \
+  X(webkit_cookie_manager_get_cookies_finish)                    \
   X(webkit_get_major_version)                                    \
   X(webkit_get_minor_version)                                    \
   X(webkit_navigation_action_get_request)                        \
@@ -59,6 +61,7 @@
   X(webkit_user_content_manager_register_script_message_handler) \
   X(webkit_user_script_new)                                      \
   X(webkit_web_inspector_show)                                   \
+  X(webkit_web_context_get_cookie_manager)                       \
   X(webkit_web_view_execute_editing_command)                     \
   X(webkit_web_view_get_context)                                 \
   X(webkit_web_view_get_inspector)                               \
@@ -73,6 +76,11 @@
   X(webkit_web_view_set_background_color)                        \
   X(webkit_web_view_set_input_method_context)                    \
   X(webkit_window_properties_get_geometry)
+
+#define WK_SOUP_SYMS(X)                                          \
+  X(soup_cookie_free)                                            \
+  X(soup_cookie_get_name)                                        \
+  X(soup_cookie_get_value)
 
 // JS-result readers. Mirror webview.h's version gate EXACTLY: the pre-2.22
 // JSValueRef path (webkit_javascript_result_get_global_context / _get_value)
@@ -103,6 +111,7 @@ struct WkFns {
 // ill-formed ([class.mem] "changes meaning"). The shim maps `sym` -> `fn_sym`.
 #define WK_DECL_MEMBER(sym) decltype(&sym) fn_##sym;
   WK_WEBKIT_SYMS(WK_DECL_MEMBER)
+  WK_SOUP_SYMS(WK_DECL_MEMBER)
   WK_WEBKIT_JS_SYMS(WK_DECL_MEMBER)
   WK_JSC_JS_SYMS(WK_DECL_MEMBER)
 #undef WK_DECL_MEMBER
