@@ -3122,24 +3122,15 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
         webkit_web_view_set_input_method_context(
             WEBKIT_WEB_VIEW(e->web), NULL);
 
-        // Wire the "external" script-message handler so the bind shim's
-        // window.external.invoke(JSON) round-trips back into Java.  The
-        // shim and envelope are identical to the heavyweight engine --
-        // bindings are the single source of truth for the
-        // window.<name>(...) contract across both modes.
-        g_signal_connect(
-            e->manager, "script-message-received::external",
-            G_CALLBACK(+[](WebKitUserContentManager *m,
-                           WebKitJavascriptResult *r, gpointer arg) {
-                auto *eng = static_cast<OffEngine *>(arg);
-                JSCValue *v = webkit_javascript_result_get_js_value(r);
-                char *s = jsc_value_to_string(v);
-                off_engine_on_message(eng, s);
-                g_free(s);
-            }),
-            e);
-        webkit_user_content_manager_register_script_message_handler(
-            e->manager, "external");
+        // Install the window.external.invoke shim -- the bind shim's
+        // envelope is identical to the heavyweight engine, so bindings
+        // stay the single source of truth for the window.<name>(...)
+        // contract across both modes.
+        //
+        // The "external" channel itself is connected ABOVE and must not be
+        // connected again here: g_signal_connect is additive, so a second
+        // connection on the same manager delivers every posted message to
+        // Java twice (see Canvas 7 Safeguards).
         webkit_user_content_manager_add_script(
             e->manager,
             webkit_user_script_new(
