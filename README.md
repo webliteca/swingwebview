@@ -813,6 +813,40 @@ wv.eval("location.reload()");   // refetch from the network
   should still be spot-checked on-device (confirm a previously-cached resource
   is re-requested, and cookies/login survive).
 
+## Print to PDF
+
+Print the page a component shows to a PDF file, with no print dialog, at the
+page size and margins you choose:
+
+```java
+WebViewComponent wv = WebViewComponent.create();
+// … after the page (and any layout script it runs) has finished …
+wv.printToPdf(new File("report.pdf"))                        // Letter, no margins
+  .thenAccept(f -> System.out.println("Wrote " + f))
+  .exceptionally(t -> { System.err.println(t.getMessage()); return null; });
+
+wv.printToPdf(new File("report-a4.pdf"), PdfOptions.a4().withMargins(0.5));
+```
+
+* **The PDF is the page.** Sizes and margins are in inches; backgrounds print
+  by default; the engine's own headers and footers are always off and the scale
+  is 1. Pages laid out with CSS page boxes (`@page { size: 8.5in 11in; margin:
+  0 }`) come out one for one.
+* **Asynchronous, completes on the EDT.** The future completes with the file
+  once it is written, or fails with an `IOException` saying why: the folder does
+  not exist, the native library or engine runtime cannot print to PDF, the
+  component is not attached yet, or it was closed first. Prints on one
+  component run one after another.
+* **Capability check.** `WebViewComponent.isPdfPrintingSupported()` is `false`
+  against a native library built before this feature.
+* **Platform coverage.** Linux (lightweight) prints through WebKitGTK's
+  `WebKitPrintOperation` to GTK's "Print to File" printer; macOS (heavyweight,
+  macOS 11+) through `-[WKWebView printOperationWithPrintInfo:]`; Windows
+  (heavyweight) through WebView2's `ICoreWebView2_7::PrintToPdf`. See
+  [`demos/WebViewPdfDemo/`](demos/WebViewPdfDemo/README.md). On Linux the
+  heavyweight component refuses with "PDF printing on Linux needs the
+  lightweight WebView component."
+
 ## Demo
 
 See [`demos/WebViewHeavyweightDemo/`](demos/WebViewHeavyweightDemo/README.md)
@@ -846,6 +880,9 @@ Additional demos:
   autofill on reload, and the programmatic
   `saveCredential` / `getCredential` / `deleteCredential` API, in both
   the OS-Keychain and in-memory store modes.
+* `demos/WebViewPdfDemo/` — exercises `printToPdf`: a two-page report
+  with a full-bleed cover printed as Letter and as A4 with margins, and a
+  print into a missing folder (`run-*-pdf-demo`).
 
 ## Building from source
 

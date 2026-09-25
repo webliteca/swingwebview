@@ -42,6 +42,10 @@
   X(webkit_get_minor_version)                                    \
   X(webkit_navigation_action_get_request)                        \
   X(webkit_navigation_action_is_user_gesture)                    \
+  X(webkit_print_operation_new)                                  \
+  X(webkit_print_operation_print)                                \
+  X(webkit_print_operation_set_page_setup)                       \
+  X(webkit_print_operation_set_print_settings)                   \
   X(webkit_script_dialog_confirm_set_confirmed)                  \
   X(webkit_script_dialog_get_dialog_type)                        \
   X(webkit_script_dialog_get_message)                            \

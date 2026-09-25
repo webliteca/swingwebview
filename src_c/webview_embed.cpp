@@ -28,6 +28,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <functional>
 #include <map>
 #include <memory>
@@ -42,6 +43,7 @@
 #include <gtk/gtk.h>
 #include <gdk/gdk.h>
 #include <gdk/gdkx.h>
+#include <glib/gstdio.h>
 #include <webkit2/webkit2.h>
 // Route WebKitGTK/JSC through the runtime-resolved loader (no hard SONAME dep).
 #include "webkit_loader.h"
@@ -260,6 +262,55 @@ struct Binding {
 };
 
 using DispatchFn = std::function<void()>;
+
+// ---------------------------------------------------------------------------
+// Canvas 29: print-to-PDF request.  One per print; holds a global ref to the
+// Java WebViewPdfCallback.  pdf_finish upcalls onPdfFinished exactly once
+// (Canvas 29 D1), deletes the ref and the job.  Callable from any thread.
+// ---------------------------------------------------------------------------
+struct PdfJob {
+    JavaVM *jvm = nullptr;
+    jobject cb = nullptr;
+    bool done = false;
+};
+
+static PdfJob *pdf_new_job(JNIEnv *env, jobject cb) {
+    PdfJob *job = new PdfJob();
+    env->GetJavaVM(&job->jvm);
+    job->cb = cb ? env->NewGlobalRef(cb) : nullptr;
+    return job;
+}
+
+static void pdf_finish(PdfJob *job, bool ok, const char *err) {
+    if (!job || job->done) return;
+    job->done = true;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (job->jvm && job->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        job->jvm->AttachCurrentThread((void **)&env, nullptr);
+        detach = true;
+    }
+    if (env && job->cb) {
+        jclass cls = env->GetObjectClass(job->cb);
+        jmethodID m = cls ? env->GetMethodID(cls, "onPdfFinished",
+                                             "(ZLjava/lang/String;)V")
+                          : nullptr;
+        if (m) {
+            jstring jerr = (ok || !err) ? nullptr : env->NewStringUTF(err);
+            env->CallVoidMethod(job->cb, m, (jboolean)(ok ? JNI_TRUE : JNI_FALSE),
+                                jerr);
+            if (jerr) env->DeleteLocalRef(jerr);
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (cls) env->DeleteLocalRef(cls);
+        env->DeleteGlobalRef(job->cb);
+        job->cb = nullptr;
+    }
+    if (detach) job->jvm->DetachCurrentThread();
+    delete job;
+}
+
+static const char *const kPdfNotAttached = "The WebView is not attached yet.";
 
 #ifdef WEBVIEW_GTK
 // =========================================================================
@@ -2700,6 +2751,109 @@ static void gtk_set_user_agent_resolver(Engine *e, JNIEnv *env, jobject r) {
     if (r) {
         e->ua_resolver = env->NewGlobalRef(r);
     }
+}
+
+// Canvas 29 D8: an in-flight WebKitPrintOperation.  `failed` fires before
+// `finished`; the first to fire answers the job.
+struct GtkPdfOp {
+    PdfJob *job;
+    std::string path;
+    time_t started;
+};
+
+static void gtk_pdf_failed(WebKitPrintOperation *, GError *error,
+                           gpointer user_data) {
+    GtkPdfOp *op = static_cast<GtkPdfOp *>(user_data);
+    std::string msg = "The page could not be printed to PDF";
+    if (error && error->message && *error->message) {
+        msg += ": ";
+        msg += error->message;
+    }
+    msg += ".";
+    pdf_finish(op->job, false, msg.c_str());
+    op->job = nullptr;
+}
+
+static void gtk_pdf_finished(WebKitPrintOperation *operation,
+                             gpointer user_data) {
+    GtkPdfOp *op = static_cast<GtkPdfOp *>(user_data);
+    if (op->job) {
+        // `finished` without `failed` is not proof: a print the backend
+        // dropped also ends here.  Only a file written by this print counts.
+        GStatBuf st;
+        bool written = g_stat(op->path.c_str(), &st) == 0 && st.st_size > 0 &&
+                       st.st_mtime + 1 >= op->started;
+        pdf_finish(op->job, written,
+                   written ? nullptr : "The PDF file was not written.");
+    }
+    op->job = nullptr;
+    delete op;
+    // Emission holds its own ref; this drops the one webkit_print_operation_new
+    // gave us.
+    g_object_unref(operation);
+}
+
+// Canvas 29 D8: print `web` to a PDF at `path` through GTK's "Print to File"
+// printer.  Used by the offscreen (lightweight) engine, the supported Linux
+// mode (D13).  The GtkWidget* is
+// read on the GTK thread through `get_web`, since the engine may not have
+// created its view yet when the request arrives.
+static void gtk_print_to_pdf(std::function<GtkWidget *()> get_web,
+                             PdfJob *job, std::string path, double w,
+                             double h, double mt, double mr, double mb,
+                             double ml, bool bg) {
+    GtkPump::instance().run_async([=] {
+        time_t started = time(nullptr);
+        GtkWidget *web = get_web();
+        if (!web) {
+            pdf_finish(job, false, kPdfNotAttached);
+            return;
+        }
+        WebKitWebView *view = WEBKIT_WEB_VIEW(web);
+        g_object_set(G_OBJECT(webkit_web_view_get_settings(view)),
+                     "print-backgrounds", bg ? TRUE : FALSE, NULL);
+
+        GError *uerr = nullptr;
+        gchar *uri = g_filename_to_uri(path.c_str(), nullptr, &uerr);
+        if (!uri) {
+            if (uerr) g_error_free(uerr);
+            pdf_finish(job, false, "The PDF path is not a valid file path.");
+            return;
+        }
+        GtkPaperSize *paper = gtk_paper_size_new_custom(
+            "aaf-pdf", "PDF", w, h, GTK_UNIT_INCH);
+
+        GtkPrintSettings *settings = gtk_print_settings_new();
+        gtk_print_settings_set_printer(settings, "Print to File");
+        gtk_print_settings_set(settings, GTK_PRINT_SETTINGS_OUTPUT_FILE_FORMAT,
+                               "pdf");
+        gtk_print_settings_set(settings, GTK_PRINT_SETTINGS_OUTPUT_URI, uri);
+        gtk_print_settings_set_paper_size(settings, paper);
+        gtk_print_settings_set_orientation(settings,
+                                           GTK_PAGE_ORIENTATION_PORTRAIT);
+        g_free(uri);
+
+        GtkPageSetup *setup = gtk_page_setup_new();
+        gtk_page_setup_set_paper_size(setup, paper);
+        gtk_page_setup_set_orientation(setup, GTK_PAGE_ORIENTATION_PORTRAIT);
+        gtk_page_setup_set_top_margin(setup, mt, GTK_UNIT_INCH);
+        gtk_page_setup_set_right_margin(setup, mr, GTK_UNIT_INCH);
+        gtk_page_setup_set_bottom_margin(setup, mb, GTK_UNIT_INCH);
+        gtk_page_setup_set_left_margin(setup, ml, GTK_UNIT_INCH);
+        gtk_paper_size_free(paper);
+
+        WebKitPrintOperation *operation = webkit_print_operation_new(view);
+        webkit_print_operation_set_print_settings(operation, settings);
+        webkit_print_operation_set_page_setup(operation, setup);
+        g_object_unref(settings);
+        g_object_unref(setup);
+
+        GtkPdfOp *op = new GtkPdfOp{job, path, started};
+        g_signal_connect(operation, "failed", G_CALLBACK(gtk_pdf_failed), op);
+        g_signal_connect(operation, "finished", G_CALLBACK(gtk_pdf_finished),
+                         op);
+        webkit_print_operation_print(operation);
+    });
 }
 
 // Canvas 22: purge the WebKitGTK HTTP resource cache (memory + disk) for the
@@ -7054,6 +7208,118 @@ static void cocoa_clear_cache(Engine *e) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Canvas 29 D9: print to PDF.  -[WKWebView printOperationWithPrintInfo:]
+// (macOS 11+) run modally on the view's window with a save-job NSPrintInfo,
+// so WKWebView renders into the operation asynchronously and no panel shows.
+// ---------------------------------------------------------------------------
+
+// Answer a job off AppKit main, as the other macOS upcalls do: the Java side
+// may start the next queued print (D12) from inside the answer, and that must
+// not begin a new modal run from inside the previous one's didRun callback.
+static void cocoa_pdf_finish_async(PdfJob *job, bool ok, const char *err) {
+    std::string e = err ? err : "";
+    std::thread([job, ok, e]() {
+        pdf_finish(job, ok, ok ? nullptr : e.c_str());
+    }).detach();
+}
+
+static void impl_pdf_did_run(id, SEL, id, BOOL success, void *ctx) {
+    cocoa_pdf_finish_async(static_cast<PdfJob *>(ctx), success == YES,
+                           "The page could not be printed to PDF.");
+}
+
+static std::once_flag g_webview_embed_pdf_delegate_once;
+static id g_webview_embed_pdf_delegate = nullptr;
+
+static id get_webview_embed_pdf_delegate() {
+    std::call_once(g_webview_embed_pdf_delegate_once, [] {
+        Class c = objc_allocateClassPair((Class)objc_cls("NSObject"),
+                                         "WebviewEmbedPdfDelegate", 0);
+        class_addMethod(c, sel("printOperationDidRun:success:contextInfo:"),
+                        (IMP)impl_pdf_did_run, "v@:@c^v");
+        objc_registerClassPair(c);
+        // One shared instance for the life of the JVM; never released.
+        g_webview_embed_pdf_delegate =
+            msg<id>(msg<id>((id)c, sel("alloc")), sel("init"));
+    });
+    return g_webview_embed_pdf_delegate;
+}
+
+static void cocoa_print_to_pdf(Engine *e, PdfJob *job, std::string path,
+                               double w, double h, double mt, double mr,
+                               double mb, double ml, bool bg) {
+    cocoa_run_on_main_async([=] {
+        if (!e || e->destroyed.load() || !e->webview) {
+            cocoa_pdf_finish_async(job, false, kPdfNotAttached);
+            return;
+        }
+        id wv = e->webview;
+        if (!msg<BOOL, SEL>(wv, sel("respondsToSelector:"),
+                            sel("printOperationWithPrintInfo:"))) {
+            cocoa_pdf_finish_async(job, false,
+                                   "PDF printing needs macOS 11 or later.");
+            return;
+        }
+        id window = msg<id>(wv, sel("window"));
+        if (!window) {
+            cocoa_pdf_finish_async(job, false,
+                                   "The WebView has no window to print from.");
+            return;
+        }
+
+        // Backgrounds: WKPreferences.shouldPrintBackgrounds (macOS 13.3+).
+        id config = msg<id>(wv, sel("configuration"));
+        id prefs = config ? msg<id>(config, sel("preferences")) : nullptr;
+        if (prefs && msg<BOOL, SEL>(prefs, sel("respondsToSelector:"),
+                                    sel("setShouldPrintBackgrounds:"))) {
+            msg<void, BOOL>(prefs, sel("setShouldPrintBackgrounds:"),
+                            bg ? YES : NO);
+        }
+
+        const CGFloat pw = (CGFloat)(w * 72.0), ph = (CGFloat)(h * 72.0);
+        id info = msg<id>(msg<id>(objc_cls("NSPrintInfo"),
+                                  sel("sharedPrintInfo")), sel("copy"));
+        msg<void, id>(info, sel("setJobDisposition:"), ns_str("NSPrintSaveJob"));
+        id url = msg<id, id>(objc_cls("NSURL"), sel("fileURLWithPath:"),
+                             ns_str(path.c_str()));
+        id dict = msg<id>(info, sel("dictionary"));
+        msg<void, id, id>(dict, sel("setObject:forKey:"), url,
+                          ns_str("NSJobSavingURL"));
+        msg<void, CGSize>(info, sel("setPaperSize:"), CGSizeMake(pw, ph));
+        msg<void, long>(info, sel("setOrientation:"), 0L);  // portrait
+        msg<void, CGFloat>(info, sel("setTopMargin:"), (CGFloat)(mt * 72.0));
+        msg<void, CGFloat>(info, sel("setRightMargin:"), (CGFloat)(mr * 72.0));
+        msg<void, CGFloat>(info, sel("setBottomMargin:"), (CGFloat)(mb * 72.0));
+        msg<void, CGFloat>(info, sel("setLeftMargin:"), (CGFloat)(ml * 72.0));
+        // NSPrintingPaginationModeAutomatic == 0.
+        msg<void, long>(info, sel("setHorizontalPagination:"), 0L);
+        msg<void, long>(info, sel("setVerticalPagination:"), 0L);
+        msg<void, BOOL>(info, sel("setHorizontallyCentered:"), NO);
+        msg<void, BOOL>(info, sel("setVerticallyCentered:"), NO);
+
+        id op = msg<id, id>(wv, sel("printOperationWithPrintInfo:"), info);
+        msg<void>(info, sel("release"));
+        if (!op) {
+            cocoa_pdf_finish_async(job, false,
+                                   "The page could not be printed to PDF.");
+            return;
+        }
+        msg<void, BOOL>(op, sel("setShowsPrintPanel:"), NO);
+        msg<void, BOOL>(op, sel("setShowsProgressPanel:"), NO);
+        // Without a frame the operation's view prints blank pages.
+        id opView = msg<id>(op, sel("view"));
+        if (opView) {
+            msg<void, CGRect>(opView, sel("setFrame:"),
+                              CGRectMake(0, 0, pw, ph));
+        }
+        msg<void, id, id, SEL, void *>(
+            op, sel("runOperationModalForWindow:delegate:didRunSelector:contextInfo:"),
+            window, get_webview_embed_pdf_delegate(),
+            sel("printOperationDidRun:success:contextInfo:"), (void *)job);
+    });
+}
+
 // Asynchronous engine destroy.  Returns immediately on the calling
 // thread (typically the EDT) after a small Java-side cleanup; the
 // AppKit teardown, view-hierarchy removal, KVO observer unregister,
@@ -8745,6 +9011,75 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
     embed::gtk_off_clear_cache((embed::OffEngine *)peer);
 #else
     (void)peer;
+#endif
+}
+
+// Print to PDF — Canvas 29.  Must live inside this `extern "C"` block (D11).
+// Every path answers the callback exactly once; nothing throws into Java.
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1pdf_1available
+  (JNIEnv *, jclass) {
+#if defined(WEBVIEW_GTK) || defined(WEBVIEW_COCOA)
+    return JNI_TRUE;
+#else
+    return JNI_FALSE;
+#endif
+}
+
+static std::string embed_jstring_utf8(JNIEnv *env, jstring s) {
+    std::string out;
+    if (!s) return out;
+    const char *c = env->GetStringUTFChars(s, nullptr);
+    if (c) {
+        out = c;
+        env->ReleaseStringUTFChars(s, c);
+    }
+    return out;
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1print_1to_1pdf
+  (JNIEnv *env, jclass, jlong wv, jstring path, jdouble w, jdouble h,
+   jdouble mt, jdouble mr, jdouble mb, jdouble ml, jboolean bg, jobject cb) {
+    embed::PdfJob *job = embed::pdf_new_job(env, cb);
+    if (wv == 0) {
+        embed::pdf_finish(job, false, embed::kPdfNotAttached);
+        return;
+    }
+    std::string p = embed_jstring_utf8(env, path);
+#ifdef WEBVIEW_GTK
+    // Linux supports the lightweight component only (Canvas 29 D13): printing
+    // the embedded (heavyweight) view crashes inside WebKitGTK's print
+    // operation, so refuse rather than take the JVM down.
+    (void)p; (void)w; (void)h; (void)mt; (void)mr; (void)mb; (void)ml; (void)bg;
+    embed::pdf_finish(job, false,
+        "PDF printing on Linux needs the lightweight WebView component.");
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_print_to_pdf((embed::Engine *)wv, job, p, w, h, mt, mr, mb, ml,
+                              bg == JNI_TRUE);
+#else
+    (void)p; (void)w; (void)h; (void)mt; (void)mr; (void)mb; (void)ml; (void)bg;
+    embed::pdf_finish(job, false,
+        "PDF printing is not available in this version of the native library.");
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1print_1to_1pdf
+  (JNIEnv *env, jclass, jlong peer, jstring path, jdouble w, jdouble h,
+   jdouble mt, jdouble mr, jdouble mb, jdouble ml, jboolean bg, jobject cb) {
+    embed::PdfJob *job = embed::pdf_new_job(env, cb);
+#ifdef WEBVIEW_GTK
+    if (peer == 0) {
+        embed::pdf_finish(job, false, embed::kPdfNotAttached);
+        return;
+    }
+    embed::OffEngine *e = (embed::OffEngine *)peer;
+    embed::gtk_print_to_pdf([e] { return e->web; }, job,
+                            embed_jstring_utf8(env, path), w, h, mt, mr, mb,
+                            ml, bg == JNI_TRUE);
+#else
+    // No offscreen engine off Linux (Canvas 29 op 10).
+    (void)peer; (void)path; (void)w; (void)h; (void)mt; (void)mr; (void)mb;
+    (void)ml; (void)bg;
+    embed::pdf_finish(job, false, embed::kPdfNotAttached);
 #endif
 }
 

@@ -601,6 +601,91 @@ public:
     }
 };
 
+// ---------------------------------------------------------------------------
+// Canvas 29: print-to-PDF request.  One per print; holds a global ref to the
+// Java WebViewPdfCallback.  pdf_finish upcalls onPdfFinished exactly once
+// (D1), deletes the ref and the job.  Callable from any thread.
+// ---------------------------------------------------------------------------
+struct PdfJob {
+    JavaVM *jvm = nullptr;
+    jobject cb = nullptr;
+    bool done = false;
+};
+
+static PdfJob *pdf_new_job(JNIEnv *env, jobject cb) {
+    PdfJob *job = new PdfJob();
+    env->GetJavaVM(&job->jvm);
+    job->cb = cb ? env->NewGlobalRef(cb) : nullptr;
+    return job;
+}
+
+static void pdf_finish(PdfJob *job, bool ok, const char *err) {
+    if (!job || job->done) return;
+    job->done = true;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (job->jvm && job->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        job->jvm->AttachCurrentThread((void **)&env, nullptr);
+        detach = true;
+    }
+    if (env && job->cb) {
+        jclass cls = env->GetObjectClass(job->cb);
+        jmethodID m = cls ? env->GetMethodID(cls, "onPdfFinished",
+                                             "(ZLjava/lang/String;)V")
+                          : nullptr;
+        if (m) {
+            jstring jerr = (ok || !err) ? nullptr : env->NewStringUTF(err);
+            env->CallVoidMethod(job->cb, m, (jboolean)(ok ? JNI_TRUE : JNI_FALSE),
+                                jerr);
+            if (jerr) env->DeleteLocalRef(jerr);
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (cls) env->DeleteLocalRef(cls);
+        env->DeleteGlobalRef(job->cb);
+        job->cb = nullptr;
+    }
+    if (detach) job->jvm->DetachCurrentThread();
+    delete job;
+}
+
+static const char *const kPdfNotAttached = "The WebView is not attached yet.";
+
+static void pdf_finish_hr(PdfJob *job, HRESULT hr) {
+    char buf[96];
+    snprintf(buf, sizeof(buf),
+             "The page could not be printed to PDF (HRESULT 0x%08lX).",
+             (unsigned long)hr);
+    pdf_finish(job, false, buf);
+}
+
+// Canvas 29 D10: completed-handler for ICoreWebView2_7::PrintToPdf.
+class PrintToPdfHandler : public CallbackBase<
+    ICoreWebView2PrintToPdfCompletedHandler> {
+public:
+    explicit PrintToPdfHandler(PdfJob *job) : m_job(job) {}
+    // Take the job back when PrintToPdf fails synchronously and will never
+    // invoke this handler.
+    PdfJob *take() {
+        PdfJob *job = m_job;
+        m_job = nullptr;
+        return job;
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT errorCode,
+                                     BOOL isSuccessful) override {
+        PdfJob *job = take();
+        if (!job) return S_OK;
+        if (FAILED(errorCode)) {
+            pdf_finish_hr(job, errorCode);
+        } else {
+            pdf_finish(job, isSuccessful ? true : false,
+                       "The page could not be printed to PDF.");
+        }
+        return S_OK;
+    }
+private:
+    PdfJob *m_job;
+};
+
 // Forward declarations.
 static void engine_on_message(Engine *e, LPCWSTR msg);
 static std::wstring utf8_to_wide(const char *s);
@@ -3709,6 +3794,91 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1cle
 // link-symmetry with the JNI declaration.
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1clear_1cache
   (JNIEnv *, jclass, jlong) {
+}
+
+// Print to PDF — Canvas 29 D10.  Must live inside this `extern "C"` block
+// (D11).  Every path answers the callback exactly once; nothing throws into
+// Java.
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1pdf_1available
+  (JNIEnv *, jclass) {
+    return JNI_TRUE;
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1print_1to_1pdf
+  (JNIEnv *env, jclass, jlong wv, jstring path, jdouble w, jdouble h,
+   jdouble mt, jdouble mr, jdouble mb, jdouble ml, jboolean bg, jobject cb) {
+    embed_win::PdfJob *job = embed_win::pdf_new_job(env, cb);
+    auto *e = (Engine *)wv;
+    if (!e) {
+        embed_win::pdf_finish(job, false, embed_win::kPdfNotAttached);
+        return;
+    }
+    // The path goes to WebView2 as UTF-16, straight from the Java string.
+    std::wstring wpath;
+    if (path) {
+        const jchar *chars = env->GetStringChars(path, nullptr);
+        if (chars) {
+            wpath.assign(reinterpret_cast<const wchar_t *>(chars),
+                         (size_t)env->GetStringLength(path));
+            env->ReleaseStringChars(path, chars);
+        }
+    }
+    const bool backgrounds = bg == JNI_TRUE;
+    embed_win::dispatch_to_thread(e, [=] {
+        if (!e->webview) {
+            embed_win::pdf_finish(job, false, embed_win::kPdfNotAttached);
+            return;
+        }
+        ICoreWebView2_7 *wv7 = nullptr;
+        ICoreWebView2Environment6 *env6 = nullptr;
+        if (FAILED(e->webview->QueryInterface(
+                __uuidof(ICoreWebView2_7), reinterpret_cast<void **>(&wv7))) ||
+            !wv7 || !e->environment ||
+            FAILED(e->environment->QueryInterface(
+                __uuidof(ICoreWebView2Environment6),
+                reinterpret_cast<void **>(&env6))) || !env6) {
+            if (wv7) wv7->Release();
+            embed_win::pdf_finish(job, false,
+                "PDF printing needs a newer WebView2 runtime.");
+            return;
+        }
+        ICoreWebView2PrintSettings *settings = nullptr;
+        HRESULT hr = env6->CreatePrintSettings(&settings);
+        env6->Release();
+        if (FAILED(hr) || !settings) {
+            wv7->Release();
+            embed_win::pdf_finish_hr(job, FAILED(hr) ? hr : E_FAIL);
+            return;
+        }
+        settings->put_Orientation(COREWEBVIEW2_PRINT_ORIENTATION_PORTRAIT);
+        settings->put_PageWidth(w);
+        settings->put_PageHeight(h);
+        settings->put_MarginTop(mt);
+        settings->put_MarginRight(mr);
+        settings->put_MarginBottom(mb);
+        settings->put_MarginLeft(ml);
+        settings->put_ScaleFactor(1.0);
+        settings->put_ShouldPrintBackgrounds(backgrounds ? TRUE : FALSE);
+        settings->put_ShouldPrintHeaderAndFooter(FALSE);
+
+        auto *handler = new embed_win::PrintToPdfHandler(job);
+        hr = wv7->PrintToPdf(wpath.c_str(), settings, handler);
+        if (FAILED(hr)) {
+            // The handler will not be invoked; answer here.
+            embed_win::pdf_finish_hr(handler->take(), hr);
+        }
+        handler->Release();
+        settings->Release();
+        wv7->Release();
+    });
+}
+
+// Offscreen print — Windows has no offscreen engine (Canvas 29 D13).
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1print_1to_1pdf
+  (JNIEnv *env, jclass, jlong, jstring, jdouble, jdouble, jdouble, jdouble,
+   jdouble, jdouble, jboolean, jobject cb) {
+    embed_win::pdf_finish(embed_win::pdf_new_job(env, cb), false,
+                          embed_win::kPdfNotAttached);
 }
 
 // Adopt a retained popup child (Canvas 20) into `parent`'s realized AWT HWND.

@@ -381,6 +381,23 @@ native static void webview_embed_set_user_agent_resolver(long w, Object resolver
 // no-op.  Never throws via JNI.
 native static void webview_embed_clear_cache(long w);
 
+// Canvas 29: whether this native library can print to PDF.  Present only in
+// natives built with the feature; PdfPrinting.isAvailable() absorbs the
+// UnsatisfiedLinkError an older native raises.
+native static boolean webview_pdf_available();
+
+// Canvas 29: print the embedded WebView's page to a PDF file at `path`
+// (absolute), with the page size and margins in inches and backgrounds on or
+// off, no dialog, engine headers/footers off.  Runs on the engine UI thread
+// and calls cb.onPdfFinished(ok, error) exactly once.  Per platform: Windows
+// ICoreWebView2_7::PrintToPdf; Linux WebKitPrintOperation to GTK's "Print to
+// File" printer; macOS -[WKWebView printOperationWithPrintInfo:] run modally
+// on the view's window.  Never throws via JNI.
+native static void webview_embed_print_to_pdf(long w, String path,
+        double pageWidth, double pageHeight, double marginTop,
+        double marginRight, double marginBottom, double marginLeft,
+        boolean backgrounds, WebViewPdfCallback cb);
+
 // Adopt a browser-initiated popup child that was retained (not shown) after
 // an ADOPT disposition, reparenting it into `parent`'s realized native
 // surface and returning an opaque engine pointer for it (as
@@ -542,6 +559,14 @@ native static void webview_offscreen_set_user_agent_resolver(long peer, Object r
 // are stubs and this is a native-side no-op.  Passing 0 for peer is a silent
 // no-op.  Never throws via JNI.
 native static void webview_offscreen_clear_cache(long peer);
+
+// Offscreen counterpart to webview_embed_print_to_pdf (Canvas 29).  Linux
+// prints the offscreen WebKitWebView; macOS / Windows have no offscreen
+// engine and finish with "The WebView is not attached yet.".
+native static void webview_offscreen_print_to_pdf(long peer, String path,
+        double pageWidth, double pageHeight, double marginTop,
+        double marginRight, double marginBottom, double marginLeft,
+        boolean backgrounds, WebViewPdfCallback cb);
 
 // Offscreen counterpart to webview_embed_adopt_popup (Canvas 19).  Adopt a
 // browser-initiated popup child that was retained (not shown) after an ADOPT

@@ -224,6 +224,23 @@ public class WebViewLightweightComponent extends WebViewComponent {
     }
 
     @Override
+    protected boolean printToPdfOnPeer(java.io.File out,
+                                       ca.weblite.webview.PdfOptions o,
+                                       final ca.weblite.webview.WebViewPdfCallback cb) {
+        OffscreenWebView e = engine;
+        if (e == null) {
+            return false;
+        }
+        // The component owns the caller's future; the wrapper's future only
+        // relays the outcome to cb (Canvas 29 op 7).
+        e.printToPdf(out, o).whenComplete((f, t) -> cb.onPdfFinished(t == null,
+                t == null ? null
+                        : (t instanceof java.util.concurrent.CompletionException
+                                && t.getCause() != null ? t.getCause() : t).getMessage()));
+        return true;
+    }
+
+    @Override
     public void addNotify() {
         super.addNotify();
         if (engine != null) return;
@@ -485,6 +502,7 @@ public class WebViewLightweightComponent extends WebViewComponent {
         popupDispatcher.disposeAll();
         downloadDispatcher.disposeAll();
         passwordDispatcher.disposeAll();
+        failPendingPdf();
         if (engine != null) {
             OffscreenWebView ow = engine;
             engine = null;
@@ -711,6 +729,7 @@ public class WebViewLightweightComponent extends WebViewComponent {
             repaintTimer.stop();
             repaintTimer = null;
         }
+        failPendingPdf();
         if (engine != null) {
             OffscreenWebView ow = engine;
             engine = null;

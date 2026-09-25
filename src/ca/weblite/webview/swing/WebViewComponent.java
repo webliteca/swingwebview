@@ -12,6 +12,8 @@ import ca.weblite.webview.DownloadDispatcher;
 import ca.weblite.webview.PasswordDispatcher;
 import ca.weblite.webview.PopupDispatcher;
 import ca.weblite.webview.JavaScriptEvalException;
+import ca.weblite.webview.PdfOptions;
+import ca.weblite.webview.PdfPrinting;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewCredential;
 import ca.weblite.webview.WebViewCredentialStore;
@@ -21,13 +23,17 @@ import ca.weblite.webview.WebViewFillPasswordHandler;
 import ca.weblite.webview.WebViewPopupHandler;
 import ca.weblite.webview.WebViewMouseDispatcher;
 import ca.weblite.webview.WebViewMouseListener;
+import ca.weblite.webview.WebViewPdfCallback;
 import ca.weblite.webview.WebViewSavePasswordHandler;
 
+import java.io.File;
 import java.io.PrintStream;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
 import java.util.function.Function;
+import javax.swing.SwingUtilities;
 import javax.swing.JComponent;
 
 /**
@@ -405,6 +411,111 @@ public abstract class WebViewComponent extends JComponent {
      *  class and when no peer is attached; subclasses forward to their engine
      *  wrapper's {@code clearCache}. */
     protected void clearCacheOnPeer() {
+    }
+
+    /** Print requests not yet answered, failed with {@link PdfPrinting#CLOSED}
+     *  when the peer goes away (Canvas 29 D6).  EDT-confined. */
+    private final List<PdfPrinting.Request> pendingPdf =
+            new ArrayList<PdfPrinting.Request>();
+
+    /**
+     * Print the page this component shows to a PDF file on US Letter pages
+     * with zero margins and backgrounds.
+     *
+     * @see #printToPdf(File, PdfOptions)
+     */
+    public CompletableFuture<File> printToPdf(File out) {
+        return printToPdf(out, PdfOptions.letter());
+    }
+
+    /**
+     * Print the page this component shows to a PDF file, with no print
+     * dialog (Canvas 29).  The engine's own headers and footers are off and
+     * the scale is 1, so the PDF is the page as laid out — wait for the
+     * page's own layout to finish before calling.
+     *
+     * <p>The future completes on the Swing event thread with {@code out} once
+     * the file is written, or exceptionally with an {@link java.io.IOException}
+     * whose message says why not: the folder does not exist, the native
+     * library or engine runtime cannot print to PDF, the component is not
+     * attached yet, or it was closed before the print finished.
+     *
+     * @param out     the PDF file to write; its folder must exist
+     * @param options page size, margins and backgrounds; {@code null} means
+     *                {@link PdfOptions#letter()}
+     */
+    public CompletableFuture<File> printToPdf(File out, PdfOptions options) {
+        final PdfOptions o = options == null ? PdfOptions.letter() : options;
+        String reason = PdfPrinting.precheck(out, o, pdfPrintingAvailable());
+        if (reason != null) {
+            PdfPrinting.Request failed = PdfPrinting.request(out, EDT);
+            failed.fail(reason);
+            return failed.future;
+        }
+        final PdfPrinting.Request request = PdfPrinting.request(out, EDT);
+        onEdt(new Runnable() {
+            @Override
+            public void run() {
+                pendingPdf.add(request);
+            }
+        });
+        request.future.whenComplete((f, t) -> pendingPdf.remove(request));
+        onEdt(new Runnable() {
+            @Override
+            public void run() {
+                if (request.future.isDone()) {
+                    return;
+                }
+                if (!printToPdfOnPeer(out, o, request.callback)) {
+                    request.fail(PdfPrinting.NOT_ATTACHED);
+                }
+            }
+        });
+        return request.future;
+    }
+
+    /**
+     * Start printing the live peer's page to {@code out}, answering
+     * {@code cb} exactly once.  Returns {@code false} when no peer is
+     * attached.  Called on the EDT.  The base class has no peer.
+     */
+    protected boolean printToPdfOnPeer(File out, PdfOptions o,
+                                       WebViewPdfCallback cb) {
+        return false;
+    }
+
+    /** Whether this component's native library can print to PDF.  Defaults
+     *  to {@link PdfPrinting#isAvailable()}; a test double without natives
+     *  overrides it. */
+    protected boolean pdfPrintingAvailable() {
+        return PdfPrinting.isAvailable();
+    }
+
+    /** Fail every unanswered print request with {@link PdfPrinting#CLOSED}.
+     *  Subclasses call this before disposing their engine.  EDT-only. */
+    protected void failPendingPdf() {
+        for (PdfPrinting.Request r : new ArrayList<PdfPrinting.Request>(pendingPdf)) {
+            r.fail(PdfPrinting.CLOSED);
+        }
+    }
+
+    /**
+     * Whether the loaded native library can print to PDF.  {@code false}
+     * against a native built before the feature, or without natives at all.
+     */
+    public static boolean isPdfPrintingSupported() {
+        return PdfPrinting.isAvailable();
+    }
+
+    private static final java.util.concurrent.Executor EDT =
+            SwingUtilities::invokeLater;
+
+    private static void onEdt(Runnable r) {
+        if (SwingUtilities.isEventDispatchThread()) {
+            r.run();
+        } else {
+            SwingUtilities.invokeLater(r);
+        }
     }
 
     /** Toggle developer tools (where supported).  Must be called before display. */
