@@ -136,8 +136,12 @@ public class WebViewComponentPrintToPdfTest {
         drainEdt();
         assertEquals(8.5, c.lastOptions.getPageWidth(), 1e-9);
         c.lastCb.onPdfFinished(true, null);
-        assertSame(out, f.get(5, TimeUnit.SECONDS));
+        // Drain rather than f.get(): a thread blocked in get() runs pending
+        // dependents itself once it wakes, so the whenComplete above could
+        // run off the EDT and the check would race.
         drainEdt();
+        assertTrue(f.isDone());
+        assertSame(out, f.getNow(null));
         assertTrue("completes on the EDT", onEdt.get());
     }
 
