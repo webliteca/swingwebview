@@ -248,6 +248,7 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         popupDispatcher.disposeAll();
         downloadDispatcher.disposeAll();
         passwordDispatcher.disposeAll();
+        failPendingPdf();
         if (embedded != null) {
             EmbeddedWebView e = embedded;
             embedded = null;
@@ -518,6 +519,23 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         if (e != null) {
             e.clearCache();
         }
+    }
+
+    @Override
+    protected boolean printToPdfOnPeer(java.io.File out,
+                                       ca.weblite.webview.PdfOptions o,
+                                       final ca.weblite.webview.WebViewPdfCallback cb) {
+        EmbeddedWebView e = embedded;
+        if (e == null) {
+            return false;
+        }
+        // The component owns the caller's future; the wrapper's future only
+        // relays the outcome to cb (Canvas 29 op 7).
+        e.printToPdf(out, o).whenComplete((f, t) -> cb.onPdfFinished(t == null,
+                t == null ? null
+                        : (t instanceof java.util.concurrent.CompletionException
+                                && t.getCause() != null ? t.getCause() : t).getMessage()));
+        return true;
     }
 
     private void createPeer() {
