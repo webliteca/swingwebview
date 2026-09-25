@@ -418,6 +418,35 @@ public abstract class WebViewComponent extends JComponent {
     private final List<PdfPrinting.Request> pendingPdf =
             new ArrayList<PdfPrinting.Request>();
 
+    /** Whether {@link #preloadNatives()} has loaded the natives (Canvas 29 D15). */
+    private static volatile boolean nativesPreloaded;
+
+    /**
+     * On macOS, load the native library now (Canvas 29 D15).  Loading it on
+     * the EDT once a window is showing deadlocks: the load holds the JVM's
+     * library lock and waits on the AppKit thread, which is waiting for that
+     * lock to initialise {@code java.awt.event.MouseEvent} for the window's
+     * first mouse-entered event.  Components are constructed before they are
+     * shown, so loading here happens before AppKit delivers window events.
+     */
+    protected WebViewComponent() {
+        preloadNatives();
+    }
+
+    private static void preloadNatives() {
+        if (nativesPreloaded
+                || !System.getProperty("os.name", "").startsWith("Mac")) {
+            return;
+        }
+        try {
+            Class.forName("ca.weblite.webview.WebViewNative", true,
+                    WebViewComponent.class.getClassLoader());
+            nativesPreloaded = true;
+        } catch (Throwable t) {
+            // A missing native keeps isPdfPrintingSupported() false.
+        }
+    }
+
     /**
      * Print the page this component shows to a PDF file on US Letter pages
      * with zero margins and backgrounds.

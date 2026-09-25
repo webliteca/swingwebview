@@ -101,6 +101,16 @@ generated_at: 2026-09-25T02:00:00-07:00
   dropped print ends there too): the request succeeds only when the destination exists, is non-empty
   and was modified by this print (mtime no earlier than the print's start, 1 s slack); otherwise it
   fails with "The PDF file was not written."
+- **D15 · On macOS the native library loads when a component is constructed.** The first touch of
+  `WebViewNative` loads `libjawt` and `libwebview` under the JVM's library lock. Done on the EDT once
+  a window is showing — which is what `isPdfPrintingSupported()` right after `setVisible(true)` did in
+  the demo — it deadlocks: the AppKit thread, delivering the window's first mouse-entered event,
+  initialises `java.awt.event.MouseEvent`, whose static initialiser waits for the same lock, while the
+  EDT's load waits on the AppKit thread. So on macOS the `WebViewComponent` constructor loads the
+  natives (forcing `WebViewNative`'s class initialisation). Construction comes before showing in
+  every normal use, so the load happens before AppKit delivers any window event. Any failure is
+  swallowed: a missing native leaves `isPdfPrintingSupported()` answering false as before. Linux and
+  Windows are unchanged.
 
 ## R · Requirements
 
@@ -235,6 +245,9 @@ the future.
   false.
 - `protected void failPendingPdf()`: fail every pending request with `CLOSED`.
 - `public static boolean isPdfPrintingSupported()` → `PdfPrinting.isAvailable()`.
+- Constructor (D15): on macOS (`os.name` starting with "Mac"), `preloadNatives()` initialises
+  `WebViewNative` via `Class.forName(name, true, loader)` inside a catch-all; a no-op elsewhere and
+  after the first success. `isPdfPrintingSupported()` is unchanged.
 
 ### 7. Heavyweight / lightweight (**edited**)
 Override `printToPdfOnPeer`: engine null → false; else call the wrapper's public `printToPdf(out, o)`
@@ -310,4 +323,5 @@ disposes its engine, call `failPendingPdf()` first.
 - No print dialog is ever shown; engine headers/footers are off.
 - The future completes exactly once; a callback after completion is ignored.
 - One engine never runs two prints at once (D12); a Linux success is a file this print wrote (D14).
+- On macOS no API in this Canvas is the first to load the natives after a window is showing (D15).
 - Paths go to engines as UTF-8 (Linux/macOS) or UTF-16 (Windows) absolute paths; no shell.
