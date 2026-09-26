@@ -173,6 +173,9 @@ public class EmbeddedWebView {
             throw new IllegalStateException(
                 "parent is not displayable; addNotify() has not been called.");
         }
+        // Canvas 30 D1: the first engine freezes the custom-scheme registry
+        // and installs any schemes before the engine that must see them exists.
+        WebViewSchemes.freezeForEngine();
         long p = WebViewNative.webview_embed_create(parent, debug ? 1 : 0);
         if (p == 0L) {
             throw new IllegalStateException(

@@ -847,6 +847,78 @@ wv.printToPdf(new File("report-a4.pdf"), PdfOptions.a4().withMargins(0.5));
   heavyweight component refuses with "PDF printing on Linux needs the
   lightweight WebView component."
 
+## Custom URL schemes
+
+Serve an application's own pages from a URL scheme of its own, such as
+`demo://app/index.html`, answered in Java. There is no local HTTP server, no
+open port and no token:
+
+```java
+// Before the first WebView is created:
+if (WebViewSchemes.isSupported()) {
+    WebViewSchemes.register("demo", (request, responder) -> {
+        if (request.url().equals("demo://app/index.html")) {
+            responder.respond(WebViewSchemeResponse.ok("text/html",
+                "<h1>Hello</h1>".getBytes(StandardCharsets.UTF_8)));
+        } else {
+            responder.respond(WebViewSchemeResponse.text(404, "Not found"));
+        }
+    });
+}
+WebViewComponent wv = WebViewComponent.create();
+wv.setUrl("demo://app/index.html");
+```
+
+* **Register before the first WebView.** Engines fix their schemes when the
+  first WebView is created, so a later `register` is refused with "Custom
+  schemes must be registered before the first WebView is created." A scheme
+  name is 2–32 characters: a letter first, then letters, digits, `+`, `-` or
+  `.`. The web's own schemes (`http`, `https`, `file`, `data`, `blob`,
+  `about`, `javascript`, `ws`, `wss`, `ftp`) cannot be registered.
+* **The handler contract.** Handlers run off the UI thread, on daemon threads
+  named `webview-scheme-N`. The request carries the method, the full URL, the
+  headers (`header(name)` ignores case) and the body. Answer once, from any
+  thread, whenever you are ready: later answers are ignored. A handler that
+  throws gives the page a 500, and one that has not answered after 30 seconds
+  gives a 504. A request to a scheme with no handler gets a 404.
+* **Headers.** `Content-Length` is computed for you. A missing `Content-Type`
+  becomes `application/octet-stream`, and `Access-Control-Allow-Origin` is set
+  to the request's own origin, so scripts on `demo://app/` can `fetch` other
+  `demo://app/…` addresses.
+* **Caps.** A request body over 16 MB is answered 413 without calling the
+  handler; a response body over 64 MB is replaced by a 500. Bodies arrive
+  whole: there is no streaming.
+* **Capability check.** `WebViewSchemes.isSupported()` is `false` against a
+  native library without this feature, and `register` then fails with "Custom
+  URL schemes are not available in this version of the native library".
+* **Platform coverage.** macOS (heavyweight) through a `WKURLSchemeHandler` on
+  each view's configuration, popups included. Linux (lightweight and
+  heavyweight) through a URI scheme on WebKitGTK's default web context,
+  registered as secure and CORS-enabled, which every view and popup shares.
+  Windows (heavyweight) through custom scheme registrations on the WebView2
+  environment (secure, with a host, accepting requests from pages on the same
+  scheme) and `WebResourceRequested`, on every view and popup. The standalone
+  `WebView` window is not covered. See
+  [`demos/WebViewSchemeDemo/`](demos/WebViewSchemeDemo/README.md).
+* **Linux notes.**
+  * Request bodies need WebKitGTK 2.40 or newer. On older engines the handler
+    gets an empty body and `bodyAvailable()` is `false`.
+  * Response status codes and headers need WebKitGTK 2.36 or newer. On older
+    engines a 2xx answer keeps only its body and `Content-Type`, and any other
+    status reaches the page as a network error.
+  * WebKitGTK does not report abandoned requests, so Linux never cancels one:
+    an unanswered request ends at the 30-second timeout.
+  * Schemes are registered on the default web context, which the standalone
+    `WebView` window also uses, but that window remains unsupported.
+* **Windows notes.**
+  * WebView2 does not report abandoned requests, so Windows never cancels one:
+    an unanswered request ends at the 30-second timeout.
+  * A WebView2 Runtime too old for custom scheme registration cannot load pages
+    from the scheme; the evergreen Runtime on current Windows can.
+  * Do not combine the standalone `WebView` window with registered schemes in
+    one process: WebView2 may refuse the second environment because its options
+    differ.
+
 ## Demo
 
 See [`demos/WebViewHeavyweightDemo/`](demos/WebViewHeavyweightDemo/README.md)
@@ -883,6 +955,9 @@ Additional demos:
 * `demos/WebViewPdfDemo/` — exercises `printToPdf`: a two-page report
   with a full-bleed cover printed as Letter and as A4 with margins, and a
   print into a missing folder (`run-*-pdf-demo`).
+* `demos/WebViewSchemeDemo/` — serves a two-file page from the `demo://`
+  scheme in Java: a script, a POST echoed as JSON, a slow answer, a failing
+  handler and a popup (`run-*-scheme-demo`).
 
 ## Building from source
 

@@ -386,6 +386,16 @@ native static void webview_embed_clear_cache(long w);
 // UnsatisfiedLinkError an older native raises.
 native static boolean webview_pdf_available();
 
+// Canvas 30: custom URL schemes.  webview_scheme_available is present only in
+// natives built with the feature (WebViewSchemes.isSupported() absorbs the
+// UnsatisfiedLinkError an older native raises).  webview_scheme_install hands
+// native the frozen scheme names and the SchemeDispatcher it upcalls
+// (onSchemeRequest / onSchemeCancelled), once, before the first engine;
+// webview_scheme_respond answers one request by id, from any thread.
+native static boolean webview_scheme_available();
+native static void webview_scheme_install(String[] schemes, Object dispatcher);
+native static void webview_scheme_respond(long id, int status, String[] headerPairs, byte[] body);
+
 // Canvas 29: print the embedded WebView's page to a PDF file at `path`
 // (absolute), with the page size and margins in inches and backgrounds on or
 // off, no dialog, engine headers/footers off.  Runs on the engine UI thread

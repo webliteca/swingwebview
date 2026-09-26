@@ -51,6 +51,8 @@
   X(webkit_script_dialog_get_message)                            \
   X(webkit_script_dialog_prompt_get_default_text)                \
   X(webkit_script_dialog_prompt_set_text)                        \
+  X(webkit_security_manager_register_uri_scheme_as_cors_enabled) \
+  X(webkit_security_manager_register_uri_scheme_as_secure)       \
   X(webkit_settings_get_enable_developer_extras)                 \
   X(webkit_settings_set_enable_developer_extras)                 \
   X(webkit_settings_set_enable_write_console_messages_to_stdout) \
@@ -59,10 +61,16 @@
   X(webkit_uri_response_get_content_length)                      \
   X(webkit_uri_response_get_mime_type)                           \
   X(webkit_uri_response_get_uri)                                 \
+  X(webkit_uri_scheme_request_finish)                            \
+  X(webkit_uri_scheme_request_finish_error)                      \
+  X(webkit_uri_scheme_request_get_uri)                           \
   X(webkit_user_content_manager_add_script)                      \
   X(webkit_user_content_manager_register_script_message_handler) \
   X(webkit_user_script_new)                                      \
   X(webkit_web_inspector_show)                                   \
+  X(webkit_web_context_get_default)                              \
+  X(webkit_web_context_get_security_manager)                     \
+  X(webkit_web_context_register_uri_scheme)                      \
   X(webkit_web_view_execute_editing_command)                     \
   X(webkit_web_view_get_context)                                 \
   X(webkit_web_view_get_inspector)                               \
@@ -98,6 +106,38 @@
   X(JSStringGetUTF8CString)
 #endif
 
+// Optional symbols (Canvas 31 D5): resolved when the runtime has them, null
+// otherwise -- they never fail the load.  Each group is also gated on the
+// headers, because the members are declared with decltype(&sym).  Every call
+// site sits inside the same #if AND behind WK_HAS(sym).  The libsoup symbols
+// resolve through the WebKit handle, i.e. from the libsoup generation WebKit
+// itself loaded (2 for the 4.0 API, 3 for 4.1); their signatures match in both.
+#if WEBKIT_CHECK_VERSION(2, 12, 0)
+#define WK_OPT_2_12(X) X(webkit_uri_scheme_request_get_http_method)
+#else
+#define WK_OPT_2_12(X)
+#endif
+#if WEBKIT_CHECK_VERSION(2, 36, 0)
+#define WK_OPT_2_36(X)                                                         \
+  X(webkit_uri_scheme_request_get_http_headers)                               \
+  X(webkit_uri_scheme_request_finish_with_response)                           \
+  X(webkit_uri_scheme_response_new)                                           \
+  X(webkit_uri_scheme_response_set_status)                                    \
+  X(webkit_uri_scheme_response_set_content_type)                              \
+  X(webkit_uri_scheme_response_set_http_headers)                              \
+  X(soup_message_headers_new)                                                 \
+  X(soup_message_headers_append)                                              \
+  X(soup_message_headers_foreach)
+#else
+#define WK_OPT_2_36(X)
+#endif
+#if WEBKIT_CHECK_VERSION(2, 40, 0)
+#define WK_OPT_2_40(X) X(webkit_uri_scheme_request_get_http_body)
+#else
+#define WK_OPT_2_40(X)
+#endif
+#define WK_WEBKIT_OPT_SYMS(X) WK_OPT_2_12(X) WK_OPT_2_36(X) WK_OPT_2_40(X)
+
 // The pointer table. Member types are taken from the real declarations via
 // decltype — unevaluated, so this creates no link-time dependency on the
 // WebKit/JSC symbols.
@@ -109,12 +149,17 @@ struct WkFns {
   WK_WEBKIT_SYMS(WK_DECL_MEMBER)
   WK_WEBKIT_JS_SYMS(WK_DECL_MEMBER)
   WK_JSC_JS_SYMS(WK_DECL_MEMBER)
+  WK_WEBKIT_OPT_SYMS(WK_DECL_MEMBER)
 #undef WK_DECL_MEMBER
 };
 
 // The single resolved table (defined in webkit_loader.cpp). Call sites reach
 // it through the redirects in webkit_shim.h.
 extern WkFns g_wk;
+
+// Whether an optional symbol (WK_WEBKIT_OPT_SYMS) resolved at run time.  The
+// ## paste keeps webkit_shim.h's redirect of `sym` from expanding here.
+#define WK_HAS(sym) (::g_wk.fn_##sym != nullptr)
 
 // Resolve the WebKit/JSC runtime once (idempotent, thread-safe). Returns true
 // on success. On failure, if errbuf/errlen are non-null, copies a diagnostic
