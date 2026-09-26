@@ -380,8 +380,10 @@ SchemeDispatcher --> Sink : native (webview_scheme_respond) or test
    - `Map<String, WebViewSchemeHandler> handlers` (a `LinkedHashMap`);
    - `boolean frozen`;
    - `SchemeDispatcher dispatcher` (the anchor, D16);
-   - the package-private test seams `BooleanSupplier available` (default: the native probe) and
-     `SchemeDispatcher.Sink sink` (default: native).
+   - the package-private test seams `BooleanSupplier available` (default: the native probe),
+     `Installer installer` (default: `webview_scheme_install`; a package-private interface
+     `install(String[] schemes, Object dispatcher)`) and `SchemeDispatcher.Sink sink` (default:
+     native).
 2. **`isSupported()`**: `available.getAsBoolean()`, wrapped in `try/catch (Throwable) → false`.
 3. **`register(String scheme, WebViewSchemeHandler handler)`**, synchronized. It checks, in order:
    1. the handler is non-null (D3);

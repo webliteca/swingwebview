@@ -312,6 +312,95 @@ static void pdf_finish(PdfJob *job, bool ok, const char *err) {
 
 static const char *const kPdfNotAttached = "The WebView is not attached yet.";
 
+// ---------------------------------------------------------------------------
+// Canvas 30: custom URL schemes -- the state every engine shares (D14).
+// Installed once by webview_scheme_install, before the first engine exists:
+// the lower-case scheme names, the Java SchemeDispatcher (a global ref) and
+// the JVM.  Requests get monotonic ids; each engine keeps its own table of
+// pending platform objects (Cocoa: the WKURLSchemeTask) under the one lock.
+// ---------------------------------------------------------------------------
+static std::vector<std::string> g_scheme_names;
+static jobject g_scheme_dispatcher = nullptr;
+static JavaVM *g_scheme_jvm = nullptr;
+static std::atomic<long long> g_scheme_next_id(0);
+static std::mutex g_scheme_mutex;
+static bool g_scheme_installed = false;
+
+// JNI env for the current thread, attaching when needed; *attached says so.
+static JNIEnv *scheme_env(bool *attached) {
+    *attached = false;
+    if (!g_scheme_jvm) return nullptr;
+    JNIEnv *env = nullptr;
+    if (g_scheme_jvm->GetEnv((void **)&env, JNI_VERSION_1_6) == JNI_OK) return env;
+    if (g_scheme_jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK) return nullptr;
+    *attached = true;
+    return env;
+}
+
+// Upcall SchemeDispatcher.onSchemeRequest (D15).  Call from a non-UI thread.
+__attribute__((unused))
+static void scheme_upcall_request(long long id, const std::string &method,
+                                  const std::string &url,
+                                  const std::vector<std::string> &headerPairs,
+                                  const std::vector<unsigned char> &body,
+                                  bool bodyAvailable) {
+    if (!g_scheme_dispatcher) return;
+    bool attached = false;
+    JNIEnv *env = scheme_env(&attached);
+    if (!env) return;
+    jclass cls = env->GetObjectClass(g_scheme_dispatcher);
+    jmethodID m = cls ? env->GetMethodID(cls, "onSchemeRequest",
+        "(JLjava/lang/String;Ljava/lang/String;[Ljava/lang/String;[BZ)V") : nullptr;
+    if (m) {
+        jstring jmethod = env->NewStringUTF(method.c_str());
+        jstring jurl = env->NewStringUTF(url.c_str());
+        jclass strCls = env->FindClass("java/lang/String");
+        jobjectArray jpairs = strCls
+            ? env->NewObjectArray((jsize)headerPairs.size(), strCls, nullptr) : nullptr;
+        if (jpairs) {
+            for (size_t i = 0; i < headerPairs.size(); i++) {
+                jstring v = env->NewStringUTF(headerPairs[i].c_str());
+                env->SetObjectArrayElement(jpairs, (jsize)i, v);
+                if (v) env->DeleteLocalRef(v);
+            }
+        }
+        jbyteArray jbody = env->NewByteArray((jsize)body.size());
+        if (jbody && !body.empty()) {
+            env->SetByteArrayRegion(jbody, 0, (jsize)body.size(),
+                                    (const jbyte *)body.data());
+        }
+        env->CallVoidMethod(g_scheme_dispatcher, m, (jlong)id, jmethod, jurl, jpairs,
+                            jbody, (jboolean)(bodyAvailable ? JNI_TRUE : JNI_FALSE));
+        if (jmethod) env->DeleteLocalRef(jmethod);
+        if (jurl) env->DeleteLocalRef(jurl);
+        if (jpairs) env->DeleteLocalRef(jpairs);
+        if (jbody) env->DeleteLocalRef(jbody);
+        if (strCls) env->DeleteLocalRef(strCls);
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (cls) env->DeleteLocalRef(cls);
+    if (attached) g_scheme_jvm->DetachCurrentThread();
+}
+
+// Upcall SchemeDispatcher.onSchemeCancelled (D15).  Call from a non-UI thread.
+__attribute__((unused))
+static void scheme_upcall_cancelled(long long id) {
+    if (!g_scheme_dispatcher) return;
+    bool attached = false;
+    JNIEnv *env = scheme_env(&attached);
+    if (!env) return;
+    jclass cls = env->GetObjectClass(g_scheme_dispatcher);
+    jmethodID m = cls ? env->GetMethodID(cls, "onSchemeCancelled", "(J)V") : nullptr;
+    if (m) env->CallVoidMethod(g_scheme_dispatcher, m, (jlong)id);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (cls) env->DeleteLocalRef(cls);
+    if (attached) g_scheme_jvm->DetachCurrentThread();
+}
+
+// The largest request body read from the engine: the dispatcher's cap plus
+// one byte, so an over-cap body is still recognised and answered 413.
+static const size_t kSchemeMaxRequestRead = 16u * 1024u * 1024u + 1u;
+
 #ifdef WEBVIEW_GTK
 // =========================================================================
 // Linux / GTK / X11
@@ -4023,6 +4112,160 @@ static id ns_str(const char *s) {
     return msg(objc_cls("NSString"), sel("stringWithUTF8String:"), s);
 }
 
+// ---------------------------------------------------------------------------
+// Canvas 30 D13: custom URL schemes on WKWebView.  One WKURLSchemeHandler class
+// and one shared instance serve every scheme of every engine.  Pending tasks
+// live in g_scheme_tasks (id -> retained task); start/stop and the response
+// all run on AppKit main, and Java is only ever called from detached threads.
+// ---------------------------------------------------------------------------
+static std::map<long long, id> g_scheme_tasks;
+static std::once_flag g_scheme_handler_once;
+static id g_scheme_handler_instance = nil;
+
+static std::string ns_utf8(id s) {
+    if (!s) return std::string();
+    const char *c = msg<const char *>(s, sel("UTF8String"));
+    return c ? std::string(c) : std::string();
+}
+
+static void impl_scheme_start(id, SEL, id, id task) {
+    long long rid = ++g_scheme_next_id;
+    msg(task, sel("retain"));
+    {
+        std::lock_guard<std::mutex> lk(g_scheme_mutex);
+        g_scheme_tasks[rid] = task;
+    }
+    id req = msg(task, sel("request"));
+    std::string url = ns_utf8(msg(msg(req, sel("URL")), sel("absoluteString")));
+    std::string method = ns_utf8(msg(req, sel("HTTPMethod")));
+    std::vector<std::string> pairs;
+    id fields = msg(req, sel("allHTTPHeaderFields"));
+    if (fields) {
+        id keys = msg(fields, sel("allKeys"));
+        unsigned long n = msg<unsigned long>(keys, sel("count"));
+        for (unsigned long i = 0; i < n; i++) {
+            id k = msg<id, unsigned long>(keys, sel("objectAtIndex:"), i);
+            id v = msg<id, id>(fields, sel("objectForKey:"), k);
+            pairs.push_back(ns_utf8(k));
+            pairs.push_back(ns_utf8(v));
+        }
+    }
+    std::vector<unsigned char> body;
+    id data = msg(req, sel("HTTPBody"));
+    if (data) {
+        unsigned long len = msg<unsigned long>(data, sel("length"));
+        const unsigned char *bytes = msg<const unsigned char *>(data, sel("bytes"));
+        if (bytes && len) {
+            size_t take = std::min((size_t)len, kSchemeMaxRequestRead);
+            body.assign(bytes, bytes + take);
+        }
+    } else {
+        id stream = msg(req, sel("HTTPBodyStream"));
+        if (stream) {
+            msg<void>(stream, sel("open"));
+            unsigned char buf[16384];
+            while (body.size() < kSchemeMaxRequestRead) {
+                long got = msg<long, unsigned char *, unsigned long>(
+                    stream, sel("read:maxLength:"), buf, (unsigned long)sizeof(buf));
+                if (got <= 0) break;
+                body.insert(body.end(), buf, buf + got);
+            }
+            if (body.size() > kSchemeMaxRequestRead) body.resize(kSchemeMaxRequestRead);
+            msg<void>(stream, sel("close"));
+        }
+    }
+    std::thread([rid, method, url, pairs, body]() {
+        scheme_upcall_request(rid, method, url, pairs, body, true);
+    }).detach();
+}
+
+static void impl_scheme_stop(id, SEL, id, id task) {
+    long long rid = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_scheme_mutex);
+        for (auto it = g_scheme_tasks.begin(); it != g_scheme_tasks.end(); ++it) {
+            if (it->second == task) {
+                rid = it->first;
+                g_scheme_tasks.erase(it);
+                break;
+            }
+        }
+    }
+    if (!rid) return;
+    msg<void>(task, sel("release"));
+    std::thread([rid]() { scheme_upcall_cancelled(rid); }).detach();
+}
+
+static id cocoa_scheme_handler() {
+    std::call_once(g_scheme_handler_once, [] {
+        Class c = objc_allocateClassPair((Class)objc_cls("NSObject"),
+                                         "WebviewSchemeHandler", 0);
+        if (c) {
+            class_addProtocol(c, objc_getProtocol("WKURLSchemeHandler"));
+            class_addMethod(c, sel("webView:startURLSchemeTask:"),
+                            (IMP)impl_scheme_start, "v@:@@");
+            class_addMethod(c, sel("webView:stopURLSchemeTask:"),
+                            (IMP)impl_scheme_stop, "v@:@@");
+            objc_registerClassPair(c);
+        } else {
+            c = (Class)objc_cls("WebviewSchemeHandler");
+        }
+        if (c) g_scheme_handler_instance = msg(msg((id)c, sel("alloc")), sel("init"));
+    });
+    return g_scheme_handler_instance;
+}
+
+// Set the shared handler for every installed scheme on a configuration that
+// has not yet been used to create a WKWebView (D13).
+static void cocoa_install_schemes(id config) {
+    if (!config || g_scheme_names.empty()) return;
+    id handler = cocoa_scheme_handler();
+    if (!handler) return;
+    for (const std::string &name : g_scheme_names) {
+        msg<void, id, id>(config, sel("setURLSchemeHandler:forURLScheme:"), handler,
+                          ns_str(name.c_str()));
+    }
+}
+
+// Apply a response on AppKit main, if its task is still pending (D13).
+static void cocoa_scheme_respond(long long rid, int status,
+                                 std::vector<std::string> pairs,
+                                 std::vector<unsigned char> body) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id task = nil;
+        {
+            std::lock_guard<std::mutex> lk(g_scheme_mutex);
+            auto it = g_scheme_tasks.find(rid);
+            if (it == g_scheme_tasks.end()) return;
+            task = it->second;
+            g_scheme_tasks.erase(it);
+        }
+        id url = msg(msg(task, sel("request")), sel("URL"));
+        id fields = msg(objc_cls("NSMutableDictionary"), sel("dictionary"));
+        for (size_t i = 0; i + 1 < pairs.size(); i += 2) {
+            id k = ns_str(pairs[i].c_str());
+            id prev = msg<id, id>(fields, sel("objectForKey:"), k);
+            std::string v = pairs[i + 1];
+            if (prev) v = ns_utf8(prev) + ", " + v;
+            msg<void, id, id>(fields, sel("setObject:forKey:"), ns_str(v.c_str()), k);
+        }
+        id resp = msg(objc_cls("NSHTTPURLResponse"), sel("alloc"));
+        resp = msg<id, id, long, id, id>(resp,
+            sel("initWithURL:statusCode:HTTPVersion:headerFields:"), url, (long)status,
+            ns_str("HTTP/1.1"), fields);
+        msg<void, id>(task, sel("didReceiveResponse:"), resp);
+        if (!body.empty()) {
+            id data = msg<id, const void *, unsigned long>(objc_cls("NSData"),
+                sel("dataWithBytes:length:"), (const void *)body.data(),
+                (unsigned long)body.size());
+            msg<void, id>(task, sel("didReceiveData:"), data);
+        }
+        msg<void>(task, sel("didFinish"));
+        if (resp) msg<void>(resp, sel("release"));
+        msg<void>(task, sel("release"));
+    });
+}
+
 struct Engine {
     id webview = nullptr;   // WKWebView
     id manager = nullptr;   // WKUserContentController
@@ -6772,6 +7015,9 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
         install_click_swizzle();
 
         e->config = msg(objc_cls("WKWebViewConfiguration"), sel("new"));
+        // Canvas 30 D13: custom schemes must be on the configuration before
+        // the WKWebView is created from it; popups inherit them from it.
+        cocoa_install_schemes(e->config);
         e->manager = msg(e->config, sel("userContentController"));
         id wv = msg(objc_cls("WKWebView"), sel("alloc"));
         wv = msg<id, CGRect, id>(
@@ -9022,6 +9268,67 @@ JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1pdf_1a
     return JNI_TRUE;
 #else
     return JNI_FALSE;
+#endif
+}
+
+// Custom URL schemes — Canvas 30.  Inside this `extern "C"` block like every
+// export.  macOS serves them now; GTK reports "not supported" until Canvas 31.
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1scheme_1available
+  (JNIEnv *, jclass) {
+#if defined(WEBVIEW_COCOA)
+    return JNI_TRUE;
+#else
+    return JNI_FALSE;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1scheme_1install
+  (JNIEnv *env, jclass, jobjectArray names, jobject dispatcher) {
+    std::lock_guard<std::mutex> lk(embed::g_scheme_mutex);
+    if (embed::g_scheme_installed) return;
+    embed::g_scheme_installed = true;
+    env->GetJavaVM(&embed::g_scheme_jvm);
+    if (dispatcher) embed::g_scheme_dispatcher = env->NewGlobalRef(dispatcher);
+    jsize n = names ? env->GetArrayLength(names) : 0;
+    for (jsize i = 0; i < n; i++) {
+        jstring js = (jstring)env->GetObjectArrayElement(names, i);
+        if (!js) continue;
+        const char *c = env->GetStringUTFChars(js, nullptr);
+        if (c) {
+            embed::g_scheme_names.push_back(c);
+            env->ReleaseStringUTFChars(js, c);
+        }
+        env->DeleteLocalRef(js);
+    }
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1scheme_1respond
+  (JNIEnv *env, jclass, jlong id, jint status, jobjectArray headerPairs, jbyteArray body) {
+    std::vector<std::string> pairs;
+    jsize n = headerPairs ? env->GetArrayLength(headerPairs) : 0;
+    for (jsize i = 0; i < n; i++) {
+        jstring js = (jstring)env->GetObjectArrayElement(headerPairs, i);
+        std::string v;
+        if (js) {
+            const char *c = env->GetStringUTFChars(js, nullptr);
+            if (c) {
+                v = c;
+                env->ReleaseStringUTFChars(js, c);
+            }
+            env->DeleteLocalRef(js);
+        }
+        pairs.push_back(v);
+    }
+    std::vector<unsigned char> bytes;
+    jsize len = body ? env->GetArrayLength(body) : 0;
+    if (len > 0) {
+        bytes.resize((size_t)len);
+        env->GetByteArrayRegion(body, 0, len, (jbyte *)bytes.data());
+    }
+#if defined(WEBVIEW_COCOA)
+    embed::cocoa_scheme_respond((long long)id, (int)status, pairs, bytes);
+#else
+    (void)id; (void)status;
 #endif
 }
 

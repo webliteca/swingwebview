@@ -847,6 +847,56 @@ wv.printToPdf(new File("report-a4.pdf"), PdfOptions.a4().withMargins(0.5));
   heavyweight component refuses with "PDF printing on Linux needs the
   lightweight WebView component."
 
+## Custom URL schemes
+
+Serve an application's own pages from a URL scheme of its own, such as
+`demo://app/index.html`, answered in Java. There is no local HTTP server, no
+open port and no token:
+
+```java
+// Before the first WebView is created:
+if (WebViewSchemes.isSupported()) {
+    WebViewSchemes.register("demo", (request, responder) -> {
+        if (request.url().equals("demo://app/index.html")) {
+            responder.respond(WebViewSchemeResponse.ok("text/html",
+                "<h1>Hello</h1>".getBytes(StandardCharsets.UTF_8)));
+        } else {
+            responder.respond(WebViewSchemeResponse.text(404, "Not found"));
+        }
+    });
+}
+WebViewComponent wv = WebViewComponent.create();
+wv.setUrl("demo://app/index.html");
+```
+
+* **Register before the first WebView.** Engines fix their schemes when the
+  first WebView is created, so a later `register` is refused with "Custom
+  schemes must be registered before the first WebView is created." A scheme
+  name is 2–32 characters: a letter first, then letters, digits, `+`, `-` or
+  `.`. The web's own schemes (`http`, `https`, `file`, `data`, `blob`,
+  `about`, `javascript`, `ws`, `wss`, `ftp`) cannot be registered.
+* **The handler contract.** Handlers run off the UI thread, on daemon threads
+  named `webview-scheme-N`. The request carries the method, the full URL, the
+  headers (`header(name)` ignores case) and the body. Answer once, from any
+  thread, whenever you are ready: later answers are ignored. A handler that
+  throws gives the page a 500, and one that has not answered after 30 seconds
+  gives a 504. A request to a scheme with no handler gets a 404.
+* **Headers.** `Content-Length` is computed for you. A missing `Content-Type`
+  becomes `application/octet-stream`, and `Access-Control-Allow-Origin` is set
+  to the request's own origin, so scripts on `demo://app/` can `fetch` other
+  `demo://app/…` addresses.
+* **Caps.** A request body over 16 MB is answered 413 without calling the
+  handler; a response body over 64 MB is replaced by a 500. Bodies arrive
+  whole: there is no streaming.
+* **Capability check.** `WebViewSchemes.isSupported()` is `false` against a
+  native library without this feature, and `register` then fails with "Custom
+  URL schemes are not available in this version of the native library".
+* **Platform coverage.** macOS (heavyweight) through a `WKURLSchemeHandler` on
+  each view's configuration, popups included. Linux (WebKitGTK) and Windows
+  (WebView2) follow in the next releases; until then `isSupported()` is
+  `false` there. The standalone `WebView` window is not covered. See
+  [`demos/WebViewSchemeDemo/`](demos/WebViewSchemeDemo/README.md).
+
 ## Demo
 
 See [`demos/WebViewHeavyweightDemo/`](demos/WebViewHeavyweightDemo/README.md)
@@ -883,6 +933,9 @@ Additional demos:
 * `demos/WebViewPdfDemo/` — exercises `printToPdf`: a two-page report
   with a full-bleed cover printed as Letter and as A4 with margins, and a
   print into a missing folder (`run-*-pdf-demo`).
+* `demos/WebViewSchemeDemo/` — serves a two-file page from the `demo://`
+  scheme in Java: a script, a POST echoed as JSON, a slow answer, a failing
+  handler and a popup (`run-*-scheme-demo`).
 
 ## Building from source
 

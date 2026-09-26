@@ -101,6 +101,8 @@ public class OffscreenWebView {
      * Returns null on unsupported platform or native failure.
      */
     public static OffscreenWebView create(int width, int height, boolean debug) {
+        // Canvas 30 D1: freeze the custom-scheme registry before the engine exists.
+        WebViewSchemes.freezeForEngine();
         long p = WebViewNative.webview_offscreen_create(
             Math.max(1, width), Math.max(1, height), debug ? 1 : 0);
         if (p == 0L) return null;

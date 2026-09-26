@@ -3804,6 +3804,21 @@ JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1pdf_1a
     return JNI_TRUE;
 }
 
+// Custom URL schemes — Canvas 30 stubs.  Canvas 32 fills these in; until then
+// WebViewSchemes.isSupported() is false on Windows and nothing is installed.
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1scheme_1available
+  (JNIEnv *, jclass) {
+    return JNI_FALSE;
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1scheme_1install
+  (JNIEnv *, jclass, jobjectArray, jobject) {
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1scheme_1respond
+  (JNIEnv *, jclass, jlong, jint, jobjectArray, jbyteArray) {
+}
+
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1print_1to_1pdf
   (JNIEnv *env, jclass, jlong wv, jstring path, jdouble w, jdouble h,
    jdouble mt, jdouble mr, jdouble mb, jdouble ml, jboolean bg, jobject cb) {
