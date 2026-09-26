@@ -1,5 +1,7 @@
 package ca.weblite.webview;
 
+import java.awt.GraphicsEnvironment;
+import java.awt.Toolkit;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
@@ -35,9 +37,17 @@ public final class WebViewSchemes {
         void install(String[] schemes, Object dispatcher);
     }
 
+    /**
+     * The native probe (D4). It runs at start-up, before any window, so it starts the AWT toolkit
+     * before loading {@link WebViewNative}: on macOS that load pulls in {@code libawt_lwawt}, which
+     * crashes the JVM if AWT has not started. Headless, no component can exist, so it answers false
+     * without loading the native library.
+     */
     private static final BooleanSupplier NATIVE_PROBE = new BooleanSupplier() {
         @Override
         public boolean getAsBoolean() {
+            if (GraphicsEnvironment.isHeadless()) return false;
+            Toolkit.getDefaultToolkit();
             return WebViewNative.webview_scheme_available();
         }
     };

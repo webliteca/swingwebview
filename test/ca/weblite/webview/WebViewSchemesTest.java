@@ -147,4 +147,11 @@ public class WebViewSchemesTest {
         assertArrayEquals(new String[] {"demo"}, installs.get(0));
         assertNotNull(WebViewSchemes.dispatcher());
     }
+
+    @Test
+    public void theDefaultProbeIsFalseWhenHeadlessWithoutLoadingNative() {     // D4 "AWT first"
+        org.junit.Assume.assumeTrue(java.awt.GraphicsEnvironment.isHeadless());
+        WebViewSchemes.resetForTests();
+        assertFalse(WebViewSchemes.isSupported());
+    }
 }

@@ -92,6 +92,12 @@ generated_at: 2026-09-26T14:45:00-07:00
 - **D4 · Capability.**
   - `WebViewSchemes.isSupported()` calls `WebViewNative.webview_scheme_available()` inside
     `catch (Throwable) → false`, the same as `PdfPrinting.isAvailable()`.
+  - **AWT first.** Unlike the PDF probe, this one runs at start-up, before any window exists, and
+    loading `WebViewNative` loads `libjawt`. On macOS under JDK 8 that pulls in `libawt_lwawt`,
+    whose `JNI_OnLoad` crashes the JVM (SIGSEGV) when the AWT toolkit has not started yet. So the
+    native probe first checks `GraphicsEnvironment.isHeadless()`: when headless it answers `false`
+    without touching `WebViewNative` (no WebView component can exist there); otherwise it calls
+    `Toolkit.getDefaultToolkit()`, and only then the native probe.
   - `register` checks it first. If it is false, `register` throws `UnsupportedOperationException`:
     "Custom URL schemes are not available in this version of the native library" (AC10).
   - After this Canvas: `true` on macOS, and `false` on Linux and Windows until Canvases 31 and 32.
@@ -385,6 +391,9 @@ SchemeDispatcher --> Sink : native (webview_scheme_respond) or test
      `install(String[] schemes, Object dispatcher)`) and `SchemeDispatcher.Sink sink` (default:
      native).
 2. **`isSupported()`**: `available.getAsBoolean()`, wrapped in `try/catch (Throwable) → false`.
+   The default `available` (the native probe) follows D4's "AWT first": headless → `false` without
+   loading `WebViewNative`; otherwise `Toolkit.getDefaultToolkit()`, then
+   `WebViewNative.webview_scheme_available()`.
 3. **`register(String scheme, WebViewSchemeHandler handler)`**, synchronized. It checks, in order:
    1. the handler is non-null (D3);
    2. `isSupported()` (D4);
@@ -541,7 +550,8 @@ A "Custom URL schemes" section covering:
 4. **Bounded:** 16 MB per request body, 64 MB per response body, and 30 s per request.
 5. **Refusals:** the web's own schemes, invalid names, duplicates, late registration and an
    unsupported native are each refused with the exact message in D3, D1 or D4.
-6. **Crash-free:** every `Throwable` in the dispatcher is caught. Every JNI upcall clears pending
+6. **Crash-free:** calling `isSupported()` or `register` in `main`, before any AWT window, never
+   loads the native library ahead of the AWT toolkit (D4). Every `Throwable` in the dispatcher is caught. Every JNI upcall clears pending
    exceptions. A response for a stopped macOS task is never delivered to that task.
 7. **Scope:**
    - no streaming;
