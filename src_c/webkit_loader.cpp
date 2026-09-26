@@ -3,6 +3,7 @@
 // Linux-only. Resolves WebKitGTK / JavaScriptCore at runtime (dlopen + dlsym),
 // preferring the 4.1 SONAMEs and falling back to 4.0, so a single libwebview.so
 // runs on both. See webkit_loader.h for the design and the symbol inventory.
+// A missing mandatory symbol fails the load; optional symbols never do.
 //
 // This file deliberately does NOT include webkit_shim.h: it assigns the real
 // g_wk members and resolves symbols by string name.
@@ -81,6 +82,15 @@ bool do_init() {
 #undef WK_RESOLVE_JSC
 #undef WK_RESOLVE_WEBKIT
 #undef WK_RESOLVE
+
+  // Optional symbols (Canvas 31 D5): same lookup, but an absent one is simply
+  // left null and never fails the load.  Searching the WebKit handle also
+  // finds the libsoup WebKit depends on.
+#define WK_RESOLVE_OPTIONAL_WEBKIT(sym)                                        \
+  g_wk.fn_##sym =                                                              \
+      reinterpret_cast<decltype(g_wk.fn_##sym)>(dlsym(g_webkit_handle, #sym));
+  WK_WEBKIT_OPT_SYMS(WK_RESOLVE_OPTIONAL_WEBKIT)
+#undef WK_RESOLVE_OPTIONAL_WEBKIT
 
   if (missing) {
     std::snprintf(g_err, sizeof(g_err),

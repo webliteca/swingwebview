@@ -8,6 +8,7 @@
 # AC-mapped checklist.
 #
 # Usage:    ./run-mac-scheme-demo.sh
+#           SCHEMEDEMO_AUTO=1 ./run-mac-scheme-demo.sh   # run the checks, exit (0 = passed)
 # Override: JAVA_HOME=/path/to/jdk ./run-mac-scheme-demo.sh
 #
 set -e
@@ -114,5 +115,6 @@ echo "Compiling demo ..."
 
 echo "Launching WebViewSchemeDemo ..."
 exec "$JAVA" \
+    "-Dschemedemo.auto=${SCHEMEDEMO_AUTO:+true}" \
     -cp "$DEMO_CLASSES:$WV_JAR" \
     ca.weblite.webview.demos.WebViewSchemeDemo

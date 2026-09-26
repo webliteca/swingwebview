@@ -2,11 +2,13 @@
 # One-shot script: build the Linux native lib, build WebView.jar, compile
 # and run the custom URL scheme demo (WebViewSchemeDemo, Canvas 30).
 #
-# Linux support arrives with Canvas 31: until then the demo prints "Custom URL
-# schemes are not available in this version of the native library" and exits.
-# See demos/WebViewSchemeDemo/README.md for the AC-mapped checklist.
+# Serves a two-file page (HTML plus a script that fetches JSON) from the
+# demo:// scheme, answered in Java, through WebKitGTK (Canvas 31).  See
+# demos/WebViewSchemeDemo/README.md for the AC-mapped checklist.
 #
 # Usage:    ./run-linux-scheme-demo.sh   # lightweight, the supported Linux mode
+#           SCHEMEDEMO_AUTO=1 ./run-linux-scheme-demo.sh   # run the checks, exit (0 = passed)
+#           xvfb-run -a env SCHEMEDEMO_AUTO=1 ./run-linux-scheme-demo.sh   # no display
 #
 # Override JDK:  JAVA_HOME=/path/to/jdk ./run-linux-scheme-demo.sh
 #
@@ -177,5 +179,6 @@ export WEBKIT_DISABLE_SANDBOX_THIS_IS_DANGEROUS=1
 
 exec "$JAVA" \
     "-Dca.weblite.webview.mode=$MODE" \
+    "-Dschemedemo.auto=${SCHEMEDEMO_AUTO:+true}" \
     -cp "$DEMO_CLASSES:$WV_JAR" \
     ca.weblite.webview.demos.WebViewSchemeDemo

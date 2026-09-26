@@ -188,8 +188,9 @@ generated_at: 2026-09-26T14:55:00-07:00
 - **D10 · The demo's automatic mode** (`-Dschemedemo.auto=true`, set by `SCHEMEDEMO_AUTO=1`):
   - Java watchdog: if no report arrives within 60 s, print "FAIL: no report" and exit 2.
   - The page, in auto mode (it learns this from `index.html?auto=1`, which Java loads instead of
-    `index.html`), runs the checks in order and then POSTs a JSON report to
-    `demo://app/api/report`:
+    `index.html`), runs the checks in order and then sends a JSON report to
+    `demo://app/api/report` as a **GET**, URL-encoded in the `r` query parameter. A GET and its URL reach
+    Java on every engine, while a POST body does not on WebKitGTK < 2.40, which would lose the report:
     - `script` (the script ran), `origin` (`demo://app`), `secure` (`isSecureContext`),
       `storage` (`localStorage` round trip);
     - `post` (status 200 and the echoed body; on engines without request bodies the echo's
@@ -197,8 +198,10 @@ generated_at: 2026-09-26T14:55:00-07:00
     - `slow` (the 2 s answer arrives, and `setInterval` ticks at least 5 times meanwhile — the UI
       thread was never blocked, AC5);
     - `broken` (status 500, AC6);
-    - `other` (`fetch("demo://other/x")` from the page: a different origin of the same scheme,
-      answered 404 by the handler — the request reached Java).
+    - `missing` (`fetch("demo://app/no-such-page")`: answered 404 by the handler — an unknown path
+      still reaches Java and its status reaches the page). A different host of the same scheme is
+      a different origin, and Canvas 30 D11 grants CORS only to the request's own origin, so a
+      cross-host fetch is not a check here.
   - After posting the report, the page starts a new `slow` request and navigates to
     `demo://app/index.html?done=1` without waiting (D8).
   - Java prints each result, then `PASS` and exits 0 if every check passed, else `FAIL` and exits
@@ -377,10 +380,8 @@ The class comment's platform sentence becomes: "macOS and Linux serve schemes no
 1. `WebViewSchemeDemo`:
    - read `Boolean.getBoolean("schemedemo.auto")`;
    - in auto mode, load `demo://app/index.html?auto=1` and start the 60 s watchdog;
-   - serve `api/report`: print each `name: result` pair, then `PASS`/`FAIL`, answer 200, and exit
+   - serve `api/report`: decode the `r` query parameter (`URLDecoder`, UTF-8), print each `name: result` pair, then `PASS`/`FAIL`, answer 200, and exit
      0 or 1 after 3 s on a daemon timer;
-   - the handler already answers other hosts: make any host other than `app` answer 404 "No such
-     host" so the `other` check has a defined answer;
    - strip `?…` and `#…` from the path before matching (already done).
 2. `app.js`: when `location.search` contains `auto=1`, run the D10 checks in order with promises
    and POST the report; when it contains `done=1`, do nothing. Manual behaviour is unchanged.

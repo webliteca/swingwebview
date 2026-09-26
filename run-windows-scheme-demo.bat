@@ -9,7 +9,8 @@ REM
 REM Windows support arrives with Canvas 32: until then the demo prints
 REM "Custom URL schemes are not available in this version of the native
 REM library" and exits.  See demos\WebViewSchemeDemo\README.md for the
-REM AC-mapped manual test checklist.
+REM AC-mapped manual test checklist.  Set SCHEMEDEMO_AUTO=1 to run the checks
+REM and exit (0 = passed).
 REM
 REM Requires:
 REM   - JAVA_HOME set to a JDK 8+ install.
@@ -209,6 +210,8 @@ if errorlevel 1 (
 )
 
 echo Launching WebViewSchemeDemo ...
-"%JAVA_HOME%\bin\java.exe" -cp "%DEMO_CLASSES%;%WV_JAR%" ca.weblite.webview.demos.WebViewSchemeDemo
+set "SCHEMEDEMO_AUTO_FLAG=false"
+if defined SCHEMEDEMO_AUTO set "SCHEMEDEMO_AUTO_FLAG=true"
+"%JAVA_HOME%\bin\java.exe" "-Dschemedemo.auto=%SCHEMEDEMO_AUTO_FLAG%" -cp "%DEMO_CLASSES%;%WV_JAR%" ca.weblite.webview.demos.WebViewSchemeDemo
 
 endlocal

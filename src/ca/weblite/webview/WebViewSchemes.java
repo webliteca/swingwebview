@@ -23,8 +23,8 @@ import java.util.regex.Pattern;
  * the registry is frozen by the first engine a component creates (D1). Registering after that is
  * refused. An application that registers nothing never touches the scheme natives (D2).
  *
- * <p>macOS serves schemes now; on Linux and Windows {@link #isSupported()} is false until the next
- * releases (Canvases 31 and 32), and {@link #register} says so.
+ * <p>macOS and Linux serve schemes now; on Windows {@link #isSupported()} is false until Canvas 32,
+ * and {@link #register} says so.
  */
 public final class WebViewSchemes {
 

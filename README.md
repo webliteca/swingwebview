@@ -892,10 +892,22 @@ wv.setUrl("demo://app/index.html");
   native library without this feature, and `register` then fails with "Custom
   URL schemes are not available in this version of the native library".
 * **Platform coverage.** macOS (heavyweight) through a `WKURLSchemeHandler` on
-  each view's configuration, popups included. Linux (WebKitGTK) and Windows
-  (WebView2) follow in the next releases; until then `isSupported()` is
+  each view's configuration, popups included. Linux (lightweight and
+  heavyweight) through a URI scheme on WebKitGTK's default web context,
+  registered as secure and CORS-enabled, which every view and popup shares.
+  Windows (WebView2) follows in the next release; until then `isSupported()` is
   `false` there. The standalone `WebView` window is not covered. See
   [`demos/WebViewSchemeDemo/`](demos/WebViewSchemeDemo/README.md).
+* **Linux notes.**
+  * Request bodies need WebKitGTK 2.40 or newer. On older engines the handler
+    gets an empty body and `bodyAvailable()` is `false`.
+  * Response status codes and headers need WebKitGTK 2.36 or newer. On older
+    engines a 2xx answer keeps only its body and `Content-Type`, and any other
+    status reaches the page as a network error.
+  * WebKitGTK does not report abandoned requests, so Linux never cancels one:
+    an unanswered request ends at the 30-second timeout.
+  * Schemes are registered on the default web context, which the standalone
+    `WebView` window also uses, but that window remains unsupported.
 
 ## Demo
 

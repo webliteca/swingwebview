@@ -337,8 +337,8 @@ static JNIEnv *scheme_env(bool *attached) {
     return env;
 }
 
-// Upcall SchemeDispatcher.onSchemeRequest (D15).  Call from a non-UI thread.
-__attribute__((unused))
+// Upcall SchemeDispatcher.onSchemeRequest (D15).  Call from a non-UI thread
+// on macOS; on GTK from the pump thread, since it only enqueues (Canvas 31 D6).
 static void scheme_upcall_request(long long id, const std::string &method,
                                   const std::string &url,
                                   const std::vector<std::string> &headerPairs,
@@ -508,6 +508,155 @@ private:
         started.store(true);
     }
 };
+
+// ---------------------------------------------------------------------------
+// Canvas 31: custom URL schemes on WebKitGTK.  Every view the library creates
+// shares WebKit's default web context (D1), so each scheme is registered there
+// once, on the pump thread, before the first view (D2).  WebKit calls
+// gtk_scheme_request_cb on the pump thread; the request is kept (ref'd) by id
+// until Java answers, and the answer is applied back on the pump thread (D7).
+// WebKitGTK does not report abandoned requests, so Linux never upcalls a
+// cancellation; an unanswered request ends at the dispatcher's 504 (D8).
+// ---------------------------------------------------------------------------
+static std::map<long long, WebKitURISchemeRequest *> g_scheme_requests;
+
+#if WEBKIT_CHECK_VERSION(2, 36, 0)
+static void gtk_scheme_header_pair(const char *name, const char *value, gpointer data) {
+    auto *pairs = static_cast<std::vector<std::string> *>(data);
+    pairs->push_back(name ? name : "");
+    pairs->push_back(value ? value : "");
+}
+#endif
+
+// D6.  Pump thread.
+static void gtk_scheme_request_cb(WebKitURISchemeRequest *request, gpointer) {
+    long long id = ++g_scheme_next_id;
+    g_object_ref(request);
+    {
+        std::lock_guard<std::mutex> lk(g_scheme_mutex);
+        g_scheme_requests[id] = request;
+    }
+    const gchar *uri = webkit_uri_scheme_request_get_uri(request);
+    std::string url = uri ? uri : "";
+    std::string method = "GET";
+#if WEBKIT_CHECK_VERSION(2, 12, 0)
+    if (WK_HAS(webkit_uri_scheme_request_get_http_method)) {
+        const gchar *m = webkit_uri_scheme_request_get_http_method(request);
+        if (m && *m) method = m;
+    }
+#endif
+    std::vector<std::string> pairs;
+#if WEBKIT_CHECK_VERSION(2, 36, 0)
+    if (WK_HAS(webkit_uri_scheme_request_get_http_headers) &&
+        WK_HAS(soup_message_headers_foreach)) {
+        SoupMessageHeaders *h = webkit_uri_scheme_request_get_http_headers(request);
+        if (h) soup_message_headers_foreach(h, gtk_scheme_header_pair, &pairs);
+    }
+#endif
+    std::vector<unsigned char> body;
+    bool bodyAvailable = false;
+#if WEBKIT_CHECK_VERSION(2, 40, 0)
+    if (WK_HAS(webkit_uri_scheme_request_get_http_body)) {
+        bodyAvailable = true;
+        GInputStream *in = webkit_uri_scheme_request_get_http_body(request);
+        if (in) {
+            unsigned char buf[16384];
+            while (body.size() < kSchemeMaxRequestRead) {
+                gssize got = g_input_stream_read(in, buf, sizeof(buf), nullptr, nullptr);
+                if (got <= 0) break;
+                body.insert(body.end(), buf, buf + got);
+            }
+            if (body.size() > kSchemeMaxRequestRead) body.resize(kSchemeMaxRequestRead);
+            g_object_unref(in);
+        }
+    }
+#endif
+    // The dispatcher only builds the request and submits the handler, so the
+    // pump thread never waits on application code (Canvas 30 D5).
+    scheme_upcall_request(id, method, url, pairs, body, bodyAvailable);
+}
+
+// D2, D3.  Pump thread only; runs once, and not at all when nothing is
+// registered (Canvas 30 D2).
+static void gtk_install_schemes_once() {
+    static bool done = false;
+    if (done || g_scheme_names.empty()) return;
+    done = true;
+    WebKitWebContext *ctx = webkit_web_context_get_default();
+    WebKitSecurityManager *sm = webkit_web_context_get_security_manager(ctx);
+    for (const std::string &name : g_scheme_names) {
+        webkit_web_context_register_uri_scheme(ctx, name.c_str(), gtk_scheme_request_cb,
+                                               nullptr, nullptr);
+        webkit_security_manager_register_uri_scheme_as_secure(sm, name.c_str());
+        webkit_security_manager_register_uri_scheme_as_cors_enabled(sm, name.c_str());
+    }
+}
+
+// D7.  Any thread; the answer is applied on the pump thread, and only if the
+// request is still pending.
+static void gtk_scheme_respond(long long id, int status, std::vector<std::string> pairs,
+                               std::vector<unsigned char> body) {
+    GtkPump::instance().run_async([id, status, pairs, body]() {
+        WebKitURISchemeRequest *req = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_scheme_mutex);
+            auto it = g_scheme_requests.find(id);
+            if (it == g_scheme_requests.end()) return;
+            req = it->second;
+            g_scheme_requests.erase(it);
+        }
+        std::string contentType;
+        for (size_t i = 0; i + 1 < pairs.size(); i += 2) {
+            if (g_ascii_strcasecmp(pairs[i].c_str(), "Content-Type") == 0) {
+                contentType = pairs[i + 1];
+                break;
+            }
+        }
+        GBytes *bytes = g_bytes_new(body.empty() ? nullptr : body.data(), body.size());
+        GInputStream *stream = g_memory_input_stream_new_from_bytes(bytes);
+        g_bytes_unref(bytes);
+        bool done = false;
+#if WEBKIT_CHECK_VERSION(2, 36, 0)
+        if (WK_HAS(webkit_uri_scheme_response_new) &&
+            WK_HAS(webkit_uri_scheme_response_set_status) &&
+            WK_HAS(webkit_uri_scheme_response_set_content_type) &&
+            WK_HAS(webkit_uri_scheme_response_set_http_headers) &&
+            WK_HAS(webkit_uri_scheme_request_finish_with_response) &&
+            WK_HAS(soup_message_headers_new) && WK_HAS(soup_message_headers_append)) {
+            WebKitURISchemeResponse *resp =
+                webkit_uri_scheme_response_new(stream, (gint64)body.size());
+            webkit_uri_scheme_response_set_status(resp, (guint)status, nullptr);
+            if (!contentType.empty()) {
+                webkit_uri_scheme_response_set_content_type(resp, contentType.c_str());
+            }
+            SoupMessageHeaders *hdrs = soup_message_headers_new(SOUP_MESSAGE_HEADERS_RESPONSE);
+            for (size_t i = 0; i + 1 < pairs.size(); i += 2) {
+                if (g_ascii_strcasecmp(pairs[i].c_str(), "Content-Type") == 0) continue;
+                soup_message_headers_append(hdrs, pairs[i].c_str(), pairs[i + 1].c_str());
+            }
+            webkit_uri_scheme_response_set_http_headers(resp, hdrs);  // takes ownership
+            webkit_uri_scheme_request_finish_with_response(req, resp);
+            g_object_unref(resp);
+            done = true;
+        }
+#endif
+        if (!done) {
+            // WebKitGTK < 2.36: only a content type can be sent, so a 2xx keeps
+            // its body and type and anything else becomes a load error.
+            if (status >= 200 && status <= 299) {
+                webkit_uri_scheme_request_finish(req, stream, (gint64)body.size(),
+                                                 contentType.empty() ? nullptr : contentType.c_str());
+            } else {
+                GError *err = g_error_new(g_quark_from_static_string("webview-scheme"), status,
+                                          "HTTP %d", status);
+                webkit_uri_scheme_request_finish_error(req, err);
+                g_error_free(err);
+            }
+        }
+        g_object_unref(stream);
+        g_object_unref(req);
+    });
+}
 
 struct Engine {
     Window parent_xid = 0;
@@ -1896,6 +2045,9 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug,
         // navigation from handle_create_web_view; the caller (gtk_adopt_popup)
         // has already disconnected the child's old PopupEngine signal handlers
         // so the fresh engine-scoped handlers connected below are the only ones.
+        // Canvas 31 D2: custom schemes go on the default context before the
+        // first view exists (a no-op once done, or when none are registered).
+        gtk_install_schemes_once();
         if (existing_web) {
             e->web = existing_web;
         } else {
@@ -3272,6 +3424,9 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
         // Canvas 19: reuse the retained popup child (adoption) or create fresh.
         // The reused child already carries its opener linkage + in-flight POST
         // navigation from handle_create_web_view.
+        // Canvas 31 D2: custom schemes go on the default context before the
+        // first view exists (a no-op once done, or when none are registered).
+        gtk_install_schemes_once();
         e->web = existing_web ? existing_web : webkit_web_view_new();
         e->manager =
             webkit_web_view_get_user_content_manager(WEBKIT_WEB_VIEW(e->web));
@@ -9271,11 +9426,13 @@ JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1pdf_1a
 #endif
 }
 
-// Custom URL schemes — Canvas 30.  Inside this `extern "C"` block like every
-// export.  macOS serves them now; GTK reports "not supported" until Canvas 31.
+// Custom URL schemes — Canvases 30 and 31.  Inside this `extern "C"` block like
+// every export.  macOS and Linux serve them now; Windows follows in Canvas 32.
+// On GTK the mandatory scheme symbols are resolved in JNI_OnLoad, so a loaded
+// library can always serve them (Canvas 31 D9).
 JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1scheme_1available
   (JNIEnv *, jclass) {
-#if defined(WEBVIEW_COCOA)
+#if defined(WEBVIEW_COCOA) || defined(WEBVIEW_GTK)
     return JNI_TRUE;
 #else
     return JNI_FALSE;
@@ -9327,6 +9484,8 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1scheme_1re
     }
 #if defined(WEBVIEW_COCOA)
     embed::cocoa_scheme_respond((long long)id, (int)status, pairs, bytes);
+#elif defined(WEBVIEW_GTK)
+    embed::gtk_scheme_respond((long long)id, (int)status, pairs, bytes);
 #else
     (void)id; (void)status;
 #endif

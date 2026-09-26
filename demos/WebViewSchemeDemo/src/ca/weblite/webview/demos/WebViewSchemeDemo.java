@@ -40,6 +40,49 @@ public class WebViewSchemeDemo {
     private static final String DETAIL = "<!doctype html><html><head><meta charset=\"utf-8\"></head>"
         + "<body><h1>Detail</h1><p>Served for demo://app/detail.html.</p></body></html>\n";
 
+    /** Canvas 31 D10: the automatic checks, run when the page is loaded with {@code ?auto=1}. */
+    private static final String AUTO_JS = ""
+        + "if (location.search.indexOf('auto=1') >= 0) (function () {\n"
+        + "  var r = {script: 'ok'};\n"
+        + "  r.origin = location.origin === 'demo://app' ? 'ok' : 'got ' + location.origin;\n"
+        + "  r.secure = window.isSecureContext ? 'ok' : 'isSecureContext is false';\n"
+        + "  try { localStorage.setItem('auto', 'v');\n"
+        + "        r.storage = localStorage.getItem('auto') === 'v' ? 'ok' : 'read back wrong'; }\n"
+        + "  catch (e) { r.storage = 'error ' + e; }\n"
+        + "  function step(name, p) {\n"
+        + "    return p.then(function (v) { r[name] = v; }, function (e) { r[name] = 'error ' + e; });\n"
+        + "  }\n"
+        + "  step('post', fetch('demo://app/api/echo', {method: 'POST', body: '{\"n\":3}'}).then(function (x) {\n"
+        + "    return x.json().then(function (j) {\n"
+        + "      if (x.status !== 200) return 'status ' + x.status;\n"
+        + "      if (j.received === null) return 'post-body-unavailable';\n"
+        + "      return j.received && j.received.n === 3 ? 'ok' : 'got ' + JSON.stringify(j);\n"
+        + "    });\n"
+        + "  })).then(function () {\n"
+        + "    var ticks = 0, t = setInterval(function () { ticks++; }, 100);\n"
+        + "    return step('slow', fetch('demo://app/slow').then(function (x) {\n"
+        + "      return x.text().then(function (s) {\n"
+        + "        clearInterval(t);\n"
+        + "        return s === 'done' && ticks >= 5 ? 'ok' : 'got ' + s + ' after ' + ticks + ' ticks';\n"
+        + "      });\n"
+        + "    }));\n"
+        + "  }).then(function () {\n"
+        + "    return step('broken', fetch('demo://app/broken').then(function (x) {\n"
+        + "      return x.status === 500 ? 'ok' : 'status ' + x.status;\n"
+        + "    }));\n"
+        + "  }).then(function () {\n"
+        + "    return step('missing', fetch('demo://app/no-such-page').then(function (x) {\n"
+        + "      return x.status === 404 ? 'ok' : 'status ' + x.status;\n"
+        + "    }));\n"
+        + "  }).then(function () {\n"
+        + "    log('auto: ' + JSON.stringify(r));\n"
+        + "    return fetch('demo://app/api/report?r=' + encodeURIComponent(JSON.stringify(r)));\n"
+        + "  }).then(function () {\n"
+        + "    fetch('demo://app/slow');\n"
+        + "    location.href = 'demo://app/index.html?done=1';\n"
+        + "  });\n"
+        + "})();\n";
+
     private static final String APP_JS = ""
         + "var out = document.getElementById('out');\n"
         + "function log(s) { out.textContent += s + '\\n'; }\n"
@@ -61,12 +104,17 @@ public class WebViewSchemeDemo {
         + "document.getElementById('broken').onclick = function () {\n"
         + "  fetch('demo://app/broken').then(function (r) { log('broken: status ' + r.status); });\n"
         + "};\n"
-        + "document.getElementById('popup').onclick = function () { window.open('demo://app/detail.html'); };\n";
+        + "document.getElementById('popup').onclick = function () { window.open('demo://app/detail.html'); };\n"
+        + AUTO_JS;
 
     public static void main(String[] args) {
         if (!WebViewSchemes.isSupported()) {
             System.out.println("Custom URL schemes are not available in this version of the native library");
             System.exit(0);
+        }
+        final boolean auto = Boolean.getBoolean("schemedemo.auto");
+        if (auto) {
+            exitAfter(60000, 2, "FAIL: no report");
         }
         WebViewSchemes.register("demo", new WebViewSchemeHandler() {
             @Override
@@ -94,6 +142,9 @@ public class WebViewSchemeDemo {
                             responder.respond(WebViewSchemeResponse.text(200, "done"));
                         }
                     }, "demo-slow").start();
+                } else if (path.equals("api/report")) {
+                    report(reportParameter(request.url()));
+                    responder.respond(WebViewSchemeResponse.text(200, "ok"));
                 } else if (path.equals("broken")) {
                     throw new IllegalStateException("This handler always fails.");
                 } else {
@@ -111,9 +162,59 @@ public class WebViewSchemeDemo {
                 WebViewComponent wv = WebViewComponent.create();
                 frame.add(wv, BorderLayout.CENTER);
                 frame.setVisible(true);
-                wv.setUrl("demo://app/index.html");
+                wv.setUrl(auto ? "demo://app/index.html?auto=1" : "demo://app/index.html");
             }
         });
+    }
+
+    /**
+     * Canvas 31 D10: print each check, then PASS or FAIL, and exit 0 or 1 three seconds later so
+     * the request the page abandons on its way out has time to reach native.
+     */
+    private static void report(String json) {
+        java.util.regex.Matcher m = java.util.regex.Pattern
+            .compile("\"([a-z]+)\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"").matcher(json);
+        boolean pass = true;
+        int checks = 0;
+        while (m.find()) {
+            String name = m.group(1);
+            String result = m.group(2);
+            checks++;
+            System.out.println("  " + name + ": " + result);
+            boolean ok = result.equals("ok") || (name.equals("post") && result.equals("post-body-unavailable"));
+            if (!ok) pass = false;
+        }
+        if (checks < 8) pass = false;
+        String verdict = pass ? "PASS" : "FAIL";
+        System.out.println(verdict);
+        if (Boolean.getBoolean("schemedemo.auto")) exitAfter(3000, pass ? 0 : 1, null);
+    }
+
+    /** The URL-decoded {@code r} query parameter: the page's report (a GET works on every engine). */
+    private static String reportParameter(String url) {
+        java.util.regex.Matcher m = java.util.regex.Pattern.compile("[?&]r=([^&#]*)").matcher(url);
+        if (!m.find()) return "";
+        try {
+            return java.net.URLDecoder.decode(m.group(1), "UTF-8");
+        } catch (java.io.UnsupportedEncodingException e) {
+            return "";
+        }
+    }
+
+    private static void exitAfter(final long ms, final int status, final String message) {
+        Thread t = new Thread(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    Thread.sleep(ms);
+                } catch (InterruptedException ignored) {
+                }
+                if (message != null) System.out.println(message);
+                System.exit(status);
+            }
+        }, "demo-exit");
+        t.setDaemon(true);
+        t.start();
     }
 
     private static byte[] utf8(String s) {
