@@ -4,10 +4,8 @@ Demo for **custom URL schemes** (Canvas 30, STORY-008-001).
 
 Run it with `./run-mac-scheme-demo.sh` (heavyweight, the supported macOS mode)
 or `./run-linux-scheme-demo.sh` (lightweight, the supported Linux mode;
-`./run-linux-scheme-demo.sh heavyweight` also works). `run-windows-scheme-demo.bat`
-builds and runs the same demo, which on Windows still prints "Custom URL schemes
-are not available in this version of the native library" and exits: Windows
-follows in Canvas 32.
+`./run-linux-scheme-demo.sh heavyweight` also works), or
+`run-windows-scheme-demo.bat` (heavyweight, the supported Windows mode).
 
 The demo registers `demo` before any WebView exists and answers every request
 from Java:
@@ -60,6 +58,18 @@ xvfb-run -a env SCHEMEDEMO_AUTO=1 ./run-linux-scheme-demo.sh
   status reaches the page as a network error.
 - WebKitGTK does not report abandoned requests, so a request the page leaves
   behind stays open until its handler answers or the 30-second timeout ends it.
+
+## Windows notes
+
+- WebView2 does not report abandoned requests either, so a request the page
+  leaves behind stays open until its handler answers or the 30-second timeout
+  ends it.
+- Custom schemes need a WebView2 Runtime that supports custom scheme
+  registration; the evergreen Runtime on current Windows does. An older one
+  cannot load pages from the scheme.
+- Do not combine the standalone `WebView` window with registered schemes in the
+  same process: WebView2 may refuse to create the second environment because
+  its options differ.
 
 ## Manual acceptance checklist
 

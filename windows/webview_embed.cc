@@ -18,11 +18,13 @@
 // WIN32_LEAN_AND_MEAN excludes objbase.h, which defines `interface` (=struct)
 // used pervasively by WebView2.h's COM declarations.  Pull it in explicitly.
 #include <objbase.h>
+#include <shlwapi.h>  // SHCreateMemStream (Canvas 32 D5)
 // Windows Credential Manager (CredWriteW / CredReadW / CredEnumerateW /
 // CredDeleteW / CredFree) for the password-manager secret store (Canvas 28).
 #include <wincred.h>
 
 #include <atomic>
+#include <cctype>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -39,6 +41,10 @@
 
 #include "ca_weblite_webview_WebViewNative.h"
 #include "WebView2.h"
+// Canvas 32 D2: the SDK's own WRL helpers for environment options and custom
+// scheme registrations (they keep every other option at the SDK default).
+#include <wrl.h>
+#include "WebView2EnvironmentOptions.h"
 
 #define WV_LOG(fmt, ...) do { \
     fprintf(stderr, "[webview-embed] " fmt "\n", ##__VA_ARGS__); \
@@ -1989,6 +1995,310 @@ static void propagate_popup_user_agent(Engine *opener, ICoreWebView2 *child,
     hook->Release();
 }
 
+// ---------------------------------------------------------------------------
+// Canvas 32: custom URL schemes on WebView2.  The schemes are declared on the
+// environment when it is created (D1, D2), a WebResourceRequested filter and
+// handler go on every webview the library creates (D3), and each request is
+// held by a deferral until Java answers (D4, D5).  WebView2 never reports an
+// abandoned request, so Windows never upcalls a cancellation (D6).
+//
+// The shared state and the upcall mirror src_c/webview_embed.cpp (Canvas 30
+// D14, D15); this file is a separate translation unit, so it has its own copy
+// (Canvas 32 D9).
+// ---------------------------------------------------------------------------
+static std::vector<std::string> g_scheme_names;
+static jobject g_scheme_dispatcher = nullptr;
+static JavaVM *g_scheme_jvm = nullptr;
+static std::atomic<long long> g_scheme_next_id(0);
+static std::mutex g_scheme_mutex;
+static bool g_scheme_installed = false;
+
+// The largest request body read: the dispatcher's cap plus one byte, so an
+// over-cap body is still recognised and answered 413.
+static const size_t kSchemeMaxRequestRead = 16u * 1024u * 1024u + 1u;
+
+struct WinSchemeRequest {
+    ICoreWebView2WebResourceRequestedEventArgs *args = nullptr;
+    ICoreWebView2Deferral *deferral = nullptr;
+    ICoreWebView2Environment *env = nullptr;
+    DWORD thread_id = 0;
+};
+static std::map<long long, WinSchemeRequest> g_win_scheme_requests;
+
+// Upcall SchemeDispatcher.onSchemeRequest (Canvas 30 D15).  Called from a
+// detached thread, never the engine thread.
+static void scheme_upcall_request(long long id, const std::string &method,
+                                  const std::string &url,
+                                  const std::vector<std::string> &headerPairs,
+                                  const std::vector<unsigned char> &body,
+                                  bool bodyAvailable) {
+    if (!g_scheme_dispatcher || !g_scheme_jvm) return;
+    JNIEnv *env = nullptr;
+    bool attached = false;
+    if (g_scheme_jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (g_scheme_jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env) return;
+        attached = true;
+    }
+    jclass cls = env->GetObjectClass(g_scheme_dispatcher);
+    jmethodID m = cls ? env->GetMethodID(cls, "onSchemeRequest",
+        "(JLjava/lang/String;Ljava/lang/String;[Ljava/lang/String;[BZ)V") : nullptr;
+    if (m) {
+        jstring jmethod = env->NewStringUTF(method.c_str());
+        jstring jurl = env->NewStringUTF(url.c_str());
+        jclass strCls = env->FindClass("java/lang/String");
+        jobjectArray jpairs = strCls
+            ? env->NewObjectArray((jsize)headerPairs.size(), strCls, nullptr) : nullptr;
+        if (jpairs) {
+            for (size_t i = 0; i < headerPairs.size(); i++) {
+                jstring v = env->NewStringUTF(headerPairs[i].c_str());
+                env->SetObjectArrayElement(jpairs, (jsize)i, v);
+                if (v) env->DeleteLocalRef(v);
+            }
+        }
+        jbyteArray jbody = env->NewByteArray((jsize)body.size());
+        if (jbody && !body.empty()) {
+            env->SetByteArrayRegion(jbody, 0, (jsize)body.size(),
+                                    (const jbyte *)body.data());
+        }
+        env->CallVoidMethod(g_scheme_dispatcher, m, (jlong)id, jmethod, jurl, jpairs,
+                            jbody, (jboolean)(bodyAvailable ? JNI_TRUE : JNI_FALSE));
+        if (jmethod) env->DeleteLocalRef(jmethod);
+        if (jurl) env->DeleteLocalRef(jurl);
+        if (jpairs) env->DeleteLocalRef(jpairs);
+        if (jbody) env->DeleteLocalRef(jbody);
+        if (strCls) env->DeleteLocalRef(strCls);
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (cls) env->DeleteLocalRef(cls);
+    if (attached) g_scheme_jvm->DetachCurrentThread();
+}
+
+// D2.  The environment options carrying the scheme registrations, or null when
+// nothing is registered (then environments are created exactly as before) or
+// on any failure (then the engine is created without schemes).
+static Microsoft::WRL::ComPtr<ICoreWebView2EnvironmentOptions> win_scheme_environment_options() {
+    Microsoft::WRL::ComPtr<ICoreWebView2EnvironmentOptions> result;
+    if (g_scheme_names.empty()) return result;
+    auto options = Microsoft::WRL::Make<CoreWebView2EnvironmentOptions>();
+    if (!options) {
+        WV_LOG("scheme options: Make<CoreWebView2EnvironmentOptions> failed");
+        return result;
+    }
+    std::vector<Microsoft::WRL::ComPtr<ICoreWebView2CustomSchemeRegistration>> regs;
+    std::vector<ICoreWebView2CustomSchemeRegistration *> raw;
+    for (const std::string &name : g_scheme_names) {
+        std::wstring wname = utf8_to_wide(name.c_str());
+        std::wstring origins = wname + L"://*";
+        auto reg = Microsoft::WRL::Make<CoreWebView2CustomSchemeRegistration>(wname.c_str());
+        if (!reg) {
+            WV_LOG("scheme options: registration for %s failed", name.c_str());
+            return result;
+        }
+        reg->put_TreatAsSecure(TRUE);
+        reg->put_HasAuthorityComponent(TRUE);
+        LPCWSTR allowed[1] = { origins.c_str() };
+        reg->SetAllowedOrigins(1, allowed);
+        Microsoft::WRL::ComPtr<ICoreWebView2CustomSchemeRegistration> iface;
+        if (FAILED(reg.As(&iface))) return result;
+        regs.push_back(iface);
+        raw.push_back(iface.Get());
+    }
+    Microsoft::WRL::ComPtr<ICoreWebView2EnvironmentOptions4> options4;
+    if (FAILED(options.As(&options4)) || !options4) {
+        WV_LOG("scheme options: ICoreWebView2EnvironmentOptions4 unavailable");
+        return result;
+    }
+    HRESULT hr = options4->SetCustomSchemeRegistrations((UINT32)raw.size(), raw.data());
+    if (FAILED(hr)) {
+        WV_LOG("scheme options: SetCustomSchemeRegistrations hr=0x%08lx", (unsigned long)hr);
+        return result;
+    }
+    options.As(&result);
+    return result;
+}
+
+// D4.  One handler per webview; it ignores every request whose scheme is not
+// registered, because WebView2 hands each filtered request to every handler
+// on the webview (the popup UA hook filters "*").
+class SchemeRequestHandler : public CallbackBase<
+    ICoreWebView2WebResourceRequestedEventHandler> {
+public:
+    explicit SchemeRequestHandler(ICoreWebView2Environment *env) : m_env(env) {
+        if (m_env) m_env->AddRef();
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(
+        ICoreWebView2 *,
+        ICoreWebView2WebResourceRequestedEventArgs *args) override {
+        if (!args || !m_env) return S_OK;
+        ICoreWebView2WebResourceRequest *req = nullptr;
+        if (FAILED(args->get_Request(&req)) || !req) return S_OK;
+        std::string url;
+        LPWSTR wuri = nullptr;
+        if (SUCCEEDED(req->get_Uri(&wuri)) && wuri) {
+            url = wide_to_utf8(wuri);
+            CoTaskMemFree(wuri);
+        }
+        size_t colon = url.find(':');
+        std::string scheme = colon == std::string::npos ? std::string() : url.substr(0, colon);
+        for (auto &c : scheme) c = (char)tolower((unsigned char)c);
+        bool ours = false;
+        for (const std::string &n : g_scheme_names) {
+            if (n == scheme) { ours = true; break; }
+        }
+        if (!ours) { req->Release(); return S_OK; }
+
+        std::string method = "GET";
+        LPWSTR wmethod = nullptr;
+        if (SUCCEEDED(req->get_Method(&wmethod)) && wmethod) {
+            if (*wmethod) method = wide_to_utf8(wmethod);
+            CoTaskMemFree(wmethod);
+        }
+        std::vector<std::string> pairs;
+        ICoreWebView2HttpRequestHeaders *headers = nullptr;
+        if (SUCCEEDED(req->get_Headers(&headers)) && headers) {
+            ICoreWebView2HttpHeadersCollectionIterator *it = nullptr;
+            if (SUCCEEDED(headers->GetIterator(&it)) && it) {
+                BOOL has = FALSE;
+                while (SUCCEEDED(it->get_HasCurrentHeader(&has)) && has) {
+                    LPWSTR n = nullptr, v = nullptr;
+                    if (SUCCEEDED(it->GetCurrentHeader(&n, &v))) {
+                        pairs.push_back(n ? wide_to_utf8(n) : std::string());
+                        pairs.push_back(v ? wide_to_utf8(v) : std::string());
+                    }
+                    if (n) CoTaskMemFree(n);
+                    if (v) CoTaskMemFree(v);
+                    BOOL next = FALSE;
+                    if (FAILED(it->MoveNext(&next)) || !next) break;
+                }
+                it->Release();
+            }
+            headers->Release();
+        }
+        std::vector<unsigned char> body;
+        IStream *content = nullptr;
+        if (SUCCEEDED(req->get_Content(&content)) && content) {
+            unsigned char buf[16384];
+            while (body.size() < kSchemeMaxRequestRead) {
+                ULONG got = 0;
+                HRESULT hr = content->Read(buf, (ULONG)sizeof(buf), &got);
+                if (FAILED(hr) || got == 0) break;
+                body.insert(body.end(), buf, buf + got);
+            }
+            if (body.size() > kSchemeMaxRequestRead) body.resize(kSchemeMaxRequestRead);
+            content->Release();
+        }
+        req->Release();
+
+        ICoreWebView2Deferral *deferral = nullptr;
+        HRESULT hr = args->GetDeferral(&deferral);
+        if (FAILED(hr) || !deferral) {
+            WV_LOG("scheme GetDeferral failed: HRESULT=0x%08lx", (unsigned long)hr);
+            return S_OK;   // left to WebView2: a load failure, never a hang
+        }
+        long long id = ++g_scheme_next_id;
+        args->AddRef();
+        m_env->AddRef();
+        {
+            std::lock_guard<std::mutex> lk(g_scheme_mutex);
+            WinSchemeRequest &r = g_win_scheme_requests[id];
+            r.args = args;
+            r.deferral = deferral;
+            r.env = m_env;
+            r.thread_id = GetCurrentThreadId();
+        }
+        std::thread([id, method, url, pairs, body] {
+            scheme_upcall_request(id, method, url, pairs, body, true);
+        }).detach();
+        return S_OK;
+    }
+protected:
+    ~SchemeRequestHandler() override {
+        if (m_env) m_env->Release();
+    }
+private:
+    ICoreWebView2Environment *m_env;
+};
+
+// D3.  Filter and hook one webview (the engine's, or a popup child).  A no-op
+// when nothing is registered.  The handler lives as long as the webview.
+static void win_install_scheme_hook(ICoreWebView2 *wv, ICoreWebView2Environment *env) {
+    if (!wv || !env || g_scheme_names.empty()) return;
+    for (const std::string &name : g_scheme_names) {
+        std::wstring filter = utf8_to_wide(name.c_str()) + L":*";
+        HRESULT hr = wv->AddWebResourceRequestedFilter(
+            filter.c_str(), COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+        if (FAILED(hr)) {
+            WV_LOG("scheme filter %s failed: HRESULT=0x%08lx", name.c_str(), (unsigned long)hr);
+        }
+    }
+    auto *h = new SchemeRequestHandler(env);
+    EventRegistrationToken token{};
+    HRESULT hr = wv->add_WebResourceRequested(h, &token);
+    if (FAILED(hr)) {
+        WV_LOG("scheme add_WebResourceRequested failed: HRESULT=0x%08lx", (unsigned long)hr);
+    }
+    h->Release();
+}
+
+static LPCWSTR win_reason_phrase(int status) {
+    switch (status) {
+    case 200: return L"OK";
+    case 204: return L"No Content";
+    case 301: return L"Moved Permanently";
+    case 302: return L"Found";
+    case 304: return L"Not Modified";
+    case 400: return L"Bad Request";
+    case 403: return L"Forbidden";
+    case 404: return L"Not Found";
+    case 405: return L"Method Not Allowed";
+    case 413: return L"Payload Too Large";
+    case 500: return L"Internal Server Error";
+    case 504: return L"Gateway Timeout";
+    default:  return L"";
+    }
+}
+
+// D5.  Any thread; applied on the request's engine thread, once.
+static void win_scheme_respond(long long id, int status, std::vector<std::string> pairs,
+                               std::vector<unsigned char> body) {
+    WinSchemeRequest r;
+    {
+        std::lock_guard<std::mutex> lk(g_scheme_mutex);
+        auto it = g_win_scheme_requests.find(id);
+        if (it == g_win_scheme_requests.end()) return;
+        r = it->second;
+        g_win_scheme_requests.erase(it);
+    }
+    // If the engine thread has already exited, the post fails and these COM
+    // references are leaked rather than released on the wrong apartment (D5.3).
+    post_to_worker_thread(r.thread_id, [r, status, pairs, body] {
+        IStream *stream = SHCreateMemStream(body.empty() ? nullptr : body.data(),
+                                            (UINT)body.size());
+        std::wstring headers;
+        for (size_t i = 0; i + 1 < pairs.size(); i += 2) {
+            headers += utf8_to_wide(pairs[i].c_str());
+            headers += L": ";
+            headers += utf8_to_wide(pairs[i + 1].c_str());
+            headers += L"\r\n";
+        }
+        ICoreWebView2WebResourceResponse *resp = nullptr;
+        HRESULT hr = r.env->CreateWebResourceResponse(stream, status, win_reason_phrase(status),
+                                                      headers.c_str(), &resp);
+        if (SUCCEEDED(hr) && resp) {
+            r.args->put_Response(resp);
+        } else {
+            WV_LOG("scheme CreateWebResourceResponse failed: HRESULT=0x%08lx",
+                   (unsigned long)hr);
+        }
+        r.deferral->Complete();   // always: a load failure, never a hang
+        if (resp) resp->Release();
+        if (stream) stream->Release();
+        r.deferral->Release();
+        r.args->Release();
+        r.env->Release();
+    });
+}
+
 // NewWindowRequested -> allow/deny via Java, then create the linked child in an
 // engine-owned top-level window.  Deferral pattern; see the block comment.
 class NewWindowRequestedHandler : public CallbackBase<
@@ -2153,6 +2463,8 @@ public:
                             // Canvas 21: inherit the opener's custom UA before
                             // the child's in-flight initial navigation.
                             propagate_popup_user_agent(e, child, uri.c_str());
+                            // Canvas 32 D3: the popup child answers the same custom schemes (AC11).
+                            win_install_scheme_hook(child, e->environment);
 
                             // Return the LINKED child to WebView2 so it drives
                             // the original request (POST verb+body,
@@ -2274,6 +2586,8 @@ public:
                         // Canvas 21: inherit the opener's custom UA before the
                         // child's in-flight initial navigation.
                         propagate_popup_user_agent(e, child, uri.c_str());
+                        // Canvas 32 D3: the popup child answers the same custom schemes (AC11).
+                        win_install_scheme_hook(child, e->environment);
 
                         args->put_NewWindow(child);   // LINKED to opener
                         args->put_Handled(TRUE);
@@ -2582,6 +2896,10 @@ static void engine_thread(Engine *e, HWND /*parent*/, int width, int height,
                         nwh, &e->new_window_token);
                     nwh->Release();
 
+                    // Custom URL schemes (Canvas 32 D3); a no-op when none
+                    // are registered.
+                    win_install_scheme_hook(e->webview, e->environment);
+
                     init_done.clear();
                 });
             HRESULT r2 = env->CreateCoreWebView2Controller(
@@ -2594,8 +2912,12 @@ static void engine_thread(Engine *e, HWND /*parent*/, int width, int height,
                 init_done.clear();
             }
         });
+    // Canvas 32 D1: declare the custom schemes on the environment.  Null when
+    // none are registered, so the environment is created exactly as before.
+    Microsoft::WRL::ComPtr<ICoreWebView2EnvironmentOptions> scheme_options =
+        win_scheme_environment_options();
     HRESULT res = CreateCoreWebView2EnvironmentWithOptions(
-        nullptr, nullptr, nullptr, env_handler);
+        nullptr, nullptr, scheme_options.Get(), env_handler);
     env_handler->Release();
     if (FAILED(res)) {
         WV_LOG("CreateCoreWebView2EnvironmentWithOptions failed: "
@@ -3804,19 +4126,58 @@ JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1pdf_1a
     return JNI_TRUE;
 }
 
-// Custom URL schemes — Canvas 30 stubs.  Canvas 32 fills these in; until then
-// WebViewSchemes.isSupported() is false on Windows and nothing is installed.
+// Canvas 32: custom URL schemes on WebView2.  Whether the installed Runtime
+// honours the registrations is only known when an environment is created
+// (D7), so the library reports support.
 JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1scheme_1available
   (JNIEnv *, jclass) {
-    return JNI_FALSE;
+    return JNI_TRUE;
 }
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1scheme_1install
-  (JNIEnv *, jclass, jobjectArray, jobject) {
+  (JNIEnv *env, jclass, jobjectArray names, jobject dispatcher) {
+    std::lock_guard<std::mutex> lk(embed_win::g_scheme_mutex);
+    if (embed_win::g_scheme_installed) return;
+    embed_win::g_scheme_installed = true;
+    env->GetJavaVM(&embed_win::g_scheme_jvm);
+    if (dispatcher) embed_win::g_scheme_dispatcher = env->NewGlobalRef(dispatcher);
+    jsize n = names ? env->GetArrayLength(names) : 0;
+    for (jsize i = 0; i < n; i++) {
+        jstring js = (jstring)env->GetObjectArrayElement(names, i);
+        if (!js) continue;
+        const char *c = env->GetStringUTFChars(js, nullptr);
+        if (c) {
+            embed_win::g_scheme_names.push_back(c);
+            env->ReleaseStringUTFChars(js, c);
+        }
+        env->DeleteLocalRef(js);
+    }
 }
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1scheme_1respond
-  (JNIEnv *, jclass, jlong, jint, jobjectArray, jbyteArray) {
+  (JNIEnv *env, jclass, jlong id, jint status, jobjectArray headerPairs, jbyteArray body) {
+    std::vector<std::string> pairs;
+    jsize n = headerPairs ? env->GetArrayLength(headerPairs) : 0;
+    for (jsize i = 0; i < n; i++) {
+        jstring js = (jstring)env->GetObjectArrayElement(headerPairs, i);
+        std::string v;
+        if (js) {
+            const char *c = env->GetStringUTFChars(js, nullptr);
+            if (c) {
+                v = c;
+                env->ReleaseStringUTFChars(js, c);
+            }
+            env->DeleteLocalRef(js);
+        }
+        pairs.push_back(v);
+    }
+    std::vector<unsigned char> bytes;
+    jsize len = body ? env->GetArrayLength(body) : 0;
+    if (len > 0) {
+        bytes.resize((size_t)len);
+        env->GetByteArrayRegion(body, 0, len, (jbyte *)bytes.data());
+    }
+    embed_win::win_scheme_respond((long long)id, (int)status, pairs, bytes);
 }
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1print_1to_1pdf

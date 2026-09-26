@@ -895,8 +895,10 @@ wv.setUrl("demo://app/index.html");
   each view's configuration, popups included. Linux (lightweight and
   heavyweight) through a URI scheme on WebKitGTK's default web context,
   registered as secure and CORS-enabled, which every view and popup shares.
-  Windows (WebView2) follows in the next release; until then `isSupported()` is
-  `false` there. The standalone `WebView` window is not covered. See
+  Windows (heavyweight) through custom scheme registrations on the WebView2
+  environment (secure, with a host, accepting requests from pages on the same
+  scheme) and `WebResourceRequested`, on every view and popup. The standalone
+  `WebView` window is not covered. See
   [`demos/WebViewSchemeDemo/`](demos/WebViewSchemeDemo/README.md).
 * **Linux notes.**
   * Request bodies need WebKitGTK 2.40 or newer. On older engines the handler
@@ -908,6 +910,14 @@ wv.setUrl("demo://app/index.html");
     an unanswered request ends at the 30-second timeout.
   * Schemes are registered on the default web context, which the standalone
     `WebView` window also uses, but that window remains unsupported.
+* **Windows notes.**
+  * WebView2 does not report abandoned requests, so Windows never cancels one:
+    an unanswered request ends at the 30-second timeout.
+  * A WebView2 Runtime too old for custom scheme registration cannot load pages
+    from the scheme; the evergreen Runtime on current Windows can.
+  * Do not combine the standalone `WebView` window with registered schemes in
+    one process: WebView2 may refuse the second environment because its options
+    differ.
 
 ## Demo
 

@@ -6,10 +6,10 @@ REM One-shot build & launch of WebViewSchemeDemo on Windows (Canvas 30).  Builds
 REM the WebView2-backed native DLL, packages WebView.jar, compiles the demo, and
 REM runs it.  No Ant required.
 REM
-REM Windows support arrives with Canvas 32: until then the demo prints
-REM "Custom URL schemes are not available in this version of the native
-REM library" and exits.  See demos\WebViewSchemeDemo\README.md for the
-REM AC-mapped manual test checklist.  Set SCHEMEDEMO_AUTO=1 to run the checks
+REM Serves a two-file page (HTML plus a script that fetches JSON) from the
+REM demo:// scheme, answered in Java, through WebView2 (Canvas 32), in the
+REM heavyweight component, the supported Windows mode.  See
+REM demos\WebViewSchemeDemo\README.md for the AC-mapped manual test checklist.  Set SCHEMEDEMO_AUTO=1 to run the checks
 REM and exit (0 = passed).
 REM
 REM Requires:
