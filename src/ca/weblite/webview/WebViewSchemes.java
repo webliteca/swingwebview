@@ -105,15 +105,15 @@ public final class WebViewSchemes {
         }
         String name = scheme == null ? "" : scheme.toLowerCase(Locale.ROOT);
         if (!NAME.matcher(name).matches()) {
-            throw new IllegalArgumentException("“" + scheme + "” is not a valid scheme name: 2–32 "
+            throw new IllegalArgumentException("\u201C" + scheme + "\u201D is not a valid scheme name: 2\u201332 "
                     + "characters, a letter first, then letters, digits, '+', '-' or '.'.");
         }
         if (WEB_SCHEMES.contains(name)) {
-            throw new IllegalArgumentException("“" + name + "” cannot be registered: it is one of the "
+            throw new IllegalArgumentException("\u201C" + name + "\u201D cannot be registered: it is one of the "
                     + "web's own schemes.");
         }
         if (handlers.containsKey(name)) {
-            throw new IllegalArgumentException("“" + name + "” is already registered.");
+            throw new IllegalArgumentException("\u201C" + name + "\u201D is already registered.");
         }
         handlers.put(name, handler);
     }

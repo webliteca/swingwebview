@@ -516,7 +516,9 @@ Comment: "Canvas 32 fills these in."
 
 It opens a `WebViewComponent` on `demo://app/index.html`. If `WebViewSchemes.isSupported()` is
 false, it prints AC10's sentence and exits 0. The run scripts follow `run-mac-pdf-demo.sh`, and the
-Linux and Windows scripts exist and currently report "not supported".
+Linux and Windows scripts exist and currently report "not supported". `run-windows-scheme-demo.bat`
+passes `-encoding UTF-8` to both javac calls, because the sources are UTF-8 and javac's Windows
+default is Cp1252.
 
 ### 12. `README.md` (**edited**)
 A "Custom URL schemes" section covering:
@@ -538,6 +540,9 @@ A "Custom URL schemes" section covering:
    applied on the main queue.
 5. `java.util.logging` or the uncaught-exception handler only. No new logging dependency.
 6. Javadoc cites `Canvas 30 Dn`, and tests map to the story's ACs in their class comment.
+7. **Source encoding.** Non-ASCII characters in Java string literals are written as `\u` escapes
+   (the refusal messages' `\u201C` `\u201D` `\u2013`), so the sources compile under any
+   `-encoding`, including javac's Cp1252 default on Windows. The strings are unchanged.
 
 ## S · Safeguards
 

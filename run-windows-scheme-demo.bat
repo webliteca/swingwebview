@@ -171,7 +171,7 @@ if exist "%WV_CLASSES%" rmdir /s /q "%WV_CLASSES%"
 mkdir "%WV_CLASSES%"
 echo Compiling WebView Java sources ...
 dir /s /b "%REPO_DIR%\src\*.java" > "%BUILD_DIR%\wv-sources.txt"
-"%JAVA_HOME%\bin\javac.exe" -d "%WV_CLASSES%" -classpath "%REPO_DIR%\lib\*" @"%BUILD_DIR%\wv-sources.txt"
+"%JAVA_HOME%\bin\javac.exe" -encoding UTF-8 -d "%WV_CLASSES%" -classpath "%REPO_DIR%\lib\*" @"%BUILD_DIR%\wv-sources.txt"
 if errorlevel 1 (
     echo ERROR: javac failed.
     exit /b 1
@@ -203,7 +203,7 @@ set "DEMO_DIR=%REPO_DIR%\demos\WebViewSchemeDemo"
 set "DEMO_CLASSES=%BUILD_DIR%\classes-scheme-demo"
 if not exist "%DEMO_CLASSES%" mkdir "%DEMO_CLASSES%"
 echo Compiling demo ...
-"%JAVA_HOME%\bin\javac.exe" -d "%DEMO_CLASSES%" -classpath "%WV_JAR%" "%DEMO_DIR%\src\ca\weblite\webview\demos\WebViewSchemeDemo.java"
+"%JAVA_HOME%\bin\javac.exe" -encoding UTF-8 -d "%DEMO_CLASSES%" -classpath "%WV_JAR%" "%DEMO_DIR%\src\ca\weblite\webview\demos\WebViewSchemeDemo.java"
 if errorlevel 1 (
     echo ERROR: javac failed on demo.
     exit /b 1
