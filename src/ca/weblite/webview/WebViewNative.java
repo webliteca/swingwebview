@@ -284,6 +284,24 @@ native static void webview_embed_set_attach_callback(long w, Object cb);
 native static void webview_embed_set_dialog_callback(long w, WebViewDialogCallback cb);
 
 // Register (or clear, by passing null) a callback invoked when the
+// embedded page's injected password-manager script reports a login
+// submission or requests autofill.  The callback's frameUrl argument is
+// the committed frame URL read natively from the engine (the trusted
+// origin source); the username/password are base64url strings decoded in
+// Java.  The callback methods are void (non-blocking): the library
+// marshals the save prompt to the EDT via invokeLater and runs store I/O
+// on a worker.  Per-platform delivery:
+//   - macOS:   a dedicated WKScriptMessageHandler named "__webview_pw__"
+//              on the WKUserContentController (Canvas 26).
+//   - Linux:   script-message-received::__webview_pw__ on the
+//              WebKitUserContentManager (Canvas 27).
+//   - Windows: the __webview_pw__: branch of the WebView2
+//              WebMessageReceived handler (Canvas 28).
+// cb may be null to clear the registration.  Passing 0 for w is a
+// silent no-op.  Never throws via JNI.
+native static void webview_embed_set_password_callback(long w, WebViewPasswordCallback cb);
+
+// Register (or clear, by passing null) a callback invoked when the
 // embedded page requests a popup (window.open / target=_blank).  The
 // callback's onPopupRequested returns the allow/deny decision
 // synchronously on the native UI thread; onPopupOpened / onPopupClosed
@@ -340,6 +358,18 @@ native static void webview_embed_set_download_callback(long w, WebViewDownloadCa
 // Passing 0 for w is a silent no-op.  Never throws via JNI.
 native static void webview_embed_set_user_agent(long w, String ua);
 
+// Install a per-destination User-Agent resolver on the embedded WebView.  The
+// resolver is invoked as java.util.function.Function#apply(Object)Object with
+// the URL a navigation is about to load, and returns the User-Agent to present
+// for it (null or empty => fall through to the static setUserAgent value).
+// Held as a JNI global reference until replaced or the engine is destroyed;
+// resolver == null clears it.  Only the engine-driven popup-child path upcalls
+// it -- navigations Java drives resolve on the Java side.  The upcall runs on
+// the engine UI thread, attaches that thread to the JVM when needed, and clears
+// any pending exception, so a throwing resolver falls through instead of
+// propagating.  Passing 0 for w is a silent no-op.  Never throws via JNI.
+native static void webview_embed_set_user_agent_resolver(long w, Object resolver);
+
 // Purge the embedded WebView's HTTP resource cache (disk + memory) so the
 // next navigation re-fetches from the network.  Clears the resource cache
 // ONLY: cookies, local storage, and service-worker registrations are left
@@ -357,6 +387,33 @@ native static void webview_embed_clear_cache(long w);
 // success. Passing a dead peer or invalid URL completes with an error.
 native static void webview_embed_get_cookies(long w, String url,
                                              WebViewCookieCallback callback);
+
+// Canvas 29: whether this native library can print to PDF.  Present only in
+// natives built with the feature; PdfPrinting.isAvailable() absorbs the
+// UnsatisfiedLinkError an older native raises.
+native static boolean webview_pdf_available();
+
+// Canvas 30: custom URL schemes.  webview_scheme_available is present only in
+// natives built with the feature (WebViewSchemes.isSupported() absorbs the
+// UnsatisfiedLinkError an older native raises).  webview_scheme_install hands
+// native the frozen scheme names and the SchemeDispatcher it upcalls
+// (onSchemeRequest / onSchemeCancelled), once, before the first engine;
+// webview_scheme_respond answers one request by id, from any thread.
+native static boolean webview_scheme_available();
+native static void webview_scheme_install(String[] schemes, Object dispatcher);
+native static void webview_scheme_respond(long id, int status, String[] headerPairs, byte[] body);
+
+// Canvas 29: print the embedded WebView's page to a PDF file at `path`
+// (absolute), with the page size and margins in inches and backgrounds on or
+// off, no dialog, engine headers/footers off.  Runs on the engine UI thread
+// and calls cb.onPdfFinished(ok, error) exactly once.  Per platform: Windows
+// ICoreWebView2_7::PrintToPdf; Linux WebKitPrintOperation to GTK's "Print to
+// File" printer; macOS -[WKWebView printOperationWithPrintInfo:] run modally
+// on the view's window.  Never throws via JNI.
+native static void webview_embed_print_to_pdf(long w, String path,
+        double pageWidth, double pageHeight, double marginTop,
+        double marginRight, double marginBottom, double marginLeft,
+        boolean backgrounds, WebViewPdfCallback cb);
 
 // Adopt a browser-initiated popup child that was retained (not shown) after
 // an ADOPT disposition, reparenting it into `parent`'s realized native
@@ -485,6 +542,12 @@ native static void webview_offscreen_execute_editing_command(long peer, int cmdI
 // engine on those platforms is itself a stub).  Never throws via JNI.
 native static void webview_offscreen_set_dialog_callback(long peer, WebViewDialogCallback cb);
 
+// Offscreen counterpart to webview_embed_set_password_callback.  A native
+// no-op stub on macOS / Windows (offscreen is itself a stub there); Linux
+// lightweight wires the GTK script-message handler in Canvas 27.  cb may
+// be null to clear.  Never throws via JNI.
+native static void webview_offscreen_set_password_callback(long peer, WebViewPasswordCallback cb);
+
 // Offscreen counterpart to webview_embed_set_popup_callback.  Used by
 // WebViewLightweightComponent on Linux to bridge window.open requests in
 // the offscreen engine to the per-component PopupDispatcher.  macOS /
@@ -503,6 +566,11 @@ native static void webview_offscreen_set_download_callback(long peer, WebViewDow
 // throws via JNI.
 native static void webview_offscreen_set_user_agent(long peer, String ua);
 
+// Offscreen counterpart to webview_embed_set_user_agent_resolver.  Same
+// contract; Linux only, a native-side no-op where the offscreen engine is a
+// stub.
+native static void webview_offscreen_set_user_agent_resolver(long peer, Object resolver);
+
 // Offscreen counterpart to webview_embed_clear_cache.  Linux purges the
 // WebKitGTK context's HTTP resource cache; macOS / Windows offscreen engines
 // are stubs and this is a native-side no-op.  Passing 0 for peer is a silent
@@ -513,6 +581,14 @@ native static void webview_offscreen_clear_cache(long peer);
 // unsupported platform stubs complete with an error rather than hanging.
 native static void webview_offscreen_get_cookies(long peer, String url,
                                                  WebViewCookieCallback callback);
+
+// Offscreen counterpart to webview_embed_print_to_pdf (Canvas 29).  Linux
+// prints the offscreen WebKitWebView; macOS / Windows have no offscreen
+// engine and finish with "The WebView is not attached yet.".
+native static void webview_offscreen_print_to_pdf(long peer, String path,
+        double pageWidth, double pageHeight, double marginTop,
+        double marginRight, double marginBottom, double marginLeft,
+        boolean backgrounds, WebViewPdfCallback cb);
 
 // Offscreen counterpart to webview_embed_adopt_popup (Canvas 19).  Adopt a
 // browser-initiated popup child that was retained (not shown) after an ADOPT
@@ -533,6 +609,46 @@ native static long webview_offscreen_adopt_popup(int width, int height,
 // `peer` is unused (kept for signature symmetry with the heavyweight bridge).
 // Unknown popupId is a silent no-op.  Never throws via JNI.
 native static void webview_offscreen_discard_popup(long peer, long popupId);
+
+
+// ---------------------------------------------------------------------------
+// Process-global credential store (password manager, Canvas 26+).
+//
+// These primitives are NOT tied to a WebView engine — the OS-native secret
+// store is process-global.  `service` is the library namespace constant
+// isolating these items; `origin` is the canonical scheme+host+port key.
+// The stored value blob encodes `savedAtMillis + "\n" + password` so recency
+// ordering is uniform across platforms regardless of native metadata.
+// Per platform: macOS Keychain (SecItem*, Canvas 26); Linux libsecret
+// (Canvas 27); Windows Credential Manager (Canvas 28).  On a platform whose
+// backend is not yet wired, these return false / an empty array (graceful).
+// Never throw via JNI.
+// ---------------------------------------------------------------------------
+
+// Insert or overwrite the credential for {service, origin, username}.
+// Returns whether the write succeeded.
+native static boolean webview_cred_store_save(String service, String origin,
+                                              String username, String password,
+                                              long savedAtMillis);
+
+// Return every credential for {service, origin} as flat triples
+// [username, savedAtMillisString, password, ...], most-recently-saved first
+// (Java re-sorts regardless).  Empty array when none / unavailable.
+native static String[] webview_cred_store_find(String service, String origin);
+
+// Return every credential under {service} across all origins as flat quads
+// [origin, username, savedAtMillisString, password, ...] (Java re-sorts).
+// Empty array when none / unavailable.  Backs enumerate-all (getAllCredentials).
+native static String[] webview_cred_store_find_all(String service);
+
+// Remove the credential for {service, origin, username}.  Returns whether a
+// credential was actually removed.
+native static boolean webview_cred_store_delete(String service, String origin,
+                                                String username);
+
+// Whether the platform secret store is usable (always true on macOS /
+// Windows; meaningful on Linux where the Secret Service may be absent).
+native static boolean webview_cred_store_available();
 
 
 }

@@ -9,17 +9,31 @@ import ca.weblite.webview.ConsoleDispatcher;
 import ca.weblite.webview.ConsoleListener;
 import ca.weblite.webview.DialogDispatcher;
 import ca.weblite.webview.DownloadDispatcher;
+import ca.weblite.webview.PasswordDispatcher;
 import ca.weblite.webview.PopupDispatcher;
 import ca.weblite.webview.JavaScriptEvalException;
+import ca.weblite.webview.PdfOptions;
+import ca.weblite.webview.PdfPrinting;
 import ca.weblite.webview.WebView;
+import ca.weblite.webview.WebViewCredential;
+import ca.weblite.webview.WebViewCredentialStore;
 import ca.weblite.webview.WebViewDialogHandler;
 import ca.weblite.webview.WebViewDownloadHandler;
+import ca.weblite.webview.WebViewFillPasswordHandler;
 import ca.weblite.webview.WebViewPopupHandler;
 import ca.weblite.webview.WebViewMouseDispatcher;
 import ca.weblite.webview.WebViewMouseListener;
+import ca.weblite.webview.WebViewPdfCallback;
+import ca.weblite.webview.WebViewSavePasswordHandler;
 
+import java.io.File;
 import java.io.PrintStream;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Optional;
 import java.util.concurrent.CompletableFuture;
+import java.util.function.Function;
+import javax.swing.SwingUtilities;
 import javax.swing.JComponent;
 
 /**
@@ -97,6 +111,13 @@ public abstract class WebViewComponent extends JComponent {
      *  native peer at peer-attach time that delegates to this dispatcher's
      *  {@code dispatch*} methods. */
     protected final DownloadDispatcher downloadDispatcher = new DownloadDispatcher(this);
+
+    /** Per-component hub for the password manager (login-submission
+     *  capture + autofill + credential store).  Subclasses inject
+     *  {@link PasswordDispatcher#SHIM_JS} and install a
+     *  {@link ca.weblite.webview.WebViewPasswordCallback} on their native
+     *  peer at peer-attach time that delegates to this dispatcher. */
+    protected final PasswordDispatcher passwordDispatcher = new PasswordDispatcher(this);
 
     /** When non-zero, this component was created via {@link #adoptPopup} and
      *  its peer, at attach time, adopts the pre-existing native popup child
@@ -241,6 +262,7 @@ public abstract class WebViewComponent extends JComponent {
      */
     public WebViewComponent setUserAgent(String ua) {
         pendingUserAgent = (ua == null || ua.isEmpty()) ? null : ua;
+        lastAppliedUserAgentValid = false;
         applyUserAgentToPeer(pendingUserAgent);
         return this;
     }
@@ -255,6 +277,108 @@ public abstract class WebViewComponent extends JComponent {
      *  No-op on the base class and when no peer is attached; subclasses
      *  forward to their engine wrapper's {@code setUserAgent}. */
     protected void applyUserAgentToPeer(String ua) {
+    }
+
+    /** Per-destination User-Agent resolver, or {@code null} when none is
+     *  set.  Survives the peer's create/destroy cycle alongside
+     *  {@link #pendingUserAgent}. */
+    protected Function<String, String> pendingUserAgentResolver = null;
+
+    /** The User-Agent last pushed to the peer, so an unchanged value is not
+     *  re-entered into the engine setter on every navigation. */
+    private String lastAppliedUserAgent = null;
+    private boolean lastAppliedUserAgentValid = false;
+
+    /**
+     * Install a <b>per-destination</b> User-Agent resolver: a function from
+     * the URL a navigation is about to load to the User-Agent to present for
+     * it.  This lets one embedded browser show a different UA per destination
+     * host — useful when two sites want opposite things (one rejects the
+     * engine's own UA as an unsupported browser, another penalises the
+     * mainstream UA the first one demands).
+     *
+     * <p><b>Precedence.</b>  The resolver's answer wins when it is non-null
+     * and non-blank; otherwise the static {@link #setUserAgent(String)} value
+     * applies; otherwise the engine default.  A {@code null} or blank return
+     * therefore means <em>fall through</em>, not "use the engine default" — a
+     * resolver can never force the engine default over a static override.
+     *
+     * <p><b>When it is consulted.</b>  At exactly three points, each a
+     * navigation that is about to start and that this library controls:
+     * before a view's initial navigation, before any Java-initiated
+     * {@link #setUrl(String)} on a live view, and before a browser-initiated
+     * pop-up child's first navigation (keyed on the pop-up's own target URL,
+     * so an OAuth sign-in opened from a UA-spoofing site can present a
+     * different UA than its opener).
+     *
+     * <p><b>Limitation.</b>  This is not per-request switching: a server-side
+     * redirect that crosses hosts <em>during</em> a navigation keeps the UA
+     * that navigation started with.
+     *
+     * <p><b>Threading.</b>  The resolver is invoked on the engine UI thread
+     * immediately before the navigation it governs, so it must be fast and
+     * must not block.  A resolver that throws is swallowed and treated as a
+     * {@code null} return — it can never break a navigation.
+     *
+     * @param resolver the resolver, or {@code null} to clear it
+     * @return {@code this} for chaining
+     */
+    public WebViewComponent setUserAgentResolver(Function<String, String> resolver) {
+        pendingUserAgentResolver = resolver;
+        lastAppliedUserAgentValid = false;
+        applyUserAgentResolverToPeer(resolver);
+        return this;
+    }
+
+    /** @return the per-destination User-Agent resolver, or {@code null}. */
+    public Function<String, String> getUserAgentResolver() {
+        return pendingUserAgentResolver;
+    }
+
+    /**
+     * Run the User-Agent precedence chain for a navigation to {@code url}:
+     * the resolver's answer when non-null and non-blank, else the static
+     * {@link #pendingUserAgent}, else {@code null} (engine default).  Never
+     * throws — a resolver that fails falls through to the static value.
+     */
+    protected String resolveUserAgentFor(String url) {
+        Function<String, String> r = pendingUserAgentResolver;
+        if (r != null && url != null && url.trim().length() > 0) {
+            try {
+                String ua = r.apply(url);
+                if (ua != null && ua.trim().length() > 0) {
+                    return ua;
+                }
+            } catch (Throwable ignored) {
+                // A resolver must never be able to break a navigation.
+            }
+        }
+        return pendingUserAgent;
+    }
+
+    /**
+     * Resolve and apply the User-Agent for an imminent navigation to
+     * {@code url}.  Applied only when it differs from the value last pushed
+     * to the peer, so an unchanged UA does not re-enter the engine setter on
+     * every navigation.  Called from the attach path (before the first
+     * navigate) and from each subclass's {@link #setUrl(String)}.
+     */
+    protected void applyResolvedUserAgentFor(String url) {
+        String ua = resolveUserAgentFor(url);
+        if (lastAppliedUserAgentValid
+                && (ua == null ? lastAppliedUserAgent == null : ua.equals(lastAppliedUserAgent))) {
+            return;
+        }
+        applyUserAgentToPeer(ua);
+        lastAppliedUserAgent = ua;
+        lastAppliedUserAgentValid = true;
+    }
+
+    /** Push the (possibly {@code null}) resolver down to the live native peer
+     *  so the engine-driven pop-up path can consult it.  No-op on the base
+     *  class and when no peer is attached; subclasses forward to their engine
+     *  wrapper's {@code setUserAgentResolver}. */
+    protected void applyUserAgentResolverToPeer(Function<String, String> resolver) {
     }
 
     /**
@@ -302,6 +426,140 @@ public abstract class WebViewComponent extends JComponent {
      *  class and when no peer is attached; subclasses forward to their engine
      *  wrapper's {@code clearCache}. */
     protected void clearCacheOnPeer() {
+    }
+
+    /** Print requests not yet answered, failed with {@link PdfPrinting#CLOSED}
+     *  when the peer goes away (Canvas 29 D6).  EDT-confined. */
+    private final List<PdfPrinting.Request> pendingPdf =
+            new ArrayList<PdfPrinting.Request>();
+
+    /** Whether {@link #preloadNatives()} has loaded the natives (Canvas 29 D15). */
+    private static volatile boolean nativesPreloaded;
+
+    /**
+     * On macOS, load the native library now (Canvas 29 D15).  Loading it on
+     * the EDT once a window is showing deadlocks: the load holds the JVM's
+     * library lock and waits on the AppKit thread, which is waiting for that
+     * lock to initialise {@code java.awt.event.MouseEvent} for the window's
+     * first mouse-entered event.  Components are constructed before they are
+     * shown, so loading here happens before AppKit delivers window events.
+     */
+    protected WebViewComponent() {
+        preloadNatives();
+    }
+
+    private static void preloadNatives() {
+        if (nativesPreloaded
+                || !System.getProperty("os.name", "").startsWith("Mac")) {
+            return;
+        }
+        try {
+            Class.forName("ca.weblite.webview.WebViewNative", true,
+                    WebViewComponent.class.getClassLoader());
+            nativesPreloaded = true;
+        } catch (Throwable t) {
+            // A missing native keeps isPdfPrintingSupported() false.
+        }
+    }
+
+    /**
+     * Print the page this component shows to a PDF file on US Letter pages
+     * with zero margins and backgrounds.
+     *
+     * @see #printToPdf(File, PdfOptions)
+     */
+    public CompletableFuture<File> printToPdf(File out) {
+        return printToPdf(out, PdfOptions.letter());
+    }
+
+    /**
+     * Print the page this component shows to a PDF file, with no print
+     * dialog (Canvas 29).  The engine's own headers and footers are off and
+     * the scale is 1, so the PDF is the page as laid out — wait for the
+     * page's own layout to finish before calling.
+     *
+     * <p>The future completes on the Swing event thread with {@code out} once
+     * the file is written, or exceptionally with an {@link java.io.IOException}
+     * whose message says why not: the folder does not exist, the native
+     * library or engine runtime cannot print to PDF, the component is not
+     * attached yet, or it was closed before the print finished.
+     *
+     * @param out     the PDF file to write; its folder must exist
+     * @param options page size, margins and backgrounds; {@code null} means
+     *                {@link PdfOptions#letter()}
+     */
+    public CompletableFuture<File> printToPdf(File out, PdfOptions options) {
+        final PdfOptions o = options == null ? PdfOptions.letter() : options;
+        String reason = PdfPrinting.precheck(out, o, pdfPrintingAvailable());
+        if (reason != null) {
+            PdfPrinting.Request failed = PdfPrinting.request(out, EDT);
+            failed.fail(reason);
+            return failed.future;
+        }
+        final PdfPrinting.Request request = PdfPrinting.request(out, EDT);
+        onEdt(new Runnable() {
+            @Override
+            public void run() {
+                pendingPdf.add(request);
+            }
+        });
+        request.future.whenComplete((f, t) -> pendingPdf.remove(request));
+        onEdt(new Runnable() {
+            @Override
+            public void run() {
+                if (request.future.isDone()) {
+                    return;
+                }
+                if (!printToPdfOnPeer(out, o, request.callback)) {
+                    request.fail(PdfPrinting.NOT_ATTACHED);
+                }
+            }
+        });
+        return request.future;
+    }
+
+    /**
+     * Start printing the live peer's page to {@code out}, answering
+     * {@code cb} exactly once.  Returns {@code false} when no peer is
+     * attached.  Called on the EDT.  The base class has no peer.
+     */
+    protected boolean printToPdfOnPeer(File out, PdfOptions o,
+                                       WebViewPdfCallback cb) {
+        return false;
+    }
+
+    /** Whether this component's native library can print to PDF.  Defaults
+     *  to {@link PdfPrinting#isAvailable()}; a test double without natives
+     *  overrides it. */
+    protected boolean pdfPrintingAvailable() {
+        return PdfPrinting.isAvailable();
+    }
+
+    /** Fail every unanswered print request with {@link PdfPrinting#CLOSED}.
+     *  Subclasses call this before disposing their engine.  EDT-only. */
+    protected void failPendingPdf() {
+        for (PdfPrinting.Request r : new ArrayList<PdfPrinting.Request>(pendingPdf)) {
+            r.fail(PdfPrinting.CLOSED);
+        }
+    }
+
+    /**
+     * Whether the loaded native library can print to PDF.  {@code false}
+     * against a native built before the feature, or without natives at all.
+     */
+    public static boolean isPdfPrintingSupported() {
+        return PdfPrinting.isAvailable();
+    }
+
+    private static final java.util.concurrent.Executor EDT =
+            SwingUtilities::invokeLater;
+
+    private static void onEdt(Runnable r) {
+        if (SwingUtilities.isEventDispatchThread()) {
+            r.run();
+        } else {
+            SwingUtilities.invokeLater(r);
+        }
     }
 
     /** Toggle developer tools (where supported).  Must be called before display. */
@@ -751,5 +1009,133 @@ public abstract class WebViewComponent extends JComponent {
      */
     public final WebViewDownloadHandler getDownloadHandler() {
         return downloadDispatcher.getHandler();
+    }
+
+    // ---------------------------------------------------------------------
+    // Password manager (Canvas 26+).  The manager auto-detects login
+    // submissions and offers to save them, and auto-fills a stored
+    // credential on page load.  Credentials are keyed by page origin
+    // (scheme+host+port) and matched exact-origin only.  Passwords live
+    // only in the OS-native secret store (Keychain on macOS this
+    // iteration; libsecret / Credential Manager to follow).  This
+    // iteration wires the capture/fill on macOS heavyweight; on Linux /
+    // Windows the API works but automatic capture/fill activate in the
+    // follow-up canvases.
+    // ---------------------------------------------------------------------
+
+    /**
+     * Enable or disable the automatic save-prompt and autofill.  Enabled
+     * by default.  When disabled, no prompt appears and no autofill fires,
+     * but the programmatic methods below still work.
+     *
+     * @return {@code this} for chaining
+     */
+    public final WebViewComponent setPasswordManagerEnabled(boolean enabled) {
+        passwordDispatcher.setEnabled(enabled);
+        return this;
+    }
+
+    /** @return whether the automatic password manager is enabled. */
+    public final boolean isPasswordManagerEnabled() {
+        return passwordDispatcher.isEnabled();
+    }
+
+    /**
+     * Replace the credential store.  Passing {@code null} reinstalls the
+     * default {@link ca.weblite.webview.NativeCredentialStore} (the OS
+     * secret store).
+     *
+     * @return {@code this} for chaining
+     */
+    public final WebViewComponent setCredentialStore(WebViewCredentialStore store) {
+        passwordDispatcher.setStore(store);
+        return this;
+    }
+
+    /** @return the active credential store; never {@code null}. */
+    public final WebViewCredentialStore getCredentialStore() {
+        return passwordDispatcher.getStore();
+    }
+
+    /**
+     * Replace the save-password policy.  Passing {@code null} reinstalls
+     * the default {@link WebViewSavePasswordHandler#DEFAULT} (the Swing
+     * "Save password?" prompt).
+     *
+     * @return {@code this} for chaining
+     */
+    public final WebViewComponent setSavePasswordHandler(WebViewSavePasswordHandler handler) {
+        passwordDispatcher.setHandler(handler);
+        return this;
+    }
+
+    /** @return the active save-password policy; never {@code null}. */
+    public final WebViewSavePasswordHandler getSavePasswordHandler() {
+        return passwordDispatcher.getHandler();
+    }
+
+    /**
+     * Replace the autofill-consent policy.  Passing {@code null} reinstalls
+     * the default {@link WebViewFillPasswordHandler#DEFAULT} (autofill
+     * unconditionally).  Install {@link WebViewFillPasswordHandler#CONFIRM}
+     * for a browser-style "use saved password?" confirmation, or a custom
+     * handler that performs an OS biometric / re-authentication check
+     * before autofill.  The handler is consulted only on the automatic
+     * page-load autofill path; the programmatic read methods are never
+     * gated by it.
+     *
+     * @return {@code this} for chaining
+     */
+    public final WebViewComponent setFillPasswordHandler(WebViewFillPasswordHandler handler) {
+        passwordDispatcher.setFillHandler(handler);
+        return this;
+    }
+
+    /** @return the active autofill-consent policy; never {@code null}. */
+    public final WebViewFillPasswordHandler getFillPasswordHandler() {
+        return passwordDispatcher.getFillHandler();
+    }
+
+    /**
+     * Programmatically store a credential (bypasses the save prompt).
+     * Overwrites any existing password for the same {@code {origin,
+     * username}}.
+     */
+    public final void saveCredential(WebViewCredential credential) {
+        passwordDispatcher.saveCredential(credential);
+    }
+
+    /**
+     * @return the most-recently-saved credential for {@code origin}, or
+     *         empty if none is stored.
+     */
+    public final Optional<WebViewCredential> getCredential(String origin) {
+        return passwordDispatcher.getCredential(origin);
+    }
+
+    /**
+     * @return every credential stored for {@code origin},
+     *         most-recently-saved first (empty when none).
+     */
+    public final List<WebViewCredential> getCredentials(String origin) {
+        return passwordDispatcher.getCredentials(origin);
+    }
+
+    /**
+     * @return every credential stored across all origins,
+     *         most-recently-saved first (empty when none). The primitive
+     *         a host uses to build a "manage saved passwords" UI.
+     */
+    public final List<WebViewCredential> getAllCredentials() {
+        return passwordDispatcher.getAllCredentials();
+    }
+
+    /**
+     * Delete the stored credential for {@code {origin, username}}.
+     *
+     * @return whether a credential was actually removed
+     */
+    public final boolean deleteCredential(String origin, String username) {
+        return passwordDispatcher.deleteCredential(origin, username);
     }
 }

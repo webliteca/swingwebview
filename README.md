@@ -34,6 +34,45 @@ web engine:
   hard-linked), so a single jar runs on both.
 * **macOS** needs nothing extra — WKWebView ships with the OS.
 
+### Early access via GitHub Packages
+
+Every tagged release is published to GitHub Packages *before* Maven
+Central, and is resolvable there the moment the release build finishes —
+useful when a downstream project needs to build against a new version
+without waiting for Central to sync.
+
+GitHub Packages requires an authenticated read even for public packages,
+so this channel is only practical for first-party projects and CI that
+already hold a token.  **Maven Central is the canonical channel; external
+consumers should use the coordinates above.**
+
+Add the repository to your `pom.xml`:
+
+```xml
+<repositories>
+    <repository>
+        <id>github-webliteca</id>
+        <url>https://maven.pkg.github.com/webliteca/swingwebview</url>
+    </repository>
+</repositories>
+```
+
+and a matching server entry in `~/.m2/settings.xml`, where the password is
+a personal access token with the `read:packages` scope (in GitHub Actions,
+use `${{ github.actor }}` and the built-in `GITHUB_TOKEN` instead):
+
+```xml
+<server>
+    <id>github-webliteca</id>
+    <username>YOUR_GITHUB_USERNAME</username>
+    <password>YOUR_PAT_WITH_READ_PACKAGES</password>
+</server>
+```
+
+The `<id>` values must match.  Once Maven Central has synced the same
+version, the repository entry can be dropped again — the artifacts are
+identical.
+
 ## Platform support
 
 | Platform | Heavyweight | Lightweight |
@@ -469,6 +508,100 @@ See [`demos/WebViewDownloadDemo/`](demos/WebViewDownloadDemo/README.md)
 for a runnable example that serves five download shapes from a loopback
 server and exercises all three handler modes.
 
+## Password manager
+
+The embedded engines (`WKWebView`, `WebKitGTK`, `WebView2`) do **not**
+give an embedding app the browser "offer to save this password / autofill
+it next time" experience — that is a browser-privileged feature the raw
+engine withholds.  `WebViewComponent` provides its own password manager
+instead: an injected script detects login-form submissions and the library
+shows a Swing "Save password?" prompt; on approval the credential is
+written to the **OS-native secret store**; on a later page load a stored
+credential for the same origin is auto-filled.
+
+```java
+WebViewComponent wv = WebViewComponent.create();
+// Enabled by default.  Turn it off with:
+wv.setPasswordManagerEnabled(false);
+
+// Programmatic access (works regardless of the enabled flag):
+wv.saveCredential(new WebViewCredential("https://example.com", "alice", "s3cret"));
+Optional<WebViewCredential> c = wv.getCredential("https://example.com");
+List<WebViewCredential> everything = wv.getAllCredentials(); // all origins
+wv.deleteCredential("https://example.com", "alice");
+
+// Require a confirmation (or an OS biometric check) before autofill:
+wv.setFillPasswordHandler(WebViewFillPasswordHandler.CONFIRM);
+```
+
+Key points:
+
+* **Origin keying.** Credentials are keyed by page **origin** =
+  scheme + host + port (the default port is implied by the scheme, so
+  `https://example.com` and `https://example.com:443` are the same
+  origin).  Autofill is **exact-origin only** — a credential for one
+  origin is never offered on another (`http` vs `https`, a different
+  port, or a different host are all distinct).
+* **OS-native storage.**  Passwords live only in the OS secret store —
+  macOS **Keychain**, Windows **Credential Manager**, and Linux
+  **libsecret** / Secret Service (GNOME Keyring, KWallet, or any
+  freedesktop Secret Service provider) are all wired.  On Windows the
+  credentials are stored in the library's *own* Credential-Manager
+  namespace (per-user, DPAPI-protected), not the Edge profile, and Edge's
+  built-in password autosave is disabled so it does not compete with this
+  manager.  On Linux libsecret is loaded at runtime (`libsecret-1.so.0`);
+  where no Secret Service provider is available the store degrades to a
+  no-op.  The library never writes a plaintext credential file and never
+  logs a password.
+* **Overridable seams.**  `setCredentialStore(WebViewCredentialStore)`
+  swaps the backing store (e.g. `InMemoryCredentialStore` for tests);
+  `setSavePasswordHandler(WebViewSavePasswordHandler)` replaces the
+  "Save password?" policy (return a disposition programmatically for
+  headless use).  Passing `null` to either restores the default.  Both
+  getters never return `null`.
+* **Autofill consent.**  By default a stored credential is filled
+  silently on page load.  `setFillPasswordHandler(WebViewFillPasswordHandler)`
+  gates that: install `WebViewFillPasswordHandler.CONFIRM` for a
+  browser-style "Use the saved password for `<origin>`?" prompt, or your
+  own handler that performs an OS biometric / re-authentication check
+  (Touch ID, Windows Hello) and returns `DONT_FILL` to decline.  The
+  event handed to the handler carries only the origin and username —
+  never the password.  Passing `null` restores the silent-autofill
+  default; the getter never returns `null`.  The consent handler gates
+  the automatic page-load autofill only — the programmatic
+  `getCredential` / `getCredentials` / `getAllCredentials` reads are
+  trusted host calls and are never gated.
+* **Managing saved passwords.**  `getAllCredentials()` enumerates every
+  stored credential across all origins (most-recently-saved first) — the
+  primitive you need to build a Chrome-style "manage saved passwords"
+  screen on top of the OS-native store, combined with `saveCredential`
+  (add/edit) and `deleteCredential` (remove).  Like the origin-scoped
+  reads it returns credentials to host code only; page JavaScript has no
+  path to any stored credential.
+* **Security note.**  Once a credential is auto-filled it lives in the
+  page DOM and is readable by any script running on that page — exactly
+  the same exposure as a browser's autofill.  The library only ever fills
+  the single origin-matched credential it chose to send.
+* **Coverage: all three platforms.**  Automatic capture / autofill and the
+  native secret store are wired on macOS (Keychain), Windows (Credential
+  Manager), and Linux (libsecret, both heavyweight and lightweight).  Where
+  a platform has no available secret store — notably a headless or
+  keyring-less Linux session — the store degrades to a graceful no-op:
+  page load and form submission still work, and the programmatic API
+  simply reports nothing stored.
+
+Known limitation: multi-step / identifier-first login flows (username and
+password on separate pages, e.g. some Okta configurations) are captured
+best-effort per page; cross-page correlation is not guaranteed.
+
+See [`demos/WebViewPasswordDemo/`](demos/WebViewPasswordDemo/README.md)
+for a runnable example exercising capture, autofill, and the programmatic
+API in both the Keychain-backed and in-memory store modes.
+[`demos/WebViewPasswordOptInDemo/`](demos/WebViewPasswordOptInDemo/README.md)
+shows a **Chrome-style opt-in fill** — silent autofill suppressed, an
+account chooser under the focused login field, and a simulated unlock
+before the password is filled.
+
 ## Browser-initiated popups (`window.open`)
 
 Pages can call `window.open(url, name, features)` or click a link / form
@@ -605,6 +738,56 @@ wv.setUrl("https://example.com/");   // first request carries the custom UA
   pattern-faithful but must be validated on-device (confirm the header via an
   echo endpoint).
 
+## Per-host user agent
+
+One static UA cannot satisfy two sites that want opposite things. Slack
+rejects the engine's own UA as an unsupported browser and wants a mainstream
+desktop Chrome string; Google's sign-in, presented that same Chrome UA by a
+WebKit engine, scores it as a spoof — the claimed Chrome build has no
+`navigator.userAgentData`, sends no `Sec-CH-UA` client hints, and carries a
+WebKit TLS fingerprint — and answers with a CAPTCHA that cannot be passed at
+any score.
+
+`setUserAgentResolver` picks the UA per destination instead:
+
+```java
+WebViewComponent wv = WebViewComponent.create();
+wv.setUserAgent(SAFARI_UA);                  // the default for everything
+wv.setUserAgentResolver(url ->
+    url.contains("://app.slack.com/") ? CHROME_UA : null);   // null = fall through
+wv.setUrl("https://app.slack.com/client");   // first request carries CHROME_UA
+```
+
+* **Precedence.** The resolver's answer wins when it is non-null and
+  non-blank; otherwise the static `setUserAgent` value applies; otherwise the
+  engine default. A `null` or blank return means *fall through*, **not** "use
+  the engine default" — a resolver can never force the engine default over a
+  static override.
+* **When it is consulted.** At three points, each a navigation that is about
+  to start and that the library controls: before a view's initial navigation,
+  before any `setUrl` on a live view, and before a browser-initiated pop-up
+  child's first navigation — keyed on the **pop-up's own target URL**. That
+  last one is the point of the feature: an OAuth sign-in popped out of a site
+  that needs a spoofed UA lands on an identity provider that penalises exactly
+  that spoof. When a resolver is installed it supersedes the opener-copy
+  described under *Popups inherit it* above; with no resolver, opener-copy is
+  unchanged.
+* **Limitation.** This is not per-request switching. A server-side redirect
+  that crosses hosts *during* a navigation keeps the UA that navigation
+  started with. Intercepting every navigation was considered and rejected:
+  WebKit does not reliably expose `NSURLRequest.HTTPBody` to
+  `decidePolicyForNavigationAction` for form POSTs, so the
+  cancel-set-UA-reissue pattern would silently drop OAuth form-post bodies.
+* **Threading.** The resolver runs on the engine UI thread immediately before
+  the navigation it governs, so keep it fast and non-blocking — a host-suffix
+  check, not a network call. A resolver that throws is treated as a `null`
+  return and can never break a navigation.
+* **Platform coverage.** The pop-up path upcalls the resolver natively on
+  macOS, Linux and Windows; the other two points resolve in Java. As with the
+  UA setters, the native upcall ships pattern-faithful but must be validated
+  on-device (`WebViewAdoptPopupDemo`'s **Resolver** toggle plus the
+  `https://httpbin.org/user-agent` echo).
+
 ## Clear cache
 
 When a site renders blank because a stale (or poisoned) cached resource is
@@ -660,6 +843,112 @@ The implementation uses `WKHTTPCookieStore` on macOS,
 The WebView must be displayed and its native peer attached before calling this
 method. Cookie queries are asynchronous and do not block the Swing thread.
 
+## Print to PDF
+
+Print the page a component shows to a PDF file, with no print dialog, at the
+page size and margins you choose:
+
+```java
+WebViewComponent wv = WebViewComponent.create();
+// … after the page (and any layout script it runs) has finished …
+wv.printToPdf(new File("report.pdf"))                        // Letter, no margins
+  .thenAccept(f -> System.out.println("Wrote " + f))
+  .exceptionally(t -> { System.err.println(t.getMessage()); return null; });
+
+wv.printToPdf(new File("report-a4.pdf"), PdfOptions.a4().withMargins(0.5));
+```
+
+* **The PDF is the page.** Sizes and margins are in inches; backgrounds print
+  by default; the engine's own headers and footers are always off and the scale
+  is 1. Pages laid out with CSS page boxes (`@page { size: 8.5in 11in; margin:
+  0 }`) come out one for one.
+* **Asynchronous, completes on the EDT.** The future completes with the file
+  once it is written, or fails with an `IOException` saying why: the folder does
+  not exist, the native library or engine runtime cannot print to PDF, the
+  component is not attached yet, or it was closed first. Prints on one
+  component run one after another.
+* **Capability check.** `WebViewComponent.isPdfPrintingSupported()` is `false`
+  against a native library built before this feature.
+* **Platform coverage.** Linux (lightweight) prints through WebKitGTK's
+  `WebKitPrintOperation` to GTK's "Print to File" printer; macOS (heavyweight,
+  macOS 11+) through `-[WKWebView printOperationWithPrintInfo:]`; Windows
+  (heavyweight) through WebView2's `ICoreWebView2_7::PrintToPdf`. See
+  [`demos/WebViewPdfDemo/`](demos/WebViewPdfDemo/README.md). On Linux the
+  heavyweight component refuses with "PDF printing on Linux needs the
+  lightweight WebView component."
+
+## Custom URL schemes
+
+Serve an application's own pages from a URL scheme of its own, such as
+`demo://app/index.html`, answered in Java. There is no local HTTP server, no
+open port and no token:
+
+```java
+// Before the first WebView is created:
+if (WebViewSchemes.isSupported()) {
+    WebViewSchemes.register("demo", (request, responder) -> {
+        if (request.url().equals("demo://app/index.html")) {
+            responder.respond(WebViewSchemeResponse.ok("text/html",
+                "<h1>Hello</h1>".getBytes(StandardCharsets.UTF_8)));
+        } else {
+            responder.respond(WebViewSchemeResponse.text(404, "Not found"));
+        }
+    });
+}
+WebViewComponent wv = WebViewComponent.create();
+wv.setUrl("demo://app/index.html");
+```
+
+* **Register before the first WebView.** Engines fix their schemes when the
+  first WebView is created, so a later `register` is refused with "Custom
+  schemes must be registered before the first WebView is created." A scheme
+  name is 2–32 characters: a letter first, then letters, digits, `+`, `-` or
+  `.`. The web's own schemes (`http`, `https`, `file`, `data`, `blob`,
+  `about`, `javascript`, `ws`, `wss`, `ftp`) cannot be registered.
+* **The handler contract.** Handlers run off the UI thread, on daemon threads
+  named `webview-scheme-N`. The request carries the method, the full URL, the
+  headers (`header(name)` ignores case) and the body. Answer once, from any
+  thread, whenever you are ready: later answers are ignored. A handler that
+  throws gives the page a 500, and one that has not answered after 30 seconds
+  gives a 504. A request to a scheme with no handler gets a 404.
+* **Headers.** `Content-Length` is computed for you. A missing `Content-Type`
+  becomes `application/octet-stream`, and `Access-Control-Allow-Origin` is set
+  to the request's own origin, so scripts on `demo://app/` can `fetch` other
+  `demo://app/…` addresses.
+* **Caps.** A request body over 16 MB is answered 413 without calling the
+  handler; a response body over 64 MB is replaced by a 500. Bodies arrive
+  whole: there is no streaming.
+* **Capability check.** `WebViewSchemes.isSupported()` is `false` against a
+  native library without this feature, and `register` then fails with "Custom
+  URL schemes are not available in this version of the native library".
+* **Platform coverage.** macOS (heavyweight) through a `WKURLSchemeHandler` on
+  each view's configuration, popups included. Linux (lightweight and
+  heavyweight) through a URI scheme on WebKitGTK's default web context,
+  registered as secure and CORS-enabled, which every view and popup shares.
+  Windows (heavyweight) through custom scheme registrations on the WebView2
+  environment (secure, with a host, accepting requests from pages on the same
+  scheme) and `WebResourceRequested`, on every view and popup. The standalone
+  `WebView` window is not covered. See
+  [`demos/WebViewSchemeDemo/`](demos/WebViewSchemeDemo/README.md).
+* **Linux notes.**
+  * Request bodies need WebKitGTK 2.40 or newer. On older engines the handler
+    gets an empty body and `bodyAvailable()` is `false`.
+  * Response status codes and headers need WebKitGTK 2.36 or newer. On older
+    engines a 2xx answer keeps only its body and `Content-Type`, and any other
+    status reaches the page as a network error.
+  * WebKitGTK does not report abandoned requests, so Linux never cancels one:
+    an unanswered request ends at the 30-second timeout.
+  * Schemes are registered on the default web context, which the standalone
+    `WebView` window also uses, but that window remains unsupported.
+* **Windows notes.**
+  * WebView2 does not report abandoned requests, so Windows never cancels one:
+    an unanswered request ends at the 30-second timeout.
+  * A WebView2 Runtime too old for custom scheme registration cannot load pages
+    from the scheme; the evergreen Runtime on current Windows can.
+  * Do not combine the standalone `WebView` window with registered schemes in
+    one process: WebView2 may refuse the second environment because its options
+    differ.
+
 ## Demo
 
 See [`demos/WebViewHeavyweightDemo/`](demos/WebViewHeavyweightDemo/README.md)
@@ -688,6 +977,17 @@ Additional demos:
   (`alert` / `confirm` / `prompt` / file picker), a custom handler
   returning programmatic answers, and the
   `setDialogHandler(null)` drop mode for headless tests.
+* `demos/WebViewPasswordDemo/` — exercises the built-in password
+  manager: login-submission capture + "Save password?" prompt,
+  autofill on reload, and the programmatic
+  `saveCredential` / `getCredential` / `deleteCredential` API, in both
+  the OS-Keychain and in-memory store modes.
+* `demos/WebViewPdfDemo/` — exercises `printToPdf`: a two-page report
+  with a full-bleed cover printed as Letter and as A4 with margins, and a
+  print into a missing folder (`run-*-pdf-demo`).
+* `demos/WebViewSchemeDemo/` — serves a two-file page from the `demo://`
+  scheme in Java: a script, a POST echoed as JSON, a slow answer, a failing
+  handler and a popup (`run-*-scheme-demo`).
 
 ## Building from source
 

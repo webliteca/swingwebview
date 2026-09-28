@@ -11,8 +11,10 @@ import ca.weblite.webview.EditingCommand;
 import ca.weblite.webview.GdkInput;
 import ca.weblite.webview.JavascriptFunction;
 import ca.weblite.webview.OffscreenWebView;
+import ca.weblite.webview.PasswordDispatcher;
 import ca.weblite.webview.PopupDispatcher;
 import ca.weblite.webview.WebViewDownloadCallback;
+import ca.weblite.webview.WebViewPasswordCallback;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewDialogCallback;
 import ca.weblite.webview.WebViewPopupCallback;
@@ -206,11 +208,36 @@ public class WebViewLightweightComponent extends WebViewComponent {
     }
 
     @Override
+    protected void applyUserAgentResolverToPeer(java.util.function.Function<String, String> resolver) {
+        OffscreenWebView e = engine;
+        if (e != null) {
+            e.setUserAgentResolver(resolver);
+        }
+    }
+
+    @Override
     protected void clearCacheOnPeer() {
         OffscreenWebView e = engine;
         if (e != null) {
             e.clearCache();
         }
+    }
+
+    @Override
+    protected boolean printToPdfOnPeer(java.io.File out,
+                                       ca.weblite.webview.PdfOptions o,
+                                       final ca.weblite.webview.WebViewPdfCallback cb) {
+        OffscreenWebView e = engine;
+        if (e == null) {
+            return false;
+        }
+        // The component owns the caller's future; the wrapper's future only
+        // relays the outcome to cb (Canvas 29 op 7).
+        e.printToPdf(out, o).whenComplete((f, t) -> cb.onPdfFinished(t == null,
+                t == null ? null
+                        : (t instanceof java.util.concurrent.CompletionException
+                                && t.getCause() != null ? t.getCause() : t).getMessage()));
+        return true;
     }
 
     @Override
@@ -309,6 +336,24 @@ public class WebViewLightweightComponent extends WebViewComponent {
                                          String frameUrl) {
                 return dialogDispatcher.dispatchFilePicker(
                     multiple, mimeTypes, extensions, pageUrl, frameUrl);
+            }
+        });
+        // Install the password-manager bridge: inject the shared
+        // detection/fill script and route native login-submission /
+        // fill-request messages to the PasswordDispatcher.  Canvas 27 wires
+        // the native WebKitGTK __webview_pw__ script-message handler on the
+        // offscreen engine; until then this setPasswordCallback call is a
+        // native-side no-op.
+        engine.addOnBeforeLoad(PasswordDispatcher.SHIM_JS);
+        engine.setPasswordCallback(new WebViewPasswordCallback() {
+            @Override
+            public void onLoginSubmitted(String frameUrl, String b64User,
+                                         String b64Pass) {
+                passwordDispatcher.dispatchLoginSubmitted(frameUrl, b64User, b64Pass);
+            }
+            @Override
+            public void onFillRequested(String frameUrl) {
+                passwordDispatcher.dispatchFillRequested(frameUrl);
             }
         });
         // Install the popup bridge (window.open) on the offscreen engine.
@@ -412,9 +457,16 @@ public class WebViewLightweightComponent extends WebViewComponent {
         }
         allocateBuffer(w, h);
         // Apply any custom User-Agent BEFORE the first navigate so the
-        // initial request carries it.
-        if (pendingUserAgent != null) {
-            engine.setUserAgent(pendingUserAgent);
+        // initial request carries it.  With no resolver installed this
+        // resolves to pendingUserAgent, i.e. the pre-1.5.0 behaviour.
+        String initialUa = resolveUserAgentFor(pendingUrl);
+        if (initialUa != null) {
+            engine.setUserAgent(initialUa);
+        }
+        // Push the resolver down so the engine-driven popup path can key a
+        // child's UA off the child's own target URL (consultation point (c)).
+        if (pendingUserAgentResolver != null) {
+            engine.setUserAgentResolver(pendingUserAgentResolver);
         }
         // An adopted popup already carries the engine's own in-flight
         // navigation (the original request WebKit drove into the child, POST
@@ -449,6 +501,8 @@ public class WebViewLightweightComponent extends WebViewComponent {
         dialogDispatcher.disposeAll();
         popupDispatcher.disposeAll();
         downloadDispatcher.disposeAll();
+        passwordDispatcher.disposeAll();
+        failPendingPdf();
         if (engine != null) {
             OffscreenWebView ow = engine;
             engine = null;
@@ -556,6 +610,9 @@ public class WebViewLightweightComponent extends WebViewComponent {
     public WebViewComponent setUrl(String url) {
         pendingUrl = url;
         if (engine != null) {
+            // Resolve the User-Agent for this destination before navigating,
+            // so the request carries it (Canvas 21, consultation point (b)).
+            applyResolvedUserAgentFor(url);
             engine.navigate(url);
         }
         return this;
@@ -684,6 +741,7 @@ public class WebViewLightweightComponent extends WebViewComponent {
             repaintTimer.stop();
             repaintTimer = null;
         }
+        failPendingPdf();
         if (engine != null) {
             OffscreenWebView ow = engine;
             engine = null;

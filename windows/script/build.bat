@@ -38,6 +38,7 @@ cl /D "WEBVIEW_API=__declspec(dllexport)" ^
 	/I "%src_dir%\script\Microsoft.Web.WebView2.0.8.355\build\native\include" ^
 	"%src_dir%\script\Microsoft.Web.WebView2.0.8.355\build\native\x86\WebView2Loader.dll.lib" ^
 	"%JAVA_HOME%\lib\jawt.lib" ^
+	Advapi32.lib ^
 	/std:c++17 /EHsc "/Fo%build_dir%"\ ^
 	"%src_dir%\webview.cc" "%src_dir%\webview_embed.cc" ^
 	/link /DLL "/OUT:%build_dir%\webview.dll"
@@ -53,6 +54,7 @@ cl /D "WEBVIEW_API=__declspec(dllexport)" ^
 	/I "%src_dir%\script\Microsoft.Web.WebView2.0.8.355\build\native\include" ^
 	"%src_dir%\script\Microsoft.Web.WebView2.0.8.355\build\native\x64\WebView2Loader.dll.lib" ^
 	"%JAVA_HOME%\lib\jawt.lib" ^
+	Advapi32.lib ^
 	/std:c++17 /EHsc "/Fo%build_dir%"\ ^
 	"%src_dir%\webview.cc" "%src_dir%\webview_embed.cc" ^
 	/link /DLL "/OUT:%build_dir%\webview.dll"

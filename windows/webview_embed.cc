@@ -18,8 +18,13 @@
 // WIN32_LEAN_AND_MEAN excludes objbase.h, which defines `interface` (=struct)
 // used pervasively by WebView2.h's COM declarations.  Pull it in explicitly.
 #include <objbase.h>
+#include <shlwapi.h>  // SHCreateMemStream (Canvas 32 D5)
+// Windows Credential Manager (CredWriteW / CredReadW / CredEnumerateW /
+// CredDeleteW / CredFree) for the password-manager secret store (Canvas 28).
+#include <wincred.h>
 
 #include <atomic>
+#include <cctype>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -37,6 +42,10 @@
 
 #include "ca_weblite_webview_WebViewNative.h"
 #include "WebView2.h"
+// Canvas 32 D2: the SDK's own WRL helpers for environment options and custom
+// scheme registrations (they keep every other option at the SDK default).
+#include <wrl.h>
+#include "WebView2EnvironmentOptions.h"
 
 #define WV_LOG(fmt, ...) do { \
     fprintf(stderr, "[webview-embed] " fmt "\n", ##__VA_ARGS__); \
@@ -283,6 +292,11 @@ struct Engine {
     std::mutex downloads_mutex;
     std::map<ICoreWebView2DownloadOperation *, struct WinDownloadCtx *> downloads;
 
+    // JNI global ref to the registered WebViewPasswordCallback, or nullptr.
+    // Stored here on Windows (Canvas 26); Canvas 28 wires the __webview_pw__
+    // branch of the WebMessageReceived handler off this field.
+    jobject password_callback = nullptr;
+
     // JNI global ref to the registered WebViewPopupCallback, or nullptr —
     // Canvas 15.  Stored here on Windows; the follow-up Windows coverage
     // canvas wires ICoreWebView2::add_NewWindowRequested off this field
@@ -324,6 +338,21 @@ struct Engine {
     // cannot distinguish an override from the default, so we cache it here.
     // Written / read on this engine's WebView2 worker thread only.
     std::wstring user_agent;
+
+    // Canvas 21 Op 7.3: the PRISTINE engine User-Agent, captured from
+    // get_UserAgent on the first setter call -- necessarily before any
+    // override, since the setter is the only thing that overrides. WebView2
+    // has no "clear" verb: put_UserAgent(L"") returns S_OK and leaves the
+    // previous override in force, so a reset has to write this string back
+    // literally. Worker thread only.
+    std::wstring default_user_agent;
+
+    // Canvas 21 (1.5.0): per-destination User-Agent resolver
+    // (java.util.function.Function<String,String>) held as a JNI global ref.
+    // Consulted at the popup-child creation site with the CHILD's own target
+    // URL; a decline falls back to the tracked `user_agent` above.  Deleted on
+    // replacement and on engine destroy.
+    jobject ua_resolver = nullptr;
 };
 
 static void fire_focus_callback(Engine *e, bool became) {
@@ -542,6 +571,89 @@ static char *fire_dialog_prompt(JavaVM *jvm, jobject callback,
     return result;  // caller owns; free with free()
 }
 
+// Password-manager fire helpers (Canvas 28) -- mirror the fire_dialog_*
+// shape.  Both target methods are void and non-blocking on the Java side
+// (PasswordDispatcher marshals the save prompt to the EDT via invokeLater
+// and runs store I/O on a worker), so unlike the dialog confirm/prompt
+// path these may be called directly from the WebMessageReceived worker
+// without a deferral.  The username / password arrive already base64url
+// encoded and are passed through verbatim; Java decodes them.  No-op when
+// the callback global ref is null.
+static void fire_password_submitted(JavaVM *jvm, jobject callback,
+                                    const char *frameUrl,
+                                    const char *b64user,
+                                    const char *b64pass) {
+    if (!jvm || !callback) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK
+                || !env) {
+            return;
+        }
+        detach = true;
+    }
+    if (!env) {
+        if (detach) jvm->DetachCurrentThread();
+        return;
+    }
+    jstring jframe = env->NewStringUTF(frameUrl ? frameUrl : "");
+    jstring juser = env->NewStringUTF(b64user ? b64user : "");
+    jstring jpass = env->NewStringUTF(b64pass ? b64pass : "");
+    jclass cls = env->GetObjectClass(callback);
+    if (cls) {
+        jmethodID m = env->GetMethodID(
+            cls, "onLoginSubmitted",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+        if (m) {
+            env->CallVoidMethod(callback, m, jframe, juser, jpass);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (jframe) env->DeleteLocalRef(jframe);
+    if (juser) env->DeleteLocalRef(juser);
+    if (jpass) env->DeleteLocalRef(jpass);
+    if (detach) jvm->DetachCurrentThread();
+}
+
+static void fire_password_fill_requested(JavaVM *jvm, jobject callback,
+                                         const char *frameUrl) {
+    if (!jvm || !callback) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK
+                || !env) {
+            return;
+        }
+        detach = true;
+    }
+    if (!env) {
+        if (detach) jvm->DetachCurrentThread();
+        return;
+    }
+    jstring jframe = env->NewStringUTF(frameUrl ? frameUrl : "");
+    jclass cls = env->GetObjectClass(callback);
+    if (cls) {
+        jmethodID m = env->GetMethodID(cls, "onFillRequested",
+                                       "(Ljava/lang/String;)V");
+        if (m) {
+            env->CallVoidMethod(callback, m, jframe);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (jframe) env->DeleteLocalRef(jframe);
+    if (detach) jvm->DetachCurrentThread();
+}
+
 // IUnknown helper -- gives each WebView2 callback proper refcounting and
 // QueryInterface support.  The interfaces we implement are all single-
 // inheritance (Iface : IUnknown), so a templated base keeps boilerplate low.
@@ -608,6 +720,91 @@ public:
     HRESULT STDMETHODCALLTYPE Invoke(HRESULT /*errorCode*/) override {
         return S_OK;
     }
+};
+
+// ---------------------------------------------------------------------------
+// Canvas 29: print-to-PDF request.  One per print; holds a global ref to the
+// Java WebViewPdfCallback.  pdf_finish upcalls onPdfFinished exactly once
+// (D1), deletes the ref and the job.  Callable from any thread.
+// ---------------------------------------------------------------------------
+struct PdfJob {
+    JavaVM *jvm = nullptr;
+    jobject cb = nullptr;
+    bool done = false;
+};
+
+static PdfJob *pdf_new_job(JNIEnv *env, jobject cb) {
+    PdfJob *job = new PdfJob();
+    env->GetJavaVM(&job->jvm);
+    job->cb = cb ? env->NewGlobalRef(cb) : nullptr;
+    return job;
+}
+
+static void pdf_finish(PdfJob *job, bool ok, const char *err) {
+    if (!job || job->done) return;
+    job->done = true;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (job->jvm && job->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        job->jvm->AttachCurrentThread((void **)&env, nullptr);
+        detach = true;
+    }
+    if (env && job->cb) {
+        jclass cls = env->GetObjectClass(job->cb);
+        jmethodID m = cls ? env->GetMethodID(cls, "onPdfFinished",
+                                             "(ZLjava/lang/String;)V")
+                          : nullptr;
+        if (m) {
+            jstring jerr = (ok || !err) ? nullptr : env->NewStringUTF(err);
+            env->CallVoidMethod(job->cb, m, (jboolean)(ok ? JNI_TRUE : JNI_FALSE),
+                                jerr);
+            if (jerr) env->DeleteLocalRef(jerr);
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (cls) env->DeleteLocalRef(cls);
+        env->DeleteGlobalRef(job->cb);
+        job->cb = nullptr;
+    }
+    if (detach) job->jvm->DetachCurrentThread();
+    delete job;
+}
+
+static const char *const kPdfNotAttached = "The WebView is not attached yet.";
+
+static void pdf_finish_hr(PdfJob *job, HRESULT hr) {
+    char buf[96];
+    snprintf(buf, sizeof(buf),
+             "The page could not be printed to PDF (HRESULT 0x%08lX).",
+             (unsigned long)hr);
+    pdf_finish(job, false, buf);
+}
+
+// Canvas 29 D10: completed-handler for ICoreWebView2_7::PrintToPdf.
+class PrintToPdfHandler : public CallbackBase<
+    ICoreWebView2PrintToPdfCompletedHandler> {
+public:
+    explicit PrintToPdfHandler(PdfJob *job) : m_job(job) {}
+    // Take the job back when PrintToPdf fails synchronously and will never
+    // invoke this handler.
+    PdfJob *take() {
+        PdfJob *job = m_job;
+        m_job = nullptr;
+        return job;
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT errorCode,
+                                     BOOL isSuccessful) override {
+        PdfJob *job = take();
+        if (!job) return S_OK;
+        if (FAILED(errorCode)) {
+            pdf_finish_hr(job, errorCode);
+        } else {
+            pdf_finish(job, isSuccessful ? true : false,
+                       "The page could not be printed to PDF.");
+        }
+        return S_OK;
+    }
+private:
+    PdfJob *m_job;
 };
 
 // Forward declarations.
@@ -756,6 +953,53 @@ public:
             args->get_WebMessageAsJson(&msg);
         }
         if (msg) {
+            // Password-manager channel (Canvas 28): the shared SHIM_JS posts
+            // `__webview_pw__:<payload>` on the single WebView2 message
+            // channel.  Demux by content -- a `__webview_pw__:` prefix is a
+            // login-submission ("S|b64user|b64pass") or fill-request ("F")
+            // and is routed to the password callback; everything else falls
+            // through to the normal bind dispatch.
+            std::string full = wide_to_utf8(msg);
+            static const std::string PW_PREFIX = "__webview_pw__:";
+            if (full.rfind(PW_PREFIX, 0) == 0) {
+                std::string payload = full.substr(PW_PREFIX.size());
+                // Committed source URL, read natively (the trusted origin).
+                std::string src;
+                LPWSTR src_w = nullptr;
+                if (SUCCEEDED(args->get_Source(&src_w)) && src_w) {
+                    src = wide_to_utf8(src_w);
+                    CoTaskMemFree(src_w);
+                } else if (m_engine && m_engine->webview) {
+                    LPWSTR page_w = nullptr;
+                    if (SUCCEEDED(m_engine->webview->get_Source(&page_w))
+                            && page_w) {
+                        src = wide_to_utf8(page_w);
+                        CoTaskMemFree(page_w);
+                    }
+                }
+                JavaVM *jvm = m_engine ? m_engine->jvm : nullptr;
+                jobject cb = m_engine ? m_engine->password_callback : nullptr;
+                if (cb && !payload.empty()) {
+                    if (payload[0] == 'S') {
+                        // S|b64user|b64pass -- the base64url fields never
+                        // contain '|', so a plain split is unambiguous.
+                        std::string rest = payload.substr(1);
+                        if (!rest.empty() && rest[0] == '|') rest = rest.substr(1);
+                        size_t bar = rest.find('|');
+                        std::string b64user = (bar == std::string::npos)
+                            ? rest : rest.substr(0, bar);
+                        std::string b64pass = (bar == std::string::npos)
+                            ? std::string() : rest.substr(bar + 1);
+                        fire_password_submitted(jvm, cb, src.c_str(),
+                                                b64user.c_str(),
+                                                b64pass.c_str());
+                    } else if (payload[0] == 'F') {
+                        fire_password_fill_requested(jvm, cb, src.c_str());
+                    }
+                }
+                CoTaskMemFree(msg);
+                return S_OK;
+            }
             engine_on_message(m_engine, msg);
             CoTaskMemFree(msg);
         }
@@ -1818,19 +2062,468 @@ private:
 // interface (mirrors the embed setter's tolerance).  Nested popups reuse the
 // opener engine, so they inherit the same override.  Covers BOTH the ADOPT and
 // NATIVE_WINDOW dispositions.
-static void propagate_popup_user_agent(Engine *opener, ICoreWebView2 *child) {
-    if (!opener || !child || opener->user_agent.empty()) return;
+// Canvas 21 (1.5.0): ask the per-destination User-Agent resolver which UA to
+// present for a navigation to `url`.  Returns the empty string when there is no
+// resolver, no url, or the resolver declines (a null/empty return) or throws --
+// a resolver must never be able to break a navigation, so a pending exception
+// is cleared and treated as a decline.  Runs on the WebView2 worker thread,
+// which is not attached to the JVM, so it attaches and detaches symmetrically.
+static std::wstring resolve_ua_for_win(Engine *e, const char *url) {
+    std::wstring out;
+    // Canvas 21 Op 7.4: "declined" and "never installed" imply different bugs,
+    // so say which.
+    if (!e || !e->jvm) { WV_LOG("resolve_ua: no engine/jvm"); return out; }
+    if (!e->ua_resolver) {
+        WV_LOG("resolve_ua: NO RESOLVER INSTALLED on this engine");
+        return out;
+    }
+    if (!url || !*url) { WV_LOG("resolve_ua: no target url"); return out; }
+    JavaVM *jvm = e->jvm;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return out;
+        detach = true;
+    }
+    jstring ju = env->NewStringUTF(url);
+    jclass cls = env->GetObjectClass(e->ua_resolver);
+    if (cls && ju) {
+        jmethodID mid = env->GetMethodID(cls, "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;");
+        if (mid) {
+            jobject r = env->CallObjectMethod(e->ua_resolver, mid, ju);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+                r = nullptr;
+            }
+            if (r) {
+                const char *cs = env->GetStringUTFChars((jstring)r, nullptr);
+                if (cs && *cs) out = utf8_to_wide(cs);
+                if (cs) env->ReleaseStringUTFChars((jstring)r, cs);
+                env->DeleteLocalRef(r);
+            }
+        }
+    }
+    if (cls) env->DeleteLocalRef(cls);
+    if (ju) env->DeleteLocalRef(ju);
+    if (detach) jvm->DetachCurrentThread();
+    return out;
+}
+
+// Canvas 21 Op 7.5: sets the User-Agent on a pop-up child's FIRST request.
+//
+// put_UserAgent on the child returns S_OK and does not affect that request --
+// by the time NewWindowRequested hands us the child, WebView2 has committed the
+// navigation and a settings write cannot overtake it. The request HEADER can
+// still be rewritten, and a request cannot lose a race with itself.
+//
+// Scoped as narrowly as possible: filtered to the DOCUMENT resource context, so
+// only the child's main-document request is seen, and latched so it acts once
+// and is inert thereafter. Nothing is cancelled or re-issued -- only a header is
+// set -- so window.opener and the in-flight POST body (Canvas 18 D7) survive.
+class PopupUaHeaderHandler : public CallbackBase<
+    ICoreWebView2WebResourceRequestedEventHandler> {
+public:
+    explicit PopupUaHeaderHandler(std::wstring ua) : m_ua(std::move(ua)) {}
+    HRESULT STDMETHODCALLTYPE Invoke(
+        ICoreWebView2 *,
+        ICoreWebView2WebResourceRequestedEventArgs *args) override {
+        if (m_done || !args) return S_OK;
+        ICoreWebView2WebResourceRequest *req = nullptr;
+        if (SUCCEEDED(args->get_Request(&req)) && req) {
+            ICoreWebView2HttpRequestHeaders *headers = nullptr;
+            if (SUCCEEDED(req->get_Headers(&headers)) && headers) {
+                HRESULT hr = headers->SetHeader(L"User-Agent", m_ua.c_str());
+                WV_LOG("popup_ua: first-request header rewrite hr=0x%08lx ua=%ls",
+                       (unsigned long)hr, m_ua.c_str());
+                if (SUCCEEDED(hr)) m_done = true;
+                headers->Release();
+            } else {
+                WV_LOG("popup_ua: first-request get_Headers failed");
+            }
+            req->Release();
+        } else {
+            WV_LOG("popup_ua: first-request get_Request failed");
+        }
+        return S_OK;
+    }
+private:
+    std::wstring m_ua;
+    bool m_done = false;
+};
+
+static void propagate_popup_user_agent(Engine *opener, ICoreWebView2 *child,
+                                       const char *target_uri) {
+    // Canvas 21 Op 7.4: this function has three silent exits and an unchecked
+    // put_UserAgent, and a child left on the engine default is consistent with
+    // every one of them. Log which path was taken.
+    WV_LOG("popup_ua: enter uri=%s opener=%p child=%p",
+           target_uri ? target_uri : "(null)", (void *)opener, (void *)child);
+    if (!opener || !child) {
+        WV_LOG("popup_ua: no opener or child -- nothing to propagate");
+        return;
+    }
+    // Canvas 21 (1.5.0): a resolver keyed on the CHILD's own target URL wins --
+    // the case that matters is an OAuth sign-in popped out of a site that
+    // requires a spoofed UA, landing on an identity provider that penalises
+    // exactly that spoof.  A resolver that declines (or none at all) falls
+    // through to the opener's tracked override, so pre-1.5.0 behaviour is
+    // preserved byte-for-byte for callers that never set one.
+    std::wstring resolved = resolve_ua_for_win(opener, target_uri);
+    std::wstring ua = resolved;
+    const char *source = "resolver";
+    if (ua.empty()) {
+        ua = opener->user_agent;
+        source = "opener tracked override";
+    }
+    WV_LOG("popup_ua: resolver=%ls openerTracked=%ls chose=%s",
+           resolved.empty() ? L"(declined)" : resolved.c_str(),
+           opener->user_agent.empty() ? L"(none)" : opener->user_agent.c_str(),
+           ua.empty() ? "(nothing -- child keeps the engine default)" : source);
+    if (ua.empty()) return;
     ICoreWebView2Settings *settings = nullptr;
-    if (SUCCEEDED(child->get_Settings(&settings)) && settings) {
+    HRESULT hrGet = child->get_Settings(&settings);
+    if (SUCCEEDED(hrGet) && settings) {
         ICoreWebView2Settings2 *settings2 = nullptr;
-        if (SUCCEEDED(settings->QueryInterface(
+        HRESULT hrQi = settings->QueryInterface(
                 __uuidof(ICoreWebView2Settings2),
-                reinterpret_cast<void **>(&settings2))) && settings2) {
-            settings2->put_UserAgent(opener->user_agent.c_str());
+                reinterpret_cast<void **>(&settings2));
+        if (SUCCEEDED(hrQi) && settings2) {
+            HRESULT hrPut = settings2->put_UserAgent(ua.c_str());
+            WV_LOG("popup_ua: put_UserAgent hr=0x%08lx ua=%ls",
+                   (unsigned long)hrPut, ua.c_str());
             settings2->Release();
+        } else {
+            WV_LOG("popup_ua: ICoreWebView2Settings2 UNAVAILABLE on the child "
+                   "hr=0x%08lx -- cannot set its UA", (unsigned long)hrQi);
         }
         settings->Release();
+    } else {
+        WV_LOG("popup_ua: child get_Settings failed hr=0x%08lx",
+               (unsigned long)hrGet);
     }
+
+    // The settings write above cannot reach the child's FIRST request, so hook
+    // that one request and set the header directly (Op 7.5). Registered here,
+    // inside the deferral and before Complete(), which is the only window in
+    // which the request has not yet gone out. put_UserAgent still covers every
+    // request after this one.
+    auto *hook = new PopupUaHeaderHandler(ua);
+    EventRegistrationToken hookToken{};
+    HRESULT hrFilter = child->AddWebResourceRequestedFilter(
+        L"*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT);
+    HRESULT hrAdd = child->add_WebResourceRequested(hook, &hookToken);
+    WV_LOG("popup_ua: first-request hook filter=0x%08lx add=0x%08lx",
+           (unsigned long)hrFilter, (unsigned long)hrAdd);
+    // WebView2 holds its own reference on success; on failure this is the last
+    // one and the handler deletes itself.
+    hook->Release();
+}
+
+// ---------------------------------------------------------------------------
+// Canvas 32: custom URL schemes on WebView2.  The schemes are declared on the
+// environment when it is created (D1, D2), a WebResourceRequested filter and
+// handler go on every webview the library creates (D3), and each request is
+// held by a deferral until Java answers (D4, D5).  WebView2 never reports an
+// abandoned request, so Windows never upcalls a cancellation (D6).
+//
+// The shared state and the upcall mirror src_c/webview_embed.cpp (Canvas 30
+// D14, D15); this file is a separate translation unit, so it has its own copy
+// (Canvas 32 D9).
+// ---------------------------------------------------------------------------
+static std::vector<std::string> g_scheme_names;
+static jobject g_scheme_dispatcher = nullptr;
+static JavaVM *g_scheme_jvm = nullptr;
+static std::atomic<long long> g_scheme_next_id(0);
+static std::mutex g_scheme_mutex;
+static bool g_scheme_installed = false;
+
+// The largest request body read: the dispatcher's cap plus one byte, so an
+// over-cap body is still recognised and answered 413.
+static const size_t kSchemeMaxRequestRead = 16u * 1024u * 1024u + 1u;
+
+struct WinSchemeRequest {
+    ICoreWebView2WebResourceRequestedEventArgs *args = nullptr;
+    ICoreWebView2Deferral *deferral = nullptr;
+    ICoreWebView2Environment *env = nullptr;
+    DWORD thread_id = 0;
+};
+static std::map<long long, WinSchemeRequest> g_win_scheme_requests;
+
+// Upcall SchemeDispatcher.onSchemeRequest (Canvas 30 D15).  Called from a
+// detached thread, never the engine thread.
+static void scheme_upcall_request(long long id, const std::string &method,
+                                  const std::string &url,
+                                  const std::vector<std::string> &headerPairs,
+                                  const std::vector<unsigned char> &body,
+                                  bool bodyAvailable) {
+    if (!g_scheme_dispatcher || !g_scheme_jvm) return;
+    JNIEnv *env = nullptr;
+    bool attached = false;
+    if (g_scheme_jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (g_scheme_jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env) return;
+        attached = true;
+    }
+    jclass cls = env->GetObjectClass(g_scheme_dispatcher);
+    jmethodID m = cls ? env->GetMethodID(cls, "onSchemeRequest",
+        "(JLjava/lang/String;Ljava/lang/String;[Ljava/lang/String;[BZ)V") : nullptr;
+    if (m) {
+        jstring jmethod = env->NewStringUTF(method.c_str());
+        jstring jurl = env->NewStringUTF(url.c_str());
+        jclass strCls = env->FindClass("java/lang/String");
+        jobjectArray jpairs = strCls
+            ? env->NewObjectArray((jsize)headerPairs.size(), strCls, nullptr) : nullptr;
+        if (jpairs) {
+            for (size_t i = 0; i < headerPairs.size(); i++) {
+                jstring v = env->NewStringUTF(headerPairs[i].c_str());
+                env->SetObjectArrayElement(jpairs, (jsize)i, v);
+                if (v) env->DeleteLocalRef(v);
+            }
+        }
+        jbyteArray jbody = env->NewByteArray((jsize)body.size());
+        if (jbody && !body.empty()) {
+            env->SetByteArrayRegion(jbody, 0, (jsize)body.size(),
+                                    (const jbyte *)body.data());
+        }
+        env->CallVoidMethod(g_scheme_dispatcher, m, (jlong)id, jmethod, jurl, jpairs,
+                            jbody, (jboolean)(bodyAvailable ? JNI_TRUE : JNI_FALSE));
+        if (jmethod) env->DeleteLocalRef(jmethod);
+        if (jurl) env->DeleteLocalRef(jurl);
+        if (jpairs) env->DeleteLocalRef(jpairs);
+        if (jbody) env->DeleteLocalRef(jbody);
+        if (strCls) env->DeleteLocalRef(strCls);
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (cls) env->DeleteLocalRef(cls);
+    if (attached) g_scheme_jvm->DetachCurrentThread();
+}
+
+// D2.  The environment options carrying the scheme registrations, or null when
+// nothing is registered (then environments are created exactly as before) or
+// on any failure (then the engine is created without schemes).
+static Microsoft::WRL::ComPtr<ICoreWebView2EnvironmentOptions> win_scheme_environment_options() {
+    Microsoft::WRL::ComPtr<ICoreWebView2EnvironmentOptions> result;
+    if (g_scheme_names.empty()) return result;
+    auto options = Microsoft::WRL::Make<CoreWebView2EnvironmentOptions>();
+    if (!options) {
+        WV_LOG("scheme options: Make<CoreWebView2EnvironmentOptions> failed");
+        return result;
+    }
+    std::vector<Microsoft::WRL::ComPtr<ICoreWebView2CustomSchemeRegistration>> regs;
+    std::vector<ICoreWebView2CustomSchemeRegistration *> raw;
+    for (const std::string &name : g_scheme_names) {
+        std::wstring wname = utf8_to_wide(name.c_str());
+        std::wstring origins = wname + L"://*";
+        auto reg = Microsoft::WRL::Make<CoreWebView2CustomSchemeRegistration>(wname.c_str());
+        if (!reg) {
+            WV_LOG("scheme options: registration for %s failed", name.c_str());
+            return result;
+        }
+        reg->put_TreatAsSecure(TRUE);
+        reg->put_HasAuthorityComponent(TRUE);
+        LPCWSTR allowed[1] = { origins.c_str() };
+        reg->SetAllowedOrigins(1, allowed);
+        Microsoft::WRL::ComPtr<ICoreWebView2CustomSchemeRegistration> iface;
+        if (FAILED(reg.As(&iface))) return result;
+        regs.push_back(iface);
+        raw.push_back(iface.Get());
+    }
+    Microsoft::WRL::ComPtr<ICoreWebView2EnvironmentOptions4> options4;
+    if (FAILED(options.As(&options4)) || !options4) {
+        WV_LOG("scheme options: ICoreWebView2EnvironmentOptions4 unavailable");
+        return result;
+    }
+    HRESULT hr = options4->SetCustomSchemeRegistrations((UINT32)raw.size(), raw.data());
+    if (FAILED(hr)) {
+        WV_LOG("scheme options: SetCustomSchemeRegistrations hr=0x%08lx", (unsigned long)hr);
+        return result;
+    }
+    options.As(&result);
+    return result;
+}
+
+// D4.  One handler per webview; it ignores every request whose scheme is not
+// registered, because WebView2 hands each filtered request to every handler
+// on the webview (the popup UA hook filters "*").
+class SchemeRequestHandler : public CallbackBase<
+    ICoreWebView2WebResourceRequestedEventHandler> {
+public:
+    explicit SchemeRequestHandler(ICoreWebView2Environment *env) : m_env(env) {
+        if (m_env) m_env->AddRef();
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(
+        ICoreWebView2 *,
+        ICoreWebView2WebResourceRequestedEventArgs *args) override {
+        if (!args || !m_env) return S_OK;
+        ICoreWebView2WebResourceRequest *req = nullptr;
+        if (FAILED(args->get_Request(&req)) || !req) return S_OK;
+        std::string url;
+        LPWSTR wuri = nullptr;
+        if (SUCCEEDED(req->get_Uri(&wuri)) && wuri) {
+            url = wide_to_utf8(wuri);
+            CoTaskMemFree(wuri);
+        }
+        size_t colon = url.find(':');
+        std::string scheme = colon == std::string::npos ? std::string() : url.substr(0, colon);
+        for (auto &c : scheme) c = (char)tolower((unsigned char)c);
+        bool ours = false;
+        for (const std::string &n : g_scheme_names) {
+            if (n == scheme) { ours = true; break; }
+        }
+        if (!ours) { req->Release(); return S_OK; }
+
+        std::string method = "GET";
+        LPWSTR wmethod = nullptr;
+        if (SUCCEEDED(req->get_Method(&wmethod)) && wmethod) {
+            if (*wmethod) method = wide_to_utf8(wmethod);
+            CoTaskMemFree(wmethod);
+        }
+        std::vector<std::string> pairs;
+        ICoreWebView2HttpRequestHeaders *headers = nullptr;
+        if (SUCCEEDED(req->get_Headers(&headers)) && headers) {
+            ICoreWebView2HttpHeadersCollectionIterator *it = nullptr;
+            if (SUCCEEDED(headers->GetIterator(&it)) && it) {
+                BOOL has = FALSE;
+                while (SUCCEEDED(it->get_HasCurrentHeader(&has)) && has) {
+                    LPWSTR n = nullptr, v = nullptr;
+                    if (SUCCEEDED(it->GetCurrentHeader(&n, &v))) {
+                        pairs.push_back(n ? wide_to_utf8(n) : std::string());
+                        pairs.push_back(v ? wide_to_utf8(v) : std::string());
+                    }
+                    if (n) CoTaskMemFree(n);
+                    if (v) CoTaskMemFree(v);
+                    BOOL next = FALSE;
+                    if (FAILED(it->MoveNext(&next)) || !next) break;
+                }
+                it->Release();
+            }
+            headers->Release();
+        }
+        std::vector<unsigned char> body;
+        IStream *content = nullptr;
+        if (SUCCEEDED(req->get_Content(&content)) && content) {
+            unsigned char buf[16384];
+            while (body.size() < kSchemeMaxRequestRead) {
+                ULONG got = 0;
+                HRESULT hr = content->Read(buf, (ULONG)sizeof(buf), &got);
+                if (FAILED(hr) || got == 0) break;
+                body.insert(body.end(), buf, buf + got);
+            }
+            if (body.size() > kSchemeMaxRequestRead) body.resize(kSchemeMaxRequestRead);
+            content->Release();
+        }
+        req->Release();
+
+        ICoreWebView2Deferral *deferral = nullptr;
+        HRESULT hr = args->GetDeferral(&deferral);
+        if (FAILED(hr) || !deferral) {
+            WV_LOG("scheme GetDeferral failed: HRESULT=0x%08lx", (unsigned long)hr);
+            return S_OK;   // left to WebView2: a load failure, never a hang
+        }
+        long long id = ++g_scheme_next_id;
+        args->AddRef();
+        m_env->AddRef();
+        {
+            std::lock_guard<std::mutex> lk(g_scheme_mutex);
+            WinSchemeRequest &r = g_win_scheme_requests[id];
+            r.args = args;
+            r.deferral = deferral;
+            r.env = m_env;
+            r.thread_id = GetCurrentThreadId();
+        }
+        std::thread([id, method, url, pairs, body] {
+            scheme_upcall_request(id, method, url, pairs, body, true);
+        }).detach();
+        return S_OK;
+    }
+protected:
+    ~SchemeRequestHandler() override {
+        if (m_env) m_env->Release();
+    }
+private:
+    ICoreWebView2Environment *m_env;
+};
+
+// D3.  Filter and hook one webview (the engine's, or a popup child).  A no-op
+// when nothing is registered.  The handler lives as long as the webview.
+static void win_install_scheme_hook(ICoreWebView2 *wv, ICoreWebView2Environment *env) {
+    if (!wv || !env || g_scheme_names.empty()) return;
+    for (const std::string &name : g_scheme_names) {
+        std::wstring filter = utf8_to_wide(name.c_str()) + L":*";
+        HRESULT hr = wv->AddWebResourceRequestedFilter(
+            filter.c_str(), COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+        if (FAILED(hr)) {
+            WV_LOG("scheme filter %s failed: HRESULT=0x%08lx", name.c_str(), (unsigned long)hr);
+        }
+    }
+    auto *h = new SchemeRequestHandler(env);
+    EventRegistrationToken token{};
+    HRESULT hr = wv->add_WebResourceRequested(h, &token);
+    if (FAILED(hr)) {
+        WV_LOG("scheme add_WebResourceRequested failed: HRESULT=0x%08lx", (unsigned long)hr);
+    }
+    h->Release();
+}
+
+static LPCWSTR win_reason_phrase(int status) {
+    switch (status) {
+    case 200: return L"OK";
+    case 204: return L"No Content";
+    case 301: return L"Moved Permanently";
+    case 302: return L"Found";
+    case 304: return L"Not Modified";
+    case 400: return L"Bad Request";
+    case 403: return L"Forbidden";
+    case 404: return L"Not Found";
+    case 405: return L"Method Not Allowed";
+    case 413: return L"Payload Too Large";
+    case 500: return L"Internal Server Error";
+    case 504: return L"Gateway Timeout";
+    default:  return L"";
+    }
+}
+
+// D5.  Any thread; applied on the request's engine thread, once.
+static void win_scheme_respond(long long id, int status, std::vector<std::string> pairs,
+                               std::vector<unsigned char> body) {
+    WinSchemeRequest r;
+    {
+        std::lock_guard<std::mutex> lk(g_scheme_mutex);
+        auto it = g_win_scheme_requests.find(id);
+        if (it == g_win_scheme_requests.end()) return;
+        r = it->second;
+        g_win_scheme_requests.erase(it);
+    }
+    // If the engine thread has already exited, the post fails and these COM
+    // references are leaked rather than released on the wrong apartment (D5.3).
+    post_to_worker_thread(r.thread_id, [r, status, pairs, body] {
+        IStream *stream = SHCreateMemStream(body.empty() ? nullptr : body.data(),
+                                            (UINT)body.size());
+        std::wstring headers;
+        for (size_t i = 0; i + 1 < pairs.size(); i += 2) {
+            headers += utf8_to_wide(pairs[i].c_str());
+            headers += L": ";
+            headers += utf8_to_wide(pairs[i + 1].c_str());
+            headers += L"\r\n";
+        }
+        ICoreWebView2WebResourceResponse *resp = nullptr;
+        HRESULT hr = r.env->CreateWebResourceResponse(stream, status, win_reason_phrase(status),
+                                                      headers.c_str(), &resp);
+        if (SUCCEEDED(hr) && resp) {
+            r.args->put_Response(resp);
+        } else {
+            WV_LOG("scheme CreateWebResourceResponse failed: HRESULT=0x%08lx",
+                   (unsigned long)hr);
+        }
+        r.deferral->Complete();   // always: a load failure, never a hang
+        if (resp) resp->Release();
+        if (stream) stream->Release();
+        r.deferral->Release();
+        r.args->Release();
+        r.env->Release();
+    });
 }
 
 // NewWindowRequested -> allow/deny via Java, then create the linked child in an
@@ -1996,7 +2689,9 @@ public:
 
                             // Canvas 21: inherit the opener's custom UA before
                             // the child's in-flight initial navigation.
-                            propagate_popup_user_agent(e, child);
+                            propagate_popup_user_agent(e, child, uri.c_str());
+                            // Canvas 32 D3: the popup child answers the same custom schemes (AC11).
+                            win_install_scheme_hook(child, e->environment);
 
                             // Return the LINKED child to WebView2 so it drives
                             // the original request (POST verb+body,
@@ -2117,7 +2812,9 @@ public:
 
                         // Canvas 21: inherit the opener's custom UA before the
                         // child's in-flight initial navigation.
-                        propagate_popup_user_agent(e, child);
+                        propagate_popup_user_agent(e, child, uri.c_str());
+                        // Canvas 32 D3: the popup child answers the same custom schemes (AC11).
+                        win_install_scheme_hook(child, e->environment);
 
                         args->put_NewWindow(child);   // LINKED to opener
                         args->put_Handled(TRUE);
@@ -2344,6 +3041,18 @@ static void engine_thread(Engine *e, HWND /*parent*/, int width, int height,
                         // the ScriptDialogHandler registered below.
                         // STORY-004-003.
                         settings->put_AreDefaultScriptDialogsEnabled(FALSE);
+                        // Disable Edge's built-in "save password?" autosave so
+                        // it does not compete with this library's own manager
+                        // (Canvas 28).  Guarded: a Runtime without
+                        // ICoreWebView2Settings4 is a silent no-op.
+                        ICoreWebView2Settings4 *settings4 = nullptr;
+                        if (SUCCEEDED(settings->QueryInterface(
+                                __uuidof(ICoreWebView2Settings4),
+                                reinterpret_cast<void **>(&settings4)))
+                                && settings4) {
+                            settings4->put_IsPasswordAutosaveEnabled(FALSE);
+                            settings4->Release();
+                        }
                         settings->Release();
                     }
 
@@ -2414,6 +3123,10 @@ static void engine_thread(Engine *e, HWND /*parent*/, int width, int height,
                         nwh, &e->new_window_token);
                     nwh->Release();
 
+                    // Custom URL schemes (Canvas 32 D3); a no-op when none
+                    // are registered.
+                    win_install_scheme_hook(e->webview, e->environment);
+
                     init_done.clear();
                 });
             HRESULT r2 = env->CreateCoreWebView2Controller(
@@ -2434,10 +3147,14 @@ static void engine_thread(Engine *e, HWND /*parent*/, int width, int height,
                "GetLastError=%lu; falling back to the WebView2 default",
                user_data_error);
     }
+    // Canvas 32 D1: declare the custom schemes on the environment. Null when
+    // none are registered, retaining the default WebView2 environment options.
+    Microsoft::WRL::ComPtr<ICoreWebView2EnvironmentOptions> scheme_options =
+        win_scheme_environment_options();
     HRESULT res = CreateCoreWebView2EnvironmentWithOptions(
         nullptr,
         user_data_folder.empty() ? nullptr : user_data_folder.c_str(),
-        nullptr, env_handler);
+        scheme_options.Get(), env_handler);
     env_handler->Release();
     if (FAILED(res)) {
         WV_LOG("CreateCoreWebView2EnvironmentWithOptions failed: "
@@ -2618,6 +3335,20 @@ static void destroy_engine(Engine *e) {
         e->dialog_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
+    // Symmetric cleanup for the password callback global ref (Canvas 28).
+    // The WebMessageReceived handler fires off this field, so clear it
+    // before the worker thread tears down.
+    if (e->password_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->password_callback);
+        e->password_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     // Symmetric cleanup for the download callback global ref (Canvas 25),
     // plus every download still in flight.  A download can outlive the
     // page and the navigation, so both go before the worker thread tears
@@ -2657,6 +3388,11 @@ static void destroy_engine(Engine *e) {
         }
         if (env) env->DeleteGlobalRef(e->popup_callback);
         e->popup_callback = nullptr;
+        // Canvas 21 (1.5.0): the User-Agent resolver's global ref goes with the
+        // popup callback -- only the popup path reads it, and a late popup
+        // during teardown would otherwise follow a freed ref.
+        if (env && e->ua_resolver) env->DeleteGlobalRef(e->ua_resolver);
+        e->ua_resolver = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
     // Release the environment ref taken at environment-ready (Canvas 17).
@@ -2824,6 +3560,63 @@ static Engine *adopt_retained_popup(JNIEnv *env, HWND parent, RetainedPopup *rp,
     });
 
     return e;
+}
+
+// Standard base64url (no padding) over raw bytes -- used to build a
+// delimiter-safe Credential Manager TargetName in the password store
+// (Canvas 28).
+static std::string pw_b64url_encode(const std::string &in) {
+    static const char *T =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    std::string out;
+    out.reserve(((in.size() + 2) / 3) * 4);
+    size_t i = 0;
+    for (; i + 2 < in.size(); i += 3) {
+        unsigned n = ((unsigned char)in[i] << 16)
+                   | ((unsigned char)in[i + 1] << 8)
+                   | ((unsigned char)in[i + 2]);
+        out.push_back(T[(n >> 18) & 63]);
+        out.push_back(T[(n >> 12) & 63]);
+        out.push_back(T[(n >> 6) & 63]);
+        out.push_back(T[n & 63]);
+    }
+    size_t rem = in.size() - i;
+    if (rem == 1) {
+        unsigned n = ((unsigned char)in[i] << 16);
+        out.push_back(T[(n >> 18) & 63]);
+        out.push_back(T[(n >> 12) & 63]);
+    } else if (rem == 2) {
+        unsigned n = ((unsigned char)in[i] << 16)
+                   | ((unsigned char)in[i + 1] << 8);
+        out.push_back(T[(n >> 18) & 63]);
+        out.push_back(T[(n >> 12) & 63]);
+        out.push_back(T[(n >> 6) & 63]);
+    }
+    return out;
+}
+
+static bool pw_b64url_decode(const std::string &in, std::string &out) {
+    auto val = [](char c) -> int {
+        if (c >= 'A' && c <= 'Z') return c - 'A';
+        if (c >= 'a' && c <= 'z') return c - 'a' + 26;
+        if (c >= '0' && c <= '9') return c - '0' + 52;
+        if (c == '-') return 62;
+        if (c == '_') return 63;
+        return -1;
+    };
+    out.clear();
+    int buf = 0, bits = 0;
+    for (char c : in) {
+        int v = val(c);
+        if (v < 0) return false;
+        buf = (buf << 6) | v;
+        bits += 6;
+        if (bits >= 8) {
+            bits -= 8;
+            out.push_back((char)((buf >> bits) & 0xFF));
+        }
+    }
+    return true;
 }
 
 } // namespace embed_win
@@ -3183,6 +3976,208 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
     // Stub it for link-symmetry across all three native binaries.
 }
 
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1password_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    // Stores the WebViewPasswordCallback global ref that the
+    // __webview_pw__ branch of the WebMessageReceived handler fires off
+    // (Canvas 28).  Cleared here on replacement and in the engine destroy
+    // path.
+    auto *e = (Engine *)wv;
+    if (!e) return;
+    if (e->password_callback) {
+        env->DeleteGlobalRef(e->password_callback);
+        e->password_callback = nullptr;
+    }
+    if (cb) {
+        e->password_callback = env->NewGlobalRef(cb);
+    }
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1password_1callback
+  (JNIEnv *, jclass, jlong, jobject) {
+    // Windows has no offscreen engine; stub for link-symmetry.
+}
+
+// Credential store primitives — Canvas 28, backed by the Windows
+// Credential Manager (CredWriteW / CredEnumerateW / CredDeleteW).
+//
+// Each record is a CRED_TYPE_GENERIC credential whose TargetName is
+//   "<service>:" + b64url(origin) + "|" + b64url(username)
+// (origin and username are base64url-encoded so the '|' delimiter and any
+// URL characters are unambiguous), and whose CredentialBlob is UTF-8
+// "<savedAtMillis>\n<password>".  b64url keeps TargetName a valid,
+// delimiter-safe wide string.  The base64url helpers live in namespace
+// embed_win (above); reference them qualified from this extern "C" block.
+
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1cred_1store_1save
+  (JNIEnv *env, jclass, jstring jservice, jstring jorigin, jstring juser,
+   jstring jpass, jlong millis) {
+    const char *service = env->GetStringUTFChars(jservice, nullptr);
+    const char *origin = env->GetStringUTFChars(jorigin, nullptr);
+    const char *user = env->GetStringUTFChars(juser, nullptr);
+    const char *pass = env->GetStringUTFChars(jpass, nullptr);
+    std::string target = std::string(service ? service : "") + ":"
+        + embed_win::pw_b64url_encode(origin ? origin : "") + "|"
+        + embed_win::pw_b64url_encode(user ? user : "");
+    std::string blob = std::to_string((long long)millis) + "\n"
+        + (pass ? pass : "");
+    std::wstring targetW = embed_win::utf8_to_wide(target.c_str());
+    std::wstring userW = embed_win::utf8_to_wide(user ? user : "");
+
+    CREDENTIALW cred = {};
+    cred.Type = CRED_TYPE_GENERIC;
+    cred.TargetName = const_cast<LPWSTR>(targetW.c_str());
+    cred.CredentialBlobSize = (DWORD)blob.size();
+    cred.CredentialBlob = (LPBYTE)blob.data();
+    cred.Persist = CRED_PERSIST_LOCAL_MACHINE;
+    cred.UserName = const_cast<LPWSTR>(userW.c_str());
+    BOOL ok = CredWriteW(&cred, 0);
+    // Do not leave the plaintext password lingering in this buffer.
+    if (!blob.empty()) SecureZeroMemory(&blob[0], blob.size());
+
+    if (service) env->ReleaseStringUTFChars(jservice, service);
+    if (origin) env->ReleaseStringUTFChars(jorigin, origin);
+    if (user) env->ReleaseStringUTFChars(juser, user);
+    if (pass) env->ReleaseStringUTFChars(jpass, pass);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jobjectArray JNICALL Java_ca_weblite_webview_WebViewNative_webview_1cred_1store_1find
+  (JNIEnv *env, jclass, jstring jservice, jstring jorigin) {
+    jclass strCls = env->FindClass("java/lang/String");
+    const char *service = env->GetStringUTFChars(jservice, nullptr);
+    const char *origin = env->GetStringUTFChars(jorigin, nullptr);
+    std::string svc = service ? service : "";
+    std::string targetOrigin = origin ? origin : "";
+    std::string prefix = svc + ":";
+    std::wstring filterW = embed_win::utf8_to_wide((svc + ":*").c_str());
+
+    std::vector<std::string> triples;
+    DWORD count = 0;
+    PCREDENTIALW *creds = nullptr;
+    if (CredEnumerateW(filterW.c_str(), 0, &count, &creds) && creds) {
+        for (DWORD i = 0; i < count; i++) {
+            PCREDENTIALW c = creds[i];
+            if (!c || !c->TargetName) continue;
+            std::string name = embed_win::wide_to_utf8(c->TargetName);
+            if (name.rfind(prefix, 0) != 0) continue;
+            std::string rest = name.substr(prefix.size());
+            size_t bar = rest.find('|');
+            if (bar == std::string::npos) continue;
+            std::string origin_dec, user_dec;
+            if (!embed_win::pw_b64url_decode(rest.substr(0, bar), origin_dec)) continue;
+            if (!embed_win::pw_b64url_decode(rest.substr(bar + 1), user_dec)) continue;
+            if (origin_dec != targetOrigin) continue;
+            std::string blob;
+            if (c->CredentialBlob && c->CredentialBlobSize > 0) {
+                blob.assign((const char *)c->CredentialBlob,
+                            (size_t)c->CredentialBlobSize);
+            }
+            std::string millisStr = "0", password;
+            size_t nl = blob.find('\n');
+            if (nl != std::string::npos) {
+                millisStr = blob.substr(0, nl);
+                password = blob.substr(nl + 1);
+            } else {
+                password = blob;
+            }
+            triples.push_back(user_dec);
+            triples.push_back(millisStr);
+            triples.push_back(password);
+        }
+        CredFree(creds);
+    }
+    if (service) env->ReleaseStringUTFChars(jservice, service);
+    if (origin) env->ReleaseStringUTFChars(jorigin, origin);
+
+    jobjectArray out =
+        env->NewObjectArray((jsize)triples.size(), strCls, nullptr);
+    for (size_t i = 0; i < triples.size(); i++) {
+        jstring js = env->NewStringUTF(triples[i].c_str());
+        env->SetObjectArrayElement(out, (jsize)i, js);
+        env->DeleteLocalRef(js);
+    }
+    return out;
+}
+
+JNIEXPORT jobjectArray JNICALL Java_ca_weblite_webview_WebViewNative_webview_1cred_1store_1find_1all
+  (JNIEnv *env, jclass, jstring jservice) {
+    jclass strCls = env->FindClass("java/lang/String");
+    const char *service = env->GetStringUTFChars(jservice, nullptr);
+    std::string svc = service ? service : "";
+    std::string prefix = svc + ":";
+    std::wstring filterW = embed_win::utf8_to_wide((svc + ":*").c_str());
+
+    // Enumerate-all: same CredEnumerateW over the namespace prefix as find,
+    // but with no origin filter — every entry is kept and its origin emitted.
+    std::vector<std::string> quads;
+    DWORD count = 0;
+    PCREDENTIALW *creds = nullptr;
+    if (CredEnumerateW(filterW.c_str(), 0, &count, &creds) && creds) {
+        for (DWORD i = 0; i < count; i++) {
+            PCREDENTIALW c = creds[i];
+            if (!c || !c->TargetName) continue;
+            std::string name = embed_win::wide_to_utf8(c->TargetName);
+            if (name.rfind(prefix, 0) != 0) continue;
+            std::string rest = name.substr(prefix.size());
+            size_t bar = rest.find('|');
+            if (bar == std::string::npos) continue;
+            std::string origin_dec, user_dec;
+            if (!embed_win::pw_b64url_decode(rest.substr(0, bar), origin_dec)) continue;
+            if (!embed_win::pw_b64url_decode(rest.substr(bar + 1), user_dec)) continue;
+            std::string blob;
+            if (c->CredentialBlob && c->CredentialBlobSize > 0) {
+                blob.assign((const char *)c->CredentialBlob,
+                            (size_t)c->CredentialBlobSize);
+            }
+            std::string millisStr = "0", password;
+            size_t nl = blob.find('\n');
+            if (nl != std::string::npos) {
+                millisStr = blob.substr(0, nl);
+                password = blob.substr(nl + 1);
+            } else {
+                password = blob;
+            }
+            quads.push_back(origin_dec);
+            quads.push_back(user_dec);
+            quads.push_back(millisStr);
+            quads.push_back(password);
+        }
+        CredFree(creds);
+    }
+    if (service) env->ReleaseStringUTFChars(jservice, service);
+
+    jobjectArray out =
+        env->NewObjectArray((jsize)quads.size(), strCls, nullptr);
+    for (size_t i = 0; i < quads.size(); i++) {
+        jstring js = env->NewStringUTF(quads[i].c_str());
+        env->SetObjectArrayElement(out, (jsize)i, js);
+        env->DeleteLocalRef(js);
+    }
+    return out;
+}
+
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1cred_1store_1delete
+  (JNIEnv *env, jclass, jstring jservice, jstring jorigin, jstring juser) {
+    const char *service = env->GetStringUTFChars(jservice, nullptr);
+    const char *origin = env->GetStringUTFChars(jorigin, nullptr);
+    const char *user = env->GetStringUTFChars(juser, nullptr);
+    std::string target = std::string(service ? service : "") + ":"
+        + embed_win::pw_b64url_encode(origin ? origin : "") + "|"
+        + embed_win::pw_b64url_encode(user ? user : "");
+    std::wstring targetW = embed_win::utf8_to_wide(target.c_str());
+    BOOL ok = CredDeleteW(targetW.c_str(), CRED_TYPE_GENERIC, 0);
+    if (service) env->ReleaseStringUTFChars(jservice, service);
+    if (origin) env->ReleaseStringUTFChars(jorigin, origin);
+    if (user) env->ReleaseStringUTFChars(juser, user);
+    return ok ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1cred_1store_1available
+  (JNIEnv *, jclass) {
+    return JNI_TRUE;
+}
+
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1popup_1callback
   (JNIEnv *env, jclass, jlong wv, jobject cb) {
     // Canvas 15 ships the callback storage on Windows; the follow-up
@@ -3239,19 +4234,83 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
         // propagate it to popup children (empty == engine default).  Recorded
         // on the worker thread, where the popup handler also reads it.
         e->user_agent = w;
-        if (!e->webview) return;
+        if (!e->webview) {
+            WV_LOG("set_user_agent: no webview yet, stored only");
+            return;
+        }
+        // Canvas 21 Op 7.3: report the outcome. WebView2's failure mode for an
+        // unavailable _2 interface is a silent no-op, so without this a UA that
+        // never changes is indistinguishable from one the engine ignored.
         ICoreWebView2Settings *settings = nullptr;
-        if (SUCCEEDED(e->webview->get_Settings(&settings)) && settings) {
+        HRESULT hrGet = e->webview->get_Settings(&settings);
+        if (SUCCEEDED(hrGet) && settings) {
             ICoreWebView2Settings2 *settings2 = nullptr;
-            if (SUCCEEDED(settings->QueryInterface(
+            HRESULT hrQi = settings->QueryInterface(
                     __uuidof(ICoreWebView2Settings2),
-                    reinterpret_cast<void **>(&settings2))) && settings2) {
-                settings2->put_UserAgent(w.c_str()); // empty -> default
+                    reinterpret_cast<void **>(&settings2));
+            if (SUCCEEDED(hrQi) && settings2) {
+                // Capture the pristine default before the first override, so a
+                // later reset has something literal to write back.
+                if (e->default_user_agent.empty()) {
+                    LPWSTR cur = nullptr;
+                    if (SUCCEEDED(settings2->get_UserAgent(&cur)) && cur) {
+                        e->default_user_agent.assign(cur);
+                        CoTaskMemFree(cur);
+                    }
+                }
+                // A reset restores the captured default. put_UserAgent(L"") is
+                // NOT a reset on this engine -- it succeeds and does nothing.
+                const bool reset = w.empty();
+                const std::wstring &target =
+                    reset ? e->default_user_agent : w;
+                if (reset && target.empty()) {
+                    WV_LOG("set_user_agent: cannot reset -- the engine default "
+                           "was never captured; the previous override stays in "
+                           "force");
+                } else {
+                    HRESULT hrPut = settings2->put_UserAgent(target.c_str());
+                    WV_LOG("set_user_agent: put_UserAgent hr=0x%08lx %sua=%ls",
+                           (unsigned long)hrPut,
+                           reset ? "(restoring captured default) " : "",
+                           target.c_str());
+                }
                 settings2->Release();
+            } else {
+                WV_LOG("set_user_agent: ICoreWebView2Settings2 UNAVAILABLE "
+                       "hr=0x%08lx -- the runtime is too old to set a UA; "
+                       "this call is a no-op", (unsigned long)hrQi);
             }
             settings->Release();
+        } else {
+            WV_LOG("set_user_agent: get_Settings failed hr=0x%08lx",
+                   (unsigned long)hrGet);
         }
     });
+}
+
+// Install/clear the per-destination User-Agent resolver — Canvas 21 (1.5.0).
+// The resolver is a java.util.function.Function<String,String>; it is held as a
+// JNI global ref and consulted by the NewWindowRequested handler with the popup
+// child's own target URL.  resolver == nullptr clears it.  The global ref is
+// created/deleted on the CALLING thread (which holds a JNIEnv); the worker
+// thread only reads the jobject, which is safe for a global ref.  Never throws.
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1user_1agent_1resolver
+  (JNIEnv *env, jclass, jlong wv, jobject resolver) {
+    auto *e = (embed_win::Engine *)wv;
+    if (!e) return;
+    if (e->ua_resolver) {
+        env->DeleteGlobalRef(e->ua_resolver);
+        e->ua_resolver = nullptr;
+    }
+    if (resolver) {
+        e->ua_resolver = env->NewGlobalRef(resolver);
+    }
+}
+
+// Offscreen counterpart — no offscreen engine on Windows, so a silent no-op
+// (mirrors webview_offscreen_set_user_agent).
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1user_1agent_1resolver
+  (JNIEnv *, jclass, jlong, jobject) {
 }
 
 // Clear the embedded WebView's HTTP resource cache — Canvas 22.  Purges the
@@ -3352,6 +4411,145 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
     auto *completion = embed_win::new_cookie_completion(env, callback);
     embed_win::complete_cookie_query(
         completion, "", "Offscreen cookie queries are unsupported on Windows");
+}
+
+// Print to PDF — Canvas 29 D10.  Must live inside this `extern "C"` block
+// (D11).  Every path answers the callback exactly once; nothing throws into
+// Java.
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1pdf_1available
+  (JNIEnv *, jclass) {
+    return JNI_TRUE;
+}
+
+// Canvas 32: custom URL schemes on WebView2.  Whether the installed Runtime
+// honours the registrations is only known when an environment is created
+// (D7), so the library reports support.
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1scheme_1available
+  (JNIEnv *, jclass) {
+    return JNI_TRUE;
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1scheme_1install
+  (JNIEnv *env, jclass, jobjectArray names, jobject dispatcher) {
+    std::lock_guard<std::mutex> lk(embed_win::g_scheme_mutex);
+    if (embed_win::g_scheme_installed) return;
+    embed_win::g_scheme_installed = true;
+    env->GetJavaVM(&embed_win::g_scheme_jvm);
+    if (dispatcher) embed_win::g_scheme_dispatcher = env->NewGlobalRef(dispatcher);
+    jsize n = names ? env->GetArrayLength(names) : 0;
+    for (jsize i = 0; i < n; i++) {
+        jstring js = (jstring)env->GetObjectArrayElement(names, i);
+        if (!js) continue;
+        const char *c = env->GetStringUTFChars(js, nullptr);
+        if (c) {
+            embed_win::g_scheme_names.push_back(c);
+            env->ReleaseStringUTFChars(js, c);
+        }
+        env->DeleteLocalRef(js);
+    }
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1scheme_1respond
+  (JNIEnv *env, jclass, jlong id, jint status, jobjectArray headerPairs, jbyteArray body) {
+    std::vector<std::string> pairs;
+    jsize n = headerPairs ? env->GetArrayLength(headerPairs) : 0;
+    for (jsize i = 0; i < n; i++) {
+        jstring js = (jstring)env->GetObjectArrayElement(headerPairs, i);
+        std::string v;
+        if (js) {
+            const char *c = env->GetStringUTFChars(js, nullptr);
+            if (c) {
+                v = c;
+                env->ReleaseStringUTFChars(js, c);
+            }
+            env->DeleteLocalRef(js);
+        }
+        pairs.push_back(v);
+    }
+    std::vector<unsigned char> bytes;
+    jsize len = body ? env->GetArrayLength(body) : 0;
+    if (len > 0) {
+        bytes.resize((size_t)len);
+        env->GetByteArrayRegion(body, 0, len, (jbyte *)bytes.data());
+    }
+    embed_win::win_scheme_respond((long long)id, (int)status, pairs, bytes);
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1print_1to_1pdf
+  (JNIEnv *env, jclass, jlong wv, jstring path, jdouble w, jdouble h,
+   jdouble mt, jdouble mr, jdouble mb, jdouble ml, jboolean bg, jobject cb) {
+    embed_win::PdfJob *job = embed_win::pdf_new_job(env, cb);
+    auto *e = (Engine *)wv;
+    if (!e) {
+        embed_win::pdf_finish(job, false, embed_win::kPdfNotAttached);
+        return;
+    }
+    // The path goes to WebView2 as UTF-16, straight from the Java string.
+    std::wstring wpath;
+    if (path) {
+        const jchar *chars = env->GetStringChars(path, nullptr);
+        if (chars) {
+            wpath.assign(reinterpret_cast<const wchar_t *>(chars),
+                         (size_t)env->GetStringLength(path));
+            env->ReleaseStringChars(path, chars);
+        }
+    }
+    const bool backgrounds = bg == JNI_TRUE;
+    embed_win::dispatch_to_thread(e, [=] {
+        if (!e->webview) {
+            embed_win::pdf_finish(job, false, embed_win::kPdfNotAttached);
+            return;
+        }
+        ICoreWebView2_7 *wv7 = nullptr;
+        ICoreWebView2Environment6 *env6 = nullptr;
+        if (FAILED(e->webview->QueryInterface(
+                __uuidof(ICoreWebView2_7), reinterpret_cast<void **>(&wv7))) ||
+            !wv7 || !e->environment ||
+            FAILED(e->environment->QueryInterface(
+                __uuidof(ICoreWebView2Environment6),
+                reinterpret_cast<void **>(&env6))) || !env6) {
+            if (wv7) wv7->Release();
+            embed_win::pdf_finish(job, false,
+                "PDF printing needs a newer WebView2 runtime.");
+            return;
+        }
+        ICoreWebView2PrintSettings *settings = nullptr;
+        HRESULT hr = env6->CreatePrintSettings(&settings);
+        env6->Release();
+        if (FAILED(hr) || !settings) {
+            wv7->Release();
+            embed_win::pdf_finish_hr(job, FAILED(hr) ? hr : E_FAIL);
+            return;
+        }
+        settings->put_Orientation(COREWEBVIEW2_PRINT_ORIENTATION_PORTRAIT);
+        settings->put_PageWidth(w);
+        settings->put_PageHeight(h);
+        settings->put_MarginTop(mt);
+        settings->put_MarginRight(mr);
+        settings->put_MarginBottom(mb);
+        settings->put_MarginLeft(ml);
+        settings->put_ScaleFactor(1.0);
+        settings->put_ShouldPrintBackgrounds(backgrounds ? TRUE : FALSE);
+        settings->put_ShouldPrintHeaderAndFooter(FALSE);
+
+        auto *handler = new embed_win::PrintToPdfHandler(job);
+        hr = wv7->PrintToPdf(wpath.c_str(), settings, handler);
+        if (FAILED(hr)) {
+            // The handler will not be invoked; answer here.
+            embed_win::pdf_finish_hr(handler->take(), hr);
+        }
+        handler->Release();
+        settings->Release();
+        wv7->Release();
+    });
+}
+
+// Offscreen print — Windows has no offscreen engine (Canvas 29 D13).
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1print_1to_1pdf
+  (JNIEnv *env, jclass, jlong, jstring, jdouble, jdouble, jdouble, jdouble,
+   jdouble, jdouble, jboolean, jobject cb) {
+    embed_win::pdf_finish(embed_win::pdf_new_job(env, cb), false,
+                          embed_win::kPdfNotAttached);
 }
 
 // Adopt a retained popup child (Canvas 20) into `parent`'s realized AWT HWND.

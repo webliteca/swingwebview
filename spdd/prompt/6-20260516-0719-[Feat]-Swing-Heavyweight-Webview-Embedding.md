@@ -13,6 +13,22 @@ generated_at: 2026-05-16T07:19:13-07:00
 - The component must:
   - Be a `JComponent` subclass that callers add to any Swing
     container (`WebViewHeavyweightComponent.java:49`).
+  - Report **no intrinsic minimum size**, so a layout that
+    consults minimum sizes may shrink the component freely. A
+    web view renders at whatever size it is given, so it has no
+    honest minimum — but the AWT canvas peer this component
+    wraps answers `getMinimumSize()` with the canvas's
+    **current** size (`LWCanvasPeer.getMinimumSize` on macOS,
+    `WComponentPeer.getMinimumSize` on Windows,
+    `XComponentPeer.getMinimumSize` on X11), which the
+    component's `BorderLayout` then reports as its own. Left
+    alone, that makes the component claim "I can never be
+    narrower or shorter than I am right now", which is false and
+    which breaks callers: a `JSplitPane` with such a child
+    computes its divider's drag range from the children's
+    minimums and pins the divider where it already sits, so the
+    split cannot be resized by dragging at all. Operation 7b
+    states the honest answer instead.
   - Create the native peer lazily on first display
     (`addNotify`/first `paint`), and tear it down on
     `removeNotify` (`WebViewHeavyweightComponent.java:142`,
@@ -47,6 +63,11 @@ generated_at: 2026-05-16T07:19:13-07:00
     writable per-user data folder so packaged applications installed in
     protected locations such as `Program Files` can start WebView2 without
     requiring administrator rights.
+- Expose `getCookies(String url)` on the Swing component and both native
+  wrappers. Return an asynchronous HTTP `Cookie` header containing only
+  cookies applicable to the URL, including HttpOnly cookies held by the
+  browser; complete on the Swing EDT. A failed or unavailable native query
+  completes exceptionally rather than returning a partial header.
 - Implement the developer-visibility surface declared in
   [[swing-webview-component-mode-selection]]:
   - `openDevTools(): boolean` — when `debug=true` was set
@@ -374,6 +395,10 @@ generated_at: 2026-05-16T07:19:13-07:00
     runs, symmetric with the existing `setFocusCallback(null)`
     cleanup, so a late native click event during teardown
     cannot fire into a freed global ref.
+- **WebViewCookieCallback** (`src/ca/weblite/webview/WebViewCookieCallback.java`)
+  — one native completion with a non-null Cookie header and nullable error.
+  `EmbeddedWebView` and `OffscreenWebView` adapt it to an EDT-completed
+  `CompletableFuture<String>`; Swing wrappers forward the result.
 - **Windows WebView2 user-data folder** (`windows/webview_embed.cc`) —
   resolved once for each environment creation. An explicit non-empty
   `WEBVIEW2_USER_DATA_FOLDER` environment variable wins. Otherwise the
@@ -536,6 +561,11 @@ generated_at: 2026-05-16T07:19:13-07:00
   honors `WEBVIEW2_USER_DATA_FOLDER`; absent an override it prefers
   `LOCALAPPDATA` and falls back to the Windows temporary directory only when
   the Local AppData path cannot be created.
+- **Native cookie store, not page JavaScript.** Query each engine's own
+  persistent cookie manager so HttpOnly credentials can be transferred to
+  an HTTP client without exposing them to scripts. The query is asynchronous
+  and returns URL-matching name/value pairs only; callers must treat the
+  result as a credential.
 - **Coordinate translation for macOS.** The native side parents
   the WKWebView onto `NSWindow.contentView`, so positioning
   inside Swing requires converting the canvas's location to the
@@ -936,10 +966,20 @@ generated_at: 2026-05-16T07:19:13-07:00
   later if an engine-reset operation is ever needed.
 
 ## S · Structure
+- Cookie queries use the attached engine's store: WKHTTPCookieStore on macOS,
+  WebKitCookieManager on Linux, and ICoreWebView2CookieManager on Windows.
+  Linux offscreen views share the WebKitGTK path; unsupported offscreen
+  backends complete with an explicit error.
 - `src/ca/weblite/webview/swing/WebViewHeavyweightComponent.java`
   — Swing wrapper and lifecycle.
 - `src/ca/weblite/webview/EmbeddedWebView.java` — low-level
   embed JNI wrapper.
+- `src/ca/weblite/webview/WebViewCookieCallback.java` — callback shared by
+  the two native JNI entry points and their Java future adapters.
+- `src/ca/weblite/webview/swing/WebViewComponent.java` and its heavyweight
+  and lightweight subclasses — public `getCookies(String)` and delegation.
+- `src_c/webkit_loader.h`, `src_c/webkit_loader.cpp`, and
+  `src_c/webkit_shim.h` — dynamically loaded WebKitGTK cookie-manager symbols.
 - `src/ca/weblite/webview/WebViewNative.java:131`–
   `src/ca/weblite/webview/WebViewNative.java:177` — native
   entry points (`webview_embed_create`,
@@ -1396,6 +1436,30 @@ File: `src/ca/weblite/webview/swing/WebViewHeavyweightComponent.java`
      - Logic: call super; if null or both dimensions <= 0,
        return `new Dimension(800, 600)`
        (`WebViewHeavyweightComponent.java:134`).
+
+### 7b. Minimum Size — getMinimumSize
+File: `src/ca/weblite/webview/swing/WebViewHeavyweightComponent.java`
+
+1. Responsibility: report that the component has no intrinsic
+   minimum size, shadowing the AWT canvas peer's "my minimum is
+   my current size" answer that the component's `BorderLayout`
+   would otherwise pass on.
+2. Methods:
+   - `getMinimumSize(): Dimension`
+     - Logic: if the caller has set an explicit minimum
+       (`isMinimumSizeSet()`), defer to `super.getMinimumSize()`
+       so an application-supplied floor still wins; otherwise
+       return `new Dimension(0, 0)`.
+3. Constraints / Invariants:
+   - Preferred sizing is untouched: operation 7 keeps returning
+     the super/fallback preferred size, so nothing about normal
+     layout changes — only the claim about how far the component
+     may be *shrunk*.
+   - The lightweight sibling (`WebViewLightweightComponent`,
+     canvas 7) already answers with an empty minimum, since it
+     hosts no canvas; this brings the heavyweight component to
+     the same contract, so the two modes no longer disagree on a
+     standard Swing question.
 
 ### 8. Open Native DevTools — webview_embed_open_devtools
 Files: `src/ca/weblite/webview/WebViewNative.java`,
@@ -2467,7 +2531,40 @@ File: `windows/webview_embed.cc`
 7. Verify with a Windows native build and an embedded WebView startup from a
    host whose executable directory is not the selected user-data location.
 
+### 16. Query URL-Matching Browser Cookies
+Files: `src/ca/weblite/webview/WebViewCookieCallback.java`,
+`src/ca/weblite/webview/WebViewNative.java`,
+`src/ca/weblite/webview/EmbeddedWebView.java`,
+`src/ca/weblite/webview/OffscreenWebView.java`,
+`src/ca/weblite/webview/swing/WebViewComponent.java` and its two subclasses,
+`src_c/webkit_loader.h`, `src_c/webkit_loader.cpp`, `src_c/webkit_shim.h`,
+`src_c/webview_embed.cpp`, `windows/webview_embed.cc`, `README.md`.
+
+1. Add `getCookies(String url)` returning `CompletableFuture<String>` on
+   the Swing component and native wrappers. Require an attached/live peer;
+   adapt the one-shot native callback to complete on the Swing EDT. Native
+   errors complete the future exceptionally. Heavyweight and lightweight
+   components forward to their corresponding native wrappers.
+2. Declare embedded and offscreen JNI query functions that accept the URL
+   and `WebViewCookieCallback.completed(String cookieHeader, String error)`.
+   Hold a JNI global reference until exactly one asynchronous completion.
+   Produce an empty string when no cookies match and format matches as
+   `name=value; name2=value2`.
+3. On macOS, query `WKHTTPCookieStore.getAllCookies` on the AppKit main
+   queue; filter by URL host/domain, path, secure scheme and expiry before
+   formatting. On Linux, dynamically load the WebKitGTK cookie-manager
+   functions and asynchronously query cookies for the requested URL on
+   the GTK pump; include HttpOnly cookies and support offscreen views.
+4. On Windows, use `ICoreWebView2CookieManager.GetCookies` on the WebView2
+   worker for the URL and assemble the header including HttpOnly cookies.
+   macOS and Windows offscreen peers are unsupported and report an error.
+5. Document credential handling, platform coverage and the attached-peer
+   requirement in `README.md`. Retain existing PDF, password-manager and
+   custom-scheme entry points when integrating with later Canvases.
+
 ## N · Norms
+- Cookie values returned by `getCookies` are credentials: never print them
+  in diagnostics or error strings; JNI completion releases its global ref.
 - All AWT/JAWT interaction must respect the rule that the
   native peer is only valid while the host AWT Component is
   displayable. Use the buffer/replay pattern in
@@ -2650,6 +2747,9 @@ File: `windows/webview_embed.cc`
   writable temporary-root path; it must not silently retry the protected
   executable directory. A final fallback to WebView2's legacy default is
   permitted only after both per-user roots fail and must emit a diagnostic.
+- Cookie queries must not use `document.cookie` (which omits HttpOnly);
+  return only cookies for the requested URL and do not block the Swing EDT.
+  Unsupported offscreen backends fail explicitly rather than hanging.
 - `WebViewHeavyweightComponent.setDebug` throws
   `IllegalStateException` if called after display
   (`WebViewHeavyweightComponent.java:90`) — the native peer
@@ -2661,6 +2761,13 @@ File: `windows/webview_embed.cc`
 - `sizeNative()` no-ops on non-positive dimensions so a
   collapsed split-pane region doesn't drive negative bounds
   into the native side (`WebViewHeavyweightComponent.java:167`).
+- `getMinimumSize()` (operation 7b) must check
+  `isMinimumSizeSet()` before returning the empty minimum, so a
+  caller's explicit `setMinimumSize` is never silently
+  discarded. Removing the override altogether reinstates the
+  canvas peer's "minimum == current size" answer and with it the
+  pinned-`JSplitPane`-divider failure, which no compilation or
+  test failure would reveal — the split simply stops resizing.
 - HierarchyListener only acts on `SHOWING_CHANGED` events to
   avoid running the visibility/resize logic on unrelated
   hierarchy changes (`WebViewHeavyweightComponent.java:211`).

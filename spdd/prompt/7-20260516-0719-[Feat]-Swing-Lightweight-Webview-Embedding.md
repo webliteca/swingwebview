@@ -1159,6 +1159,26 @@ Files:
   messages (e.g. WebKit `load-failed`) still print unconditionally.
 
 ## S · Safeguards
+- **Each script-message channel is connected exactly once per
+  offscreen engine.** `g_signal_connect` is additive, so a
+  second `script-message-received::<channel>` connection on the
+  same `WebKitUserContentManager` does not replace the first —
+  both callbacks run, and every message the page posts is
+  delivered to Java twice.  Nothing upstream can detect this:
+  the page posts once, the shim carries one id, and the
+  dispatcher hands the same argument to the handler twice.
+  *Added 2026-09-21, from a defect rather than a design: the
+  `external` channel was connected twice in
+  `gtk_off_create_engine` — once by the DevTools/console work
+  and once by the offscreen JS-parity work, the same day,
+  neither noticing the other.  Because every binding
+  multiplexes through `external`, this doubled every
+  `addJavascriptFunction` call, every `addJavascriptCallback`,
+  console capture and evalAsync resolution on Linux, which is
+  the only platform whose default mode
+  (`WebViewComponent.resolveDefaultMode`) is LIGHTWEIGHT.  The
+  heavyweight path was never affected, which is why it
+  survived unnoticed on macOS and Windows.*
 - `OffscreenWebView.create` returns `null` for unsupported
   platforms or native failure rather than throwing
   (`OffscreenWebView.java:39`), so the Swing component can

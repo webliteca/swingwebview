@@ -40,6 +40,10 @@
 #define webkit_cookie_manager_get_cookies_finish (::g_wk.fn_webkit_cookie_manager_get_cookies_finish)
 #define webkit_navigation_action_get_request (::g_wk.fn_webkit_navigation_action_get_request)
 #define webkit_navigation_action_is_user_gesture (::g_wk.fn_webkit_navigation_action_is_user_gesture)
+#define webkit_print_operation_new (::g_wk.fn_webkit_print_operation_new)
+#define webkit_print_operation_print (::g_wk.fn_webkit_print_operation_print)
+#define webkit_print_operation_set_page_setup (::g_wk.fn_webkit_print_operation_set_page_setup)
+#define webkit_print_operation_set_print_settings (::g_wk.fn_webkit_print_operation_set_print_settings)
 #define webkit_script_dialog_confirm_set_confirmed (::g_wk.fn_webkit_script_dialog_confirm_set_confirmed)
 #define webkit_script_dialog_get_dialog_type (::g_wk.fn_webkit_script_dialog_get_dialog_type)
 #define webkit_script_dialog_get_message (::g_wk.fn_webkit_script_dialog_get_message)
@@ -71,6 +75,35 @@
 #define soup_cookie_free (::g_wk.fn_soup_cookie_free)
 #define soup_cookie_get_name (::g_wk.fn_soup_cookie_get_name)
 #define soup_cookie_get_value (::g_wk.fn_soup_cookie_get_value)
+
+// Custom URL schemes (Canvas 31 D4): mandatory.
+#define webkit_security_manager_register_uri_scheme_as_cors_enabled (::g_wk.fn_webkit_security_manager_register_uri_scheme_as_cors_enabled)
+#define webkit_security_manager_register_uri_scheme_as_secure (::g_wk.fn_webkit_security_manager_register_uri_scheme_as_secure)
+#define webkit_uri_scheme_request_finish (::g_wk.fn_webkit_uri_scheme_request_finish)
+#define webkit_uri_scheme_request_finish_error (::g_wk.fn_webkit_uri_scheme_request_finish_error)
+#define webkit_uri_scheme_request_get_uri (::g_wk.fn_webkit_uri_scheme_request_get_uri)
+#define webkit_web_context_get_default (::g_wk.fn_webkit_web_context_get_default)
+#define webkit_web_context_get_security_manager (::g_wk.fn_webkit_web_context_get_security_manager)
+#define webkit_web_context_register_uri_scheme (::g_wk.fn_webkit_web_context_register_uri_scheme)
+
+// Custom URL schemes (Canvas 31 D5): optional -- test WK_HAS before calling.
+#if WEBKIT_CHECK_VERSION(2, 12, 0)
+#define webkit_uri_scheme_request_get_http_method (::g_wk.fn_webkit_uri_scheme_request_get_http_method)
+#endif
+#if WEBKIT_CHECK_VERSION(2, 36, 0)
+#define webkit_uri_scheme_request_get_http_headers (::g_wk.fn_webkit_uri_scheme_request_get_http_headers)
+#define webkit_uri_scheme_request_finish_with_response (::g_wk.fn_webkit_uri_scheme_request_finish_with_response)
+#define webkit_uri_scheme_response_new (::g_wk.fn_webkit_uri_scheme_response_new)
+#define webkit_uri_scheme_response_set_status (::g_wk.fn_webkit_uri_scheme_response_set_status)
+#define webkit_uri_scheme_response_set_content_type (::g_wk.fn_webkit_uri_scheme_response_set_content_type)
+#define webkit_uri_scheme_response_set_http_headers (::g_wk.fn_webkit_uri_scheme_response_set_http_headers)
+#define soup_message_headers_new (::g_wk.fn_soup_message_headers_new)
+#define soup_message_headers_append (::g_wk.fn_soup_message_headers_append)
+#define soup_message_headers_foreach (::g_wk.fn_soup_message_headers_foreach)
+#endif
+#if WEBKIT_CHECK_VERSION(2, 40, 0)
+#define webkit_uri_scheme_request_get_http_body (::g_wk.fn_webkit_uri_scheme_request_get_http_body)
+#endif
 
 // JS-result readers — gate identically to webkit_loader.h / webview.h.
 #if WEBKIT_MAJOR_VERSION >= 2 && WEBKIT_MINOR_VERSION >= 22

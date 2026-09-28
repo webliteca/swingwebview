@@ -50,6 +50,9 @@ public class EmbeddedWebView {
 
     private long peer;
     private final List<Object> heap = new ArrayList<Object>();
+
+    /** One print at a time on this engine (Canvas 29 D12). */
+    private final PdfPrinting.Queue pdfQueue = new PdfPrinting.Queue();
     private final Map<String, WebView.JavascriptCallback> bindings =
             new HashMap<String, WebView.JavascriptCallback>();
 
@@ -170,6 +173,9 @@ public class EmbeddedWebView {
             throw new IllegalStateException(
                 "parent is not displayable; addNotify() has not been called.");
         }
+        // Canvas 30 D1: the first engine freezes the custom-scheme registry
+        // and installs any schemes before the engine that must see them exists.
+        WebViewSchemes.freezeForEngine();
         long p = WebViewNative.webview_embed_create(parent, debug ? 1 : 0);
         if (p == 0L) {
             throw new IllegalStateException(
@@ -573,6 +579,25 @@ public class EmbeddedWebView {
     }
 
     /**
+     * Register the password-manager callback invoked when the embedded
+     * page's injected detection/fill script reports a login submission or
+     * requests autofill.  Anchored in {@link #heap} so the JVM does not
+     * collect it while the native side holds a global ref, mirroring
+     * {@link #setDialogCallback}.  {@code cb == null} clears the
+     * registration.  On macOS the native side is a dedicated
+     * {@code __webview_pw__} script-message handler (Canvas 26); Linux and
+     * Windows wire theirs in the follow-up canvases.
+     */
+    public EmbeddedWebView setPasswordCallback(WebViewPasswordCallback cb) {
+        checkAlive();
+        if (cb != null) {
+            heap.add(cb);
+        }
+        WebViewNative.webview_embed_set_password_callback(peer, cb);
+        return this;
+    }
+
+    /**
      * Register the popup callback for browser-initiated popups
      * ({@code window.open}, {@code target="_blank"}).  Anchors {@code cb} in
      * {@link #heap} so the JVM does not collect the adapter while the native
@@ -641,6 +666,32 @@ public class EmbeddedWebView {
     }
 
     /**
+     * Install a per-destination User-Agent resolver: a function from the URL a
+     * navigation is about to load to the User-Agent to present for it.  A
+     * {@code null} or blank return falls through to the static
+     * {@link #setUserAgent(String)} value.
+     *
+     * <p>Only the engine-driven pop-up path upcalls this natively (a pop-up
+     * child's UA is keyed on the child's own target URL); navigations Java
+     * drives are resolved on the Java side before {@code navigate}.  The
+     * upcall runs on the engine UI thread, so the resolver must be fast and
+     * must not block; one that throws is treated as a {@code null} return.
+     *
+     * @param resolver the resolver, or {@code null} to clear it
+     * @return {@code this} for chaining
+     */
+    public EmbeddedWebView setUserAgentResolver(java.util.function.Function<String, String> resolver) {
+        checkAlive();
+        if (resolver != null) {
+            // Anchored so the JNI global ref never outlives a collectable
+            // Java object (mirrors setDownloadCallback).
+            heap.add(resolver);
+        }
+        WebViewNative.webview_embed_set_user_agent_resolver(peer, resolver);
+        return this;
+    }
+
+    /**
      * Purge the engine's HTTP resource cache (disk + memory), keeping cookies
      * and other site data so an active login survives.  The purge runs on the
      * engine UI thread; trigger a navigation afterwards to refetch from the
@@ -684,6 +735,56 @@ public class EmbeddedWebView {
                 }
             });
         return future;
+    }
+
+    /**
+     * Print the page this WebView shows to a PDF file, with no dialog
+     * (Canvas 29).  The future completes with {@code out} when the file is
+     * written, or exceptionally with an {@link java.io.IOException} naming
+     * the reason.  It completes on the engine UI thread: chain further work
+     * with the {@code …Async} variants.
+     *
+     * @param out     the PDF file to write; its folder must exist
+     * @param options page size, margins and backgrounds; {@code null} means
+     *                {@link PdfOptions#letter()}
+     */
+    public CompletableFuture<java.io.File> printToPdf(java.io.File out,
+                                                      PdfOptions options) {
+        checkAlive();
+        final PdfOptions o = options == null ? PdfOptions.letter() : options;
+        String reason = PdfPrinting.precheck(out, o);
+        if (reason != null) {
+            return PdfPrinting.failed(reason);
+        }
+        final PdfPrinting.Request request = PdfPrinting.request(out,
+                new java.util.concurrent.Executor() {
+                    @Override
+                    public void execute(Runnable r) {
+                        r.run();
+                    }
+                });
+        // Anchor the callback until it fires (Canvas 29 D1).
+        final WebViewPdfCallback anchored = new WebViewPdfCallback() {
+            @Override
+            public void onPdfFinished(boolean ok, String error) {
+                heap.remove(this);
+                request.callback.onPdfFinished(ok, error);
+            }
+        };
+        heap.add(anchored);
+        final String path = out.getAbsolutePath();
+        pdfQueue.submit(cb -> {
+            long p = peer;
+            if (p == 0L) {
+                cb.onPdfFinished(false, PdfPrinting.CLOSED);
+                return;
+            }
+            WebViewNative.webview_embed_print_to_pdf(p, path,
+                    o.getPageWidth(), o.getPageHeight(), o.getMarginTop(),
+                    o.getMarginRight(), o.getMarginBottom(), o.getMarginLeft(),
+                    o.isPrintBackgrounds(), cb);
+        }, anchored);
+        return request.future;
     }
 
     /**
@@ -873,6 +974,7 @@ public class EmbeddedWebView {
             } catch (Throwable ignored) {
                 // Don't let a clear-callback failure prevent destroy.
             }
+            pdfQueue.failWaiting(PdfPrinting.CLOSED);
             peer = 0L;
             WebViewNative.webview_embed_destroy(p);
             heap.clear();

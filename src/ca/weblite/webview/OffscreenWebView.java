@@ -39,6 +39,9 @@ public class OffscreenWebView {
 
     private long peer;
     private final List<Object> heap = new ArrayList<Object>();
+
+    /** One print at a time on this engine (Canvas 29 D12). */
+    private final PdfPrinting.Queue pdfQueue = new PdfPrinting.Queue();
     private final Map<String, WebView.JavascriptCallback> bindings =
             new LinkedHashMap<String, WebView.JavascriptCallback>();
 
@@ -98,6 +101,8 @@ public class OffscreenWebView {
      * Returns null on unsupported platform or native failure.
      */
     public static OffscreenWebView create(int width, int height, boolean debug) {
+        // Canvas 30 D1: freeze the custom-scheme registry before the engine exists.
+        WebViewSchemes.freezeForEngine();
         long p = WebViewNative.webview_offscreen_create(
             Math.max(1, width), Math.max(1, height), debug ? 1 : 0);
         if (p == 0L) return null;
@@ -438,6 +443,24 @@ public class OffscreenWebView {
     }
 
     /**
+     * Register the password-manager callback (login-submission / autofill)
+     * on the offscreen engine.  Anchored in {@link #heap} so the JVM does
+     * not collect it while the native side holds a global ref, mirroring
+     * {@link #setDialogCallback}.  On macOS / Windows, where the offscreen
+     * engine is a stub, this has no effect; Linux lightweight wires the GTK
+     * script-message handler in Canvas 27.  {@code cb == null} clears the
+     * registration.
+     */
+    public OffscreenWebView setPasswordCallback(WebViewPasswordCallback cb) {
+        checkAlive();
+        if (cb != null) {
+            heap.add(cb);
+        }
+        WebViewNative.webview_offscreen_set_password_callback(peer, cb);
+        return this;
+    }
+
+    /**
      * Offscreen counterpart to
      * {@link EmbeddedWebView#setPopupCallback} — bridges
      * {@code window.open} popup requests in the offscreen engine to the
@@ -510,6 +533,30 @@ public class OffscreenWebView {
     }
 
     /**
+     * Install a per-destination User-Agent resolver: a function from the URL a
+     * navigation is about to load to the User-Agent to present for it.  A
+     * {@code null} or blank return falls through to the static
+     * {@link #setUserAgent(String)} value.
+     *
+     * <p>Only the engine-driven pop-up path upcalls this natively (a pop-up
+     * child's UA is keyed on the child's own target URL); navigations Java
+     * drives are resolved on the Java side before {@code navigate}.  The
+     * upcall runs on the engine UI thread, so the resolver must be fast and
+     * must not block; one that throws is treated as a {@code null} return.
+     *
+     * @param resolver the resolver, or {@code null} to clear it
+     * @return {@code this} for chaining
+     */
+    public OffscreenWebView setUserAgentResolver(java.util.function.Function<String, String> resolver) {
+        checkAlive();
+        if (resolver != null) {
+            heap.add(resolver);
+        }
+        WebViewNative.webview_offscreen_set_user_agent_resolver(peer, resolver);
+        return this;
+    }
+
+    /**
      * Purge the offscreen engine's HTTP resource cache (disk + memory),
      * keeping cookies and other site data.  Runs on the engine UI thread;
      * trigger a navigation afterwards to refetch from the network.
@@ -552,6 +599,56 @@ public class OffscreenWebView {
         return future;
     }
 
+    /**
+     * Print the page this WebView shows to a PDF file, with no dialog
+     * (Canvas 29).  The future completes with {@code out} when the file is
+     * written, or exceptionally with an {@link java.io.IOException} naming
+     * the reason.  It completes on the engine UI thread: chain further work
+     * with the {@code …Async} variants.
+     *
+     * @param out     the PDF file to write; its folder must exist
+     * @param options page size, margins and backgrounds; {@code null} means
+     *                {@link PdfOptions#letter()}
+     */
+    public CompletableFuture<java.io.File> printToPdf(java.io.File out,
+                                                      PdfOptions options) {
+        checkAlive();
+        final PdfOptions o = options == null ? PdfOptions.letter() : options;
+        String reason = PdfPrinting.precheck(out, o);
+        if (reason != null) {
+            return PdfPrinting.failed(reason);
+        }
+        final PdfPrinting.Request request = PdfPrinting.request(out,
+                new java.util.concurrent.Executor() {
+                    @Override
+                    public void execute(Runnable r) {
+                        r.run();
+                    }
+                });
+        // Anchor the callback until it fires (Canvas 29 D1).
+        final WebViewPdfCallback anchored = new WebViewPdfCallback() {
+            @Override
+            public void onPdfFinished(boolean ok, String error) {
+                heap.remove(this);
+                request.callback.onPdfFinished(ok, error);
+            }
+        };
+        heap.add(anchored);
+        final String path = out.getAbsolutePath();
+        pdfQueue.submit(cb -> {
+            long p = peer;
+            if (p == 0L) {
+                cb.onPdfFinished(false, PdfPrinting.CLOSED);
+                return;
+            }
+            WebViewNative.webview_offscreen_print_to_pdf(p, path,
+                    o.getPageWidth(), o.getPageHeight(), o.getMarginTop(),
+                    o.getMarginRight(), o.getMarginBottom(), o.getMarginLeft(),
+                    o.isPrintBackgrounds(), cb);
+        }, anchored);
+        return request.future;
+    }
+
     /** Release native resources. */
     public void dispose() {
         if (peer != 0L) {
@@ -568,6 +665,7 @@ public class OffscreenWebView {
             // pending map and silently drops.
             evalDispatcher.disposeAllPending();
             functionDispatcher.disposeAll();
+            pdfQueue.failWaiting(PdfPrinting.CLOSED);
             peer = 0L;
             WebViewNative.webview_offscreen_destroy(p);
             heap.clear();

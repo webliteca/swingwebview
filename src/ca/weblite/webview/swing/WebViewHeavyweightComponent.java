@@ -9,8 +9,10 @@ import ca.weblite.webview.AsyncJavascriptFunction;
 import ca.weblite.webview.ConsoleDispatcher;
 import ca.weblite.webview.EditingCommand;
 import ca.weblite.webview.EmbeddedWebView;
+import ca.weblite.webview.PasswordDispatcher;
 import ca.weblite.webview.PopupDispatcher;
 import ca.weblite.webview.WebViewDownloadCallback;
+import ca.weblite.webview.WebViewPasswordCallback;
 import ca.weblite.webview.JavascriptFunction;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewClickCallback;
@@ -122,6 +124,9 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
     public WebViewComponent setUrl(String url) {
         pendingUrl = url;
         if (embedded != null) {
+            // Resolve the User-Agent for this destination before navigating,
+            // so the request carries it (Canvas 21, consultation point (b)).
+            applyResolvedUserAgentFor(url);
             embedded.navigate(url);
         }
         return this;
@@ -254,6 +259,8 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         dialogDispatcher.disposeAll();
         popupDispatcher.disposeAll();
         downloadDispatcher.disposeAll();
+        passwordDispatcher.disposeAll();
+        failPendingPdf();
         if (embedded != null) {
             EmbeddedWebView e = embedded;
             embedded = null;
@@ -268,6 +275,41 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
             return new Dimension(800, 600);
         }
         return d;
+    }
+
+    /**
+     * A web view has no intrinsic minimum size -- it renders at
+     * whatever size it is given -- so this reports an empty one.
+     *
+     * <p>Without the override the answer comes from the embedded
+     * {@link Canvas}: a peered AWT canvas reports its <em>current</em>
+     * size as its minimum size on every platform
+     * ({@code LWCanvasPeer.getMinimumSize} on macOS,
+     * {@code WComponentPeer.getMinimumSize} on Windows,
+     * {@code XComponentPeer.getMinimumSize} on X11), and this
+     * component's {@code BorderLayout} passes that on as its own.  The
+     * component then claims it can never be narrower or shorter than it
+     * happens to be, which is untrue and which breaks callers that
+     * consult minimum sizes.  The sharpest case: a {@code JSplitPane}
+     * computes its divider's drag range from its children's minimums,
+     * once, when the drag begins -- so with such a child on each side
+     * the range collapses onto the divider's current position and the
+     * split cannot be resized by dragging at all, however faithfully
+     * the mouse events arrive.
+     *
+     * <p>An explicit {@code setMinimumSize} by the application still
+     * wins; only the peer's accidental answer is shadowed.  Preferred
+     * sizing is deliberately left alone, so ordinary layout is
+     * unaffected -- this changes only how far the component says it may
+     * be shrunk.  {@link WebViewLightweightComponent} hosts no canvas
+     * and already answers this way, so the two modes now agree.
+     */
+    @Override
+    public Dimension getMinimumSize() {
+        if (isMinimumSizeSet()) {
+            return super.getMinimumSize();
+        }
+        return new Dimension(0, 0);
     }
 
     @Override
@@ -476,11 +518,36 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
     }
 
     @Override
+    protected void applyUserAgentResolverToPeer(java.util.function.Function<String, String> resolver) {
+        EmbeddedWebView e = embedded;
+        if (e != null) {
+            e.setUserAgentResolver(resolver);
+        }
+    }
+
+    @Override
     protected void clearCacheOnPeer() {
         EmbeddedWebView e = embedded;
         if (e != null) {
             e.clearCache();
         }
+    }
+
+    @Override
+    protected boolean printToPdfOnPeer(java.io.File out,
+                                       ca.weblite.webview.PdfOptions o,
+                                       final ca.weblite.webview.WebViewPdfCallback cb) {
+        EmbeddedWebView e = embedded;
+        if (e == null) {
+            return false;
+        }
+        // The component owns the caller's future; the wrapper's future only
+        // relays the outcome to cb (Canvas 29 op 7).
+        e.printToPdf(out, o).whenComplete((f, t) -> cb.onPdfFinished(t == null,
+                t == null ? null
+                        : (t instanceof java.util.concurrent.CompletionException
+                                && t.getCause() != null ? t.getCause() : t).getMessage()));
+        return true;
     }
 
     private void createPeer() {
@@ -554,9 +621,16 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
             embedded.addJavascriptFunction(e.getKey(), e.getValue());
         }
         // Apply any custom User-Agent BEFORE the first navigate so the
-        // initial request carries it.
-        if (pendingUserAgent != null) {
-            embedded.setUserAgent(pendingUserAgent);
+        // initial request carries it.  With no resolver installed this
+        // resolves to pendingUserAgent, i.e. the pre-1.5.0 behaviour.
+        String initialUa = resolveUserAgentFor(pendingUrl);
+        if (initialUa != null) {
+            embedded.setUserAgent(initialUa);
+        }
+        // Push the resolver down so the engine-driven popup path can key a
+        // child's UA off the child's own target URL (consultation point (c)).
+        if (pendingUserAgentResolver != null) {
+            embedded.setUserAgentResolver(pendingUserAgentResolver);
         }
         // An adopted popup already carries the engine's own in-flight
         // navigation (the original request WebKit drove into the child, POST
@@ -645,6 +719,25 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
                                          String frameUrl) {
                 return dialogDispatcher.dispatchFilePicker(
                     multiple, mimeTypes, extensions, pageUrl, frameUrl);
+            }
+        });
+        // Install the password-manager bridge: inject the shared
+        // detection/fill script at document-start and route its native
+        // login-submission / fill-request messages to the per-component
+        // PasswordDispatcher.  The frameUrl arg is the native-stamped
+        // trusted origin.  Anchored in EmbeddedWebView.heap by
+        // setPasswordCallback so the JVM does not collect the lambda while
+        // the native side holds a global ref.
+        embedded.addOnBeforeLoad(PasswordDispatcher.SHIM_JS);
+        embedded.setPasswordCallback(new WebViewPasswordCallback() {
+            @Override
+            public void onLoginSubmitted(String frameUrl, String b64User,
+                                         String b64Pass) {
+                passwordDispatcher.dispatchLoginSubmitted(frameUrl, b64User, b64Pass);
+            }
+            @Override
+            public void onFillRequested(String frameUrl) {
+                passwordDispatcher.dispatchFillRequested(frameUrl);
             }
         });
         // Install the popup bridge so window.open / target=_blank route to

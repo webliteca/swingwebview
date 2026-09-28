@@ -29,6 +29,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <ctime>
 #include <functional>
 #include <map>
 #include <memory>
@@ -43,6 +44,7 @@
 #include <gtk/gtk.h>
 #include <gdk/gdk.h>
 #include <gdk/gdkx.h>
+#include <glib/gstdio.h>
 #include <webkit2/webkit2.h>
 // Route WebKitGTK/JSC through the runtime-resolved loader (no hard SONAME dep).
 #include "webkit_loader.h"
@@ -51,6 +53,8 @@
 
 #ifdef WEBVIEW_COCOA
 #include <CoreGraphics/CoreGraphics.h>
+#include <CoreFoundation/CoreFoundation.h>
+#include <Security/Security.h>
 #include <dispatch/dispatch.h>
 #include <objc/objc-runtime.h>
 #include <objc/runtime.h>
@@ -313,6 +317,144 @@ static void complete_cookie_query(CookieCompletion *c,
     delete c;
 }
 
+// ---------------------------------------------------------------------------
+// Canvas 29: print-to-PDF request.  One per print; holds a global ref to the
+// Java WebViewPdfCallback.  pdf_finish upcalls onPdfFinished exactly once
+// (Canvas 29 D1), deletes the ref and the job.  Callable from any thread.
+// ---------------------------------------------------------------------------
+struct PdfJob {
+    JavaVM *jvm = nullptr;
+    jobject cb = nullptr;
+    bool done = false;
+};
+
+static PdfJob *pdf_new_job(JNIEnv *env, jobject cb) {
+    PdfJob *job = new PdfJob();
+    env->GetJavaVM(&job->jvm);
+    job->cb = cb ? env->NewGlobalRef(cb) : nullptr;
+    return job;
+}
+
+static void pdf_finish(PdfJob *job, bool ok, const char *err) {
+    if (!job || job->done) return;
+    job->done = true;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (job->jvm && job->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        job->jvm->AttachCurrentThread((void **)&env, nullptr);
+        detach = true;
+    }
+    if (env && job->cb) {
+        jclass cls = env->GetObjectClass(job->cb);
+        jmethodID m = cls ? env->GetMethodID(cls, "onPdfFinished",
+                                             "(ZLjava/lang/String;)V")
+                          : nullptr;
+        if (m) {
+            jstring jerr = (ok || !err) ? nullptr : env->NewStringUTF(err);
+            env->CallVoidMethod(job->cb, m, (jboolean)(ok ? JNI_TRUE : JNI_FALSE),
+                                jerr);
+            if (jerr) env->DeleteLocalRef(jerr);
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (cls) env->DeleteLocalRef(cls);
+        env->DeleteGlobalRef(job->cb);
+        job->cb = nullptr;
+    }
+    if (detach) job->jvm->DetachCurrentThread();
+    delete job;
+}
+
+static const char *const kPdfNotAttached = "The WebView is not attached yet.";
+
+// ---------------------------------------------------------------------------
+// Canvas 30: custom URL schemes -- the state every engine shares (D14).
+// Installed once by webview_scheme_install, before the first engine exists:
+// the lower-case scheme names, the Java SchemeDispatcher (a global ref) and
+// the JVM.  Requests get monotonic ids; each engine keeps its own table of
+// pending platform objects (Cocoa: the WKURLSchemeTask) under the one lock.
+// ---------------------------------------------------------------------------
+static std::vector<std::string> g_scheme_names;
+static jobject g_scheme_dispatcher = nullptr;
+static JavaVM *g_scheme_jvm = nullptr;
+static std::atomic<long long> g_scheme_next_id(0);
+static std::mutex g_scheme_mutex;
+static bool g_scheme_installed = false;
+
+// JNI env for the current thread, attaching when needed; *attached says so.
+static JNIEnv *scheme_env(bool *attached) {
+    *attached = false;
+    if (!g_scheme_jvm) return nullptr;
+    JNIEnv *env = nullptr;
+    if (g_scheme_jvm->GetEnv((void **)&env, JNI_VERSION_1_6) == JNI_OK) return env;
+    if (g_scheme_jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK) return nullptr;
+    *attached = true;
+    return env;
+}
+
+// Upcall SchemeDispatcher.onSchemeRequest (D15).  Call from a non-UI thread
+// on macOS; on GTK from the pump thread, since it only enqueues (Canvas 31 D6).
+static void scheme_upcall_request(long long id, const std::string &method,
+                                  const std::string &url,
+                                  const std::vector<std::string> &headerPairs,
+                                  const std::vector<unsigned char> &body,
+                                  bool bodyAvailable) {
+    if (!g_scheme_dispatcher) return;
+    bool attached = false;
+    JNIEnv *env = scheme_env(&attached);
+    if (!env) return;
+    jclass cls = env->GetObjectClass(g_scheme_dispatcher);
+    jmethodID m = cls ? env->GetMethodID(cls, "onSchemeRequest",
+        "(JLjava/lang/String;Ljava/lang/String;[Ljava/lang/String;[BZ)V") : nullptr;
+    if (m) {
+        jstring jmethod = env->NewStringUTF(method.c_str());
+        jstring jurl = env->NewStringUTF(url.c_str());
+        jclass strCls = env->FindClass("java/lang/String");
+        jobjectArray jpairs = strCls
+            ? env->NewObjectArray((jsize)headerPairs.size(), strCls, nullptr) : nullptr;
+        if (jpairs) {
+            for (size_t i = 0; i < headerPairs.size(); i++) {
+                jstring v = env->NewStringUTF(headerPairs[i].c_str());
+                env->SetObjectArrayElement(jpairs, (jsize)i, v);
+                if (v) env->DeleteLocalRef(v);
+            }
+        }
+        jbyteArray jbody = env->NewByteArray((jsize)body.size());
+        if (jbody && !body.empty()) {
+            env->SetByteArrayRegion(jbody, 0, (jsize)body.size(),
+                                    (const jbyte *)body.data());
+        }
+        env->CallVoidMethod(g_scheme_dispatcher, m, (jlong)id, jmethod, jurl, jpairs,
+                            jbody, (jboolean)(bodyAvailable ? JNI_TRUE : JNI_FALSE));
+        if (jmethod) env->DeleteLocalRef(jmethod);
+        if (jurl) env->DeleteLocalRef(jurl);
+        if (jpairs) env->DeleteLocalRef(jpairs);
+        if (jbody) env->DeleteLocalRef(jbody);
+        if (strCls) env->DeleteLocalRef(strCls);
+    }
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (cls) env->DeleteLocalRef(cls);
+    if (attached) g_scheme_jvm->DetachCurrentThread();
+}
+
+// Upcall SchemeDispatcher.onSchemeCancelled (D15).  Call from a non-UI thread.
+__attribute__((unused))
+static void scheme_upcall_cancelled(long long id) {
+    if (!g_scheme_dispatcher) return;
+    bool attached = false;
+    JNIEnv *env = scheme_env(&attached);
+    if (!env) return;
+    jclass cls = env->GetObjectClass(g_scheme_dispatcher);
+    jmethodID m = cls ? env->GetMethodID(cls, "onSchemeCancelled", "(J)V") : nullptr;
+    if (m) env->CallVoidMethod(g_scheme_dispatcher, m, (jlong)id);
+    if (env->ExceptionCheck()) env->ExceptionClear();
+    if (cls) env->DeleteLocalRef(cls);
+    if (attached) g_scheme_jvm->DetachCurrentThread();
+}
+
+// The largest request body read from the engine: the dispatcher's cap plus
+// one byte, so an over-cap body is still recognised and answered 413.
+static const size_t kSchemeMaxRequestRead = 16u * 1024u * 1024u + 1u;
+
 #ifdef WEBVIEW_GTK
 // =========================================================================
 // Linux / GTK / X11
@@ -421,6 +563,155 @@ private:
     }
 };
 
+// ---------------------------------------------------------------------------
+// Canvas 31: custom URL schemes on WebKitGTK.  Every view the library creates
+// shares WebKit's default web context (D1), so each scheme is registered there
+// once, on the pump thread, before the first view (D2).  WebKit calls
+// gtk_scheme_request_cb on the pump thread; the request is kept (ref'd) by id
+// until Java answers, and the answer is applied back on the pump thread (D7).
+// WebKitGTK does not report abandoned requests, so Linux never upcalls a
+// cancellation; an unanswered request ends at the dispatcher's 504 (D8).
+// ---------------------------------------------------------------------------
+static std::map<long long, WebKitURISchemeRequest *> g_scheme_requests;
+
+#if WEBKIT_CHECK_VERSION(2, 36, 0)
+static void gtk_scheme_header_pair(const char *name, const char *value, gpointer data) {
+    auto *pairs = static_cast<std::vector<std::string> *>(data);
+    pairs->push_back(name ? name : "");
+    pairs->push_back(value ? value : "");
+}
+#endif
+
+// D6.  Pump thread.
+static void gtk_scheme_request_cb(WebKitURISchemeRequest *request, gpointer) {
+    long long id = ++g_scheme_next_id;
+    g_object_ref(request);
+    {
+        std::lock_guard<std::mutex> lk(g_scheme_mutex);
+        g_scheme_requests[id] = request;
+    }
+    const gchar *uri = webkit_uri_scheme_request_get_uri(request);
+    std::string url = uri ? uri : "";
+    std::string method = "GET";
+#if WEBKIT_CHECK_VERSION(2, 12, 0)
+    if (WK_HAS(webkit_uri_scheme_request_get_http_method)) {
+        const gchar *m = webkit_uri_scheme_request_get_http_method(request);
+        if (m && *m) method = m;
+    }
+#endif
+    std::vector<std::string> pairs;
+#if WEBKIT_CHECK_VERSION(2, 36, 0)
+    if (WK_HAS(webkit_uri_scheme_request_get_http_headers) &&
+        WK_HAS(soup_message_headers_foreach)) {
+        SoupMessageHeaders *h = webkit_uri_scheme_request_get_http_headers(request);
+        if (h) soup_message_headers_foreach(h, gtk_scheme_header_pair, &pairs);
+    }
+#endif
+    std::vector<unsigned char> body;
+    bool bodyAvailable = false;
+#if WEBKIT_CHECK_VERSION(2, 40, 0)
+    if (WK_HAS(webkit_uri_scheme_request_get_http_body)) {
+        bodyAvailable = true;
+        GInputStream *in = webkit_uri_scheme_request_get_http_body(request);
+        if (in) {
+            unsigned char buf[16384];
+            while (body.size() < kSchemeMaxRequestRead) {
+                gssize got = g_input_stream_read(in, buf, sizeof(buf), nullptr, nullptr);
+                if (got <= 0) break;
+                body.insert(body.end(), buf, buf + got);
+            }
+            if (body.size() > kSchemeMaxRequestRead) body.resize(kSchemeMaxRequestRead);
+            g_object_unref(in);
+        }
+    }
+#endif
+    // The dispatcher only builds the request and submits the handler, so the
+    // pump thread never waits on application code (Canvas 30 D5).
+    scheme_upcall_request(id, method, url, pairs, body, bodyAvailable);
+}
+
+// D2, D3.  Pump thread only; runs once, and not at all when nothing is
+// registered (Canvas 30 D2).
+static void gtk_install_schemes_once() {
+    static bool done = false;
+    if (done || g_scheme_names.empty()) return;
+    done = true;
+    WebKitWebContext *ctx = webkit_web_context_get_default();
+    WebKitSecurityManager *sm = webkit_web_context_get_security_manager(ctx);
+    for (const std::string &name : g_scheme_names) {
+        webkit_web_context_register_uri_scheme(ctx, name.c_str(), gtk_scheme_request_cb,
+                                               nullptr, nullptr);
+        webkit_security_manager_register_uri_scheme_as_secure(sm, name.c_str());
+        webkit_security_manager_register_uri_scheme_as_cors_enabled(sm, name.c_str());
+    }
+}
+
+// D7.  Any thread; the answer is applied on the pump thread, and only if the
+// request is still pending.
+static void gtk_scheme_respond(long long id, int status, std::vector<std::string> pairs,
+                               std::vector<unsigned char> body) {
+    GtkPump::instance().run_async([id, status, pairs, body]() {
+        WebKitURISchemeRequest *req = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_scheme_mutex);
+            auto it = g_scheme_requests.find(id);
+            if (it == g_scheme_requests.end()) return;
+            req = it->second;
+            g_scheme_requests.erase(it);
+        }
+        std::string contentType;
+        for (size_t i = 0; i + 1 < pairs.size(); i += 2) {
+            if (g_ascii_strcasecmp(pairs[i].c_str(), "Content-Type") == 0) {
+                contentType = pairs[i + 1];
+                break;
+            }
+        }
+        GBytes *bytes = g_bytes_new(body.empty() ? nullptr : body.data(), body.size());
+        GInputStream *stream = g_memory_input_stream_new_from_bytes(bytes);
+        g_bytes_unref(bytes);
+        bool done = false;
+#if WEBKIT_CHECK_VERSION(2, 36, 0)
+        if (WK_HAS(webkit_uri_scheme_response_new) &&
+            WK_HAS(webkit_uri_scheme_response_set_status) &&
+            WK_HAS(webkit_uri_scheme_response_set_content_type) &&
+            WK_HAS(webkit_uri_scheme_response_set_http_headers) &&
+            WK_HAS(webkit_uri_scheme_request_finish_with_response) &&
+            WK_HAS(soup_message_headers_new) && WK_HAS(soup_message_headers_append)) {
+            WebKitURISchemeResponse *resp =
+                webkit_uri_scheme_response_new(stream, (gint64)body.size());
+            webkit_uri_scheme_response_set_status(resp, (guint)status, nullptr);
+            if (!contentType.empty()) {
+                webkit_uri_scheme_response_set_content_type(resp, contentType.c_str());
+            }
+            SoupMessageHeaders *hdrs = soup_message_headers_new(SOUP_MESSAGE_HEADERS_RESPONSE);
+            for (size_t i = 0; i + 1 < pairs.size(); i += 2) {
+                if (g_ascii_strcasecmp(pairs[i].c_str(), "Content-Type") == 0) continue;
+                soup_message_headers_append(hdrs, pairs[i].c_str(), pairs[i + 1].c_str());
+            }
+            webkit_uri_scheme_response_set_http_headers(resp, hdrs);  // takes ownership
+            webkit_uri_scheme_request_finish_with_response(req, resp);
+            g_object_unref(resp);
+            done = true;
+        }
+#endif
+        if (!done) {
+            // WebKitGTK < 2.36: only a content type can be sent, so a 2xx keeps
+            // its body and type and anything else becomes a load error.
+            if (status >= 200 && status <= 299) {
+                webkit_uri_scheme_request_finish(req, stream, (gint64)body.size(),
+                                                 contentType.empty() ? nullptr : contentType.c_str());
+            } else {
+                GError *err = g_error_new(g_quark_from_static_string("webview-scheme"), status,
+                                          "HTTP %d", status);
+                webkit_uri_scheme_request_finish_error(req, err);
+                g_error_free(err);
+            }
+        }
+        g_object_unref(stream);
+        g_object_unref(req);
+    });
+}
+
 struct Engine {
     Window parent_xid = 0;
     Display *parent_display = nullptr;
@@ -482,6 +773,20 @@ struct Engine {
     // Canvas 16.  A child (popup) web view inherits this ref via its own
     // PopupEngine so nested popups work.
     jobject popup_callback = nullptr;
+    // Canvas 21 (1.5.0): per-destination User-Agent resolver
+    // (java.util.function.Function<String,String>) as a JNI global ref.
+    // Consulted at the popup-child creation site with the CHILD's target
+    // URL; a decline falls back to copying the opener's UA.  Deleted on
+    // replacement and on engine destroy.
+    jobject ua_resolver = nullptr;
+
+    // JNI global ref to the registered WebViewPasswordCallback, or
+    // nullptr.  Set by cocoa_set_password_callback / gtk_set_password_callback
+    // and cleared on engine destroy.  Invoked by the __webview_pw__
+    // script-message handler (login submission / autofill request) that
+    // the injected PasswordDispatcher.SHIM_JS posts to (Canvas 26 macOS;
+    // Canvas 27 Linux).
+    jobject password_callback = nullptr;
 
     Engine() {}
     ~Engine() {}
@@ -972,6 +1277,9 @@ struct PopupEngine {
     WebKitWebView *web = nullptr;       // the related child web view
     JavaVM *jvm = nullptr;
     jobject popup_callback = nullptr;   // inherited global ref
+    // Canvas 21 (1.5.0): inherited global ref, so a nested popup resolves
+    // its own child's UA the same way its opener did.
+    jobject ua_resolver = nullptr;
     jobject dialog_callback = nullptr;  // inherited global ref, may be null
     jobject download_callback = nullptr; // inherited global ref, may be null
     jlong popup_id = 0;
@@ -1078,6 +1386,51 @@ static int fire_popup_disposition(JavaVM *jvm, jobject cb,
     if (jp) env->DeleteLocalRef(jp);
     if (detach) jvm->DetachCurrentThread();
     return disposition;
+}
+
+// Canvas 21 (1.5.0): ask the per-destination User-Agent resolver which UA to
+// present for a navigation to `url`.  Returns a freshly allocated UTF-8 string
+// the CALLER must free(), or nullptr when there is no resolver, no url, or the
+// resolver declines (a null/empty return) or throws.  A resolver must never be
+// able to break a navigation, so a pending exception is cleared and treated as
+// a decline -- the caller then falls back to the opener-copy behaviour.
+// Invoked on the engine UI thread, which is not necessarily attached to the
+// JVM, so it attaches and detaches symmetrically.  The resolver object is
+// java.util.function.Function, invoked reflectively as apply(Object)Object.
+static char *resolve_ua_for(JavaVM *jvm, jobject resolver, const char *url) {
+    if (!jvm || !resolver || !url || !*url) return nullptr;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return nullptr;
+        detach = true;
+    }
+    char *out = nullptr;
+    jstring ju = env->NewStringUTF(url);
+    jclass cls = env->GetObjectClass(resolver);
+    if (cls && ju) {
+        jmethodID mid = env->GetMethodID(cls, "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;");
+        if (mid) {
+            jobject r = env->CallObjectMethod(resolver, mid, ju);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+                r = nullptr;
+            }
+            if (r) {
+                const char *cs = env->GetStringUTFChars((jstring)r, nullptr);
+                if (cs && *cs) out = strdup(cs);
+                if (cs) env->ReleaseStringUTFChars((jstring)r, cs);
+                env->DeleteLocalRef(r);
+            }
+        }
+    }
+    if (cls) env->DeleteLocalRef(cls);
+    if (ju) env->DeleteLocalRef(ju);
+    if (detach) jvm->DetachCurrentThread();
+    return out;
 }
 
 // Fire onPopupOpened.  CallVoidMethod (fire-and-forget); the Java dispatcher
@@ -1213,6 +1566,7 @@ static void on_close_popup(WebKitWebView *web, gpointer user_data);
 // WebKitWebView for WebKit to adopt, or NULL to block the popup.
 static GtkWidget *handle_create_web_view(JavaVM *jvm, jobject popup_cb,
                                          jobject dialog_cb,
+                                         jobject ua_resolver,
                                          WebKitWebView *opener,
                                          WebKitNavigationAction *nav) {
     if (!popup_cb) return NULL;
@@ -1262,12 +1616,26 @@ static GtkWidget *handle_create_web_view(JavaVM *jvm, jobject popup_cb,
     // yields the engine default.  Composes for nested popups: a popup's child
     // reads the popup view's already-propagated UA.  Covers BOTH the ADOPT and
     // NATIVE_WINDOW dispositions.
-    if (opener) {
-        WebKitSettings *os = webkit_web_view_get_settings(opener);
+    //
+    // Canvas 21 (1.5.0): when a per-destination resolver is installed, the
+    // child's UA is chosen from the CHILD's own target URL rather than copied
+    // from the opener -- the case that matters is an OAuth sign-in popped out
+    // of a site that requires a spoofed UA, landing on an identity provider
+    // that penalises exactly that spoof.  A resolver that declines (or none at
+    // all) falls through to the opener-copy below, so pre-1.5.0 behaviour is
+    // preserved byte-for-byte for callers that never set one.
+    {
         WebKitSettings *cs = webkit_web_view_get_settings(child);
-        if (os && cs) {
-            const char *oua = webkit_settings_get_user_agent(os);
-            if (oua) webkit_settings_set_user_agent(cs, oua);
+        char *resolved = resolve_ua_for(jvm, ua_resolver, uri);
+        if (resolved) {
+            if (cs) webkit_settings_set_user_agent(cs, resolved);
+            free(resolved);
+        } else if (opener) {
+            WebKitSettings *os = webkit_web_view_get_settings(opener);
+            if (os && cs) {
+                const char *oua = webkit_settings_get_user_agent(os);
+                if (oua) webkit_settings_set_user_agent(cs, oua);
+            }
         }
     }
 
@@ -1310,6 +1678,9 @@ static GtkWidget *handle_create_web_view(JavaVM *jvm, jobject popup_cb,
     if (env) {
         pe->popup_callback = env->NewGlobalRef(popup_cb);
         if (dialog_cb) pe->dialog_callback = env->NewGlobalRef(dialog_cb);
+        // Canvas 21 (1.5.0): a nested popup resolves its own child's UA the
+        // same way its opener did, so the resolver is inherited transitively.
+        if (ua_resolver) pe->ua_resolver = env->NewGlobalRef(ua_resolver);
         // Downloads started in a popup belong to the OPENER's handler --
         // a transfer is the user's, not a property of which view began
         // it (Canvas 24).  The opener's DownloadSink is the source of
@@ -1445,10 +1816,12 @@ static void on_close_popup(WebKitWebView *web, gpointer user_data) {
         // (Canvas 24).
         if (pe->web) gtk_clear_download_sink(GTK_WIDGET(pe->web), env);
         if (pe->download_callback) env->DeleteGlobalRef(pe->download_callback);
+        if (pe->ua_resolver) env->DeleteGlobalRef(pe->ua_resolver);
         if (detach) pe->jvm->DetachCurrentThread();
     }
     pe->popup_callback = nullptr;
     pe->dialog_callback = nullptr;
+    pe->ua_resolver = nullptr;
     pe->download_callback = nullptr;
     delete pe;
 }
@@ -1459,7 +1832,8 @@ static GtkWidget *on_create_web_view_popup(WebKitWebView *web,
     PopupEngine *pe = static_cast<PopupEngine *>(user_data);
     if (!pe) return NULL;
     return handle_create_web_view(pe->jvm, pe->popup_callback,
-                                  pe->dialog_callback, web, nav);
+                                  pe->dialog_callback, pe->ua_resolver,
+                                  web, nav);
 }
 static gboolean on_script_dialog_popup(WebKitWebView *web,
         WebKitScriptDialog *dialog, gpointer user_data) {
@@ -1483,7 +1857,8 @@ static GtkWidget *on_create_web_view_engine(WebKitWebView *web,
     Engine *e = static_cast<Engine *>(user_data);
     if (!e) return NULL;
     return handle_create_web_view(e->jvm, e->popup_callback,
-                                  e->dialog_callback, web, nav);
+                                  e->dialog_callback, e->ua_resolver,
+                                  web, nav);
 }
 
 static void engine_on_message(Engine *e, const char *msg) {
@@ -1515,6 +1890,119 @@ static void engine_on_message(Engine *e, const char *msg) {
         env->DeleteLocalRef(js);
     }
     if (detach) e->jvm->DetachCurrentThread();
+}
+
+// Password-manager fire helpers (Canvas 27).  Linux copies of the macOS
+// helpers (which live inside the WEBVIEW_COCOA block); identical JNI
+// mechanics -- per-call GetMethodID, ExceptionCheck/Clear, attach/detach
+// symmetry, null-callback short-circuit.  Only one platform is compiled per
+// build, so there is no duplicate-symbol conflict with the Cocoa copies.
+static void fire_password_submitted(JavaVM *jvm, jobject callback,
+                                    const char *frameUrl,
+                                    const char *b64User,
+                                    const char *b64Pass) {
+    if (!jvm || !callback) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return;
+        detach = true;
+    }
+    if (!env) { if (detach) jvm->DetachCurrentThread(); return; }
+    jstring jurl = env->NewStringUTF(frameUrl ? frameUrl : "");
+    jstring juser = env->NewStringUTF(b64User ? b64User : "");
+    jstring jpass = env->NewStringUTF(b64Pass ? b64Pass : "");
+    jclass cls = env->GetObjectClass(callback);
+    if (cls) {
+        jmethodID m = env->GetMethodID(
+            cls, "onLoginSubmitted",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+        if (m) {
+            env->CallVoidMethod(callback, m, jurl, juser, jpass);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (jurl) env->DeleteLocalRef(jurl);
+    if (juser) env->DeleteLocalRef(juser);
+    if (jpass) env->DeleteLocalRef(jpass);
+    if (detach) jvm->DetachCurrentThread();
+}
+
+static void fire_password_fill_requested(JavaVM *jvm, jobject callback,
+                                         const char *frameUrl) {
+    if (!jvm || !callback) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return;
+        detach = true;
+    }
+    if (!env) { if (detach) jvm->DetachCurrentThread(); return; }
+    jstring jurl = env->NewStringUTF(frameUrl ? frameUrl : "");
+    jclass cls = env->GetObjectClass(callback);
+    if (cls) {
+        jmethodID m = env->GetMethodID(cls, "onFillRequested",
+                                       "(Ljava/lang/String;)V");
+        if (m) {
+            env->CallVoidMethod(callback, m, jurl);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (jurl) env->DeleteLocalRef(jurl);
+    if (detach) jvm->DetachCurrentThread();
+}
+
+// Parse a "__webview_pw__" payload from `js` and fire the matching callback.
+// Templated over the engine type so the heavyweight Engine and the
+// lightweight OffEngine (both carry web / jvm / password_callback) share one
+// code path.  The origin is stamped natively from webkit_web_view_get_uri,
+// never from the JS payload (anti-cross-origin invariant).
+template <typename E>
+static void gtk_handle_pw_message(E *e, const char *js) {
+    if (!e || !e->password_callback || !js) return;
+    const gchar *uri = webkit_web_view_get_uri(WEBKIT_WEB_VIEW(e->web));
+    std::string frameUrl = uri ? uri : "";
+    std::string payload = js;
+    if (payload.empty()) return;
+    if (payload[0] == 'F') {
+        fire_password_fill_requested(e->jvm, e->password_callback,
+                                     frameUrl.c_str());
+        return;
+    }
+    if (payload.size() >= 2 && payload[0] == 'S' && payload[1] == '|') {
+        size_t p1 = 2;
+        size_t p2 = payload.find('|', p1);
+        std::string b64user = (p2 == std::string::npos)
+            ? payload.substr(p1) : payload.substr(p1, p2 - p1);
+        std::string b64pass = (p2 == std::string::npos)
+            ? std::string() : payload.substr(p2 + 1);
+        fire_password_submitted(e->jvm, e->password_callback,
+                                frameUrl.c_str(), b64user.c_str(),
+                                b64pass.c_str());
+    }
+}
+
+// Register (or clear) the Java WebViewPasswordCallback for an engine
+// (Canvas 27).  Templated over Engine / OffEngine; mirrors
+// gtk_set_dialog_callback.
+template <typename E>
+static void gtk_set_password_callback_impl(E *e, JNIEnv *env, jobject cb) {
+    if (!e) return;
+    if (e->password_callback) {
+        env->DeleteGlobalRef(e->password_callback);
+        e->password_callback = nullptr;
+    }
+    if (cb) e->password_callback = env->NewGlobalRef(cb);
 }
 
 // Build a heavyweight engine embedded in `component`'s realized X11 surface.
@@ -1611,6 +2099,9 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug,
         // navigation from handle_create_web_view; the caller (gtk_adopt_popup)
         // has already disconnected the child's old PopupEngine signal handlers
         // so the fresh engine-scoped handlers connected below are the only ones.
+        // Canvas 31 D2: custom schemes go on the default context before the
+        // first view exists (a no-op once done, or when none are registered).
+        gtk_install_schemes_once();
         if (existing_web) {
             e->web = existing_web;
         } else {
@@ -1706,6 +2197,22 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug,
             e);
         webkit_user_content_manager_register_script_message_handler(
             e->manager, "external");
+        // Wire the "__webview_pw__" password-manager channel (Canvas 27):
+        // PasswordDispatcher.SHIM_JS (injected by the Java layer) posts to
+        // it; the handler stamps the origin natively and fires the callback.
+        g_signal_connect(
+            e->manager, "script-message-received::__webview_pw__",
+            G_CALLBACK(+[](WebKitUserContentManager *m,
+                           WebKitJavascriptResult *r, gpointer arg) {
+                auto *eng = static_cast<Engine *>(arg);
+                JSCValue *v = webkit_javascript_result_get_js_value(r);
+                char *s = jsc_value_to_string(v);
+                gtk_handle_pw_message(eng, s);
+                g_free(s);
+            }),
+            e);
+        webkit_user_content_manager_register_script_message_handler(
+            e->manager, "__webview_pw__");
         // Install the same external.invoke shim that the existing engine uses.
         webkit_user_content_manager_add_script(
             e->manager,
@@ -1904,6 +2411,20 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug,
 
 static void gtk_destroy_engine(Engine *e) {
     if (!e) return;
+    // Canvas 21 (1.5.0): drop the User-Agent resolver's global ref.  Only the
+    // popup-child creation path reads it, but a late popup during teardown
+    // would follow a freed ref, so it goes with the other callbacks.
+    if (e->ua_resolver) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm && e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->ua_resolver);
+        e->ua_resolver = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     // Release the click callback's JNI global ref BEFORE we destroy the
     // GtkWidget tree so any pressed signal already dispatched but not yet
     // run sees a null field instead of invoking a freed ref.  Symmetric
@@ -1946,6 +2467,18 @@ static void gtk_destroy_engine(Engine *e) {
         }
         if (env) env->DeleteGlobalRef(e->popup_callback);
         e->popup_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
+    // Same treatment for the password-callback global ref (Canvas 27).
+    if (e->password_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm && e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->password_callback);
+        e->password_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
     // Same treatment for the download-callback global ref, plus the
@@ -2500,6 +3033,124 @@ static void gtk_set_user_agent(Engine *e, const char *ua) {
     if (s) webkit_settings_set_user_agent(s, ua);
 }
 
+// Canvas 21 (1.5.0): install/clear the per-destination User-Agent resolver.
+// Held as a JNI global ref so it survives the setting call; the previous ref is
+// released first.  Consulted only at the popup-child creation site (navigations
+// Java drives are resolved on the Java side before navigate).
+static void gtk_set_user_agent_resolver(Engine *e, JNIEnv *env, jobject r) {
+    if (!e || !env) return;
+    if (e->ua_resolver) {
+        env->DeleteGlobalRef(e->ua_resolver);
+        e->ua_resolver = nullptr;
+    }
+    if (r) {
+        e->ua_resolver = env->NewGlobalRef(r);
+    }
+}
+
+// Canvas 29 D8: an in-flight WebKitPrintOperation.  `failed` fires before
+// `finished`; the first to fire answers the job.
+struct GtkPdfOp {
+    PdfJob *job;
+    std::string path;
+    time_t started;
+};
+
+static void gtk_pdf_failed(WebKitPrintOperation *, GError *error,
+                           gpointer user_data) {
+    GtkPdfOp *op = static_cast<GtkPdfOp *>(user_data);
+    std::string msg = "The page could not be printed to PDF";
+    if (error && error->message && *error->message) {
+        msg += ": ";
+        msg += error->message;
+    }
+    msg += ".";
+    pdf_finish(op->job, false, msg.c_str());
+    op->job = nullptr;
+}
+
+static void gtk_pdf_finished(WebKitPrintOperation *operation,
+                             gpointer user_data) {
+    GtkPdfOp *op = static_cast<GtkPdfOp *>(user_data);
+    if (op->job) {
+        // `finished` without `failed` is not proof: a print the backend
+        // dropped also ends here.  Only a file written by this print counts.
+        GStatBuf st;
+        bool written = g_stat(op->path.c_str(), &st) == 0 && st.st_size > 0 &&
+                       st.st_mtime + 1 >= op->started;
+        pdf_finish(op->job, written,
+                   written ? nullptr : "The PDF file was not written.");
+    }
+    op->job = nullptr;
+    delete op;
+    // Emission holds its own ref; this drops the one webkit_print_operation_new
+    // gave us.
+    g_object_unref(operation);
+}
+
+// Canvas 29 D8: print `web` to a PDF at `path` through GTK's "Print to File"
+// printer.  Used by the offscreen (lightweight) engine, the supported Linux
+// mode (D13).  The GtkWidget* is
+// read on the GTK thread through `get_web`, since the engine may not have
+// created its view yet when the request arrives.
+static void gtk_print_to_pdf(std::function<GtkWidget *()> get_web,
+                             PdfJob *job, std::string path, double w,
+                             double h, double mt, double mr, double mb,
+                             double ml, bool bg) {
+    GtkPump::instance().run_async([=] {
+        time_t started = time(nullptr);
+        GtkWidget *web = get_web();
+        if (!web) {
+            pdf_finish(job, false, kPdfNotAttached);
+            return;
+        }
+        WebKitWebView *view = WEBKIT_WEB_VIEW(web);
+        g_object_set(G_OBJECT(webkit_web_view_get_settings(view)),
+                     "print-backgrounds", bg ? TRUE : FALSE, NULL);
+
+        GError *uerr = nullptr;
+        gchar *uri = g_filename_to_uri(path.c_str(), nullptr, &uerr);
+        if (!uri) {
+            if (uerr) g_error_free(uerr);
+            pdf_finish(job, false, "The PDF path is not a valid file path.");
+            return;
+        }
+        GtkPaperSize *paper = gtk_paper_size_new_custom(
+            "aaf-pdf", "PDF", w, h, GTK_UNIT_INCH);
+
+        GtkPrintSettings *settings = gtk_print_settings_new();
+        gtk_print_settings_set_printer(settings, "Print to File");
+        gtk_print_settings_set(settings, GTK_PRINT_SETTINGS_OUTPUT_FILE_FORMAT,
+                               "pdf");
+        gtk_print_settings_set(settings, GTK_PRINT_SETTINGS_OUTPUT_URI, uri);
+        gtk_print_settings_set_paper_size(settings, paper);
+        gtk_print_settings_set_orientation(settings,
+                                           GTK_PAGE_ORIENTATION_PORTRAIT);
+        g_free(uri);
+
+        GtkPageSetup *setup = gtk_page_setup_new();
+        gtk_page_setup_set_paper_size(setup, paper);
+        gtk_page_setup_set_orientation(setup, GTK_PAGE_ORIENTATION_PORTRAIT);
+        gtk_page_setup_set_top_margin(setup, mt, GTK_UNIT_INCH);
+        gtk_page_setup_set_right_margin(setup, mr, GTK_UNIT_INCH);
+        gtk_page_setup_set_bottom_margin(setup, mb, GTK_UNIT_INCH);
+        gtk_page_setup_set_left_margin(setup, ml, GTK_UNIT_INCH);
+        gtk_paper_size_free(paper);
+
+        WebKitPrintOperation *operation = webkit_print_operation_new(view);
+        webkit_print_operation_set_print_settings(operation, settings);
+        webkit_print_operation_set_page_setup(operation, setup);
+        g_object_unref(settings);
+        g_object_unref(setup);
+
+        GtkPdfOp *op = new GtkPdfOp{job, path, started};
+        g_signal_connect(operation, "failed", G_CALLBACK(gtk_pdf_failed), op);
+        g_signal_connect(operation, "finished", G_CALLBACK(gtk_pdf_finished),
+                         op);
+        webkit_print_operation_print(operation);
+    });
+}
+
 // Canvas 22: purge the WebKitGTK HTTP resource cache (memory + disk) for the
 // view's web context.  Clears the resource cache only -- the cookie manager
 // is untouched, so an active login survives.
@@ -2651,6 +3302,11 @@ static Engine *gtk_adopt_popup(JNIEnv *env, jobject parent, jlong popupId,
     // gtk_set_popup_callback / gtk_set_dialog_callback at attach).
     e->popup_callback = pe->popup_callback;
     pe->popup_callback = nullptr;
+    // Canvas 21 (1.5.0): the resolver rides along with the callbacks so an
+    // adopted popup keeps resolving its own children's UAs until the
+    // component's attach installs its own.
+    e->ua_resolver = pe->ua_resolver;
+    pe->ua_resolver = nullptr;
     e->dialog_callback = pe->dialog_callback;
     pe->dialog_callback = nullptr;
     // The adopted child keeps the DownloadSink it was created with, so an
@@ -2719,10 +3375,12 @@ static void gtk_discard_popup(jlong popupId) {
         // (Canvas 24).
         if (pe->web) gtk_clear_download_sink(GTK_WIDGET(pe->web), env);
         if (pe->download_callback) env->DeleteGlobalRef(pe->download_callback);
+        if (pe->ua_resolver) env->DeleteGlobalRef(pe->ua_resolver);
         if (detach) pe->jvm->DetachCurrentThread();
     }
     pe->popup_callback = nullptr;
     pe->dialog_callback = nullptr;
+    pe->ua_resolver = nullptr;
     pe->download_callback = nullptr;
     delete pe;
 }
@@ -2767,6 +3425,18 @@ struct OffEngine {
     // gtk_off_create_engine, which routes through the shared
     // handle_create_web_view inner function (Canvas 16).
     jobject popup_callback = nullptr;
+    // Canvas 21 (1.5.0): per-destination User-Agent resolver
+    // (java.util.function.Function<String,String>) as a JNI global ref.
+    // Consulted at the popup-child creation site with the CHILD's target
+    // URL; a decline falls back to copying the opener's UA.  Deleted on
+    // replacement and on engine destroy.
+    jobject ua_resolver = nullptr;
+
+    // JNI global ref to the registered WebViewPasswordCallback, or nullptr
+    // (Canvas 27).  Set by the offscreen password-callback setter; cleared
+    // in gtk_off_destroy_engine.  Invoked by the "__webview_pw__"
+    // script-message handler installed in gtk_off_create_engine.
+    jobject password_callback = nullptr;
 };
 
 // Per-OffEngine wrapper for the `script-dialog` signal.  Reads page URL,
@@ -2800,7 +3470,8 @@ static GtkWidget *on_create_web_view_off_engine(WebKitWebView *web,
     OffEngine *e = static_cast<OffEngine *>(user_data);
     if (!e) return NULL;
     return handle_create_web_view(e->jvm, e->popup_callback,
-                                  e->dialog_callback, web, nav);
+                                  e->dialog_callback, e->ua_resolver,
+                                  web, nav);
 }
 
 // Parallel of engine_on_message for OffEngine: parse the {name, seq, args}
@@ -2862,6 +3533,9 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
         // Canvas 19: reuse the retained popup child (adoption) or create fresh.
         // The reused child already carries its opener linkage + in-flight POST
         // navigation from handle_create_web_view.
+        // Canvas 31 D2: custom schemes go on the default context before the
+        // first view exists (a no-op once done, or when none are registered).
+        gtk_install_schemes_once();
         e->web = existing_web ? existing_web : webkit_web_view_new();
         e->manager =
             webkit_web_view_get_user_content_manager(WEBKIT_WEB_VIEW(e->web));
@@ -2897,6 +3571,22 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
             e);
         webkit_user_content_manager_register_script_message_handler(
             e->manager, "external");
+
+        // Password-manager channel (Canvas 27) -- same handler as the
+        // heavyweight engine, routed through OffEngine.  Registered once.
+        g_signal_connect(
+            e->manager, "script-message-received::__webview_pw__",
+            G_CALLBACK(+[](WebKitUserContentManager *,
+                           WebKitJavascriptResult *r, gpointer arg) {
+                auto *eng = static_cast<OffEngine *>(arg);
+                JSCValue *v = webkit_javascript_result_get_js_value(r);
+                char *s = jsc_value_to_string(v);
+                gtk_handle_pw_message(eng, s);
+                g_free(s);
+            }),
+            e);
+        webkit_user_content_manager_register_script_message_handler(
+            e->manager, "__webview_pw__");
 
         // Wire JS-initiated dialogs to the per-engine Java DialogDispatcher.
         // Same shape as gtk_create_engine; the offscreen variants of the
@@ -2939,24 +3629,15 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
         webkit_web_view_set_input_method_context(
             WEBKIT_WEB_VIEW(e->web), NULL);
 
-        // Wire the "external" script-message handler so the bind shim's
-        // window.external.invoke(JSON) round-trips back into Java.  The
-        // shim and envelope are identical to the heavyweight engine --
-        // bindings are the single source of truth for the
-        // window.<name>(...) contract across both modes.
-        g_signal_connect(
-            e->manager, "script-message-received::external",
-            G_CALLBACK(+[](WebKitUserContentManager *m,
-                           WebKitJavascriptResult *r, gpointer arg) {
-                auto *eng = static_cast<OffEngine *>(arg);
-                JSCValue *v = webkit_javascript_result_get_js_value(r);
-                char *s = jsc_value_to_string(v);
-                off_engine_on_message(eng, s);
-                g_free(s);
-            }),
-            e);
-        webkit_user_content_manager_register_script_message_handler(
-            e->manager, "external");
+        // Install the window.external.invoke shim -- the bind shim's
+        // envelope is identical to the heavyweight engine, so bindings
+        // stay the single source of truth for the window.<name>(...)
+        // contract across both modes.
+        //
+        // The "external" channel itself is connected ABOVE and must not be
+        // connected again here: g_signal_connect is additive, so a second
+        // connection on the same manager delivers every posted message to
+        // Java twice (see Canvas 7 Safeguards).
         webkit_user_content_manager_add_script(
             e->manager,
             webkit_user_script_new(
@@ -3003,6 +3684,20 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
 
 static void gtk_off_destroy_engine(OffEngine *e) {
     if (!e) return;
+    // Canvas 21 (1.5.0): drop the User-Agent resolver's global ref.  Only the
+    // popup-child creation path reads it, but a late popup during teardown
+    // would follow a freed ref, so it goes with the other callbacks.
+    if (e->ua_resolver) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm && e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->ua_resolver);
+        e->ua_resolver = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     // Drop the download-callback global ref and the view's DownloadSink
     // BEFORE the widget is destroyed (Canvas 24) -- same ordering rule
     // as the heavyweight engine.
@@ -3048,6 +3743,18 @@ static void gtk_off_destroy_engine(OffEngine *e) {
         }
         if (env) env->DeleteGlobalRef(e->popup_callback);
         e->popup_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
+    // Same treatment for the password-callback global ref (Canvas 27).
+    if (e->password_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->password_callback);
+        e->password_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
     for (auto &kv : e->bindings) {
@@ -3122,6 +3829,21 @@ static void gtk_off_set_user_agent(OffEngine *e, const char *ua) {
     if (!e || !e->web) return;
     WebKitSettings *s = webkit_web_view_get_settings(WEBKIT_WEB_VIEW(e->web));
     if (s) webkit_settings_set_user_agent(s, ua);
+}
+
+// Canvas 21 (1.5.0): install/clear the per-destination User-Agent resolver.
+// Held as a JNI global ref so it survives the setting call; the previous ref is
+// released first.  Consulted only at the popup-child creation site (navigations
+// Java drives are resolved on the Java side before navigate).
+static void gtk_off_set_user_agent_resolver(OffEngine *e, JNIEnv *env, jobject r) {
+    if (!e || !env) return;
+    if (e->ua_resolver) {
+        env->DeleteGlobalRef(e->ua_resolver);
+        e->ua_resolver = nullptr;
+    }
+    if (r) {
+        e->ua_resolver = env->NewGlobalRef(r);
+    }
 }
 
 // Canvas 22: offscreen counterpart to gtk_clear_cache.
@@ -3233,6 +3955,11 @@ static OffEngine *gtk_off_adopt_popup(JNIEnv *env, jlong popupId,
     // gtk_off_set_popup_callback / gtk_off_set_dialog_callback at attach).
     e->popup_callback = pe->popup_callback;
     pe->popup_callback = nullptr;
+    // Canvas 21 (1.5.0): the resolver rides along with the callbacks so an
+    // adopted popup keeps resolving its own children's UAs until the
+    // component's attach installs its own.
+    e->ua_resolver = pe->ua_resolver;
+    pe->ua_resolver = nullptr;
     e->dialog_callback = pe->dialog_callback;
     pe->dialog_callback = nullptr;
     // The adopted child keeps the DownloadSink it was created with, so an
@@ -3649,6 +4376,160 @@ static id ns_str(const char *s) {
     return msg(objc_cls("NSString"), sel("stringWithUTF8String:"), s);
 }
 
+// ---------------------------------------------------------------------------
+// Canvas 30 D13: custom URL schemes on WKWebView.  One WKURLSchemeHandler class
+// and one shared instance serve every scheme of every engine.  Pending tasks
+// live in g_scheme_tasks (id -> retained task); start/stop and the response
+// all run on AppKit main, and Java is only ever called from detached threads.
+// ---------------------------------------------------------------------------
+static std::map<long long, id> g_scheme_tasks;
+static std::once_flag g_scheme_handler_once;
+static id g_scheme_handler_instance = nil;
+
+static std::string ns_utf8(id s) {
+    if (!s) return std::string();
+    const char *c = msg<const char *>(s, sel("UTF8String"));
+    return c ? std::string(c) : std::string();
+}
+
+static void impl_scheme_start(id, SEL, id, id task) {
+    long long rid = ++g_scheme_next_id;
+    msg(task, sel("retain"));
+    {
+        std::lock_guard<std::mutex> lk(g_scheme_mutex);
+        g_scheme_tasks[rid] = task;
+    }
+    id req = msg(task, sel("request"));
+    std::string url = ns_utf8(msg(msg(req, sel("URL")), sel("absoluteString")));
+    std::string method = ns_utf8(msg(req, sel("HTTPMethod")));
+    std::vector<std::string> pairs;
+    id fields = msg(req, sel("allHTTPHeaderFields"));
+    if (fields) {
+        id keys = msg(fields, sel("allKeys"));
+        unsigned long n = msg<unsigned long>(keys, sel("count"));
+        for (unsigned long i = 0; i < n; i++) {
+            id k = msg<id, unsigned long>(keys, sel("objectAtIndex:"), i);
+            id v = msg<id, id>(fields, sel("objectForKey:"), k);
+            pairs.push_back(ns_utf8(k));
+            pairs.push_back(ns_utf8(v));
+        }
+    }
+    std::vector<unsigned char> body;
+    id data = msg(req, sel("HTTPBody"));
+    if (data) {
+        unsigned long len = msg<unsigned long>(data, sel("length"));
+        const unsigned char *bytes = msg<const unsigned char *>(data, sel("bytes"));
+        if (bytes && len) {
+            size_t take = std::min((size_t)len, kSchemeMaxRequestRead);
+            body.assign(bytes, bytes + take);
+        }
+    } else {
+        id stream = msg(req, sel("HTTPBodyStream"));
+        if (stream) {
+            msg<void>(stream, sel("open"));
+            unsigned char buf[16384];
+            while (body.size() < kSchemeMaxRequestRead) {
+                long got = msg<long, unsigned char *, unsigned long>(
+                    stream, sel("read:maxLength:"), buf, (unsigned long)sizeof(buf));
+                if (got <= 0) break;
+                body.insert(body.end(), buf, buf + got);
+            }
+            if (body.size() > kSchemeMaxRequestRead) body.resize(kSchemeMaxRequestRead);
+            msg<void>(stream, sel("close"));
+        }
+    }
+    std::thread([rid, method, url, pairs, body]() {
+        scheme_upcall_request(rid, method, url, pairs, body, true);
+    }).detach();
+}
+
+static void impl_scheme_stop(id, SEL, id, id task) {
+    long long rid = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_scheme_mutex);
+        for (auto it = g_scheme_tasks.begin(); it != g_scheme_tasks.end(); ++it) {
+            if (it->second == task) {
+                rid = it->first;
+                g_scheme_tasks.erase(it);
+                break;
+            }
+        }
+    }
+    if (!rid) return;
+    msg<void>(task, sel("release"));
+    std::thread([rid]() { scheme_upcall_cancelled(rid); }).detach();
+}
+
+static id cocoa_scheme_handler() {
+    std::call_once(g_scheme_handler_once, [] {
+        Class c = objc_allocateClassPair((Class)objc_cls("NSObject"),
+                                         "WebviewSchemeHandler", 0);
+        if (c) {
+            class_addProtocol(c, objc_getProtocol("WKURLSchemeHandler"));
+            class_addMethod(c, sel("webView:startURLSchemeTask:"),
+                            (IMP)impl_scheme_start, "v@:@@");
+            class_addMethod(c, sel("webView:stopURLSchemeTask:"),
+                            (IMP)impl_scheme_stop, "v@:@@");
+            objc_registerClassPair(c);
+        } else {
+            c = (Class)objc_cls("WebviewSchemeHandler");
+        }
+        if (c) g_scheme_handler_instance = msg(msg((id)c, sel("alloc")), sel("init"));
+    });
+    return g_scheme_handler_instance;
+}
+
+// Set the shared handler for every installed scheme on a configuration that
+// has not yet been used to create a WKWebView (D13).
+static void cocoa_install_schemes(id config) {
+    if (!config || g_scheme_names.empty()) return;
+    id handler = cocoa_scheme_handler();
+    if (!handler) return;
+    for (const std::string &name : g_scheme_names) {
+        msg<void, id, id>(config, sel("setURLSchemeHandler:forURLScheme:"), handler,
+                          ns_str(name.c_str()));
+    }
+}
+
+// Apply a response on AppKit main, if its task is still pending (D13).
+static void cocoa_scheme_respond(long long rid, int status,
+                                 std::vector<std::string> pairs,
+                                 std::vector<unsigned char> body) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id task = nil;
+        {
+            std::lock_guard<std::mutex> lk(g_scheme_mutex);
+            auto it = g_scheme_tasks.find(rid);
+            if (it == g_scheme_tasks.end()) return;
+            task = it->second;
+            g_scheme_tasks.erase(it);
+        }
+        id url = msg(msg(task, sel("request")), sel("URL"));
+        id fields = msg(objc_cls("NSMutableDictionary"), sel("dictionary"));
+        for (size_t i = 0; i + 1 < pairs.size(); i += 2) {
+            id k = ns_str(pairs[i].c_str());
+            id prev = msg<id, id>(fields, sel("objectForKey:"), k);
+            std::string v = pairs[i + 1];
+            if (prev) v = ns_utf8(prev) + ", " + v;
+            msg<void, id, id>(fields, sel("setObject:forKey:"), ns_str(v.c_str()), k);
+        }
+        id resp = msg(objc_cls("NSHTTPURLResponse"), sel("alloc"));
+        resp = msg<id, id, long, id, id>(resp,
+            sel("initWithURL:statusCode:HTTPVersion:headerFields:"), url, (long)status,
+            ns_str("HTTP/1.1"), fields);
+        msg<void, id>(task, sel("didReceiveResponse:"), resp);
+        if (!body.empty()) {
+            id data = msg<id, const void *, unsigned long>(objc_cls("NSData"),
+                sel("dataWithBytes:length:"), (const void *)body.data(),
+                (unsigned long)body.size());
+            msg<void, id>(task, sel("didReceiveData:"), data);
+        }
+        msg<void>(task, sel("didFinish"));
+        if (resp) msg<void>(resp, sel("release"));
+        msg<void>(task, sel("release"));
+    });
+}
+
 struct Engine {
     id webview = nullptr;   // WKWebView
     id manager = nullptr;   // WKUserContentController
@@ -3747,6 +4628,12 @@ struct Engine {
     // field instead of a freed ref.
     jobject dialog_callback = nullptr;
 
+    // JNI global ref to the registered WebViewPasswordCallback, or
+    // nullptr.  Read by the __webview_pw__ WKScriptMessageHandler on each
+    // login-submission / fill-request message.  Set by
+    // cocoa_set_password_callback; cleared in cocoa_destroy_engine.
+    jobject password_callback = nullptr;
+
     // Per-engine WKUIDelegate instance assigned to e->webview via
     // setUIDelegate:.  Retained by us (we hold the only strong ref);
     // released in cocoa_destroy_engine after we clear the WKWebView's
@@ -3760,6 +4647,12 @@ struct Engine {
     // the opener's PopupDispatcher.  Cleared before ui_delegate is
     // released.
     jobject popup_callback = nullptr;
+    // Canvas 21 (1.5.0): per-destination User-Agent resolver
+    // (java.util.function.Function<String,String>) as a JNI global ref.
+    // Consulted at the popup-child creation site with the CHILD's target
+    // URL; a decline falls back to copying the opener's UA.  Deleted on
+    // replacement and on engine destroy.
+    jobject ua_resolver = nullptr;
 
     // For a child (popup) engine only: the NSWindow the engine created to
     // host the popup web view, and the opaque id correlating the
@@ -4708,6 +5601,51 @@ static int fire_popup_disposition(JavaVM *jvm, jobject cb,
     return disposition;
 }
 
+// Canvas 21 (1.5.0): ask the per-destination User-Agent resolver which UA to
+// present for a navigation to `url`.  Returns a freshly allocated UTF-8 string
+// the CALLER must free(), or nullptr when there is no resolver, no url, or the
+// resolver declines (a null/empty return) or throws.  A resolver must never be
+// able to break a navigation, so a pending exception is cleared and treated as
+// a decline -- the caller then falls back to the opener-copy behaviour.
+// Invoked on the engine UI thread, which is not necessarily attached to the
+// JVM, so it attaches and detaches symmetrically.  The resolver object is
+// java.util.function.Function, invoked reflectively as apply(Object)Object.
+static char *resolve_ua_for(JavaVM *jvm, jobject resolver, const char *url) {
+    if (!jvm || !resolver || !url || !*url) return nullptr;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return nullptr;
+        detach = true;
+    }
+    char *out = nullptr;
+    jstring ju = env->NewStringUTF(url);
+    jclass cls = env->GetObjectClass(resolver);
+    if (cls && ju) {
+        jmethodID mid = env->GetMethodID(cls, "apply",
+            "(Ljava/lang/Object;)Ljava/lang/Object;");
+        if (mid) {
+            jobject r = env->CallObjectMethod(resolver, mid, ju);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+                r = nullptr;
+            }
+            if (r) {
+                const char *cs = env->GetStringUTFChars((jstring)r, nullptr);
+                if (cs && *cs) out = strdup(cs);
+                if (cs) env->ReleaseStringUTFChars((jstring)r, cs);
+                env->DeleteLocalRef(r);
+            }
+        }
+    }
+    if (cls) env->DeleteLocalRef(cls);
+    if (ju) env->DeleteLocalRef(ju);
+    if (detach) jvm->DetachCurrentThread();
+    return out;
+}
+
 // Canvas 18: async notification that a popup child has been retained and is
 // ready to adopt.  Fire-and-forget on a detached worker thread (the Java
 // dispatcher marshals popupAdoptable to the EDT via invokeLater), mirroring
@@ -4833,9 +5771,24 @@ static id impl_create_web_view(id self, SEL, id webView, id configuration,
     // opener correctly leaves the child at the engine default.  Applied here
     // (before the `if (!adopt)` window setup) so it covers BOTH the ADOPT and
     // NATIVE_WINDOW dispositions.
-    id openerUA = e ? msg(e->webview, sel("customUserAgent")) : nullptr;
-    if (openerUA) {
-        msg<void, id>(child, sel("setCustomUserAgent:"), openerUA);
+    //
+    // Canvas 21 (1.5.0): when a per-destination resolver is installed, the
+    // child's UA is chosen from the CHILD's own target URL rather than copied
+    // from the opener -- the case that matters is an OAuth sign-in popped out
+    // of a site that requires a spoofed UA, landing on an identity provider
+    // that penalises exactly that spoof.  A resolver that declines (or none at
+    // all) falls through to the opener-copy, so pre-1.5.0 behaviour is
+    // preserved byte-for-byte for callers that never set one.
+    char *resolvedUA = e ? resolve_ua_for(jvm, e->ua_resolver, target.c_str())
+                         : nullptr;
+    if (resolvedUA) {
+        msg<void, id>(child, sel("setCustomUserAgent:"), ns_str(resolvedUA));
+        free(resolvedUA);
+    } else {
+        id openerUA = e ? msg(e->webview, sel("customUserAgent")) : nullptr;
+        if (openerUA) {
+            msg<void, id>(child, sel("setCustomUserAgent:"), openerUA);
+        }
     }
 
     // Attach a JNIEnv to create the child engine's inherited global refs.
@@ -4885,6 +5838,10 @@ static id impl_create_web_view(id self, SEL, id webView, id configuration,
         // it (Canvas 23).
         if (e->download_callback)
             child_e->download_callback = env->NewGlobalRef(e->download_callback);
+        // Canvas 21 (1.5.0): a nested popup resolves its own child's UA the
+        // same way its opener did, so the resolver is inherited transitively.
+        if (e->ua_resolver)
+            child_e->ua_resolver = env->NewGlobalRef(e->ua_resolver);
     }
     Class uicls = get_webview_embed_ui_delegate_cls();
     id ui = msg((id)uicls, sel("new"));
@@ -5630,6 +6587,162 @@ static void cocoa_set_dialog_callback(Engine *e, JNIEnv *env, jobject cb) {
 }
 
 // ---------------------------------------------------------------------------
+// Password-manager bridge (Canvas 26).
+//
+// The injected PasswordDispatcher.SHIM_JS posts to the reserved
+// "__webview_pw__" script-message channel:
+//   "S|<b64user>|<b64pass>"  a login form was submitted
+//   "F"                      the page is ready and requests autofill
+// A dedicated WKScriptMessageHandler reads the committed frame URL
+// natively (message.frameInfo / webView.URL) -- the trusted origin source,
+// never a value from the JS payload -- and invokes the Java
+// WebViewPasswordCallback.  The callback is void (non-blocking): the Java
+// PasswordDispatcher marshals the save prompt to the EDT and runs store
+// I/O on a worker, so AppKit main is not parked.
+//
+// The two fire helpers use pure JNI (no Cocoa/GLib) and mirror
+// fire_dialog_alert's shape: defensive attach + detach-if-attached,
+// per-call GetMethodID, ExceptionCheck/Clear after Call*Method.
+// ---------------------------------------------------------------------------
+
+static void fire_password_submitted(JavaVM *jvm, jobject callback,
+                                    const char *frameUrl,
+                                    const char *b64User,
+                                    const char *b64Pass) {
+    if (!jvm || !callback) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env) {
+            return;
+        }
+        detach = true;
+    }
+    if (!env) { if (detach) jvm->DetachCurrentThread(); return; }
+    jstring jurl = env->NewStringUTF(frameUrl ? frameUrl : "");
+    jstring juser = env->NewStringUTF(b64User ? b64User : "");
+    jstring jpass = env->NewStringUTF(b64Pass ? b64Pass : "");
+    jclass cls = env->GetObjectClass(callback);
+    if (cls) {
+        jmethodID m = env->GetMethodID(
+            cls, "onLoginSubmitted",
+            "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V");
+        if (m) {
+            env->CallVoidMethod(callback, m, jurl, juser, jpass);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (jurl) env->DeleteLocalRef(jurl);
+    if (juser) env->DeleteLocalRef(juser);
+    if (jpass) env->DeleteLocalRef(jpass);
+    if (detach) jvm->DetachCurrentThread();
+}
+
+static void fire_password_fill_requested(JavaVM *jvm, jobject callback,
+                                         const char *frameUrl) {
+    if (!jvm || !callback) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env) {
+            return;
+        }
+        detach = true;
+    }
+    if (!env) { if (detach) jvm->DetachCurrentThread(); return; }
+    jstring jurl = env->NewStringUTF(frameUrl ? frameUrl : "");
+    jclass cls = env->GetObjectClass(callback);
+    if (cls) {
+        jmethodID m = env->GetMethodID(cls, "onFillRequested",
+                                       "(Ljava/lang/String;)V");
+        if (m) {
+            env->CallVoidMethod(callback, m, jurl);
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (jurl) env->DeleteLocalRef(jurl);
+    if (detach) jvm->DetachCurrentThread();
+}
+
+// Parse a "__webview_pw__" payload and fire the matching callback.  The
+// origin comes from frameUrl (native-stamped), never the payload.
+static void handle_password_message(Engine *e, const std::string &payload,
+                                    const std::string &frameUrl) {
+    if (!e || !e->password_callback) return;
+    if (payload.empty()) return;
+    if (payload[0] == 'F') {
+        fire_password_fill_requested(e->jvm, e->password_callback,
+                                     frameUrl.c_str());
+        return;
+    }
+    if (payload.size() >= 2 && payload[0] == 'S' && payload[1] == '|') {
+        size_t p1 = 2;
+        size_t p2 = payload.find('|', p1);
+        std::string b64user = (p2 == std::string::npos)
+            ? payload.substr(p1) : payload.substr(p1, p2 - p1);
+        std::string b64pass = (p2 == std::string::npos)
+            ? std::string() : payload.substr(p2 + 1);
+        fire_password_submitted(e->jvm, e->password_callback,
+                                frameUrl.c_str(), b64user.c_str(),
+                                b64pass.c_str());
+    }
+}
+
+static std::once_flag g_webview_pw_delegate_once;
+static Class g_webview_pw_delegate_cls = nil;
+
+// Dedicated WKScriptMessageHandler for the "__webview_pw__" channel.  Reads
+// the committed frame URL natively (frameInfo.request.URL, falling back to
+// webView.URL) and hands it to Java as the trusted origin.
+static Class get_webview_pw_delegate_cls() {
+    std::call_once(g_webview_pw_delegate_once, [] {
+        Class c = objc_allocateClassPair((Class)objc_cls("NSObject"),
+                                         "WebviewPwDelegate", 0);
+        class_addProtocol(c, objc_getProtocol("WKScriptMessageHandler"));
+        class_addMethod(
+            c,
+            sel("userContentController:didReceiveScriptMessage:"),
+            (IMP)(+[](id self, SEL, id, id m) {
+                Engine *eng = (Engine *)objc_getAssociatedObject(self, "eng");
+                if (!eng) return;
+                id body = msg(m, sel("body"));
+                if (!body) return;
+                const char *s = msg<const char *>(body, sel("UTF8String"));
+                if (!s) return;
+                std::string payload(s);
+                std::string frameUrl = frame_url_utf8(
+                    msg(m, sel("frameInfo")), msg(m, sel("webView")));
+                handle_password_message(eng, payload, frameUrl);
+            }),
+            "v@:@@");
+        objc_registerClassPair(c);
+        g_webview_pw_delegate_cls = c;
+    });
+    return g_webview_pw_delegate_cls;
+}
+
+// Register (or clear, when cb is null) the Java WebViewPasswordCallback for
+// this engine.  Mirrors cocoa_set_dialog_callback.
+static void cocoa_set_password_callback(Engine *e, JNIEnv *env, jobject cb) {
+    if (!e) return;
+    if (e->password_callback) {
+        env->DeleteGlobalRef(e->password_callback);
+        e->password_callback = nullptr;
+    }
+    if (cb) {
+        e->password_callback = env->NewGlobalRef(cb);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Mouse-down hook on WKWebView.
 //
 // We swizzle -[WKWebView mouseDown:], -[WKWebView rightMouseDown:], and
@@ -6166,6 +7279,9 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
         install_click_swizzle();
 
         e->config = msg(objc_cls("WKWebViewConfiguration"), sel("new"));
+        // Canvas 30 D13: custom schemes must be on the configuration before
+        // the WKWebView is created from it; popups inherit them from it.
+        cocoa_install_schemes(e->config);
         e->manager = msg(e->config, sel("userContentController"));
         id wv = msg(objc_cls("WKWebView"), sel("alloc"));
         wv = msg<id, CGRect, id>(
@@ -6280,6 +7396,19 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
         msg<void, id, id>(e->manager,
                           sel("addScriptMessageHandler:name:"), delegate,
                           ns_str("external"));
+
+        // Password-manager bridge: a dedicated script-message handler for
+        // the "__webview_pw__" channel that the injected
+        // PasswordDispatcher.SHIM_JS posts login-submission / fill-request
+        // messages to.  Reads the committed frame URL natively (the trusted
+        // origin).  Removed in cocoa_destroy_engine alongside "external".
+        Class pw_delegate_cls = get_webview_pw_delegate_cls();
+        id pw_delegate = msg((id)pw_delegate_cls, sel("new"));
+        objc_setAssociatedObject(pw_delegate, "eng", (id)e,
+                                 OBJC_ASSOCIATION_ASSIGN);
+        msg<void, id, id>(e->manager,
+                          sel("addScriptMessageHandler:name:"), pw_delegate,
+                          ns_str("__webview_pw__"));
 
         // Browser-dialog bridge: install a WKUIDelegate so JS-initiated
         // alert / confirm / prompt and <input type=file> requests flow
@@ -6541,6 +7670,21 @@ static void cocoa_set_user_agent(Engine *e, const char *ua) {
     });
 }
 
+// Canvas 21 (1.5.0): install/clear the per-destination User-Agent resolver.
+// Held as a JNI global ref so it survives the setting call; the previous ref is
+// released first.  Consulted only at the popup-child creation site (navigations
+// Java drives are resolved on the Java side before navigate).
+static void cocoa_set_user_agent_resolver(Engine *e, JNIEnv *env, jobject r) {
+    if (!e || !env) return;
+    if (e->ua_resolver) {
+        env->DeleteGlobalRef(e->ua_resolver);
+        e->ua_resolver = nullptr;
+    }
+    if (r) {
+        e->ua_resolver = env->NewGlobalRef(r);
+    }
+}
+
 // Canvas 22: purge the WKWebView's HTTP resource cache (disk + memory) via its
 // configuration's WKWebsiteDataStore.  Only the cache data types are removed,
 // so cookies / local storage / service workers survive (an active login is
@@ -6670,6 +7814,118 @@ static void cocoa_get_cookies(Engine *e, const std::string &url_string,
     });
 }
 
+// ---------------------------------------------------------------------------
+// Canvas 29 D9: print to PDF.  -[WKWebView printOperationWithPrintInfo:]
+// (macOS 11+) run modally on the view's window with a save-job NSPrintInfo,
+// so WKWebView renders into the operation asynchronously and no panel shows.
+// ---------------------------------------------------------------------------
+
+// Answer a job off AppKit main, as the other macOS upcalls do: the Java side
+// may start the next queued print (D12) from inside the answer, and that must
+// not begin a new modal run from inside the previous one's didRun callback.
+static void cocoa_pdf_finish_async(PdfJob *job, bool ok, const char *err) {
+    std::string e = err ? err : "";
+    std::thread([job, ok, e]() {
+        pdf_finish(job, ok, ok ? nullptr : e.c_str());
+    }).detach();
+}
+
+static void impl_pdf_did_run(id, SEL, id, BOOL success, void *ctx) {
+    cocoa_pdf_finish_async(static_cast<PdfJob *>(ctx), success == YES,
+                           "The page could not be printed to PDF.");
+}
+
+static std::once_flag g_webview_embed_pdf_delegate_once;
+static id g_webview_embed_pdf_delegate = nullptr;
+
+static id get_webview_embed_pdf_delegate() {
+    std::call_once(g_webview_embed_pdf_delegate_once, [] {
+        Class c = objc_allocateClassPair((Class)objc_cls("NSObject"),
+                                         "WebviewEmbedPdfDelegate", 0);
+        class_addMethod(c, sel("printOperationDidRun:success:contextInfo:"),
+                        (IMP)impl_pdf_did_run, "v@:@c^v");
+        objc_registerClassPair(c);
+        // One shared instance for the life of the JVM; never released.
+        g_webview_embed_pdf_delegate =
+            msg<id>(msg<id>((id)c, sel("alloc")), sel("init"));
+    });
+    return g_webview_embed_pdf_delegate;
+}
+
+static void cocoa_print_to_pdf(Engine *e, PdfJob *job, std::string path,
+                               double w, double h, double mt, double mr,
+                               double mb, double ml, bool bg) {
+    cocoa_run_on_main_async([=] {
+        if (!e || e->destroyed.load() || !e->webview) {
+            cocoa_pdf_finish_async(job, false, kPdfNotAttached);
+            return;
+        }
+        id wv = e->webview;
+        if (!msg<BOOL, SEL>(wv, sel("respondsToSelector:"),
+                            sel("printOperationWithPrintInfo:"))) {
+            cocoa_pdf_finish_async(job, false,
+                                   "PDF printing needs macOS 11 or later.");
+            return;
+        }
+        id window = msg<id>(wv, sel("window"));
+        if (!window) {
+            cocoa_pdf_finish_async(job, false,
+                                   "The WebView has no window to print from.");
+            return;
+        }
+
+        // Backgrounds: WKPreferences.shouldPrintBackgrounds (macOS 13.3+).
+        id config = msg<id>(wv, sel("configuration"));
+        id prefs = config ? msg<id>(config, sel("preferences")) : nullptr;
+        if (prefs && msg<BOOL, SEL>(prefs, sel("respondsToSelector:"),
+                                    sel("setShouldPrintBackgrounds:"))) {
+            msg<void, BOOL>(prefs, sel("setShouldPrintBackgrounds:"),
+                            bg ? YES : NO);
+        }
+
+        const CGFloat pw = (CGFloat)(w * 72.0), ph = (CGFloat)(h * 72.0);
+        id info = msg<id>(msg<id>(objc_cls("NSPrintInfo"),
+                                  sel("sharedPrintInfo")), sel("copy"));
+        msg<void, id>(info, sel("setJobDisposition:"), ns_str("NSPrintSaveJob"));
+        id url = msg<id, id>(objc_cls("NSURL"), sel("fileURLWithPath:"),
+                             ns_str(path.c_str()));
+        id dict = msg<id>(info, sel("dictionary"));
+        msg<void, id, id>(dict, sel("setObject:forKey:"), url,
+                          ns_str("NSJobSavingURL"));
+        msg<void, CGSize>(info, sel("setPaperSize:"), CGSizeMake(pw, ph));
+        msg<void, long>(info, sel("setOrientation:"), 0L);  // portrait
+        msg<void, CGFloat>(info, sel("setTopMargin:"), (CGFloat)(mt * 72.0));
+        msg<void, CGFloat>(info, sel("setRightMargin:"), (CGFloat)(mr * 72.0));
+        msg<void, CGFloat>(info, sel("setBottomMargin:"), (CGFloat)(mb * 72.0));
+        msg<void, CGFloat>(info, sel("setLeftMargin:"), (CGFloat)(ml * 72.0));
+        // NSPrintingPaginationModeAutomatic == 0.
+        msg<void, long>(info, sel("setHorizontalPagination:"), 0L);
+        msg<void, long>(info, sel("setVerticalPagination:"), 0L);
+        msg<void, BOOL>(info, sel("setHorizontallyCentered:"), NO);
+        msg<void, BOOL>(info, sel("setVerticallyCentered:"), NO);
+
+        id op = msg<id, id>(wv, sel("printOperationWithPrintInfo:"), info);
+        msg<void>(info, sel("release"));
+        if (!op) {
+            cocoa_pdf_finish_async(job, false,
+                                   "The page could not be printed to PDF.");
+            return;
+        }
+        msg<void, BOOL>(op, sel("setShowsPrintPanel:"), NO);
+        msg<void, BOOL>(op, sel("setShowsProgressPanel:"), NO);
+        // Without a frame the operation's view prints blank pages.
+        id opView = msg<id>(op, sel("view"));
+        if (opView) {
+            msg<void, CGRect>(opView, sel("setFrame:"),
+                              CGRectMake(0, 0, pw, ph));
+        }
+        msg<void, id, id, SEL, void *>(
+            op, sel("runOperationModalForWindow:delegate:didRunSelector:contextInfo:"),
+            window, get_webview_embed_pdf_delegate(),
+            sel("printOperationDidRun:success:contextInfo:"), (void *)job);
+    });
+}
+
 // Asynchronous engine destroy.  Returns immediately on the calling
 // thread (typically the EDT) after a small Java-side cleanup; the
 // AppKit teardown, view-hierarchy removal, KVO observer unregister,
@@ -6703,6 +7959,20 @@ static void cocoa_get_cookies(Engine *e, const std::string &url_string,
 //   6. delete e.
 static void cocoa_destroy_engine(Engine *e) {
     if (!e) return;
+    // Canvas 21 (1.5.0): drop the User-Agent resolver's global ref.  Only the
+    // popup-child creation path reads it, but a late popup during teardown
+    // would follow a freed ref, so it goes with the other callbacks.
+    if (e->ua_resolver) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm && e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->ua_resolver);
+        e->ua_resolver = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     // Drop the webview from the engine map BEFORE any teardown work --
     // the swizzled responder hooks can fire at any moment during destroy
     // (AppKit unwinds the view hierarchy and resigns first responder),
@@ -6772,6 +8042,17 @@ static void cocoa_destroy_engine(Engine *e) {
         e->dialog_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
+    if (e->password_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->password_callback);
+        e->password_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     cocoa_run_on_main_async([e] {
         // Mark destroyed FIRST.  Any LATER-firing lambdas that read this
         // flag short-circuit; FIFO ordering on the main queue makes
@@ -6796,6 +8077,8 @@ static void cocoa_destroy_engine(Engine *e) {
         if (e->manager) {
             msg<void, id>(e->manager, sel("removeScriptMessageHandlerForName:"),
                           ns_str("external"));
+            msg<void, id>(e->manager, sel("removeScriptMessageHandlerForName:"),
+                          ns_str("__webview_pw__"));
         }
         // Abandon every download still in flight for this engine and
         // remove its NSProgress KVO observer.  An NSProgress released
@@ -7559,6 +8842,620 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// Password-manager callback registration + credential store (Canvas 26
+// macOS; Canvas 27 Linux).  Must live inside this extern "C" block so the
+// JVM can resolve them (UnsatisfiedLinkError otherwise).
+// ---------------------------------------------------------------------------
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1password_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    if (wv == 0) return;
+#if defined(WEBVIEW_COCOA)
+    embed::cocoa_set_password_callback((embed::Engine *)wv, env, cb);
+#elif defined(WEBVIEW_GTK)
+    embed::gtk_set_password_callback_impl((embed::Engine *)wv, env, cb);
+#else
+    (void)env; (void)cb;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1password_1callback
+  (JNIEnv *env, jclass, jlong peer, jobject cb) {
+#if defined(WEBVIEW_GTK)
+    if (peer == 0) return;
+    embed::gtk_set_password_callback_impl((embed::OffEngine *)peer, env, cb);
+#else
+    // No offscreen engine on macOS / Windows.
+    (void)peer; (void)env; (void)cb;
+#endif
+}
+
+#if defined(WEBVIEW_COCOA)
+// Build a CFString from a UTF-8 C string (caller CFRelease's).
+static CFStringRef pw_cf(const char *s) {
+    return CFStringCreateWithCString(kCFAllocatorDefault, s ? s : "",
+                                     kCFStringEncodingUTF8);
+}
+#endif
+
+#ifdef WEBVIEW_GTK
+// ---------------------------------------------------------------------------
+// libsecret runtime shim (Canvas 27).
+//
+// libsecret is dlopen'd at first use rather than linked, matching the
+// WebKitGTK runtime-load convention in webkit_loader.cpp -- absence of a
+// Secret Service provider degrades gracefully (available/save/delete return
+// false, find returns empty) and never fails library load.  The SecretSchema
+// is caller-owned by design, so we declare the libsecret ABI locally (its
+// public layout is stable) rather than #include <libsecret/secret.h>.
+// GLib symbols (g_*) are already available via the GTK link; only the
+// secret_* symbols are resolved through dlsym.
+// ---------------------------------------------------------------------------
+typedef enum { WV_SECRET_SCHEMA_NONE = 0 } WvSecretSchemaFlags;
+typedef enum { WV_SECRET_SCHEMA_ATTRIBUTE_STRING = 0 } WvSecretSchemaAttributeType;
+typedef struct { const gchar *name; WvSecretSchemaAttributeType type; }
+    WvSecretSchemaAttribute;
+// Mirrors struct _SecretSchema (name, flags, attributes[32], then 8 private
+// reserved slots).  Layout must match libsecret's header exactly.
+typedef struct {
+    const gchar *name;
+    WvSecretSchemaFlags flags;
+    WvSecretSchemaAttribute attributes[32];
+    gint reserved;
+    gpointer reserved1, reserved2, reserved3, reserved4;
+    gpointer reserved5, reserved6, reserved7;
+} WvSecretSchema;
+
+// SecretSearchFlags bits (SECRET_SEARCH_ALL|UNLOCK|LOAD_SECRETS).
+enum { WV_SECRET_SEARCH_ALL = 1 << 1,
+       WV_SECRET_SEARCH_UNLOCK = 1 << 2,
+       WV_SECRET_SEARCH_LOAD_SECRETS = 1 << 3 };
+
+static const WvSecretSchema WEBVIEW_PW_SCHEMA = {
+    "ca.weblite.webview.passwords",
+    WV_SECRET_SCHEMA_NONE,
+    {
+        { "service",  WV_SECRET_SCHEMA_ATTRIBUTE_STRING },
+        { "origin",   WV_SECRET_SCHEMA_ATTRIBUTE_STRING },
+        { "username", WV_SECRET_SCHEMA_ATTRIBUTE_STRING },
+        { NULL, WV_SECRET_SCHEMA_ATTRIBUTE_STRING }
+    },
+    0, NULL, NULL, NULL, NULL, NULL, NULL, NULL
+};
+
+typedef gboolean (*pw_store_sync_fn)(const WvSecretSchema *, const gchar *,
+    const gchar *, const gchar *, void *, GError **, ...);
+typedef gboolean (*pw_clear_sync_fn)(const WvSecretSchema *, void *,
+    GError **, ...);
+typedef GList *(*pw_search_sync_fn)(const WvSecretSchema *, int, void *,
+    GError **, ...);
+typedef GHashTable *(*pw_get_attrs_fn)(void *);
+typedef void *(*pw_retrieve_secret_sync_fn)(void *, void *, GError **);
+typedef const gchar *(*pw_value_get_text_fn)(void *);
+typedef void (*pw_value_unref_fn)(void *);
+
+static pw_store_sync_fn            p_secret_store_sync = nullptr;
+static pw_clear_sync_fn            p_secret_clear_sync = nullptr;
+static pw_search_sync_fn           p_secret_search_sync = nullptr;
+static pw_get_attrs_fn             p_secret_get_attrs = nullptr;
+static pw_retrieve_secret_sync_fn  p_secret_retrieve_secret_sync = nullptr;
+static pw_value_get_text_fn        p_secret_value_get_text = nullptr;
+static pw_value_unref_fn           p_secret_value_unref = nullptr;
+
+static bool g_secret_ok = false;
+static bool g_secret_tried = false;
+
+// Resolve libsecret once; cache the result.  Any missing symbol ⇒ off.
+static bool ensure_secret() {
+    if (g_secret_tried) return g_secret_ok;
+    g_secret_tried = true;
+    void *h = dlopen("libsecret-1.so.0", RTLD_NOW | RTLD_GLOBAL);
+    if (!h) { g_secret_ok = false; return false; }
+    p_secret_store_sync = (pw_store_sync_fn)dlsym(h, "secret_password_store_sync");
+    p_secret_clear_sync = (pw_clear_sync_fn)dlsym(h, "secret_password_clear_sync");
+    p_secret_search_sync = (pw_search_sync_fn)dlsym(h, "secret_password_search_sync");
+    p_secret_get_attrs = (pw_get_attrs_fn)dlsym(h, "secret_retrievable_get_attributes");
+    p_secret_retrieve_secret_sync = (pw_retrieve_secret_sync_fn)
+        dlsym(h, "secret_retrievable_retrieve_secret_sync");
+    p_secret_value_get_text = (pw_value_get_text_fn)dlsym(h, "secret_value_get_text");
+    p_secret_value_unref = (pw_value_unref_fn)dlsym(h, "secret_value_unref");
+    g_secret_ok = p_secret_store_sync && p_secret_clear_sync
+        && p_secret_search_sync && p_secret_get_attrs
+        && p_secret_retrieve_secret_sync && p_secret_value_get_text
+        && p_secret_value_unref;
+    return g_secret_ok;
+}
+#endif // WEBVIEW_GTK
+
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1cred_1store_1save
+  (JNIEnv *env, jclass, jstring jservice, jstring jorigin, jstring juser,
+   jstring jpass, jlong millis) {
+#if defined(WEBVIEW_COCOA)
+    const char *service = env->GetStringUTFChars(jservice, nullptr);
+    const char *origin = env->GetStringUTFChars(jorigin, nullptr);
+    const char *user = env->GetStringUTFChars(juser, nullptr);
+    const char *pass = env->GetStringUTFChars(jpass, nullptr);
+    std::string svc = std::string(service ? service : "") + ":"
+        + (origin ? origin : "");
+    std::string value = std::to_string((long long)millis) + "\n"
+        + (pass ? pass : "");
+    CFStringRef cfSvc = pw_cf(svc.c_str());
+    CFStringRef cfAcct = pw_cf(user ? user : "");
+    CFDataRef cfVal = CFDataCreate(kCFAllocatorDefault,
+        (const UInt8 *)value.data(), (CFIndex)value.size());
+    const void *qk[] = { kSecClass, kSecAttrService, kSecAttrAccount };
+    const void *qv[] = { kSecClassGenericPassword, cfSvc, cfAcct };
+    CFDictionaryRef query = CFDictionaryCreate(kCFAllocatorDefault, qk, qv, 3,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    jboolean ok = JNI_FALSE;
+    if (SecItemCopyMatching(query, nullptr) == errSecSuccess) {
+        const void *uk[] = { kSecValueData };
+        const void *uv[] = { cfVal };
+        CFDictionaryRef upd = CFDictionaryCreate(kCFAllocatorDefault, uk, uv, 1,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        ok = (SecItemUpdate(query, upd) == errSecSuccess) ? JNI_TRUE : JNI_FALSE;
+        CFRelease(upd);
+    } else {
+        const void *ak[] = { kSecClass, kSecAttrService, kSecAttrAccount,
+                             kSecValueData, kSecAttrSynchronizable };
+        const void *av[] = { kSecClassGenericPassword, cfSvc, cfAcct,
+                             cfVal, kCFBooleanFalse };
+        CFDictionaryRef add = CFDictionaryCreate(kCFAllocatorDefault, ak, av, 5,
+            &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+        OSStatus addSt = SecItemAdd(add, nullptr);
+        if (addSt == errSecDuplicateItem) {
+            // The existence check above said no and the add says duplicate:
+            // the query and the item disagree on an attribute (an empty
+            // account is the case that produced this).  Update rather than
+            // report a failure the caller cannot act on.
+            const void *uk[] = { kSecValueData };
+            const void *uv[] = { cfVal };
+            CFDictionaryRef upd = CFDictionaryCreate(kCFAllocatorDefault,
+                uk, uv, 1, &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks);
+            addSt = SecItemUpdate(query, upd);
+            CFRelease(upd);
+        }
+        ok = (addSt == errSecSuccess) ? JNI_TRUE : JNI_FALSE;
+        CFRelease(add);
+    }
+    CFRelease(query); CFRelease(cfSvc); CFRelease(cfAcct); CFRelease(cfVal);
+    if (service) env->ReleaseStringUTFChars(jservice, service);
+    if (origin) env->ReleaseStringUTFChars(jorigin, origin);
+    if (user) env->ReleaseStringUTFChars(juser, user);
+    if (pass) env->ReleaseStringUTFChars(jpass, pass);
+    return ok;
+#elif defined(WEBVIEW_GTK)
+    if (!ensure_secret()) {
+        (void)jservice; (void)jorigin; (void)juser; (void)jpass; (void)millis;
+        return JNI_FALSE;
+    }
+    const char *service = env->GetStringUTFChars(jservice, nullptr);
+    const char *origin = env->GetStringUTFChars(jorigin, nullptr);
+    const char *user = env->GetStringUTFChars(juser, nullptr);
+    const char *pass = env->GetStringUTFChars(jpass, nullptr);
+    // Same value encoding as macOS: "<millis>\n<password>".
+    std::string value = std::to_string((long long)millis) + "\n"
+        + (pass ? pass : "");
+    std::string label = std::string("WebView password for ")
+        + (origin ? origin : "");
+    GError *err = nullptr;
+    gboolean ok = p_secret_store_sync(
+        &WEBVIEW_PW_SCHEMA, "default", label.c_str(), value.c_str(),
+        nullptr, &err,
+        "service", service ? service : "",
+        "origin", origin ? origin : "",
+        "username", user ? user : "",
+        (const char *)nullptr);
+    if (service) env->ReleaseStringUTFChars(jservice, service);
+    if (origin) env->ReleaseStringUTFChars(jorigin, origin);
+    if (user) env->ReleaseStringUTFChars(juser, user);
+    if (pass) env->ReleaseStringUTFChars(jpass, pass);
+    if (err) { g_error_free(err); return JNI_FALSE; }
+    return ok ? JNI_TRUE : JNI_FALSE;
+#else
+    (void)env; (void)jservice; (void)jorigin; (void)juser; (void)jpass;
+    (void)millis;
+    return JNI_FALSE;
+#endif
+}
+
+JNIEXPORT jobjectArray JNICALL Java_ca_weblite_webview_WebViewNative_webview_1cred_1store_1find
+  (JNIEnv *env, jclass, jstring jservice, jstring jorigin) {
+    jclass strCls = env->FindClass("java/lang/String");
+#if defined(WEBVIEW_COCOA)
+    const char *service = env->GetStringUTFChars(jservice, nullptr);
+    const char *origin = env->GetStringUTFChars(jorigin, nullptr);
+    std::string svc = std::string(service ? service : "") + ":"
+        + (origin ? origin : "");
+    CFStringRef cfSvc = pw_cf(svc.c_str());
+    std::vector<std::string> triples;
+    // The macOS keychain rejects kSecMatchLimitAll combined with
+    // kSecReturnData (errSecParam), so read in two phases: phase 1
+    // enumerates the matching items (attributes and refs, no data); phase 2
+    // fetches each item's secret by reference with a data-returning query.
+    const void *q1k[] = { kSecClass, kSecAttrService, kSecMatchLimit,
+                          kSecReturnAttributes, kSecReturnRef };
+    const void *q1v[] = { kSecClassGenericPassword, cfSvc, kSecMatchLimitAll,
+                          kCFBooleanTrue, kCFBooleanTrue };
+    CFDictionaryRef q1 = CFDictionaryCreate(kCFAllocatorDefault, q1k, q1v, 5,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFTypeRef listResult = nullptr;
+    OSStatus st = SecItemCopyMatching(q1, &listResult);
+    if (st == errSecSuccess && listResult) {
+        CFArrayRef arr = (CFArrayRef)listResult;
+        CFIndex n = CFArrayGetCount(arr);
+        for (CFIndex i = 0; i < n; i++) {
+            CFDictionaryRef item =
+                (CFDictionaryRef)CFArrayGetValueAtIndex(arr, i);
+            // A credential saved with NO user name -- a two-step login, where
+            // the page carrying the password field has no username field --
+            // comes back with kSecAttrAccount empty or absent.  Skipping it
+            // here hid the credential from every lookup while it sat in the
+            // keychain: the save wrote it, and nothing could ever read it
+            // back.  An absent account is an empty user name, not a bad row.
+            CFStringRef acct =
+                (CFStringRef)CFDictionaryGetValue(item, kSecAttrAccount);
+            std::string username, millisStr = "0", password;
+            if (acct) {
+                CFIndex maxlen = CFStringGetMaximumSizeForEncoding(
+                    CFStringGetLength(acct), kCFStringEncodingUTF8) + 1;
+                std::vector<char> buf((size_t)maxlen);
+                if (!CFStringGetCString(acct, buf.data(), maxlen,
+                                        kCFStringEncodingUTF8)) {
+                    continue;
+                }
+                username = buf.data();
+            }
+            // Phase 2: fetch this item's secret BY REFERENCE.  Matching on
+            // {service, account} a second time cannot fetch an item whose
+            // account did not round-trip; the ref names the row phase 1 has
+            // already found, so the fetch no longer depends on an attribute
+            // matching itself.
+            CFTypeRef ref = CFDictionaryGetValue(item, kSecValueRef);
+            if (!ref) continue;
+            const void *q2k[] = { kSecValueRef, kSecReturnData };
+            const void *q2v[] = { ref, kCFBooleanTrue };
+            CFDictionaryRef q2 = CFDictionaryCreate(kCFAllocatorDefault,
+                q2k, q2v, 2, &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks);
+            CFTypeRef dataResult = nullptr;
+            if (SecItemCopyMatching(q2, &dataResult) == errSecSuccess
+                    && dataResult) {
+                CFDataRef data = (CFDataRef)dataResult;
+                const UInt8 *bytes = CFDataGetBytePtr(data);
+                CFIndex len = CFDataGetLength(data);
+                std::string blob((const char *)bytes, (size_t)len);
+                size_t nl = blob.find('\n');
+                if (nl != std::string::npos) {
+                    millisStr = blob.substr(0, nl);
+                    password = blob.substr(nl + 1);
+                } else {
+                    password = blob;
+                }
+            }
+            if (dataResult) CFRelease(dataResult);
+            CFRelease(q2);
+            triples.push_back(username);
+            triples.push_back(millisStr);
+            triples.push_back(password);
+        }
+    }
+    if (listResult) CFRelease(listResult);
+    CFRelease(q1); CFRelease(cfSvc);
+    if (service) env->ReleaseStringUTFChars(jservice, service);
+    if (origin) env->ReleaseStringUTFChars(jorigin, origin);
+    jobjectArray out =
+        env->NewObjectArray((jsize)triples.size(), strCls, nullptr);
+    for (size_t i = 0; i < triples.size(); i++) {
+        jstring js = env->NewStringUTF(triples[i].c_str());
+        env->SetObjectArrayElement(out, (jsize)i, js);
+        env->DeleteLocalRef(js);
+    }
+    return out;
+#elif defined(WEBVIEW_GTK)
+    if (!ensure_secret()) {
+        (void)jservice; (void)jorigin;
+        return env->NewObjectArray(0, strCls, nullptr);
+    }
+    const char *service = env->GetStringUTFChars(jservice, nullptr);
+    const char *origin = env->GetStringUTFChars(jorigin, nullptr);
+    std::vector<std::string> triples;
+    GError *err = nullptr;
+    // Search all items matching {service, origin} (username unbound) with
+    // secrets loaded; libsecret filters by the schema attributes.
+    GList *items = p_secret_search_sync(
+        &WEBVIEW_PW_SCHEMA,
+        WV_SECRET_SEARCH_ALL | WV_SECRET_SEARCH_UNLOCK
+            | WV_SECRET_SEARCH_LOAD_SECRETS,
+        nullptr, &err,
+        "service", service ? service : "",
+        "origin", origin ? origin : "",
+        (const char *)nullptr);
+    if (err) { g_error_free(err); err = nullptr; }
+    for (GList *l = items; l != nullptr; l = l->next) {
+        void *item = l->data;
+        if (!item) continue;
+        std::string username, millisStr = "0", password;
+        GHashTable *attrs = p_secret_get_attrs(item);
+        if (attrs) {
+            const char *uname =
+                (const char *)g_hash_table_lookup(attrs, (gpointer)"username");
+            if (uname) username = uname;
+        }
+        GError *e2 = nullptr;
+        void *val = p_secret_retrieve_secret_sync(item, nullptr, &e2);
+        if (e2) { g_error_free(e2); e2 = nullptr; }
+        if (val) {
+            const char *text = p_secret_value_get_text(val);
+            if (text) {
+                std::string blob(text);
+                size_t nl = blob.find('\n');
+                if (nl != std::string::npos) {
+                    millisStr = blob.substr(0, nl);
+                    password = blob.substr(nl + 1);
+                } else {
+                    password = blob;
+                }
+            }
+            p_secret_value_unref(val);
+        }
+        if (attrs) g_hash_table_unref(attrs);
+        triples.push_back(username);
+        triples.push_back(millisStr);
+        triples.push_back(password);
+    }
+    if (items) g_list_free_full(items, g_object_unref);
+    if (service) env->ReleaseStringUTFChars(jservice, service);
+    if (origin) env->ReleaseStringUTFChars(jorigin, origin);
+    jobjectArray out =
+        env->NewObjectArray((jsize)triples.size(), strCls, nullptr);
+    for (size_t i = 0; i < triples.size(); i++) {
+        jstring js = env->NewStringUTF(triples[i].c_str());
+        env->SetObjectArrayElement(out, (jsize)i, js);
+        env->DeleteLocalRef(js);
+    }
+    return out;
+#else
+    (void)jservice; (void)jorigin;
+    return env->NewObjectArray(0, strCls, nullptr);
+#endif
+}
+
+JNIEXPORT jobjectArray JNICALL Java_ca_weblite_webview_WebViewNative_webview_1cred_1store_1find_1all
+  (JNIEnv *env, jclass, jstring jservice) {
+    jclass strCls = env->FindClass("java/lang/String");
+#if defined(WEBVIEW_COCOA)
+    const char *service = env->GetStringUTFChars(jservice, nullptr);
+    std::string prefix = std::string(service ? service : "") + ":";
+    // Each item's kSecAttrService is "<namespace>:<origin>" (origin embedded
+    // in the service, plain username as the account), so there is no single
+    // service value covering all origins and the keychain has no prefix
+    // query.  Enumerate every generic-password item and keep those whose
+    // service starts with "<service>:".  Two phases as in find: the
+    // kSecMatchLimitAll + kSecReturnData combination returns errSecParam.
+    std::vector<std::string> quads;
+    const void *q1k[] = { kSecClass, kSecMatchLimit, kSecReturnAttributes,
+                          kSecReturnRef };
+    const void *q1v[] = { kSecClassGenericPassword, kSecMatchLimitAll,
+                          kCFBooleanTrue, kCFBooleanTrue };
+    CFDictionaryRef q1 = CFDictionaryCreate(kCFAllocatorDefault, q1k, q1v, 4,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    CFTypeRef listResult = nullptr;
+    OSStatus st = SecItemCopyMatching(q1, &listResult);
+    if (st == errSecSuccess && listResult) {
+        CFArrayRef arr = (CFArrayRef)listResult;
+        CFIndex n = CFArrayGetCount(arr);
+        for (CFIndex i = 0; i < n; i++) {
+            CFDictionaryRef item =
+                (CFDictionaryRef)CFArrayGetValueAtIndex(arr, i);
+            CFStringRef svcAttr =
+                (CFStringRef)CFDictionaryGetValue(item, kSecAttrService);
+            CFStringRef acct =
+                (CFStringRef)CFDictionaryGetValue(item, kSecAttrAccount);
+            // An absent account is a credential saved with no user name (a
+            // two-step login), not a row to drop -- see find() above.
+            if (!svcAttr) continue;
+            // Read the full service string.
+            CFIndex svcMax = CFStringGetMaximumSizeForEncoding(
+                CFStringGetLength(svcAttr), kCFStringEncodingUTF8) + 1;
+            std::vector<char> svcBuf((size_t)svcMax);
+            if (!CFStringGetCString(svcAttr, svcBuf.data(), svcMax,
+                                    kCFStringEncodingUTF8)) {
+                continue;
+            }
+            std::string fullSvc = svcBuf.data();
+            // Keep only our namespace; derive origin from the suffix.
+            if (fullSvc.size() < prefix.size()
+                    || fullSvc.compare(0, prefix.size(), prefix) != 0) {
+                continue;
+            }
+            std::string origin = fullSvc.substr(prefix.size());
+            // Read the account (username); absent means none was captured.
+            std::string username;
+            if (acct) {
+                CFIndex acctMax = CFStringGetMaximumSizeForEncoding(
+                    CFStringGetLength(acct), kCFStringEncodingUTF8) + 1;
+                std::vector<char> acctBuf((size_t)acctMax);
+                if (!CFStringGetCString(acct, acctBuf.data(), acctMax,
+                                        kCFStringEncodingUTF8)) {
+                    continue;
+                }
+                username = acctBuf.data();
+            }
+            std::string millisStr = "0", password;
+            // Phase 2: fetch this item's secret by reference, not by matching
+            // {service, account} again -- see find() above.
+            CFTypeRef ref = CFDictionaryGetValue(item, kSecValueRef);
+            if (!ref) continue;
+            const void *q2k[] = { kSecValueRef, kSecReturnData };
+            const void *q2v[] = { ref, kCFBooleanTrue };
+            CFDictionaryRef q2 = CFDictionaryCreate(kCFAllocatorDefault,
+                q2k, q2v, 2, &kCFTypeDictionaryKeyCallBacks,
+                &kCFTypeDictionaryValueCallBacks);
+            CFTypeRef dataResult = nullptr;
+            if (SecItemCopyMatching(q2, &dataResult) == errSecSuccess
+                    && dataResult) {
+                CFDataRef data = (CFDataRef)dataResult;
+                const UInt8 *bytes = CFDataGetBytePtr(data);
+                CFIndex len = CFDataGetLength(data);
+                std::string blob((const char *)bytes, (size_t)len);
+                size_t nl = blob.find('\n');
+                if (nl != std::string::npos) {
+                    millisStr = blob.substr(0, nl);
+                    password = blob.substr(nl + 1);
+                } else {
+                    password = blob;
+                }
+            }
+            if (dataResult) CFRelease(dataResult);
+            CFRelease(q2);
+            quads.push_back(origin);
+            quads.push_back(username);
+            quads.push_back(millisStr);
+            quads.push_back(password);
+        }
+    }
+    if (listResult) CFRelease(listResult);
+    CFRelease(q1);
+    if (service) env->ReleaseStringUTFChars(jservice, service);
+    jobjectArray out =
+        env->NewObjectArray((jsize)quads.size(), strCls, nullptr);
+    for (size_t i = 0; i < quads.size(); i++) {
+        jstring js = env->NewStringUTF(quads[i].c_str());
+        env->SetObjectArrayElement(out, (jsize)i, js);
+        env->DeleteLocalRef(js);
+    }
+    return out;
+#elif defined(WEBVIEW_GTK)
+    if (!ensure_secret()) {
+        (void)jservice;
+        return env->NewObjectArray(0, strCls, nullptr);
+    }
+    const char *service = env->GetStringUTFChars(jservice, nullptr);
+    std::vector<std::string> quads;
+    GError *err = nullptr;
+    // Enumerate every item in our namespace: bind only "service", leaving
+    // origin and username unbound (STORY-006-005).
+    GList *items = p_secret_search_sync(
+        &WEBVIEW_PW_SCHEMA,
+        WV_SECRET_SEARCH_ALL | WV_SECRET_SEARCH_UNLOCK
+            | WV_SECRET_SEARCH_LOAD_SECRETS,
+        nullptr, &err,
+        "service", service ? service : "",
+        (const char *)nullptr);
+    if (err) { g_error_free(err); err = nullptr; }
+    for (GList *l = items; l != nullptr; l = l->next) {
+        void *item = l->data;
+        if (!item) continue;
+        std::string origin, username, millisStr = "0", password;
+        GHashTable *attrs = p_secret_get_attrs(item);
+        if (attrs) {
+            const char *o =
+                (const char *)g_hash_table_lookup(attrs, (gpointer)"origin");
+            const char *u =
+                (const char *)g_hash_table_lookup(attrs, (gpointer)"username");
+            if (o) origin = o;
+            if (u) username = u;
+        }
+        GError *e2 = nullptr;
+        void *val = p_secret_retrieve_secret_sync(item, nullptr, &e2);
+        if (e2) { g_error_free(e2); e2 = nullptr; }
+        if (val) {
+            const char *text = p_secret_value_get_text(val);
+            if (text) {
+                std::string blob(text);
+                size_t nl = blob.find('\n');
+                if (nl != std::string::npos) {
+                    millisStr = blob.substr(0, nl);
+                    password = blob.substr(nl + 1);
+                } else {
+                    password = blob;
+                }
+            }
+            p_secret_value_unref(val);
+        }
+        if (attrs) g_hash_table_unref(attrs);
+        quads.push_back(origin);
+        quads.push_back(username);
+        quads.push_back(millisStr);
+        quads.push_back(password);
+    }
+    if (items) g_list_free_full(items, g_object_unref);
+    if (service) env->ReleaseStringUTFChars(jservice, service);
+    jobjectArray out =
+        env->NewObjectArray((jsize)quads.size(), strCls, nullptr);
+    for (size_t i = 0; i < quads.size(); i++) {
+        jstring js = env->NewStringUTF(quads[i].c_str());
+        env->SetObjectArrayElement(out, (jsize)i, js);
+        env->DeleteLocalRef(js);
+    }
+    return out;
+#else
+    (void)jservice;
+    return env->NewObjectArray(0, strCls, nullptr);
+#endif
+}
+
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1cred_1store_1delete
+  (JNIEnv *env, jclass, jstring jservice, jstring jorigin, jstring juser) {
+#if defined(WEBVIEW_COCOA)
+    const char *service = env->GetStringUTFChars(jservice, nullptr);
+    const char *origin = env->GetStringUTFChars(jorigin, nullptr);
+    const char *user = env->GetStringUTFChars(juser, nullptr);
+    std::string svc = std::string(service ? service : "") + ":"
+        + (origin ? origin : "");
+    CFStringRef cfSvc = pw_cf(svc.c_str());
+    CFStringRef cfAcct = pw_cf(user ? user : "");
+    const void *qk[] = { kSecClass, kSecAttrService, kSecAttrAccount };
+    const void *qv[] = { kSecClassGenericPassword, cfSvc, cfAcct };
+    CFDictionaryRef query = CFDictionaryCreate(kCFAllocatorDefault, qk, qv, 3,
+        &kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+    OSStatus st = SecItemDelete(query);
+    CFRelease(query); CFRelease(cfSvc); CFRelease(cfAcct);
+    if (service) env->ReleaseStringUTFChars(jservice, service);
+    if (origin) env->ReleaseStringUTFChars(jorigin, origin);
+    if (user) env->ReleaseStringUTFChars(juser, user);
+    return (st == errSecSuccess) ? JNI_TRUE : JNI_FALSE;
+#elif defined(WEBVIEW_GTK)
+    if (!ensure_secret()) {
+        (void)jservice; (void)jorigin; (void)juser;
+        return JNI_FALSE;
+    }
+    const char *service = env->GetStringUTFChars(jservice, nullptr);
+    const char *origin = env->GetStringUTFChars(jorigin, nullptr);
+    const char *user = env->GetStringUTFChars(juser, nullptr);
+    GError *err = nullptr;
+    gboolean removed = p_secret_clear_sync(
+        &WEBVIEW_PW_SCHEMA, nullptr, &err,
+        "service", service ? service : "",
+        "origin", origin ? origin : "",
+        "username", user ? user : "",
+        (const char *)nullptr);
+    if (service) env->ReleaseStringUTFChars(jservice, service);
+    if (origin) env->ReleaseStringUTFChars(jorigin, origin);
+    if (user) env->ReleaseStringUTFChars(juser, user);
+    if (err) { g_error_free(err); return JNI_FALSE; }
+    return removed ? JNI_TRUE : JNI_FALSE;
+#else
+    (void)env; (void)jservice; (void)jorigin; (void)juser;
+    return JNI_FALSE;
+#endif
+}
+
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1cred_1store_1available
+  (JNIEnv *env, jclass) {
+    (void)env;
+#if defined(WEBVIEW_COCOA)
+    return JNI_TRUE;
+#elif defined(WEBVIEW_GTK)
+    return ensure_secret() ? JNI_TRUE : JNI_FALSE;
+#else
+    return JNI_FALSE;
+#endif
+}
+
 // Popup (window.open) callback registration — Canvas 15 (Java + macOS),
 // Canvas 16 (Linux / GTK).  Windows native popup site lands in Canvas 17, so
 // that branch stays a no-op for now and window.open stays blocked there (the
@@ -7673,6 +9570,32 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
     if (ua && s) env->ReleaseStringUTFChars(ua, s);
 }
 
+// Install/clear the per-destination User-Agent resolver — Canvas 21 (1.5.0).
+// The resolver is a java.util.function.Function<String,String>; it is held as a
+// JNI global ref and consulted at the popup-child creation site with the
+// child's own target URL.  resolver == nullptr clears it.  Never throws.
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1user_1agent_1resolver
+  (JNIEnv *env, jclass, jlong wv, jobject resolver) {
+    if (wv == 0) return;
+#ifdef WEBVIEW_GTK
+    embed::gtk_set_user_agent_resolver((embed::Engine *)wv, env, resolver);
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_set_user_agent_resolver((embed::Engine *)wv, env, resolver);
+#else
+    (void)wv; (void)env; (void)resolver;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1user_1agent_1resolver
+  (JNIEnv *env, jclass, jlong peer, jobject resolver) {
+    if (peer == 0) return;
+#ifdef WEBVIEW_GTK
+    embed::gtk_off_set_user_agent_resolver((embed::OffEngine *)peer, env, resolver);
+#else
+    (void)peer; (void)env; (void)resolver;
+#endif
+}
+
 // Clear the embedded WebView's HTTP resource cache — Canvas 22.  Resource
 // cache only (cookies survive).  Runs on the engine UI thread; asynchronous.
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1clear_1cache
@@ -7734,6 +9657,140 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
     embed::gtk_get_cookies(((embed::OffEngine *)peer)->web, value, completion);
 #else
     embed::complete_cookie_query(completion, "", "Offscreen cookie queries are unsupported");
+#endif
+}
+
+// Print to PDF — Canvas 29.  Must live inside this `extern "C"` block (D11).
+// Every path answers the callback exactly once; nothing throws into Java.
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1pdf_1available
+  (JNIEnv *, jclass) {
+#if defined(WEBVIEW_GTK) || defined(WEBVIEW_COCOA)
+    return JNI_TRUE;
+#else
+    return JNI_FALSE;
+#endif
+}
+
+// Custom URL schemes — Canvases 30 and 31.  Inside this `extern "C"` block like
+// every export.  macOS and Linux serve them now; Windows follows in Canvas 32.
+// On GTK the mandatory scheme symbols are resolved in JNI_OnLoad, so a loaded
+// library can always serve them (Canvas 31 D9).
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1scheme_1available
+  (JNIEnv *, jclass) {
+#if defined(WEBVIEW_COCOA) || defined(WEBVIEW_GTK)
+    return JNI_TRUE;
+#else
+    return JNI_FALSE;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1scheme_1install
+  (JNIEnv *env, jclass, jobjectArray names, jobject dispatcher) {
+    std::lock_guard<std::mutex> lk(embed::g_scheme_mutex);
+    if (embed::g_scheme_installed) return;
+    embed::g_scheme_installed = true;
+    env->GetJavaVM(&embed::g_scheme_jvm);
+    if (dispatcher) embed::g_scheme_dispatcher = env->NewGlobalRef(dispatcher);
+    jsize n = names ? env->GetArrayLength(names) : 0;
+    for (jsize i = 0; i < n; i++) {
+        jstring js = (jstring)env->GetObjectArrayElement(names, i);
+        if (!js) continue;
+        const char *c = env->GetStringUTFChars(js, nullptr);
+        if (c) {
+            embed::g_scheme_names.push_back(c);
+            env->ReleaseStringUTFChars(js, c);
+        }
+        env->DeleteLocalRef(js);
+    }
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1scheme_1respond
+  (JNIEnv *env, jclass, jlong id, jint status, jobjectArray headerPairs, jbyteArray body) {
+    std::vector<std::string> pairs;
+    jsize n = headerPairs ? env->GetArrayLength(headerPairs) : 0;
+    for (jsize i = 0; i < n; i++) {
+        jstring js = (jstring)env->GetObjectArrayElement(headerPairs, i);
+        std::string v;
+        if (js) {
+            const char *c = env->GetStringUTFChars(js, nullptr);
+            if (c) {
+                v = c;
+                env->ReleaseStringUTFChars(js, c);
+            }
+            env->DeleteLocalRef(js);
+        }
+        pairs.push_back(v);
+    }
+    std::vector<unsigned char> bytes;
+    jsize len = body ? env->GetArrayLength(body) : 0;
+    if (len > 0) {
+        bytes.resize((size_t)len);
+        env->GetByteArrayRegion(body, 0, len, (jbyte *)bytes.data());
+    }
+#if defined(WEBVIEW_COCOA)
+    embed::cocoa_scheme_respond((long long)id, (int)status, pairs, bytes);
+#elif defined(WEBVIEW_GTK)
+    embed::gtk_scheme_respond((long long)id, (int)status, pairs, bytes);
+#else
+    (void)id; (void)status;
+#endif
+}
+
+static std::string embed_jstring_utf8(JNIEnv *env, jstring s) {
+    std::string out;
+    if (!s) return out;
+    const char *c = env->GetStringUTFChars(s, nullptr);
+    if (c) {
+        out = c;
+        env->ReleaseStringUTFChars(s, c);
+    }
+    return out;
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1print_1to_1pdf
+  (JNIEnv *env, jclass, jlong wv, jstring path, jdouble w, jdouble h,
+   jdouble mt, jdouble mr, jdouble mb, jdouble ml, jboolean bg, jobject cb) {
+    embed::PdfJob *job = embed::pdf_new_job(env, cb);
+    if (wv == 0) {
+        embed::pdf_finish(job, false, embed::kPdfNotAttached);
+        return;
+    }
+    std::string p = embed_jstring_utf8(env, path);
+#ifdef WEBVIEW_GTK
+    // Linux supports the lightweight component only (Canvas 29 D13): printing
+    // the embedded (heavyweight) view crashes inside WebKitGTK's print
+    // operation, so refuse rather than take the JVM down.
+    (void)p; (void)w; (void)h; (void)mt; (void)mr; (void)mb; (void)ml; (void)bg;
+    embed::pdf_finish(job, false,
+        "PDF printing on Linux needs the lightweight WebView component.");
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_print_to_pdf((embed::Engine *)wv, job, p, w, h, mt, mr, mb, ml,
+                              bg == JNI_TRUE);
+#else
+    (void)p; (void)w; (void)h; (void)mt; (void)mr; (void)mb; (void)ml; (void)bg;
+    embed::pdf_finish(job, false,
+        "PDF printing is not available in this version of the native library.");
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1print_1to_1pdf
+  (JNIEnv *env, jclass, jlong peer, jstring path, jdouble w, jdouble h,
+   jdouble mt, jdouble mr, jdouble mb, jdouble ml, jboolean bg, jobject cb) {
+    embed::PdfJob *job = embed::pdf_new_job(env, cb);
+#ifdef WEBVIEW_GTK
+    if (peer == 0) {
+        embed::pdf_finish(job, false, embed::kPdfNotAttached);
+        return;
+    }
+    embed::OffEngine *e = (embed::OffEngine *)peer;
+    embed::gtk_print_to_pdf([e] { return e->web; }, job,
+                            embed_jstring_utf8(env, path), w, h, mt, mr, mb,
+                            ml, bg == JNI_TRUE);
+#else
+    // No offscreen engine off Linux (Canvas 29 op 10).
+    (void)peer; (void)path; (void)w; (void)h; (void)mt; (void)mr; (void)mb;
+    (void)ml; (void)bg;
+    embed::pdf_finish(job, false, embed::kPdfNotAttached);
 #endif
 }
 

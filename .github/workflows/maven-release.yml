@@ -1,6 +1,17 @@
-# Release workflow: build cross-platform natives, then publish to Maven Central.
+# Release workflow: build cross-platform natives, then publish the assembled
+# jar to BOTH GitHub Packages and Maven Central, in that order.
 #
-# Uses the modern Central Publishing Maven Plugin (org.sonatype.central:central-publishing-maven-plugin).
+# GitHub Packages is readable the instant the deploy returns, so it is the fast
+# lane that unblocks downstream first-party builds while Maven Central syncs.
+# Maven Central remains the canonical public channel (GitHub Packages requires
+# an authenticated read even for public packages, so external adopters cannot
+# use it).  Central publication uses the modern Central Publishing Maven Plugin
+# (org.sonatype.central:central-publishing-maven-plugin); GitHub Packages uses
+# the ordinary maven-deploy-plugin.  Each lives in its own Maven profile —
+# see the comment above <profiles> in pom.xml for why that split is required.
+#
+# GitHub Packages authenticates with the built-in GITHUB_TOKEN; no secret is
+# needed for that leg.
 #
 # Required GitHub Secrets (provided as webliteca org-level secrets):
 #   GPG_PRIVATE_KEY        - Base64-encoded GPG private key
@@ -12,7 +23,7 @@
 #   git tag v1.0.0
 #   git push origin v1.0.0
 
-name: Release to Maven Central
+name: Release to GitHub Packages and Maven Central
 
 on:
   push:
@@ -191,14 +202,19 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # Deploy job: assemble all natives into src/<arch>/, set version from tag,
-  # sign artifacts, and publish to Maven Central via the Central Publishing
-  # Maven Plugin.  Only runs on v* tag pushes (and manual dispatch).
+  # Deploy job: assemble all natives into natives/<arch>/, set version from the
+  # tag, then publish the same jar twice — GitHub Packages first, Maven Central
+  # second.  The six-platform presence assertion gates BOTH deploys, so an
+  # incomplete release publishes to neither repository.  Only runs on v* tag
+  # pushes (and manual dispatch); build.yml never publishes anywhere.
   # ---------------------------------------------------------------------------
   deploy:
-    name: Deploy to Maven Central
+    name: Deploy to GitHub Packages and Maven Central
     needs: native
     runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
 
@@ -219,10 +235,31 @@ jobs:
           distribution: liberica
           java-version: '11'
           cache: maven
-          server-id: central
-          server-username: MAVEN_CENTRAL_USERNAME
-          server-password: MAVEN_CENTRAL_PASSWORD
-          overwrite-settings: true
+
+      # setup-java's server-id input configures exactly one server; this
+      # release authenticates two, so write the settings file directly.
+      # Credentials stay as ${env.*} lookups resolved per deploy step.
+      - name: Write Maven settings with both deploy servers
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.m2
+          cat > ~/.m2/settings.xml <<'EOF'
+          <settings xmlns="http://maven.apache.org/SETTINGS/1.0.0">
+            <servers>
+              <server>
+                <id>github</id>
+                <username>${env.GITHUB_ACTOR}</username>
+                <password>${env.GITHUB_TOKEN}</password>
+              </server>
+              <server>
+                <id>central</id>
+                <username>${env.MAVEN_CENTRAL_USERNAME}</username>
+                <password>${env.MAVEN_CENTRAL_PASSWORD}</password>
+              </server>
+            </servers>
+          </settings>
+          EOF
 
       - name: Download all native artifacts
         uses: actions/download-artifact@v4
@@ -278,13 +315,30 @@ jobs:
             -DgenerateBackupPoms=false \
             --batch-mode -ntp
 
-      - name: Build and deploy
+      # Fast lane first: available to downstream builds immediately, and
+      # deliberately unsigned — GitHub Packages does not require GPG, so this
+      # leg never touches the private key.
+      - name: Publish to GitHub Packages
         shell: bash
         run: |
           mvn -B clean deploy \
             --batch-mode -ntp \
             -DskipTests \
-            -Psign-artifacts \
+            -Pgithub-deploy
+        env:
+          GITHUB_ACTOR: ${{ github.actor }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # Canonical channel second.  No `clean`: this republishes the very same
+      # tree the step above deployed, plus the sources/javadoc jars and GPG
+      # signatures that Central requires.
+      - name: Publish to Maven Central
+        shell: bash
+        run: |
+          mvn -B deploy \
+            --batch-mode -ntp \
+            -DskipTests \
+            -Pcentral-deploy,sign-artifacts \
             -Dgpg.passphrase="$GPG_PASSPHRASE"
         env:
           GPG_PASSPHRASE: ${{ secrets.GPG_PASSPHRASE }}
