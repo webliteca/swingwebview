@@ -247,7 +247,9 @@ generated_at: 2026-05-16T07:19:13-07:00
 - **Pixel pump, no embed.** Unlike the heavyweight path
   ([[swing-heavyweight-webview-embedding]]), no native window
   is reparented into the Swing hierarchy. WebKit renders into a
-  `GtkOffscreenWindow` on the GTK side, this component
+  hidden popup toplevel on the GTK side (a `GtkOffscreenWindow` until
+  [[33-Media-Plays-In-The-Lightweight-Engine]], which WebKitGTK never
+  treats as "in a window", so media never started), this component
   periodically snapshots the resulting cairo surface into a
   `BufferedImage`, and Swing composites the image normally
   (`README.md ("Lightweight notes" section)`).

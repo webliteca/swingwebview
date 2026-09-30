@@ -3279,15 +3279,17 @@ static void gtk_discard_popup(jlong popupId) {
 // ===========================================================================
 // Linux / GTK lightweight (offscreen) engine
 //
-// Renders the WebKitWebView into a GtkOffscreenWindow which never touches
-// the user's screen.  Java polls the latest pixels via JNI and blits them
+// Renders the WebKitWebView into the engine's hidden popup toplevel, which
+// never touches the user's screen (Canvas 33 D2: a GTK_WINDOW_POPUP placed
+// outside every monitor, not a GtkOffscreenWindow -- WebKitGTK never counts
+// a view in an offscreen window as "in a window", so media never starts).  Java polls the latest pixels via JNI and blits them
 // into a JComponent itself.  The whole heavyweight AWT/X11/GTK focus and
 // frame-clock circus is bypassed -- we own the paint cycle, Java owns the
 // AWT event flow.
 // ===========================================================================
 
 struct OffEngine {
-    GtkWidget *window = nullptr;    // GtkOffscreenWindow
+    GtkWidget *window = nullptr;    // hidden popup toplevel (Canvas 33)
     GtkWidget *web = nullptr;       // WebKitWebView
     WebKitUserContentManager *manager = nullptr;
     int width = 1;
@@ -3400,7 +3402,7 @@ static void off_engine_on_message(OffEngine *e, const char *msg) {
 // (the offscreen popup-adoption path) the engine REUSES that already-created
 // WebKitWebView instead of allocating a fresh one — preserving its in-flight
 // POST navigation + window.opener linkage — while still building the
-// GtkOffscreenWindow and performing the identical external-message / dialog /
+// hidden popup toplevel (Canvas 33) and performing the identical external-message / dialog /
 // popup / IM-disable / focus-synth / container / show wiring.  `existing_web`
 // must carry no GTK parent (the ADOPT branch never adds it to a container);
 // gtk_container_add below adopts it into the offscreen window.  Mirrors
@@ -3420,7 +3422,19 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
 
     bool ok = false;
     GtkPump::instance().run_sync([&] {
-        e->window = gtk_offscreen_window_new();
+        // Canvas 33 D1/D2: a popup (override-redirect on X11, the only
+        // backend the pump allows) placed far outside every monitor, rather
+        // than a GtkOffscreenWindow.  WebKitGTK only lets a page start media
+        // once its view is in an on-screen toplevel, and never counts an
+        // offscreen window as one; this window is mapped but never visible,
+        // undecorated, unfocusable and out of the taskbar.
+        e->window = gtk_window_new(GTK_WINDOW_POPUP);
+        gtk_window_move(GTK_WINDOW(e->window), -32000, -32000);
+        gtk_window_set_accept_focus(GTK_WINDOW(e->window), FALSE);
+        gtk_window_set_focus_on_map(GTK_WINDOW(e->window), FALSE);
+        gtk_window_set_skip_taskbar_hint(GTK_WINDOW(e->window), TRUE);
+        gtk_window_set_skip_pager_hint(GTK_WINDOW(e->window), TRUE);
+        gtk_window_set_decorated(GTK_WINDOW(e->window), FALSE);
         // Canvas 19: reuse the retained popup child (adoption) or create fresh.
         // The reused child already carries its opener linkage + in-flight POST
         // navigation from handle_create_web_view.
@@ -3758,14 +3772,14 @@ static void gtk_off_clear_cache(OffEngine *e) {
 //   Phase 2 (here): the application's lightweight WebViewComponent.adoptPopup
 //     peer attach calls webview_offscreen_adopt_popup -> gtk_off_adopt_popup,
 //     which claims the retained child (adopt-once), builds a normal OffEngine
-//     that REUSES the child web view inside a GtkOffscreenWindow (via
+//     that REUSES the child web view inside a hidden popup toplevel (Canvas 33) (via
 //     gtk_off_create_engine's existing_web parameter), transfers the inherited
 //     callbacks, and frees the PopupEngine shell.
 //
 // ON-DEVICE VALIDATION REQUIRED (no GTK toolchain in the generating sandbox):
 //   * the ownership/reparent handoff — the child, held windowless by
 //     g_object_ref_sink, is gtk_container_add-ed into a fresh
-//     GtkOffscreenWindow (which takes a container ref); the retained ref is
+//     popup toplevel (which takes a container ref); the retained ref is
 //     then dropped.  Unlike the heavyweight adopt there is NO XReparentWindow
 //     into a foreign on-screen X11 tree — the child lives in an offscreen
 //     toplevel — but the refcount balance (offscreen window ref + WebKit's own
@@ -3811,7 +3825,7 @@ static OffEngine *gtk_off_adopt_popup(JNIEnv *env, jlong popupId,
     });
 
     // Build the offscreen engine reusing the retained child web view.  This
-    // creates the GtkOffscreenWindow, wires the external-message / dialog /
+    // creates the hidden popup toplevel (Canvas 33), wires the external-message / dialog /
     // popup / IM-disable / focus-synth pipeline, and gtk_container_add-s the
     // child into the offscreen window (taking a container ref) — identical to
     // a normal offscreen create except the web view is reused rather than
@@ -4170,12 +4184,12 @@ static void gtk_off_key_event(OffEngine *e, bool press,
 // BufferedImage TYPE_INT_ARGB).  The Java array must be at least w*h ints.
 //
 // Implementation note: we allocate our own image surface and ask the
-// offscreen GtkWindow to draw into it via gtk_widget_draw.  We do NOT
-// use gtk_offscreen_window_get_surface -- it's (transfer-none) so we
-// must not destroy what it returns, and its internal surface is only
-// populated after a frame-clock-driven draw, which on this code path
-// isn't reliably ticking.  Drawing on demand into a surface we own
-// sidesteps both lifetime and timing concerns.
+// engine's hidden popup toplevel (Canvas 33) to draw into it via
+// gtk_widget_draw.  This never reads the window's on-screen contents (it is
+// off every monitor), and never relied on gtk_offscreen_window_get_surface,
+// which was (transfer-none) and only populated after a frame-clock-driven
+// draw that isn't reliably ticking on this path.  Drawing on demand into a
+// surface we own sidesteps both lifetime and timing concerns.
 static void gtk_off_snapshot_into(OffEngine *e, JNIEnv *env,
                                   jintArray dest, jint w, jint h) {
     if (!e || w < 1 || h < 1) return;
@@ -9555,7 +9569,7 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
 // otherwise make them unresolvable from the JVM — UnsatisfiedLinkError; the
 // exact bug already hit and fixed for the dialog setters and the heavyweight
 // adopt/discard bridges).  Linux reuses the retained WebKitGTK child inside a
-// GtkOffscreenWindow via gtk_off_adopt_popup; the reclaim path reuses the
+// hidden popup toplevel (Canvas 33) via gtk_off_adopt_popup; the reclaim path reuses the
 // SHARED gtk_discard_popup (the retained child is the same PopupEngine in the
 // same registry).  macOS / Windows offscreen engines are stubs, so adopt
 // returns 0 (OffscreenWebView.adopt turns 0 into an IllegalStateException) and
