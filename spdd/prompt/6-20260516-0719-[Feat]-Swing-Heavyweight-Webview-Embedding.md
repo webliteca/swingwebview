@@ -2562,7 +2562,9 @@ Files: `src/ca/weblite/webview/WebViewCookieCallback.java`,
    and `WebViewCookieCallback.completed(String cookieHeader, String error)`.
    Hold a JNI global reference until exactly one asynchronous completion.
    Produce an empty string when no cookies match and format matches as
-   `name=value; name2=value2`.
+   `name=value; name2=value2`, ordered by descending cookie path length
+   (RFC 6265 section 5.4) on every platform, preserving the engine's order
+   for equal lengths.
 3. On macOS, query `WKHTTPCookieStore.getAllCookies` on the AppKit main
    queue; filter by URL host/domain, path, secure scheme and expiry before
    formatting. The file is compiled as non-ARC C++, so a block does not
@@ -2579,6 +2581,8 @@ Files: `src/ca/weblite/webview/WebViewCookieCallback.java`,
    worker for the URL and assemble the header including HttpOnly cookies.
    If posting the query to the worker thread fails, free the queued work and
    complete the query immediately with an error so the future never hangs.
+   `GetCookies` does not order its list by path, so read each cookie's path
+   and stable-sort the matches by descending path length before formatting.
    macOS and Windows offscreen peers are unsupported and report an error.
 5. Document credential handling, platform coverage and the attached-peer
    requirement in `README.md`. Retain existing PDF, password-manager and
@@ -2596,8 +2600,13 @@ Files: `src/ca/weblite/webview/WebViewCookieCallback.java`,
      absent from `document.cookie`;
    - the script-visible cookie is returned;
    - the `/private` cookie is returned for a `/private/...` URL and excluded
-     for `/`;
-   - the `Secure` cookie is excluded for the `http` page URL;
+     for `/`, and in the `/private/...` result it precedes every `Path=/`
+     cookie;
+   - the `Secure` cookie is excluded for the `http` page URL, unless the
+     engine itself exposed it to the page over `http` (it appears in
+     `document.cookie`; Chromium/WebView2 treats `http://localhost` as a
+     secure context), in which case its presence is consistent with what the
+     engine would send and is reported as INFO rather than a failure;
    - host-only cookies are excluded for `http://sub.localhost:<port>/`;
    - an unrelated host returns an empty string.
    The demo prints PASS/FAIL per check but never prints cookie values beyond

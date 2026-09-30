@@ -31,10 +31,10 @@ values. The **Run getCookies checks again** button repeats the native checks.
 | HttpOnly cookie returned | `getCookies(page)` contains `swv_http` |
 | script cookie returned | `getCookies(page)` contains `swv_js` |
 | Path=/private cookie excluded | `getCookies(page)` omits `swv_path` |
-| Secure cookie excluded for http | `getCookies(page)` omits `swv_secure` |
+| Secure cookie excluded for http | `getCookies(page)` omits `swv_secure` — unless the engine itself shows `swv_secure` to the page over http (WebView2 treats `http://localhost` as a secure context), which is reported as `INFO` |
 | header syntax | the result is `name=value; name2=value2` |
 | Path=/private cookie returned | `getCookies(.../private/area)` contains `swv_path` |
-| longer-path cookie listed first | in that result `swv_path` precedes `swv_js` (RFC 6265 §5.4) |
+| longer-path cookie listed first | in that result `swv_path` precedes every `Path=/` cookie (RFC 6265 §5.4) |
 | host-only cookies excluded | `getCookies(http://sub.localhost:<port>/)` omits `swv_http` and `swv_js` |
 | unrelated host returns empty | `getCookies(http://unrelated.invalid/)` is `""` |
 

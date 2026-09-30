@@ -23,6 +23,7 @@
 // CredDeleteW / CredFree) for the password-manager secret store (Canvas 28).
 #include <wincred.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <cstdint>
@@ -911,13 +912,14 @@ public:
             return S_OK;
         }
 
-        std::string header;
         UINT count = 0;
         if (FAILED(cookie_list->get_Count(&count))) {
             complete_cookie_query(m_completion, "", "WebView2 cookie list is unavailable");
             m_completion = nullptr;
             return S_OK;
         }
+        struct Match { size_t path_len; std::string pair; };
+        std::vector<Match> matches;
         for (UINT index = 0; index < count; ++index) {
             ICoreWebView2Cookie *cookie = nullptr;
             if (FAILED(cookie_list->GetValueAtIndex(index, &cookie)) || !cookie) {
@@ -925,16 +927,31 @@ public:
             }
             LPWSTR name = nullptr;
             LPWSTR value = nullptr;
+            LPWSTR path = nullptr;
             if (SUCCEEDED(cookie->get_Name(&name)) && name &&
                     SUCCEEDED(cookie->get_Value(&value)) && value) {
-                if (!header.empty()) header += "; ";
-                header += wide_to_utf8(name);
-                header += "=";
-                header += wide_to_utf8(value);
+                size_t path_len = 0;
+                if (SUCCEEDED(cookie->get_Path(&path)) && path) {
+                    path_len = wcslen(path);
+                }
+                matches.push_back(
+                    {path_len, wide_to_utf8(name) + "=" + wide_to_utf8(value)});
             }
             if (name) CoTaskMemFree(name);
             if (value) CoTaskMemFree(value);
+            if (path) CoTaskMemFree(path);
             cookie->Release();
+        }
+        // GetCookies does not order by path; RFC 6265 5.4 wants longer paths
+        // first.  Stable keeps WebView2's order for equal lengths.
+        std::stable_sort(matches.begin(), matches.end(),
+            [](const Match &a, const Match &b) {
+                return a.path_len > b.path_len;
+            });
+        std::string header;
+        for (const Match &m : matches) {
+            if (!header.empty()) header += "; ";
+            header += m.pair;
         }
         complete_cookie_query(m_completion, header, nullptr);
         m_completion = nullptr;

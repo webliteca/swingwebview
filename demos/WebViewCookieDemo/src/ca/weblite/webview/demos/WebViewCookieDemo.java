@@ -54,6 +54,8 @@ public class WebViewCookieDemo {
         + "</script></body></html>\n";
 
     private static volatile boolean auto;
+    /** document.cookie as the page last reported it; kept for manual re-runs. */
+    private static volatile String lastDocumentCookie = "";
     private static volatile WebViewComponent webView;
     private static int port;
 
@@ -186,6 +188,11 @@ public class WebViewCookieDemo {
         final Result r = new Result();
         System.out.println("[cookie-demo] running getCookies checks ...");
 
+        if (documentCookie != null) lastDocumentCookie = documentCookie;
+        // Chromium (WebView2) treats http://localhost as a secure context, so it
+        // stores Secure cookies there and sends them over http; WebKit does not.
+        final boolean engineSendsSecureOverHttp =
+            names(lastDocumentCookie).contains("swv_secure");
         if (documentCookie != null) {
             Set<String> dc = names(documentCookie);
             r.check("document.cookie hides HttpOnly", !dc.contains("swv_http"),
@@ -198,7 +205,12 @@ public class WebViewCookieDemo {
             r.check("HttpOnly cookie returned for " + page, n.contains("swv_http"), "names " + n);
             r.check("script cookie returned for " + page, n.contains("swv_js"), "names " + n);
             r.check("Path=/private cookie excluded for " + page, !n.contains("swv_path"), "names " + n);
-            r.check("Secure cookie excluded for http", !n.contains("swv_secure"), "names " + n);
+            if (engineSendsSecureOverHttp) {
+                r.info("Secure cookie over http://localhost", "engine exposes it to the page too; "
+                    + (n.contains("swv_secure") ? "returned (consistent)" : "not returned"));
+            } else {
+                r.check("Secure cookie excluded for http", !n.contains("swv_secure"), "names " + n);
+            }
             r.check("header syntax is name=value; ...", h.isEmpty() || h.matches("[^;=]+=[^;]*(; [^;=]+=[^;]*)*"),
                 n.size() + " pair(s)");
             return null;
@@ -206,9 +218,13 @@ public class WebViewCookieDemo {
             r.check("Path=/private cookie returned for " + priv, n.contains("swv_path"), "names " + n);
             List<String> order = orderedNames(h);
             int ip = order.indexOf("swv_path");
-            int ij = order.indexOf("swv_js");
-            if (ip >= 0 && ij >= 0) {
-                r.check("longer-path cookie listed first", ip < ij, "order " + order);
+            if (ip >= 0) {
+                boolean first = true;
+                for (String rootCookie : new String[] {"swv_http", "swv_js", "swv_secure"}) {
+                    int i = order.indexOf(rootCookie);
+                    if (i >= 0 && i < ip) first = false;
+                }
+                r.check("longer-path cookie listed first", first, "order " + order);
             }
             return null;
         })).thenCompose(v -> query(wv, secure, r, (h, n) -> {
