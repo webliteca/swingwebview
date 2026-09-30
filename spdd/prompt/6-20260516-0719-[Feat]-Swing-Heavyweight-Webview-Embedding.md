@@ -560,7 +560,9 @@ generated_at: 2026-05-16T07:19:13-07:00
   parent directories, and passes the absolute path explicitly. It first
   honors `WEBVIEW2_USER_DATA_FOLDER`; absent an override it prefers
   `LOCALAPPDATA` and falls back to the Windows temporary directory only when
-  the Local AppData path cannot be created.
+  the Local AppData path cannot be created. Existing deployments whose
+  legacy executable-adjacent folder already exists and is writable keep it,
+  so upgrading does not log users out or drop site storage.
 - **Native cookie store, not page JavaScript.** Query each engine's own
   persistent cookie manager so HttpOnly credentials can be transferred to
   an HTTP client without exposing them to scripts. The query is asynchronous
@@ -980,6 +982,9 @@ generated_at: 2026-05-16T07:19:13-07:00
   and lightweight subclasses — public `getCookies(String)` and delegation.
 - `src_c/webkit_loader.h`, `src_c/webkit_loader.cpp`, and
   `src_c/webkit_shim.h` — dynamically loaded WebKitGTK cookie-manager symbols.
+- `demos/WebViewCookieDemo/...` with `run-linux-cookie-demo.sh`,
+  `run-mac-cookie-demo.sh` and `run-windows-cookie-demo.bat` — per-platform
+  cookie query verification (Operation 16 step 6).
 - `src/ca/weblite/webview/WebViewNative.java:131`–
   `src/ca/weblite/webview/WebViewNative.java:177` — native
   entry points (`webview_embed_create`,
@@ -2513,22 +2518,27 @@ File: `windows/webview_embed.cc`
    a deterministic 64-bit hash of the full executable path; do not use a
    randomized or implementation-defined hash whose output may change between
    builds.
-3. Prefer `<LOCALAPPDATA>\SwingWebView\<host-id>.WebView2`. Create both the
+3. Preserve existing installations' browser data: when the legacy WebView2
+   default folder `<executable directory>\<executable filename>.WebView2`
+   already exists as a directory and a probe file can be created and deleted
+   in it, pass that folder unchanged. Never create the legacy folder; a
+   missing or unwritable legacy folder falls through to step 4.
+4. Otherwise prefer `<LOCALAPPDATA>\SwingWebView\<host-id>.WebView2`. Create both the
    `SwingWebView` parent and application directory before environment
    creation. Treat an existing directory as success, but never accept an
    existing non-directory at either path.
-4. If Local AppData is unavailable or its directories cannot be created,
+5. If Local AppData is unavailable or its directories cannot be created,
    repeat the same directory construction below the path returned by
    `GetTempPathW`. If both writable roots fail, log the Win32 failure and pass
    null as the final compatibility fallback; environment creation will then
    report its normal HRESULT.
-5. Pass the resolved path to
+6. Pass the resolved path to
    `CreateCoreWebView2EnvironmentWithOptions` and keep the string alive until
    that call returns. Do not change browser-runtime discovery, controller
    creation, worker-thread ownership, or any Java/JNI signature.
-6. Document the new default and the environment-variable override in the
-   Windows platform notes in `README.md`.
-7. Verify with a Windows native build and an embedded WebView startup from a
+7. Document the new default, the legacy-folder preservation and the
+   environment-variable override in the Windows platform notes in `README.md`.
+8. Verify with a Windows native build and an embedded WebView startup from a
    host whose executable directory is not the selected user-data location.
 
 ### 16. Query URL-Matching Browser Cookies
@@ -2544,7 +2554,10 @@ Files: `src/ca/weblite/webview/WebViewCookieCallback.java`,
    the Swing component and native wrappers. Require an attached/live peer;
    adapt the one-shot native callback to complete on the Swing EDT. Native
    errors complete the future exceptionally. Heavyweight and lightweight
-   components forward to their corresponding native wrappers.
+   components forward to their corresponding native wrappers. When the loaded
+   native library predates this Operation (the JNI entry point raises
+   `UnsatisfiedLinkError`), return a future already failed with
+   `UnsupportedOperationException` instead of throwing synchronously.
 2. Declare embedded and offscreen JNI query functions that accept the URL
    and `WebViewCookieCallback.completed(String cookieHeader, String error)`.
    Hold a JNI global reference until exactly one asynchronous completion.
@@ -2552,15 +2565,43 @@ Files: `src/ca/weblite/webview/WebViewCookieCallback.java`,
    `name=value; name2=value2`.
 3. On macOS, query `WKHTTPCookieStore.getAllCookies` on the AppKit main
    queue; filter by URL host/domain, path, secure scheme and expiry before
-   formatting. On Linux, dynamically load the WebKitGTK cookie-manager
+   formatting. The file is compiled as non-ARC C++, so a block does not
+   retain captured Objective-C objects: retain the parsed `NSURL` before
+   issuing the query and release it at the end of the completion block.
+   Domain matching follows the NSHTTPCookie convention: a domain with a
+   leading dot is a domain cookie matching that host and its subdomains; a
+   domain without a leading dot is host-only and matches the host exactly.
+   Emit matching cookies ordered by descending path length (RFC 6265
+   section 5.4), preserving store order for equal lengths. On Linux, dynamically load the WebKitGTK cookie-manager
    functions and asynchronously query cookies for the requested URL on
    the GTK pump; include HttpOnly cookies and support offscreen views.
 4. On Windows, use `ICoreWebView2CookieManager.GetCookies` on the WebView2
    worker for the URL and assemble the header including HttpOnly cookies.
+   If posting the query to the worker thread fails, free the queued work and
+   complete the query immediately with an error so the future never hangs.
    macOS and Windows offscreen peers are unsupported and report an error.
 5. Document credential handling, platform coverage and the attached-peer
    requirement in `README.md`. Retain existing PDF, password-manager and
    custom-scheme entry points when integrating with later Canvases.
+6. Add a manual/automated test demo `demos/WebViewCookieDemo`
+   (`src/ca/weblite/webview/demos/WebViewCookieDemo.java` plus `README.md`)
+   and launch scripts `run-linux-cookie-demo.sh`, `run-mac-cookie-demo.sh`
+   and `run-windows-cookie-demo.bat` that mirror the custom-scheme demo
+   scripts (build native library, jar, demo; `COOKIEDEMO_AUTO=1` runs the
+   checks and exits 0 on success, 1 on failure). The demo starts a JDK
+   `com.sun.net.httpserver` on `localhost` whose page sets: an HttpOnly
+   cookie, a script-visible cookie, a cookie restricted to `Path=/private`,
+   and a `Secure` cookie. After the page loads it verifies:
+   - the HttpOnly cookie is returned by `getCookies` for the page URL but is
+     absent from `document.cookie`;
+   - the script-visible cookie is returned;
+   - the `/private` cookie is returned for a `/private/...` URL and excluded
+     for `/`;
+   - the `Secure` cookie is excluded for the `http` page URL;
+   - host-only cookies are excluded for `http://sub.localhost:<port>/`;
+   - an unrelated host returns an empty string.
+   The demo prints PASS/FAIL per check but never prints cookie values beyond
+   the fixed test values it set itself.
 
 ## N · Norms
 - Cookie values returned by `getCookies` are credentials: never print them
@@ -2745,11 +2786,19 @@ Files: `src/ca/weblite/webview/WebViewCookieCallback.java`,
 - Windows user-data-folder setup must validate that every reused path is a
   directory. Failure to create the Local AppData path must fall back to a
   writable temporary-root path; it must not silently retry the protected
-  executable directory. A final fallback to WebView2's legacy default is
+  executable directory (the legacy folder is only reused when it already
+  exists and passed the writability probe before the per-user roots). A final fallback to WebView2's legacy default is
   permitted only after both per-user roots fail and must emit a diagnostic.
 - Cookie queries must not use `document.cookie` (which omits HttpOnly);
   return only cookies for the requested URL and do not block the Swing EDT.
   Unsupported offscreen backends fail explicitly rather than hanging.
+  Every native path, including a failed worker dispatch on Windows, answers
+  the callback exactly once. Host-only cookies are never returned for a
+  subdomain. An older native library yields a failed future, never a
+  synchronous `UnsatisfiedLinkError`.
+- Upgrading must not silently discard existing Windows browser data: a
+  writable legacy `<exe>.WebView2` folder beside the executable keeps being
+  used; only its absence or unwritability selects the per-user folder.
 - `WebViewHeavyweightComponent.setDebug` throws
   `IllegalStateException` if called after display
   (`WebViewHeavyweightComponent.java:90`) — the native peer

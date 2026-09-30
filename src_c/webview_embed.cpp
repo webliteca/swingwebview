@@ -7731,9 +7731,12 @@ static bool cocoa_cookie_matches_url(id cookie, id url) {
     std::string domain = ascii_lower(ns_string_to_utf8(
         msg<id>(cookie, sel("domain"))));
     if (host.empty() || domain.empty()) return false;
-    if (domain[0] == '.') domain.erase(0, 1);
+    // NSHTTPCookie convention: a leading dot marks a domain cookie (host and
+    // subdomains); no leading dot is host-only (exact host match).
+    bool domain_cookie = domain[0] == '.';
+    if (domain_cookie) domain.erase(0, 1);
     bool domain_ok = host == domain;
-    if (!domain_ok && host.size() > domain.size()
+    if (!domain_ok && domain_cookie && host.size() > domain.size()
             && host.compare(host.size() - domain.size(), domain.size(), domain) == 0
             && host[host.size() - domain.size() - 1] == '.') {
         domain_ok = true;
@@ -7790,9 +7793,14 @@ static void cocoa_get_cookies(Engine *e, const std::string &url_string,
                                   "WKHTTPCookieStore is not available");
             return;
         }
+        // Non-ARC C++: the block does not retain captured ids, and the
+        // autoreleased NSURL would be gone by the time getAllCookies:
+        // completes on a later run-loop pass.  Balanced in the block.
+        msg<id>(url, sel("retain"));
         msg<void, void (^)(id)>(cookie_store, sel("getAllCookies:"),
             ^(id cookies) {
-                std::string header;
+                struct Match { size_t path_len; std::string pair; };
+                std::vector<Match> matches;
                 unsigned long count = cookies
                     ? msg<unsigned long>(cookies, sel("count")) : 0;
                 for (unsigned long i = 0; i < count; ++i) {
@@ -7804,10 +7812,20 @@ static void cocoa_get_cookies(Engine *e, const std::string &url_string,
                     std::string value = ns_string_to_utf8(
                         msg<id>(cookie, sel("value")));
                     if (name.empty()) continue;
+                    std::string path = ns_string_to_utf8(
+                        msg<id>(cookie, sel("path")));
+                    matches.push_back({path.size(), name + "=" + value});
+                }
+                msg<void>(url, sel("release"));
+                // RFC 6265 5.4: longer paths first; stable keeps store order.
+                std::stable_sort(matches.begin(), matches.end(),
+                    [](const Match &a, const Match &b) {
+                        return a.path_len > b.path_len;
+                    });
+                std::string header;
+                for (const Match &m : matches) {
                     if (!header.empty()) header += "; ";
-                    header += name;
-                    header += '=';
-                    header += value;
+                    header += m.pair;
                 }
                 complete_cookie_query(completion, header, nullptr);
             });

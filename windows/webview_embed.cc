@@ -130,6 +130,24 @@ static std::wstring make_user_data_folder(const std::wstring &root,
     return user_data_folder;
 }
 
+// True when path is an existing directory in which a probe file can be
+// created and deleted.  Never creates the directory itself.
+static bool is_writable_directory(const std::wstring &path) {
+    DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES ||
+            !(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        return false;
+    }
+    std::wstring probe = join_path(path, L".swingwebview-write-probe");
+    HANDLE h = CreateFileW(probe.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+                           nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(h);
+    return true;
+}
+
 static std::wstring resolve_webview2_user_data_folder(DWORD *error) {
     if (error) *error = ERROR_SUCCESS;
 
@@ -144,6 +162,15 @@ static std::wstring resolve_webview2_user_data_folder(DWORD *error) {
         filename = separator == std::wstring::npos
             ? executable : executable.substr(separator + 1);
         if (filename.empty()) filename = L"host";
+
+        // Preserve existing installations: WebView2's own default is
+        // <exe dir>\<exe name>.WebView2.  Keep using it when it already
+        // exists and is writable so upgrading does not drop browser data.
+        if (separator != std::wstring::npos) {
+            std::wstring legacy = executable.substr(0, separator + 1)
+                + filename + L".WebView2";
+            if (is_writable_directory(legacy)) return legacy;
+        }
     }
 
     wchar_t hash_suffix[40]{};
@@ -811,7 +838,7 @@ private:
 static void engine_on_message(Engine *e, LPCWSTR msg);
 static std::wstring utf8_to_wide(const char *s);
 static std::string wide_to_utf8(LPCWSTR w);
-static void dispatch_to_thread(Engine *e, DispatchFn fn);
+static bool dispatch_to_thread(Engine *e, DispatchFn fn);
 
 // One-shot JNI completion for asynchronous WebView2 cookie queries.  The
 // callback remains valid after the JNI entry returns and is released after
@@ -3207,10 +3234,14 @@ static void engine_thread(Engine *e, HWND /*parent*/, int width, int height,
     CoUninitialize();
 }
 
-static void dispatch_to_thread(Engine *e, DispatchFn fn) {
-    if (!e || e->thread_id == 0) return;
+static bool dispatch_to_thread(Engine *e, DispatchFn fn) {
+    if (!e || e->thread_id == 0) return false;
     auto *holder = new DispatchFn(std::move(fn));
-    PostThreadMessage(e->thread_id, WM_EMBED_DISPATCH, 0, (LPARAM)holder);
+    if (!PostThreadMessage(e->thread_id, WM_EMBED_DISPATCH, 0, (LPARAM)holder)) {
+        delete holder;
+        return false;
+    }
+    return true;
 }
 
 static Engine *create_engine(JNIEnv *env, jobject component, int debug) {
@@ -4371,7 +4402,7 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1get
     const char *chars = env->GetStringUTFChars(url, nullptr);
     std::wstring requested_url = embed_win::utf8_to_wide(chars ? chars : "");
     if (chars) env->ReleaseStringUTFChars(url, chars);
-    embed_win::dispatch_to_thread(e, [e, requested_url, completion] {
+    bool posted = embed_win::dispatch_to_thread(e, [e, requested_url, completion] {
         if (!e->webview) {
             embed_win::complete_cookie_query(
                 completion, "", "WebView is not available");
@@ -4404,6 +4435,11 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1get
         // asynchronous completion when GetCookies succeeds.
         handler->Release();
     });
+    if (!posted) {
+        // The worker is gone; the lambda was discarded unrun, so answer here.
+        embed_win::complete_cookie_query(
+            completion, "", "WebView is not available");
+    }
 }
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1get_1cookies

@@ -27,7 +27,10 @@ web engine:
   <https://developer.microsoft.com/microsoft-edge/webview2/>. WebView2 user
   data is stored in a per-application directory under
   `%LOCALAPPDATA%\SwingWebView`; set `WEBVIEW2_USER_DATA_FOLDER` before
-  launch to override that location.
+  launch to override that location. An existing, writable
+  `<executable>.WebView2` folder beside the host executable (WebView2's own
+  default, used by earlier releases) keeps being used so upgrading does not
+  discard cookies or site storage.
 * **Linux** requires a system WebKitGTK — either **4.1** (Ubuntu 22.04+)
   or **4.0** (Ubuntu 20.04).  The bundled `libwebview.so` resolves
   whichever is present at load time (no `webkit2gtk` SONAME is
@@ -842,6 +845,11 @@ The implementation uses `WKHTTPCookieStore` on macOS,
 `WebKitCookieManager` on Linux, and `ICoreWebView2CookieManager` on Windows.
 The WebView must be displayed and its native peer attached before calling this
 method. Cookie queries are asynchronous and do not block the Swing thread.
+Matching cookies are ordered longest path first. The lightweight (offscreen)
+component supports `getCookies` on Linux; with a native library that predates
+this method the future fails with `UnsupportedOperationException`. Run
+`run-{linux,mac}-cookie-demo.sh` or `run-windows-cookie-demo.bat` to check a
+platform (see `demos/WebViewCookieDemo/README.md`).
 
 ## Print to PDF
 
