@@ -42,8 +42,12 @@
   X(webkit_cookie_manager_get_cookies_finish)                    \
   X(webkit_get_major_version)                                    \
   X(webkit_get_minor_version)                                    \
+  X(webkit_navigation_action_get_navigation_type)                \
   X(webkit_navigation_action_get_request)                        \
+  X(webkit_navigation_action_is_redirect)                        \
   X(webkit_navigation_action_is_user_gesture)                    \
+  X(webkit_navigation_policy_decision_get_navigation_action)     \
+  X(webkit_policy_decision_ignore)                               \
   X(webkit_print_operation_new)                                  \
   X(webkit_print_operation_print)                                \
   X(webkit_print_operation_set_page_setup)                       \

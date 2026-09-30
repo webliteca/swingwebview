@@ -620,6 +620,31 @@ public class EmbeddedWebView {
         return this;
     }
 
+
+    /**
+     * Register the navigation callback (Canvas 34 D5): the engine calls it
+     * synchronously, on its UI thread, before each navigation of the view
+     * or its frames, and refuses the navigation when it answers
+     * {@code false}.  Anchors {@code cb} in {@link #heap} so the JVM does
+     * not collect the adapter while the native side holds a global ref.  An
+     * older native library without the feature leaves navigation
+     * undecided; {@code WebViewComponent.isNavigationHandlerSupported()}
+     * says so.
+     *
+     * @return {@code this} for chaining
+     */
+    public EmbeddedWebView setNavigationCallback(WebViewNavigationCallback cb) {
+        checkAlive();
+        if (cb != null) {
+            heap.add(cb);
+        }
+        try {
+            WebViewNative.webview_embed_set_navigation_callback(peer, cb);
+        } catch (UnsatisfiedLinkError ule) {
+            // Native library predates Canvas 34.
+        }
+        return this;
+    }
     /**
      * Register the download callback for browser-initiated file
      * downloads.  Anchors {@code cb} in {@link #heap} so the JVM does not

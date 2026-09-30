@@ -1,5 +1,14 @@
 # Project guidance
 
+## Linux is lightweight only
+
+**On Linux we only use the lightweight (offscreen) component. Never run, test, verify or debug the
+heavyweight component on Linux, and never treat a heavyweight failure on Linux as a problem to chase.**
+Heavyweight is the mode for macOS and Windows. When you verify a change on Linux (demos, `*_AUTO=1`
+runs, Xvfb harnesses), run it in lightweight mode, which is the Linux default, and don't pass
+`heavyweight` to the `run-linux-*.sh` scripts. A heavyweight run under Xvfb here fails even on unchanged
+code, so it proves nothing about a change.
+
 ## Structured Prompt-Driven Development (SPDD)
 
 This repository uses Structured Prompt-Driven Development (SPDD). Canvases (REASONS files) under `spdd/prompt/` are the source of truth for behavior. Generated files (code, tests, configuration that implements a Canvas) live under `requirements/`, `spdd/analysis/`, `spdd/prompt/`, **and anywhere a Canvas's REASONS-Implements section points** — typically `src/`. If a source file is produced by a Canvas, it is generated, even though it lives outside `spdd/`.
