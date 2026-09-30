@@ -36,6 +36,8 @@
 #define webkit_file_chooser_request_get_mime_types (::g_wk.fn_webkit_file_chooser_request_get_mime_types)
 #define webkit_file_chooser_request_get_select_multiple (::g_wk.fn_webkit_file_chooser_request_get_select_multiple)
 #define webkit_file_chooser_request_select_files (::g_wk.fn_webkit_file_chooser_request_select_files)
+#define webkit_cookie_manager_get_cookies (::g_wk.fn_webkit_cookie_manager_get_cookies)
+#define webkit_cookie_manager_get_cookies_finish (::g_wk.fn_webkit_cookie_manager_get_cookies_finish)
 #define webkit_navigation_action_get_request (::g_wk.fn_webkit_navigation_action_get_request)
 #define webkit_navigation_action_is_user_gesture (::g_wk.fn_webkit_navigation_action_is_user_gesture)
 #define webkit_print_operation_new (::g_wk.fn_webkit_print_operation_new)
@@ -56,6 +58,7 @@
 #define webkit_user_content_manager_register_script_message_handler (::g_wk.fn_webkit_user_content_manager_register_script_message_handler)
 #define webkit_user_script_new (::g_wk.fn_webkit_user_script_new)
 #define webkit_web_inspector_show (::g_wk.fn_webkit_web_inspector_show)
+#define webkit_web_context_get_cookie_manager (::g_wk.fn_webkit_web_context_get_cookie_manager)
 #define webkit_web_view_execute_editing_command (::g_wk.fn_webkit_web_view_execute_editing_command)
 #define webkit_web_view_get_inspector (::g_wk.fn_webkit_web_view_get_inspector)
 #define webkit_web_view_get_settings (::g_wk.fn_webkit_web_view_get_settings)
@@ -69,6 +72,9 @@
 #define webkit_web_view_set_background_color (::g_wk.fn_webkit_web_view_set_background_color)
 #define webkit_web_view_set_input_method_context (::g_wk.fn_webkit_web_view_set_input_method_context)
 #define webkit_window_properties_get_geometry (::g_wk.fn_webkit_window_properties_get_geometry)
+#define soup_cookie_free (::g_wk.fn_soup_cookie_free)
+#define soup_cookie_get_name (::g_wk.fn_soup_cookie_get_name)
+#define soup_cookie_get_value (::g_wk.fn_soup_cookie_get_value)
 
 // Custom URL schemes (Canvas 31 D4): mandatory.
 #define webkit_security_manager_register_uri_scheme_as_cors_enabled (::g_wk.fn_webkit_security_manager_register_uri_scheme_as_cors_enabled)

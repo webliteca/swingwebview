@@ -24,7 +24,13 @@ web engine:
 * **Windows** requires the system-wide Microsoft Edge WebView2 Runtime,
   which ships with current Windows 11 / Edge.  On older Windows, install
   the Evergreen Runtime from
-  <https://developer.microsoft.com/microsoft-edge/webview2/>.
+  <https://developer.microsoft.com/microsoft-edge/webview2/>. WebView2 user
+  data is stored in a per-application directory under
+  `%LOCALAPPDATA%\SwingWebView`; set `WEBVIEW2_USER_DATA_FOLDER` before
+  launch to override that location. An existing, writable
+  `<executable>.WebView2` folder beside the host executable (WebView2's own
+  default, used by earlier releases) keeps being used so upgrading does not
+  discard cookies or site storage.
 * **Linux** requires a system WebKitGTK — either **4.1** (Ubuntu 22.04+)
   or **4.0** (Ubuntu 20.04).  The bundled `libwebview.so` resolves
   whichever is present at load time (no `webkit2gtk` SONAME is
@@ -215,7 +221,9 @@ snapshots `cairo_image_surface_t` pixels at ~30Hz into a
   queue.  `WebView2LoaderStatic.lib` is linked statically so we ship
   just `webview.dll`, no separate `WebView2Loader.dll`.  The system
   WebView2 Runtime (part of Edge / Windows 11) provides the actual
-  Chromium binaries.
+  Chromium binaries. The per-user WebView2 data directory is derived from
+  the host executable name and path, so applications installed under a
+  protected directory such as `Program Files` start without elevation.
 
 ### Focus cooperation (macOS + Windows heavyweight)
 
@@ -812,6 +820,36 @@ wv.eval("location.reload()");   // refetch from the network
   implemented and compiled by CI's cross-platform native build. The purges
   should still be spot-checked on-device (confirm a previously-cached resource
   is re-requested, and cookies/login survive).
+
+## Read browser cookies
+
+Use `getCookies` to transfer a browser-authenticated session to an HTTP client
+without exposing credentials to page JavaScript:
+
+```java
+wv.getCookies("https://example.com/")
+  .thenAccept(cookieHeader -> request.header("Cookie", cookieHeader))
+  .exceptionally(error -> {
+      error.printStackTrace();
+      return null;
+  });
+```
+
+The future completes on the Swing event-dispatch thread. Its result contains
+only cookies applicable to the requested URL in HTTP `Cookie` header syntax
+(`name=value; name2=value2`). Unlike `document.cookie`, the native browser API
+also returns `HttpOnly` cookies. Treat the returned value as a credential: do
+not log it or include it in exception messages.
+
+The implementation uses `WKHTTPCookieStore` on macOS,
+`WebKitCookieManager` on Linux, and `ICoreWebView2CookieManager` on Windows.
+The WebView must be displayed and its native peer attached before calling this
+method. Cookie queries are asynchronous and do not block the Swing thread.
+Matching cookies are ordered longest path first. The lightweight (offscreen)
+component supports `getCookies` on Linux; with a native library that predates
+this method the future fails with `UnsupportedOperationException`. Run
+`run-{linux,mac}-cookie-demo.sh` or `run-windows-cookie-demo.bat` to check a
+platform (see `demos/WebViewCookieDemo/README.md`).
 
 ## Print to PDF
 

@@ -23,8 +23,10 @@
 // CredDeleteW / CredFree) for the password-manager secret store (Canvas 28).
 #include <wincred.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -57,6 +59,147 @@ static const UINT WM_EMBED_DISPATCH = WM_APP + 1;
 static const UINT WM_EMBED_QUIT     = WM_APP + 2;
 
 using DispatchFn = std::function<void()>;
+
+static std::wstring get_environment_variable(const wchar_t *name) {
+    DWORD size = GetEnvironmentVariableW(name, nullptr, 0);
+    if (size == 0) return {};
+
+    std::vector<wchar_t> value(size);
+    DWORD written = GetEnvironmentVariableW(name, value.data(), size);
+    if (written == 0 || written >= size) return {};
+    return std::wstring(value.data(), written);
+}
+
+static std::wstring get_host_executable_path() {
+    // GetModuleFileNameW does not provide a size-query mode.  32,768 UTF-16
+    // code units is the maximum extended-length path supported by Win32.
+    std::vector<wchar_t> path(32768);
+    DWORD written = GetModuleFileNameW(nullptr, path.data(),
+                                       static_cast<DWORD>(path.size()));
+    if (written == 0 || written >= path.size()) return {};
+    return std::wstring(path.data(), written);
+}
+
+static uint64_t fnv1a_path_hash(const std::wstring &path) {
+    // Hash UTF-16 code units explicitly so the folder name stays stable across
+    // compiler/runtime updates (unlike std::hash, whose output is unspecified).
+    uint64_t hash = UINT64_C(14695981039346656037);
+    for (wchar_t ch : path) {
+        hash ^= static_cast<uint16_t>(ch);
+        hash *= UINT64_C(1099511628211);
+    }
+    return hash;
+}
+
+static std::wstring join_path(const std::wstring &parent,
+                              const std::wstring &child) {
+    if (parent.empty()) return child;
+    wchar_t last = parent.back();
+    return parent + ((last == L'\\' || last == L'/') ? L"" : L"\\") + child;
+}
+
+static bool ensure_directory(const std::wstring &path, DWORD *error) {
+    DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes != INVALID_FILE_ATTRIBUTES) {
+        if (attributes & FILE_ATTRIBUTE_DIRECTORY) return true;
+        if (error) *error = ERROR_ALREADY_EXISTS;
+        return false;
+    }
+
+    if (CreateDirectoryW(path.c_str(), nullptr)) return true;
+
+    DWORD create_error = GetLastError();
+    attributes = GetFileAttributesW(path.c_str());
+    if (create_error == ERROR_ALREADY_EXISTS &&
+        attributes != INVALID_FILE_ATTRIBUTES &&
+        (attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        return true;
+    }
+    if (error) *error = create_error;
+    return false;
+}
+
+static std::wstring make_user_data_folder(const std::wstring &root,
+                                          const std::wstring &host_id,
+                                          DWORD *error) {
+    if (root.empty()) return {};
+    std::wstring library_root = join_path(root, L"SwingWebView");
+    if (!ensure_directory(library_root, error)) return {};
+
+    std::wstring user_data_folder = join_path(library_root, host_id);
+    if (!ensure_directory(user_data_folder, error)) return {};
+    return user_data_folder;
+}
+
+// True when path is an existing directory in which a probe file can be
+// created and deleted.  Never creates the directory itself.
+static bool is_writable_directory(const std::wstring &path) {
+    DWORD attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES ||
+            !(attributes & FILE_ATTRIBUTE_DIRECTORY)) {
+        return false;
+    }
+    std::wstring probe = join_path(path, L".swingwebview-write-probe");
+    HANDLE h = CreateFileW(probe.c_str(), GENERIC_WRITE, 0, nullptr,
+                           CREATE_ALWAYS,
+                           FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE,
+                           nullptr);
+    if (h == INVALID_HANDLE_VALUE) return false;
+    CloseHandle(h);
+    return true;
+}
+
+static std::wstring resolve_webview2_user_data_folder(DWORD *error) {
+    if (error) *error = ERROR_SUCCESS;
+
+    std::wstring override_path =
+        get_environment_variable(L"WEBVIEW2_USER_DATA_FOLDER");
+    if (!override_path.empty()) return override_path;
+
+    std::wstring executable = get_host_executable_path();
+    std::wstring filename = L"host";
+    if (!executable.empty()) {
+        size_t separator = executable.find_last_of(L"\\/");
+        filename = separator == std::wstring::npos
+            ? executable : executable.substr(separator + 1);
+        if (filename.empty()) filename = L"host";
+
+        // Preserve existing installations: WebView2's own default is
+        // <exe dir>\<exe name>.WebView2.  Keep using it when it already
+        // exists and is writable so upgrading does not drop browser data.
+        if (separator != std::wstring::npos) {
+            std::wstring legacy = executable.substr(0, separator + 1)
+                + filename + L".WebView2";
+            if (is_writable_directory(legacy)) return legacy;
+        }
+    }
+
+    wchar_t hash_suffix[40]{};
+    swprintf_s(hash_suffix, _countof(hash_suffix), L"-%016llx.WebView2",
+               static_cast<unsigned long long>(fnv1a_path_hash(executable)));
+    std::wstring host_id = filename + hash_suffix;
+
+    DWORD last_error = ERROR_PATH_NOT_FOUND;
+    std::wstring folder = make_user_data_folder(
+        get_environment_variable(L"LOCALAPPDATA"), host_id, &last_error);
+    if (!folder.empty()) return folder;
+
+    std::vector<wchar_t> temp_path(32768);
+    DWORD temp_length = GetTempPathW(static_cast<DWORD>(temp_path.size()),
+                                     temp_path.data());
+    if (temp_length > 0 && temp_length < temp_path.size()) {
+        folder = make_user_data_folder(
+            std::wstring(temp_path.data(), temp_length), host_id, &last_error);
+        if (!folder.empty()) return folder;
+    } else if (temp_length == 0) {
+        last_error = GetLastError();
+    } else {
+        last_error = ERROR_INSUFFICIENT_BUFFER;
+    }
+
+    if (error) *error = last_error;
+    return {};
+}
 
 struct JawtLock {
     JAWT awt{};
@@ -696,7 +839,135 @@ private:
 static void engine_on_message(Engine *e, LPCWSTR msg);
 static std::wstring utf8_to_wide(const char *s);
 static std::string wide_to_utf8(LPCWSTR w);
-static void dispatch_to_thread(Engine *e, DispatchFn fn);
+static bool dispatch_to_thread(Engine *e, DispatchFn fn);
+
+// One-shot JNI completion for asynchronous WebView2 cookie queries.  The
+// callback remains valid after the JNI entry returns and is released after
+// exactly one result has been delivered.
+struct CookieCompletion {
+    JavaVM *jvm = nullptr;
+    jobject callback = nullptr;
+};
+
+static CookieCompletion *new_cookie_completion(JNIEnv *env, jobject callback) {
+    if (!env || !callback) return nullptr;
+    auto *completion = new CookieCompletion();
+    env->GetJavaVM(&completion->jvm);
+    completion->callback = env->NewGlobalRef(callback);
+    if (!completion->jvm || !completion->callback) {
+        if (completion->callback) env->DeleteGlobalRef(completion->callback);
+        delete completion;
+        return nullptr;
+    }
+    return completion;
+}
+
+static void complete_cookie_query(CookieCompletion *completion,
+                                  const std::string &header,
+                                  const char *error) {
+    if (!completion) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (completion->jvm->GetEnv(
+            reinterpret_cast<void **>(&env), JNI_VERSION_1_6) != JNI_OK) {
+        if (completion->jvm->AttachCurrentThread(
+                reinterpret_cast<void **>(&env), nullptr) == JNI_OK) {
+            detach = true;
+        }
+    }
+    if (env) {
+        jclass cls = env->GetObjectClass(completion->callback);
+        jmethodID method = cls ? env->GetMethodID(
+            cls, "completed", "(Ljava/lang/String;Ljava/lang/String;)V")
+            : nullptr;
+        jstring jheader = env->NewStringUTF(header.c_str());
+        jstring jerror = error ? env->NewStringUTF(error) : nullptr;
+        if (method) {
+            env->CallVoidMethod(completion->callback, method, jheader, jerror);
+        }
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+        }
+        if (jerror) env->DeleteLocalRef(jerror);
+        if (jheader) env->DeleteLocalRef(jheader);
+        if (cls) env->DeleteLocalRef(cls);
+        env->DeleteGlobalRef(completion->callback);
+    }
+    if (detach) completion->jvm->DetachCurrentThread();
+    delete completion;
+}
+
+class GetCookiesHandler : public CallbackBase<
+    ICoreWebView2GetCookiesCompletedHandler> {
+public:
+    explicit GetCookiesHandler(CookieCompletion *completion)
+        : m_completion(completion) {}
+
+    HRESULT STDMETHODCALLTYPE Invoke(
+            HRESULT result, ICoreWebView2CookieList *cookie_list) override {
+        if (FAILED(result) || !cookie_list) {
+            complete_cookie_query(m_completion, "", "WebView2 cookie query failed");
+            m_completion = nullptr;
+            return S_OK;
+        }
+
+        UINT count = 0;
+        if (FAILED(cookie_list->get_Count(&count))) {
+            complete_cookie_query(m_completion, "", "WebView2 cookie list is unavailable");
+            m_completion = nullptr;
+            return S_OK;
+        }
+        struct Match { size_t path_len; std::string pair; };
+        std::vector<Match> matches;
+        for (UINT index = 0; index < count; ++index) {
+            ICoreWebView2Cookie *cookie = nullptr;
+            if (FAILED(cookie_list->GetValueAtIndex(index, &cookie)) || !cookie) {
+                continue;
+            }
+            LPWSTR name = nullptr;
+            LPWSTR value = nullptr;
+            LPWSTR path = nullptr;
+            if (SUCCEEDED(cookie->get_Name(&name)) && name &&
+                    SUCCEEDED(cookie->get_Value(&value)) && value) {
+                size_t path_len = 0;
+                if (SUCCEEDED(cookie->get_Path(&path)) && path) {
+                    path_len = wcslen(path);
+                }
+                matches.push_back(
+                    {path_len, wide_to_utf8(name) + "=" + wide_to_utf8(value)});
+            }
+            if (name) CoTaskMemFree(name);
+            if (value) CoTaskMemFree(value);
+            if (path) CoTaskMemFree(path);
+            cookie->Release();
+        }
+        // GetCookies does not order by path; RFC 6265 5.4 wants longer paths
+        // first.  Stable keeps WebView2's order for equal lengths.
+        std::stable_sort(matches.begin(), matches.end(),
+            [](const Match &a, const Match &b) {
+                return a.path_len > b.path_len;
+            });
+        std::string header;
+        for (const Match &m : matches) {
+            if (!header.empty()) header += "; ";
+            header += m.pair;
+        }
+        complete_cookie_query(m_completion, header, nullptr);
+        m_completion = nullptr;
+        return S_OK;
+    }
+
+protected:
+    ~GetCookiesHandler() override {
+        if (m_completion) {
+            complete_cookie_query(m_completion, "", "WebView2 cookie query was cancelled");
+        }
+    }
+
+private:
+    CookieCompletion *m_completion;
+};
 
 class FocusHandler : public CallbackBase<
     ICoreWebView2FocusChangedEventHandler> {
@@ -2912,12 +3183,22 @@ static void engine_thread(Engine *e, HWND /*parent*/, int width, int height,
                 init_done.clear();
             }
         });
-    // Canvas 32 D1: declare the custom schemes on the environment.  Null when
-    // none are registered, so the environment is created exactly as before.
+    DWORD user_data_error = ERROR_SUCCESS;
+    std::wstring user_data_folder =
+        resolve_webview2_user_data_folder(&user_data_error);
+    if (user_data_folder.empty()) {
+        WV_LOG("Could not create a writable WebView2 user data folder: "
+               "GetLastError=%lu; falling back to the WebView2 default",
+               user_data_error);
+    }
+    // Canvas 32 D1: declare the custom schemes on the environment. Null when
+    // none are registered, retaining the default WebView2 environment options.
     Microsoft::WRL::ComPtr<ICoreWebView2EnvironmentOptions> scheme_options =
         win_scheme_environment_options();
     HRESULT res = CreateCoreWebView2EnvironmentWithOptions(
-        nullptr, nullptr, scheme_options.Get(), env_handler);
+        nullptr,
+        user_data_folder.empty() ? nullptr : user_data_folder.c_str(),
+        scheme_options.Get(), env_handler);
     env_handler->Release();
     if (FAILED(res)) {
         WV_LOG("CreateCoreWebView2EnvironmentWithOptions failed: "
@@ -2970,10 +3251,14 @@ static void engine_thread(Engine *e, HWND /*parent*/, int width, int height,
     CoUninitialize();
 }
 
-static void dispatch_to_thread(Engine *e, DispatchFn fn) {
-    if (!e || e->thread_id == 0) return;
+static bool dispatch_to_thread(Engine *e, DispatchFn fn) {
+    if (!e || e->thread_id == 0) return false;
     auto *holder = new DispatchFn(std::move(fn));
-    PostThreadMessage(e->thread_id, WM_EMBED_DISPATCH, 0, (LPARAM)holder);
+    if (!PostThreadMessage(e->thread_id, WM_EMBED_DISPATCH, 0, (LPARAM)holder)) {
+        delete holder;
+        return false;
+    }
+    return true;
 }
 
 static Engine *create_engine(JNIEnv *env, jobject component, int debug) {
@@ -4116,6 +4401,69 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1cle
 // link-symmetry with the JNI declaration.
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1clear_1cache
   (JNIEnv *, jclass, jlong) {
+}
+
+// Return all cookies applicable to the requested URL in HTTP Cookie header
+// syntax.  WebView2's cookie manager includes HttpOnly cookies, unlike
+// document.cookie, which is required for authenticated browser handoff.
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1get_1cookies
+  (JNIEnv *env, jclass, jlong wv, jstring url, jobject callback) {
+    auto *completion = embed_win::new_cookie_completion(env, callback);
+    if (!completion) return;
+    auto *e = (Engine *)wv;
+    if (!e || !url || e->thread_id == 0) {
+        embed_win::complete_cookie_query(
+            completion, "", "WebView is not available");
+        return;
+    }
+    const char *chars = env->GetStringUTFChars(url, nullptr);
+    std::wstring requested_url = embed_win::utf8_to_wide(chars ? chars : "");
+    if (chars) env->ReleaseStringUTFChars(url, chars);
+    bool posted = embed_win::dispatch_to_thread(e, [e, requested_url, completion] {
+        if (!e->webview) {
+            embed_win::complete_cookie_query(
+                completion, "", "WebView is not available");
+            return;
+        }
+        ICoreWebView2_2 *wv2 = nullptr;
+        if (FAILED(e->webview->QueryInterface(
+                __uuidof(ICoreWebView2_2),
+                reinterpret_cast<void **>(&wv2))) || !wv2) {
+            embed_win::complete_cookie_query(
+                completion, "", "WebView2 cookie manager is unavailable");
+            return;
+        }
+        ICoreWebView2CookieManager *manager = nullptr;
+        HRESULT manager_result = wv2->get_CookieManager(&manager);
+        wv2->Release();
+        if (FAILED(manager_result) || !manager) {
+            embed_win::complete_cookie_query(
+                completion, "", "WebView2 cookie manager is unavailable");
+            return;
+        }
+        auto *handler = new embed_win::GetCookiesHandler(completion);
+        HRESULT query_result = manager->GetCookies(
+            requested_url.c_str(), handler);
+        manager->Release();
+        if (FAILED(query_result)) {
+            handler->Invoke(query_result, nullptr);
+        }
+        // Release our reference. WebView2 retains the handler until its
+        // asynchronous completion when GetCookies succeeds.
+        handler->Release();
+    });
+    if (!posted) {
+        // The worker is gone; the lambda was discarded unrun, so answer here.
+        embed_win::complete_cookie_query(
+            completion, "", "WebView is not available");
+    }
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1get_1cookies
+  (JNIEnv *env, jclass, jlong, jstring, jobject callback) {
+    auto *completion = embed_win::new_cookie_completion(env, callback);
+    embed_win::complete_cookie_query(
+        completion, "", "Offscreen cookie queries are unsupported on Windows");
 }
 
 // Print to PDF — Canvas 29 D10.  Must live inside this `extern "C"` block

@@ -706,6 +706,44 @@ public class EmbeddedWebView {
     }
 
     /**
+     * Read all cookies applicable to {@code url} from the native browser cookie
+     * store, including cookies marked {@code HttpOnly}. The returned string is
+     * formatted for use as an HTTP {@code Cookie} request header.
+     *
+     * <p>Completion is delivered on the Swing event-dispatch thread.
+     */
+    public CompletableFuture<String> getCookies(String url) {
+        checkAlive();
+        if (url == null) throw new NullPointerException("url");
+        final CompletableFuture<String> future = new CompletableFuture<String>();
+        try {
+            WebViewNative.webview_embed_get_cookies(peer, url,
+                new WebViewCookieCallback() {
+                    @Override
+                    public void completed(final String cookieHeader,
+                                          final String error) {
+                        javax.swing.SwingUtilities.invokeLater(new Runnable() {
+                            @Override public void run() {
+                                if (error != null && !error.isEmpty()) {
+                                    future.completeExceptionally(
+                                        new IllegalStateException(error));
+                                } else {
+                                    future.complete(cookieHeader == null
+                                        ? "" : cookieHeader);
+                                }
+                            }
+                        });
+                    }
+                });
+        } catch (UnsatisfiedLinkError ule) {
+            // Native library predates getCookies.
+            future.completeExceptionally(new UnsupportedOperationException(
+                "The loaded native library does not support getCookies"));
+        }
+        return future;
+    }
+
+    /**
      * Print the page this WebView shows to a PDF file, with no dialog
      * (Canvas 29).  The future completes with {@code out} when the file is
      * written, or exceptionally with an {@link java.io.IOException} naming

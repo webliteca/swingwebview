@@ -178,6 +178,18 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
     }
 
     @Override
+    public CompletableFuture<String> getCookies(String url) {
+        EmbeddedWebView e = embedded;
+        if (e == null) {
+            CompletableFuture<String> f = new CompletableFuture<String>();
+            f.completeExceptionally(
+                new IllegalStateException("WebViewComponent not displayed"));
+            return f;
+        }
+        return e.getCookies(url);
+    }
+
+    @Override
     public WebViewComponent addJavascriptCallback(String name,
                                                   WebView.JavascriptCallback cb) {
         if (name != null && name.startsWith(RESERVED_BINDING_PREFIX)) {
