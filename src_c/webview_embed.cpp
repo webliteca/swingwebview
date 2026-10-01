@@ -3507,6 +3507,24 @@ static void off_engine_on_message(OffEngine *e, const char *msg) {
     if (detach) e->jvm->DetachCurrentThread();
 }
 
+// Canvas 33 D2: move the engine's hidden popup toplevel far outside every
+// monitor.  GTK multiplies a window position by the display's window scale
+// and X11 stores the result as a signed 16-bit device coordinate, so the
+// offset is divided by the scale read now: an unscaled -32000 wraps around
+// on-screen at 2x.
+static void gtk_off_park_offscreen(GtkWindow *win) {
+    int offscreen = -32000 / gdk_window_get_scale_factor(
+        gdk_screen_get_root_window(gtk_window_get_screen(win)));
+    gtk_window_move(win, offscreen, offscreen);
+}
+
+// Canvas 33 D2: the window scale can change while the engine lives (X
+// settings Gdk/WindowScaling); GTK then re-applies the old logical offset at
+// the new scale, which can wrap on-screen, so re-park at the new scale.
+static void gtk_off_on_scale_factor(GObject *win, GParamSpec *, gpointer) {
+    gtk_off_park_offscreen(GTK_WINDOW(win));
+}
+
 // Canvas 19 (lightweight/offscreen coverage): when `existing_web` is non-null
 // (the offscreen popup-adoption path) the engine REUSES that already-created
 // WebKitWebView instead of allocating a fresh one — preserving its in-flight
@@ -3536,14 +3554,13 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
         // than a GtkOffscreenWindow.  WebKitGTK only lets a page start media
         // once its view is in an on-screen toplevel, and never counts an
         // offscreen window as one; this window is mapped but never visible,
-        // undecorated, unfocusable and out of the taskbar.  GTK multiplies
-        // the position by the display's window scale and X11 stores it as a
-        // signed 16-bit device coordinate, so the offset is divided by that
-        // scale: an unscaled -32000 wraps around on-screen at 2x.
+        // undecorated, unfocusable and out of the taskbar.  Its position is
+        // scale-aware and re-applied when the window scale changes
+        // (gtk_off_park_offscreen).
         e->window = gtk_window_new(GTK_WINDOW_POPUP);
-        int offscreen = -32000 / gdk_window_get_scale_factor(
-            gdk_screen_get_root_window(gtk_window_get_screen(GTK_WINDOW(e->window))));
-        gtk_window_move(GTK_WINDOW(e->window), offscreen, offscreen);
+        gtk_off_park_offscreen(GTK_WINDOW(e->window));
+        g_signal_connect(e->window, "notify::scale-factor",
+                         G_CALLBACK(gtk_off_on_scale_factor), nullptr);
         gtk_window_set_accept_focus(GTK_WINDOW(e->window), FALSE);
         gtk_window_set_focus_on_map(GTK_WINDOW(e->window), FALSE);
         gtk_window_set_skip_taskbar_hint(GTK_WINDOW(e->window), TRUE);

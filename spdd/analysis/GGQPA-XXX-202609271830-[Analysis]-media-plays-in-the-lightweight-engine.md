@@ -31,7 +31,7 @@ See `requirements/[User-story-9]media-plays-in-the-lightweight-engine.md` → **
 
 ### Solution Direction
 - Replace `gtk_offscreen_window_new()` with `gtk_window_new(GTK_WINDOW_POPUP)`, then before it is
-  shown: `gtk_window_move(-32000, -32000)`, `gtk_window_set_accept_focus(FALSE)`,
+  shown: `gtk_window_move(-32000 / scale, -32000 / scale)`, `gtk_window_set_accept_focus(FALSE)`,
   `gtk_window_set_focus_on_map(FALSE)`, `gtk_window_set_skip_taskbar_hint(TRUE)`,
   `gtk_window_set_skip_pager_hint(TRUE)`, `gtk_window_set_decorated(FALSE)`. Everything after
   (show, synthetic focus, snapshot, input, resize) is unchanged.
@@ -42,7 +42,10 @@ See `requirements/[User-story-9]media-plays-in-the-lightweight-engine.md` → **
 - **Popup, not a normal toplevel**: override-redirect bypasses the window manager — no decoration,
   no taskbar, no focus stealing, and the position is honoured exactly.
 - **Off-screen by position**: X11 accepts negative coordinates for override-redirect windows; -32000
-  is outside any realistic monitor layout (X11 coordinates are 16-bit signed).
+  device pixels is outside any realistic monitor layout (X11 coordinates are 16-bit signed). GTK
+  multiplies a window position by the window scale, so the logical offset is `-32000 / scale`; an
+  unscaled -32000 overflows at 2x and wraps to +1536, on screen. The scale can change at runtime, so
+  the window is re-parked whenever its scale factor changes (Canvas 33 D2).
 - **No change to pixel capture**: `gtk_widget_draw` draws the widget tree into our surface for any
   GtkWindow; a mapped window's own on-screen contents are irrelevant.
 
