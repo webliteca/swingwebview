@@ -1430,6 +1430,12 @@ File: `src/ca/weblite/webview/swing/WebViewHeavyweightComponent.java`
      exactly over the canvas region rather than over the
      entire window (comment at
      `WebViewHeavyweightComponent.java:171`).
+   - On Windows the native side ignores the supplied x, y, w, h:
+     the child HWND sits at `(0,0)` under the canvas HWND and
+     takes the canvas HWND's client rect as its size, as it does
+     at creation. The supplied w, h are AWT user-space units,
+     which are smaller than the device pixels Win32 and WebView2
+     expect whenever display scaling is above 100%.
 
 ### 7. Preferred Size — getPreferredSize
 File: `src/ca/weblite/webview/swing/WebViewHeavyweightComponent.java`

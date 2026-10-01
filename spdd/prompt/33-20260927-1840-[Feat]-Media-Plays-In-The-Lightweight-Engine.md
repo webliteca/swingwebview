@@ -28,12 +28,15 @@ implements:
   `UIProcess/gtk/GtkUtilities.cpp`). In the lightweight engine every media element therefore waits
   forever — no `loadstart`, no `error`.
 - **D2 · The toplevel.** `gtk_off_create_engine` creates `gtk_window_new(GTK_WINDOW_POPUP)` instead of
-  `gtk_offscreen_window_new()`, and before it is shown sets: `gtk_window_move(win, -32000, -32000)`,
+  `gtk_offscreen_window_new()`, and before it is shown sets: `gtk_window_move(win, -32000 / scale, -32000 / scale)`,
   `gtk_window_set_accept_focus(win, FALSE)`, `gtk_window_set_focus_on_map(win, FALSE)`,
   `gtk_window_set_skip_taskbar_hint(win, TRUE)`, `gtk_window_set_skip_pager_hint(win, TRUE)`,
   `gtk_window_set_decorated(win, FALSE)`. A popup is override-redirect on X11 (the only backend the
   pump allows): no window-manager decoration, taskbar entry or focus, and its position is honoured, so
-  it is mapped but outside every monitor.
+  it is mapped but outside every monitor. `scale` is the display's window scale
+  (`gdk_window_get_scale_factor` of the screen's root window): GTK multiplies a window position by it
+  and X11 stores the result as a signed 16-bit device coordinate, so an unscaled `-32000` overflows at
+  2x and wraps to `+1536`, on-screen.
 - **D3 · Nothing else changes.** `gtk_widget_show_all`, the synthetic `GDK_FOCUS_CHANGE`,
   `gtk_off_snapshot_into` (`gtk_widget_draw` into our own image surface), input synthesis through
   `gtk_main_do_event`, `gtk_window_resize`, destruction, and popup adoption (Canvas 19, which goes

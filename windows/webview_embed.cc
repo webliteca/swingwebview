@@ -3697,7 +3697,7 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1des
 }
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1bounds
-  (JNIEnv *, jclass, jlong wv, jint /*x*/, jint /*y*/, jint w, jint h) {
+  (JNIEnv *, jclass, jlong wv, jint /*x*/, jint /*y*/, jint /*w*/, jint /*h*/) {
     auto *e = (Engine *)wv;
     if (!e) return;
     // The Java side sends x,y in AWT-window content-pane coordinates (used
@@ -3705,13 +3705,18 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
     // Windows our child HWND is parented directly under the canvas's HWND,
     // so it should always sit at (0,0) relative to its parent -- using the
     // window-relative x,y would offset us by the canvas's own position.
-    embed_win::dispatch_to_thread(e, [e, w, h] {
+    // The size comes from the canvas HWND's client rect, as at creation:
+    // the Java w,h are AWT user-space units, which are smaller than the
+    // device pixels Win32 and WebView2 expect whenever display scaling is
+    // above 100%.
+    embed_win::dispatch_to_thread(e, [e] {
+        RECT r;
+        GetClientRect(e->parent, &r);
         if (e->child) {
-            SetWindowPos(e->child, nullptr, 0, 0, w, h,
+            SetWindowPos(e->child, nullptr, 0, 0, r.right, r.bottom,
                          SWP_NOZORDER | SWP_NOACTIVATE);
         }
         if (e->controller) {
-            RECT r{0, 0, w, h};
             e->controller->put_Bounds(r);
         }
     });
