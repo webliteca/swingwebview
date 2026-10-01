@@ -555,6 +555,17 @@ native static void webview_offscreen_set_password_callback(long peer, WebViewPas
 // those platforms is itself a stub).  Never throws via JNI.
 native static void webview_offscreen_set_popup_callback(long peer, WebViewPopupCallback cb);
 
+// Canvas 34: navigation decisions.  webview_navigation_available is present
+// only in natives built with the feature (WebViewComponent.
+// isNavigationHandlerSupported() absorbs the UnsatisfiedLinkError an older
+// native raises).  The set_navigation_callback bridges hand the engine a
+// WebViewNavigationCallback it calls synchronously, on its UI thread, before
+// each navigation of the view or its frames; null removes it.  The offscreen
+// bridge is a no-op on macOS and Windows, which have no offscreen engine.
+native static boolean webview_navigation_available();
+native static void webview_embed_set_navigation_callback(long w, WebViewNavigationCallback cb);
+native static void webview_offscreen_set_navigation_callback(long peer, WebViewNavigationCallback cb);
+
 // Offscreen (lightweight) twin of webview_embed_set_download_callback.  Same
 // contract; Linux-only in practice, since the offscreen engine exists only on
 // the GTK backend.  Passing 0 for peer is a silent no-op.

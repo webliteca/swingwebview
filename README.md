@@ -957,6 +957,54 @@ wv.setUrl("demo://app/index.html");
     one process: WebView2 may refuse the second environment because its options
     differ.
 
+## Deciding where a page may navigate
+
+A page's content security policy confines what it *loads*, but not where it
+*goes*: a link, `location.href = …`, a form posted to the top window or a meta
+refresh moves the whole view to an address the page chose, and so sends
+whatever the page put in it. A navigation handler refuses those before any
+request is sent:
+
+```java
+if (!WebViewComponent.isNavigationHandlerSupported()) {
+    // An older native library: don't show a page you can't keep in place.
+}
+wv.setNavigationHandler(e ->
+    e.applicationInitiated()                 // your own setUrl calls
+        || e.url().startsWith("demo://app/")
+        || e.url().equals("about:blank")     // a frame's first page
+        || e.url().equals("about:srcdoc"));
+```
+
+* **What it's asked about.** Every navigation of the view **and of its
+  frames**: links (including `download` links), `location.href` / `assign` /
+  `replace`, forms, meta refreshes, back/forward, reload and server
+  redirects. New windows go to the popup handler instead. WebKitGTK reports a
+  frame's navigation exactly like the view's own, so no engine tells them
+  apart; allow `about:blank` and `about:srcdoc` if your pages use frames.
+* **A refusal** leaves the page as it was: nothing is sent, and there's no
+  error page.
+* **The event** gives the target `url()`, the view's `currentUrl()`, the
+  `cause()` (`LINK`, `FORM`, `BACK_FORWARD`, `RELOAD`, `REDIRECT` or `OTHER`)
+  and `applicationInitiated()`, which is true for your own `setUrl` and for a
+  server redirect of one you allowed. WebView2 can't tell a link from a form
+  or a script and reports them as `OTHER`; WKWebView reports redirects as
+  `OTHER`.
+* **Threading.** Like the popup decision, the handler runs on the native UI
+  thread, synchronously, off the EDT. Keep it fast and don't touch Swing. A
+  handler that throws refuses the navigation.
+* **No handler, no change.** `setNavigationHandler(null)` restores the default,
+  which allows everything.
+* **Platform coverage.** Linux (lightweight) through WebKitGTK's
+  `decide-policy`; macOS (heavyweight) through the navigation delegate's
+  navigation-action policy, which reproduces WebKit's own default (downloads,
+  `mailto:` and other external schemes) when it allows; Windows (heavyweight)
+  through `NavigationStarting` and `FrameNavigationStarting`. A popup adopted
+  into a component is decided by that component's handler; a popup in an
+  engine-owned window, or one not yet adopted, is not, so block or adopt the
+  popups of a page you restrict. See
+  [`demos/WebViewNavigationDemo/`](demos/WebViewNavigationDemo/README.md).
+
 ## Demo
 
 See [`demos/WebViewHeavyweightDemo/`](demos/WebViewHeavyweightDemo/README.md)
@@ -996,6 +1044,9 @@ Additional demos:
 * `demos/WebViewSchemeDemo/` — serves a two-file page from the `demo://`
   scheme in Java: a script, a POST echoed as JSON, a slow answer, a failing
   handler and a popup (`run-*-scheme-demo`).
+* `demos/WebViewNavigationDemo/` — a page that tries every way to navigate
+  away to a local listener, each refused by a navigation handler before
+  anything is sent (`run-*-navigation-demo`).
 
 ## Building from source
 

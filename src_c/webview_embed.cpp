@@ -780,6 +780,11 @@ struct Engine {
     // Canvas 16.  A child (popup) web view inherits this ref via its own
     // PopupEngine so nested popups work.
     jobject popup_callback = nullptr;
+    // Canvas 34 D7: JNI global ref to the WebViewNavigationCallback, or
+    // nullptr.  Set by gtk_set_navigation_callback; read by the
+    // "decide-policy" handler on every navigation; freed in
+    // gtk_destroy_engine.
+    jobject navigation_callback = nullptr;
     // Canvas 21 (1.5.0): per-destination User-Agent resolver
     // (java.util.function.Function<String,String>) as a JNI global ref.
     // Consulted at the popup-child creation site with the CHILD's target
@@ -1347,6 +1352,83 @@ static bool fire_popup_requested(JavaVM *jvm, jobject cb,
     return allow;
 }
 
+// Canvas 34 D7: the navigation decision, shared by Engine and OffEngine.
+// Asks the WebViewNavigationCallback (synchronously, on the GTK main thread,
+// before WebKit sends any request) about a NAVIGATION_ACTION decision of the
+// view or one of its frames -- WebKitGTK reports frame navigations exactly
+// like the view's own.  Returns TRUE after ignoring a refused navigation;
+// FALSE lets WebKit decide as it would without a handler.  New windows
+// (NEW_WINDOW_ACTION) belong to the popup path, and responses to the download
+// path, so both are left alone.  Every failure refuses.
+enum { NAV_LINK = 0, NAV_FORM = 1, NAV_BACK_FORWARD = 2, NAV_RELOAD = 3,
+       NAV_REDIRECT = 4, NAV_OTHER = 5 };
+
+static gboolean gtk_decide_navigation(JavaVM *jvm, jobject cb,
+                                      WebKitWebView *view,
+                                      WebKitPolicyDecision *decision,
+                                      WebKitPolicyDecisionType type) {
+    if (type != WEBKIT_POLICY_DECISION_TYPE_NAVIGATION_ACTION) return FALSE;
+    if (!jvm || !cb || !decision) return FALSE;
+    // Plain C casts: the WEBKIT_* GObject cast macros would reference
+    // *_get_type symbols the runtime loader does not resolve.
+    WebKitNavigationAction *action =
+        webkit_navigation_policy_decision_get_navigation_action(
+            (WebKitNavigationPolicyDecision *)decision);
+    const char *url = "";
+    int cause = NAV_OTHER;
+    if (action) {
+        WebKitURIRequest *req = webkit_navigation_action_get_request(action);
+        const char *u = req ? webkit_uri_request_get_uri(req) : nullptr;
+        if (u) url = u;
+        if (webkit_navigation_action_is_redirect(action)) {
+            cause = NAV_REDIRECT;
+        } else {
+            switch (webkit_navigation_action_get_navigation_type(action)) {
+                case WEBKIT_NAVIGATION_TYPE_LINK_CLICKED: cause = NAV_LINK; break;
+                case WEBKIT_NAVIGATION_TYPE_FORM_SUBMITTED:
+                case WEBKIT_NAVIGATION_TYPE_FORM_RESUBMITTED: cause = NAV_FORM; break;
+                case WEBKIT_NAVIGATION_TYPE_BACK_FORWARD: cause = NAV_BACK_FORWARD; break;
+                case WEBKIT_NAVIGATION_TYPE_RELOAD: cause = NAV_RELOAD; break;
+                default: cause = NAV_OTHER; break;
+            }
+        }
+    }
+    const char *current = view ? webkit_web_view_get_uri(view) : nullptr;
+
+    bool allowed = false;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK) env = nullptr;
+        else detach = true;
+    }
+    if (env) {
+        jstring ju = env->NewStringUTF(url);
+        jstring jc = env->NewStringUTF(current ? current : "");
+        jclass cls = env->GetObjectClass(cb);
+        if (cls) {
+            jmethodID mid = env->GetMethodID(cls, "onNavigationRequested",
+                "(Ljava/lang/String;Ljava/lang/String;I)Z");
+            if (mid) {
+                jboolean r = env->CallBooleanMethod(cb, mid, ju, jc, (jint)cause);
+                allowed = r == JNI_TRUE;
+            }
+            env->DeleteLocalRef(cls);
+        }
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+            allowed = false;
+        }
+        if (ju) env->DeleteLocalRef(ju);
+        if (jc) env->DeleteLocalRef(jc);
+        if (detach) jvm->DetachCurrentThread();
+    }
+    if (allowed) return FALSE;
+    webkit_policy_decision_ignore(decision);
+    return TRUE;
+}
+
 // Canvas 19: synchronous DISPOSITION hop into Java on the GTK main thread.
 // Calls WebViewPopupCallback.onPopupDisposition and returns the
 // PopupDisposition ordinal (0 = BLOCK, 1 = NATIVE_WINDOW, 2 = ADOPT).  Mirrors
@@ -1857,6 +1939,17 @@ static gboolean on_run_file_chooser_popup(WebKitWebView *web,
     return handle_run_file_chooser(pe->jvm, pe->dialog_callback, uri, request);
 }
 
+// Canvas 34 D7: per-Engine wrapper for "decide-policy" (heavyweight, and an
+// adopted popup's view).
+static gboolean on_decide_policy_engine(WebKitWebView *web,
+        WebKitPolicyDecision *decision, WebKitPolicyDecisionType type,
+        gpointer user_data) {
+    Engine *e = static_cast<Engine *>(user_data);
+    if (!e) return FALSE;
+    return gtk_decide_navigation(e->jvm, e->navigation_callback, web,
+                                 decision, type);
+}
+
 // Per-Engine wrapper for the `create` signal (heavyweight).  Mirrors
 // on_script_dialog_engine — the divergence is the shared inner it delegates to.
 static GtkWidget *on_create_web_view_engine(WebKitWebView *web,
@@ -2189,6 +2282,11 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug,
         // window.open / target=_blank -> native popup window (Canvas 16).
         g_signal_connect(WEBKIT_WEB_VIEW(e->web), "create",
                          (GCallback)on_create_web_view_engine, e);
+        // Canvas 34 D7: every navigation of the view and its frames is put
+        // to the WebViewNavigationCallback first.  Also covers an adopted
+        // popup, whose child view arrives here as `childw`.
+        g_signal_connect(WEBKIT_WEB_VIEW(e->web), "decide-policy",
+                         (GCallback)on_decide_policy_engine, e);
 
         // Wire up the "external" message handler.
         g_signal_connect(
@@ -2418,6 +2516,24 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug,
 
 static void gtk_destroy_engine(Engine *e) {
     if (!e) return;
+    // Canvas 34 D7: stop asking, then drop the navigation callback, before
+    // anything else is torn down: a decision arriving mid-teardown must not
+    // reach a freed engine or a freed ref.
+    if (e->web) {
+        g_signal_handlers_disconnect_by_func(G_OBJECT(e->web),
+            (gpointer)on_decide_policy_engine, e);
+    }
+    if (e->navigation_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm && e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->navigation_callback);
+        e->navigation_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     // Canvas 21 (1.5.0): drop the User-Agent resolver's global ref.  Only the
     // popup-child creation path reads it, but a late popup during teardown
     // would follow a freed ref, so it goes with the other callbacks.
@@ -3031,6 +3147,20 @@ static void gtk_set_popup_callback(Engine *e, JNIEnv *env, jobject cb) {
     }
 }
 
+// Canvas 34 D5: register (or clear, when cb is null) the navigation callback.
+// Mirrors gtk_set_popup_callback; the "decide-policy" handler reads the field
+// on every navigation.
+static void gtk_set_navigation_callback(Engine *e, JNIEnv *env, jobject cb) {
+    if (!e) return;
+    if (e->navigation_callback) {
+        env->DeleteGlobalRef(e->navigation_callback);
+        e->navigation_callback = nullptr;
+    }
+    if (cb) {
+        e->navigation_callback = env->NewGlobalRef(cb);
+    }
+}
+
 // Canvas 21: override the WebKitGTK User-Agent (changes the HTTP header).
 // ua == nullptr restores the engine default.  Takes effect on the next
 // navigation.
@@ -3434,6 +3564,10 @@ struct OffEngine {
     // gtk_off_create_engine, which routes through the shared
     // handle_create_web_view inner function (Canvas 16).
     jobject popup_callback = nullptr;
+    // Canvas 34 D7: the WebViewNavigationCallback global ref, or nullptr.
+    // Set by gtk_off_set_navigation_callback; freed in
+    // gtk_off_destroy_engine.
+    jobject navigation_callback = nullptr;
     // Canvas 21 (1.5.0): per-destination User-Agent resolver
     // (java.util.function.Function<String,String>) as a JNI global ref.
     // Consulted at the popup-child creation site with the CHILD's target
@@ -3481,6 +3615,16 @@ static GtkWidget *on_create_web_view_off_engine(WebKitWebView *web,
     return handle_create_web_view(e->jvm, e->popup_callback,
                                   e->dialog_callback, e->ua_resolver,
                                   web, nav);
+}
+
+// Canvas 34 D7: per-OffEngine wrapper for "decide-policy".
+static gboolean on_decide_policy_off_engine(WebKitWebView *web,
+        WebKitPolicyDecision *decision, WebKitPolicyDecisionType type,
+        gpointer user_data) {
+    OffEngine *e = static_cast<OffEngine *>(user_data);
+    if (!e) return FALSE;
+    return gtk_decide_navigation(e->jvm, e->navigation_callback, web,
+                                 decision, type);
 }
 
 // Parallel of engine_on_message for OffEngine: parse the {name, seq, args}
@@ -3621,6 +3765,9 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
         // window.open / target=_blank -> native popup window (Canvas 16).
         g_signal_connect(WEBKIT_WEB_VIEW(e->web), "create",
                          (GCallback)on_create_web_view_off_engine, e);
+        // Canvas 34 D7: the navigation decision, as for Engine.
+        g_signal_connect(WEBKIT_WEB_VIEW(e->web), "decide-policy",
+                         (GCallback)on_decide_policy_off_engine, e);
 
         webkit_user_content_manager_add_script(
             e->manager,
@@ -3705,6 +3852,24 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
 
 static void gtk_off_destroy_engine(OffEngine *e) {
     if (!e) return;
+    // Canvas 34 D7: stop asking, then drop the navigation callback, before
+    // anything else is torn down: a decision arriving mid-teardown must not
+    // reach a freed engine or a freed ref.
+    if (e->web) {
+        g_signal_handlers_disconnect_by_func(G_OBJECT(e->web),
+            (gpointer)on_decide_policy_off_engine, e);
+    }
+    if (e->navigation_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm && e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->navigation_callback);
+        e->navigation_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     // Canvas 21 (1.5.0): drop the User-Agent resolver's global ref.  Only the
     // popup-child creation path reads it, but a late popup during teardown
     // would follow a freed ref, so it goes with the other callbacks.
@@ -3842,6 +4007,19 @@ static void gtk_off_set_popup_callback(OffEngine *e, JNIEnv *env,
     }
     if (cb) {
         e->popup_callback = env->NewGlobalRef(cb);
+    }
+}
+
+// Canvas 34 D5: offscreen counterpart to gtk_set_navigation_callback.
+static void gtk_off_set_navigation_callback(OffEngine *e, JNIEnv *env,
+                                            jobject cb) {
+    if (!e) return;
+    if (e->navigation_callback) {
+        env->DeleteGlobalRef(e->navigation_callback);
+        e->navigation_callback = nullptr;
+    }
+    if (cb) {
+        e->navigation_callback = env->NewGlobalRef(cb);
     }
 }
 
@@ -4668,6 +4846,10 @@ struct Engine {
     // the opener's PopupDispatcher.  Cleared before ui_delegate is
     // released.
     jobject popup_callback = nullptr;
+    // Canvas 34 D8: JNI global ref to the WebViewNavigationCallback, or
+    // nullptr.  Read by decidePolicyForNavigationAction on AppKit main;
+    // set by cocoa_set_navigation_callback; freed in cocoa_destroy_engine.
+    jobject navigation_callback = nullptr;
     // Canvas 21 (1.5.0): per-destination User-Agent resolver
     // (java.util.function.Function<String,String>) as a JNI global ref.
     // Consulted at the popup-child creation site with the CHILD's target
@@ -6039,6 +6221,19 @@ static void cocoa_set_popup_callback(Engine *e, JNIEnv *env, jobject cb) {
     }
 }
 
+// Canvas 34 D5: register (or clear, when cb is null) the navigation callback.
+// Mirrors cocoa_set_popup_callback.
+static void cocoa_set_navigation_callback(Engine *e, JNIEnv *env, jobject cb) {
+    if (!e) return;
+    if (e->navigation_callback) {
+        env->DeleteGlobalRef(e->navigation_callback);
+        e->navigation_callback = nullptr;
+    }
+    if (cb) {
+        e->navigation_callback = env->NewGlobalRef(cb);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Browser-initiated file downloads (Canvas 23).
 //
@@ -6289,6 +6484,127 @@ static DownloadCtx *cocoa_download_claim_terminal(id download) {
     }
     cocoa_download_stop_observing(ctx);
     return ctx;
+}
+
+// Canvas 34 D8: synchronous navigation decision into Java on AppKit main,
+// like fire_popup_disposition.  A missing callback, an attach failure, or a
+// thrown decision all refuse.
+static bool cocoa_fire_navigation(JavaVM *jvm, jobject cb, const char *url,
+                                  const char *current, int cause) {
+    if (!jvm || !cb) return false;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return false;
+        detach = true;
+    }
+    bool allowed = false;
+    jstring ju = env->NewStringUTF(url ? url : "");
+    jstring jc = env->NewStringUTF(current ? current : "");
+    jclass cls = env->GetObjectClass(cb);
+    if (cls) {
+        jmethodID mid = env->GetMethodID(cls, "onNavigationRequested",
+            "(Ljava/lang/String;Ljava/lang/String;I)Z");
+        if (mid) {
+            jboolean r = env->CallBooleanMethod(cb, mid, ju, jc, (jint)cause);
+            allowed = r == JNI_TRUE;
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        allowed = false;
+    }
+    if (ju) env->DeleteLocalRef(ju);
+    if (jc) env->DeleteLocalRef(jc);
+    if (detach) jvm->DetachCurrentThread();
+    return allowed;
+}
+
+// WKNavigationDelegate:
+//   -webView:decidePolicyForNavigationAction:decisionHandler:  (Canvas 34 D8)
+// Asks the WebViewNavigationCallback about every navigation of the view and
+// its frames, answering Cancel (0) on a refusal.  Implementing this selector
+// replaces WebKit's own default, so an allowed navigation -- or any, with no
+// callback -- reproduces that default exactly: a new-window action (nil
+// targetFrame) is used (the popup path decides it); a request WebKit can load,
+// or one for a registered custom scheme, is downloaded when the action says
+// shouldPerformDownload and used otherwise; anything else is opened with
+// NSWorkspace (never a file URL) and ignored.  about:, data:, blob: and
+// javascript: are treated as loadable.
+static void impl_decide_policy_for_navigation_action(
+        id self, SEL, id webView, id navigationAction, id decisionHandler) {
+    Engine *e = (Engine *)objc_getAssociatedObject(self, "eng");
+    void (^answer)(long) = (void (^)(long))decisionHandler;
+    if (!navigationAction) { answer(1); return; }
+    id target_frame = msg(navigationAction, sel("targetFrame"));
+    if (!target_frame) { answer(1); return; }   // WKNavigationActionPolicyAllow
+
+    id req = msg(navigationAction, sel("request"));
+    id url = req ? msg(req, sel("URL")) : nullptr;
+    std::string u;
+    if (url) {
+        id abs = msg(url, sel("absoluteString"));
+        if (abs) u = ns_string_to_utf8(abs);
+    }
+
+    if (e && e->navigation_callback && !e->destroyed.load()) {
+        long type = msg<long>(navigationAction, sel("navigationType"));
+        int cause = 5;  // OTHER (redirects are not flagged by WKWebView)
+        switch (type) {
+            case 0: cause = 0; break;   // WKNavigationTypeLinkActivated
+            case 1: cause = 1; break;   // WKNavigationTypeFormSubmitted
+            case 2: cause = 2; break;   // WKNavigationTypeBackForward
+            case 3: cause = 3; break;   // WKNavigationTypeReload
+            case 4: cause = 1; break;   // WKNavigationTypeFormResubmitted
+            default: cause = 5; break;
+        }
+        std::string current = page_url_utf8(webView);
+        if (!cocoa_fire_navigation(e->jvm, e->navigation_callback, u.c_str(),
+                                   current.c_str(), cause)) {
+            answer(0);                                   // Cancel
+            return;
+        }
+    }
+
+    // WebKit's default policy, reproduced.
+    bool loadable = false;
+    if (url) {
+        std::string scheme;
+        id sc = msg(url, sel("scheme"));
+        if (sc) scheme = ns_string_to_utf8(sc);
+        for (size_t i = 0; i < scheme.size(); i++) {
+            scheme[i] = (char)tolower((unsigned char)scheme[i]);
+        }
+        if (scheme == "about" || scheme == "data" || scheme == "blob"
+                || scheme == "javascript") {
+            loadable = true;
+        }
+        for (const std::string &name : g_scheme_names) {
+            if (name == scheme) loadable = true;
+        }
+        if (!loadable && req) {
+            loadable = msg<BOOL, id>(objc_cls("NSURLConnection"),
+                                     sel("canHandleRequest:"), req) == YES;
+        }
+    }
+    if (loadable) {
+        long policy = 1;                                 // Allow
+        if (msg<BOOL, SEL>(navigationAction, sel("respondsToSelector:"),
+                           sel("shouldPerformDownload")) == YES
+                && msg<BOOL>(navigationAction, sel("shouldPerformDownload")) == YES) {
+            policy = 2;                                  // Download (11.3+)
+        }
+        answer(policy);
+        return;
+    }
+    if (url && msg<BOOL>(url, sel("isFileURL")) == NO) {
+        id ws = msg(objc_cls("NSWorkspace"), sel("sharedWorkspace"));
+        if (ws) msg<BOOL, id>(ws, sel("openURL:"), url);
+    }
+    answer(0);
 }
 
 // WKNavigationDelegate:
@@ -6563,6 +6879,13 @@ static Class get_webview_embed_ui_delegate_cls() {
             sel("webView:decidePolicyForNavigationResponse:"
                 "decisionHandler:"),
             (IMP)impl_decide_policy_for_navigation_response, "v@:@@@");
+        // Canvas 34 D8: the navigation decision (and WebKit's default,
+        // reproduced, when it allows).
+        class_addMethod(
+            c,
+            sel("webView:decidePolicyForNavigationAction:"
+                "decisionHandler:"),
+            (IMP)impl_decide_policy_for_navigation_action, "v@:@@@");
         class_addMethod(
             c,
             sel("webView:navigationAction:didBecomeDownload:"),
@@ -8047,6 +8370,18 @@ static void cocoa_destroy_engine(Engine *e) {
         }
         if (env) env->DeleteGlobalRef(e->download_callback);
         e->download_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
+    // Canvas 34 D8: the navigation-callback global ref goes the same way.
+    if (e->navigation_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->navigation_callback);
+        e->navigation_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
     // Same treatment for the click-callback global ref.  Cleared after
@@ -9543,6 +9878,41 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
 #else
     // macOS / Windows have no offscreen engine; OffscreenWebView.create
     // returns null there so this is never reached.
+    (void)env; (void)cb;
+#endif
+}
+
+// Navigation decisions — Canvas 34 D5.  webview_navigation_available is the
+// support probe (an older native lacks the symbol); the setters install the
+// WebViewNavigationCallback each engine asks before every navigation.
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1navigation_1available
+  (JNIEnv *, jclass) {
+#if defined(WEBVIEW_GTK) || defined(WEBVIEW_COCOA)
+    return JNI_TRUE;
+#else
+    return JNI_FALSE;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1navigation_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    if (wv == 0) return;
+#ifdef WEBVIEW_GTK
+    embed::gtk_set_navigation_callback((embed::Engine *)wv, env, cb);
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_set_navigation_callback((embed::Engine *)wv, env, cb);
+#else
+    (void)env; (void)cb;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1navigation_1callback
+  (JNIEnv *env, jclass, jlong peer, jobject cb) {
+    if (peer == 0) return;
+#ifdef WEBVIEW_GTK
+    embed::gtk_off_set_navigation_callback((embed::OffEngine *)peer, env, cb);
+#else
+    // No offscreen engine on macOS or Windows.
     (void)env; (void)cb;
 #endif
 }

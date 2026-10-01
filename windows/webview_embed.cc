@@ -339,6 +339,15 @@ struct Engine {
     // transitively, like the other tokens.
     EventRegistrationToken new_window_token{};
 
+    // Canvas 34 D9: JNI global ref to the WebViewNavigationCallback, or
+    // nullptr, read by NavigationStartingHandler on every navigation of the
+    // view and its frames; and the two event tokens it is registered under,
+    // removed in destroy_engine.
+    jobject navigation_callback = nullptr;
+    EventRegistrationToken navigation_starting_token{};
+    EventRegistrationToken frame_navigation_starting_token{};
+    bool navigation_registered = false;
+
     // The ICoreWebView2Environment this engine was created from, AddRef'd at
     // environment-ready and Release'd in destroy_engine (Canvas 17).  The
     // NewWindowRequested handler creates the child popup controller from THIS
@@ -2570,6 +2579,109 @@ static void win_scheme_respond(long long id, int status, std::vector<std::string
     });
 }
 
+// Canvas 34 D9: NavigationStarting and FrameNavigationStarting -> the
+// WebViewNavigationCallback, synchronously on the WebView2 thread, before any
+// request is sent; a refusal is put_Cancel(TRUE).  One class serves both
+// events: they share the handler and args interfaces.  WebView2 can't tell a
+// link from a form or a script, so those are OTHER; reload and back/forward
+// come from ICoreWebView2NavigationStartingEventArgs3 when the runtime has it.
+// Every failure refuses.
+class NavigationStartingHandler : public CallbackBase<
+    ICoreWebView2NavigationStartingEventHandler> {
+public:
+    explicit NavigationStartingHandler(Engine *e) : m_engine(e) {}
+    HRESULT STDMETHODCALLTYPE Invoke(
+        ICoreWebView2 *,
+        ICoreWebView2NavigationStartingEventArgs *args) override {
+        if (!args || !m_engine) return S_OK;
+        jobject cb = m_engine->navigation_callback;
+        JavaVM *jvm = m_engine->jvm;
+        if (!cb || !jvm) return S_OK;
+
+        LPWSTR uri_w = nullptr;
+        args->get_Uri(&uri_w);
+        std::string uri = wide_to_utf8(uri_w);
+        if (uri_w) CoTaskMemFree(uri_w);
+
+        int cause = 5;                                   // OTHER
+        BOOL redirected = FALSE;
+        args->get_IsRedirected(&redirected);
+        if (redirected) {
+            cause = 4;                                   // REDIRECT
+        } else {
+            ICoreWebView2NavigationStartingEventArgs3 *a3 = nullptr;
+            if (SUCCEEDED(args->QueryInterface(
+                    __uuidof(ICoreWebView2NavigationStartingEventArgs3),
+                    reinterpret_cast<void **>(&a3))) && a3) {
+                COREWEBVIEW2_NAVIGATION_KIND kind =
+                    COREWEBVIEW2_NAVIGATION_KIND_NEW_DOCUMENT;
+                if (SUCCEEDED(a3->get_NavigationKind(&kind))) {
+                    if (kind == COREWEBVIEW2_NAVIGATION_KIND_RELOAD) cause = 3;
+                    else if (kind == COREWEBVIEW2_NAVIGATION_KIND_BACK_OR_FORWARD) cause = 2;
+                }
+                a3->Release();
+            }
+        }
+
+        std::string current;
+        {
+            LPWSTR src = nullptr;
+            if (m_engine->webview &&
+                SUCCEEDED(m_engine->webview->get_Source(&src)) && src) {
+                current = wide_to_utf8(src);
+            }
+            if (src) CoTaskMemFree(src);
+        }
+
+        bool allowed = false;
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK) env = nullptr;
+            else detach = true;
+        }
+        if (env) {
+            jstring ju = env->NewStringUTF(uri.c_str());
+            jstring jc = env->NewStringUTF(current.c_str());
+            jclass cls = env->GetObjectClass(cb);
+            if (cls) {
+                jmethodID mid = env->GetMethodID(cls, "onNavigationRequested",
+                    "(Ljava/lang/String;Ljava/lang/String;I)Z");
+                if (mid) {
+                    jboolean r = env->CallBooleanMethod(cb, mid, ju, jc, (jint)cause);
+                    allowed = r == JNI_TRUE;
+                }
+                env->DeleteLocalRef(cls);
+            }
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+                allowed = false;
+            }
+            if (ju) env->DeleteLocalRef(ju);
+            if (jc) env->DeleteLocalRef(jc);
+            if (detach) jvm->DetachCurrentThread();
+        }
+        if (!allowed) args->put_Cancel(TRUE);
+        return S_OK;
+    }
+
+private:
+    Engine *m_engine;
+};
+
+// Canvas 34 D9: register the navigation handler on `wv` for `e`, for the view
+// and its frames.  Called beside add_NewWindowRequested, for a fresh engine
+// and for an adopted child.
+static void win_register_navigation(Engine *e, ICoreWebView2 *wv) {
+    if (!e || !wv) return;
+    auto *nh = new NavigationStartingHandler(e);
+    bool ok = SUCCEEDED(wv->add_NavigationStarting(nh, &e->navigation_starting_token));
+    ok = SUCCEEDED(wv->add_FrameNavigationStarting(nh, &e->frame_navigation_starting_token)) && ok;
+    nh->Release();
+    e->navigation_registered = ok;
+}
+
 // NewWindowRequested -> allow/deny via Java, then create the linked child in an
 // engine-owned top-level window.  Deferral pattern; see the block comment.
 class NewWindowRequestedHandler : public CallbackBase<
@@ -3167,6 +3279,9 @@ static void engine_thread(Engine *e, HWND /*parent*/, int width, int height,
                         nwh, &e->new_window_token);
                     nwh->Release();
 
+                    // Navigation decisions (Canvas 34 D9).
+                    win_register_navigation(e, e->webview);
+
                     // Custom URL schemes (Canvas 32 D3); a no-op when none
                     // are registered.
                     win_install_scheme_hook(e->webview, e->environment);
@@ -3424,6 +3539,25 @@ static void destroy_engine(Engine *e) {
         e->download_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
+    // Canvas 34 D9: stop asking, then drop the navigation callback's global
+    // ref, before the worker thread tears down.
+    if (e->navigation_registered && e->webview) {
+        e->webview->remove_NavigationStarting(e->navigation_starting_token);
+        e->webview->remove_FrameNavigationStarting(
+            e->frame_navigation_starting_token);
+        e->navigation_registered = false;
+    }
+    if (e->navigation_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->navigation_callback);
+        e->navigation_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     // Symmetric cleanup for the popup callback global ref (Canvas 17).  The
     // NewWindowRequested handler fires off this field, so clear it before the
     // worker thread tears down.
@@ -3592,6 +3726,9 @@ static Engine *adopt_retained_popup(JNIEnv *env, HWND parent, RetainedPopup *rp,
             auto *nwh = new NewWindowRequestedHandler(e);
             child->add_NewWindowRequested(nwh, &e->new_window_token);
             nwh->Release();
+
+            // Navigation decisions (Canvas 34 D9) on the adopted child.
+            win_register_navigation(e, child);
         }
 
         // The hidden holder top-level window is no longer needed once the
@@ -4247,6 +4384,30 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
   (JNIEnv *, jclass, jlong, jobject) {
     // Windows has no offscreen engine; stub for link-symmetry across all
     // three native binaries.
+}
+
+// Navigation decisions (Canvas 34 D5, D9).
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1navigation_1available
+  (JNIEnv *, jclass) {
+    return JNI_TRUE;
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1navigation_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    auto *e = (Engine *)wv;
+    if (!e) return;
+    if (e->navigation_callback) {
+        env->DeleteGlobalRef(e->navigation_callback);
+        e->navigation_callback = nullptr;
+    }
+    if (cb) {
+        e->navigation_callback = env->NewGlobalRef(cb);
+    }
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1navigation_1callback
+  (JNIEnv *, jclass, jlong, jobject) {
+    // Windows has no offscreen engine; stub for link-symmetry.
 }
 
 JNIEXPORT jlong JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1adopt_1popup

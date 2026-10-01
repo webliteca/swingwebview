@@ -10,6 +10,7 @@ import ca.weblite.webview.ConsoleListener;
 import ca.weblite.webview.DialogDispatcher;
 import ca.weblite.webview.DownloadDispatcher;
 import ca.weblite.webview.PasswordDispatcher;
+import ca.weblite.webview.NavigationDispatcher;
 import ca.weblite.webview.PopupDispatcher;
 import ca.weblite.webview.JavaScriptEvalException;
 import ca.weblite.webview.PdfOptions;
@@ -20,6 +21,7 @@ import ca.weblite.webview.WebViewCredentialStore;
 import ca.weblite.webview.WebViewDialogHandler;
 import ca.weblite.webview.WebViewDownloadHandler;
 import ca.weblite.webview.WebViewFillPasswordHandler;
+import ca.weblite.webview.WebViewNavigationHandler;
 import ca.weblite.webview.WebViewPopupHandler;
 import ca.weblite.webview.WebViewMouseDispatcher;
 import ca.weblite.webview.WebViewMouseListener;
@@ -100,6 +102,15 @@ public abstract class WebViewComponent extends JComponent {
      *  peer-attach time that delegates to this dispatcher's {@code dispatch*}
      *  methods. */
     protected final PopupDispatcher popupDispatcher = new PopupDispatcher(this);
+
+    /** Per-component hub for navigation decisions (Canvas 34).  Subclasses
+     *  install a {@link ca.weblite.webview.WebViewNavigationCallback} on
+     *  their native peer at attach time, before the first navigation, that
+     *  delegates to {@link NavigationDispatcher#dispatch}, and call
+     *  {@link NavigationDispatcher#expectApplicationNavigation} before each
+     *  native navigate they make. */
+    protected final NavigationDispatcher navigationDispatcher =
+        new NavigationDispatcher(this);
 
     /** Per-component fan-out hub for browser-initiated file downloads
      *  ({@code <a download>}, a {@code Content-Disposition: attachment}
@@ -941,6 +952,49 @@ public abstract class WebViewComponent extends JComponent {
      */
     public final WebViewPopupHandler getPopupHandler() {
         return popupDispatcher.getHandler();
+    }
+
+    // ---------------------------------------------------------------------
+    // Navigation decisions (Canvas 34).
+    // ---------------------------------------------------------------------
+
+    /**
+     * Install the handler that decides whether a page may navigate: every
+     * navigation of this component's view and of its frames is put to it
+     * before the engine sends any request, and a refused one never starts
+     * (Canvas 34 D1).  Passing {@code null} installs
+     * {@link WebViewNavigationHandler#DEFAULT}, which allows everything —
+     * the behaviour without a handler.
+     *
+     * <p>See {@link WebViewNavigationHandler} for the contract: the handler
+     * runs on the native UI thread, synchronously, off the EDT.  Check
+     * {@link #isNavigationHandlerSupported()} before relying on it to keep
+     * an untrusted page in place.
+     *
+     * @return {@code this} for chaining
+     */
+    public final WebViewComponent setNavigationHandler(WebViewNavigationHandler handler) {
+        navigationDispatcher.setHandler(handler);
+        return this;
+    }
+
+    /**
+     * @return the active {@link WebViewNavigationHandler}; never
+     * {@code null} — {@link WebViewNavigationHandler#DEFAULT} when none was
+     * installed.
+     */
+    public final WebViewNavigationHandler getNavigationHandler() {
+        return navigationDispatcher.getHandler();
+    }
+
+    /**
+     * Whether the loaded native library can decide navigations (Canvas 34
+     * D6).  {@code false} against a native built before the feature, or
+     * without natives at all: an application that relies on a navigation
+     * handler to keep an untrusted page in place should not show that page.
+     */
+    public static boolean isNavigationHandlerSupported() {
+        return NavigationDispatcher.isAvailable();
     }
 
     // ---------------------------------------------------------------------

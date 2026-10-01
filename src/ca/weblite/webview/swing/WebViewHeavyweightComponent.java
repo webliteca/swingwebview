@@ -17,6 +17,7 @@ import ca.weblite.webview.JavascriptFunction;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewClickCallback;
 import ca.weblite.webview.WebViewDialogCallback;
+import ca.weblite.webview.WebViewNavigationCallback;
 import ca.weblite.webview.WebViewPopupCallback;
 import ca.weblite.webview.WebViewFocusCallback;
 import ca.weblite.webview.WebViewAttachListener;
@@ -127,6 +128,7 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
             // Resolve the User-Agent for this destination before navigating,
             // so the request carries it (Canvas 21, consultation point (b)).
             applyResolvedUserAgentFor(url);
+            navigationDispatcher.expectApplicationNavigation(url);   // Canvas 34 D4
             embedded.navigate(url);
         }
         return this;
@@ -258,6 +260,7 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         // a half-disposed component.
         dialogDispatcher.disposeAll();
         popupDispatcher.disposeAll();
+        navigationDispatcher.disposeAll();
         downloadDispatcher.disposeAll();
         passwordDispatcher.disposeAll();
         failPendingPdf();
@@ -632,11 +635,22 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         if (pendingUserAgentResolver != null) {
             embedded.setUserAgentResolver(pendingUserAgentResolver);
         }
+        // Canvas 34 D5: the navigation bridge, installed before the first
+        // navigate so no navigation of this view escapes the decision.  It
+        // answers synchronously on the native UI thread (no EDT hop).
+        embedded.setNavigationCallback(new WebViewNavigationCallback() {
+            @Override
+            public boolean onNavigationRequested(String url, String currentUrl,
+                                                 int cause) {
+                return navigationDispatcher.dispatch(url, currentUrl, cause);
+            }
+        });
         // An adopted popup already carries the engine's own in-flight
         // navigation (the original request WebKit drove into the child, POST
         // body intact); navigating pendingUrl here would clobber it.  Only
         // navigate for the normal engine-creating path.
         if (pendingAdoptPopupId == 0L) {
+            navigationDispatcher.expectApplicationNavigation(pendingUrl);   // Canvas 34 D4
             embedded.navigate(pendingUrl);
         }
         sizeNative();
