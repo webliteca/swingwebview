@@ -113,6 +113,14 @@ generated_at: 2026-05-16T07:19:13-07:00
   remain stubs — the dispatcher is still installed there but
   its `engine == null` short-circuit makes it a no-op,
   matching the existing rendering-path stub semantics.
+- Clean JVM exit (Linux, issue #64): after a lightweight
+  `WebViewComponent` has loaded a page — and whether or not it
+  has since been disposed — a normal JVM exit
+  (`System.exit(n)`, `JFrame.EXIT_ON_CLOSE`, last non-daemon
+  thread ending) completes with the requested exit status. It
+  must never abort with SIGABRT in WebKit's teardown
+  (`WebKit::WebsiteDataStore::~WebsiteDataStore` reached from
+  libc exit handlers).
 - Definition of Done: documented at `README.md ("Quick start" section)`,
   exercised by the `WebViewHeavyweightDemo` (which uses
   `WebViewComponent.create()` so the lightweight engine is the
@@ -289,6 +297,24 @@ generated_at: 2026-05-16T07:19:13-07:00
   `bindings`, `manager`, and `jvm` fields
   (`webview_embed.cpp:887`) — the new JNI entries plug into
   those.
+- **The default web context outlives the process (issue #64).**
+  Every view the library creates shares WebKitGTK's default
+  `WebKitWebContext`, which WebKit holds in a function-local
+  static reference. That static's destructor runs from libc exit
+  handlers on whichever thread calls `exit` — for the JVM, the
+  "VM Thread" in `os::exit`, never the GTK pump thread. Once all
+  views are disposed it is the last reference, so finalizing the
+  context (and its `WebsiteDataStore`) off WebKit's main thread
+  trips a WebKit release assertion and aborts the process. The
+  GTK pump therefore takes one deliberate extra reference on
+  `webkit_web_context_get_default()` on the pump thread, right
+  after `gtk_init` and before signalling readiness, and never
+  releases it. The exit-time static release then only decrements
+  the count; the context is never finalized and the OS reclaims
+  it at process exit. Taking the reference on the pump thread
+  also makes the pump thread the one that creates the default
+  context. WebKit symbols are already resolved at
+  `JNI_OnLoad`, so the call is always safe there.
 - **DevTools call is single-shot.** No state added on the
   Java side.  The native `webview_offscreen_open_devtools`
   returns 0 if `enable_developer_extras` is FALSE on the
@@ -423,6 +449,16 @@ generated_at: 2026-05-16T07:19:13-07:00
   Adds one further entry under the Linux branch:
   `gtk_off_execute_editing_command(OffEngine *e, int cmdId)`,
   exported via `Java_..._webview_1offscreen_1execute_1editing_1command`.
+  `embed::GtkPump::ensure_started` holds the never-released
+  reference on the default `WebKitWebContext` (see Approach,
+  issue #64).
+- `demos/WebViewExitSmokeTest/src/ca/weblite/webview/demos/WebViewExitSmokeTest.java`
+  and `run-linux-exit-smoketest.sh` — regression smoke test for
+  issue #64: creates a LIGHTWEIGHT component, loads a `data:` page,
+  confirms it via `evalAsync`, disposes the component on the EDT,
+  then calls `System.exit(0)`. The script builds the native
+  library and jar like `run-linux-media-smoketest.sh` and exits
+  with the JVM's status: 0 passes, 134 (SIGABRT) is the defect.
 - `src_c/ca_weblite_webview_WebViewNative.h` — generated JNI
   header; declares the five new offscreen entries alongside
   the existing ones, plus the new
@@ -1161,6 +1197,14 @@ Files:
   messages (e.g. WebKit `load-failed`) still print unconditionally.
 
 ## S · Safeguards
+- **The default `WebKitWebContext` is never finalized.** The
+  pump-thread reference taken in `GtkPump::ensure_started` is
+  intentionally leaked — never unref it, and never route views
+  to a context the library could drop to zero references, or the
+  JVM aborts at exit (issue #64). *Added 2026-10-01, from a
+  defect: reported on Fedora 44 / WebKitGTK 2.52.5; reproduced on
+  Ubuntu 24.04 / WebKitGTK 2.52.6 by `run-linux-exit-smoketest.sh`
+  (exit status 134 before the fix, 0 after).*
 - **Each script-message channel is connected exactly once per
   offscreen engine.** `g_signal_connect` is additive, so a
   second `script-message-received::<channel>` connection on the

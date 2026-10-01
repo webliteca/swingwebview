@@ -549,6 +549,13 @@ private:
             int argc = 0;
             char **argv = nullptr;
             gtk_init(&argc, &argv);
+            // Issue #64: WebKit keeps the default web context in a static
+            // reference released by libc exit handlers on the JVM's exit
+            // thread, not this one.  If that is the last reference, the
+            // context is finalized off WebKit's main thread and the process
+            // aborts.  Hold one extra reference for the life of the process
+            // and never release it, so exit only ever decrements the count.
+            g_object_ref(webkit_web_context_get_default());
             {
                 std::lock_guard<std::mutex> lk2(ready_m);
                 ready = true;
