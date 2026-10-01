@@ -3710,8 +3710,8 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
     // device pixels Win32 and WebView2 expect whenever display scaling is
     // above 100%.
     embed_win::dispatch_to_thread(e, [e] {
-        RECT r;
-        GetClientRect(e->parent, &r);
+        RECT r{};
+        if (!GetClientRect(e->parent, &r)) return;
         if (e->child) {
             SetWindowPos(e->child, nullptr, 0, 0, r.right, r.bottom,
                          SWP_NOZORDER | SWP_NOACTIVATE);

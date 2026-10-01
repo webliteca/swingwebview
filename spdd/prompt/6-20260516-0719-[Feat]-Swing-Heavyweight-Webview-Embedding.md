@@ -1433,7 +1433,9 @@ File: `src/ca/weblite/webview/swing/WebViewHeavyweightComponent.java`
    - On Windows the native side ignores the supplied x, y, w, h:
      the child HWND sits at `(0,0)` under the canvas HWND and
      takes the canvas HWND's client rect as its size, as it does
-     at creation. The supplied w, h are AWT user-space units,
+     at creation. If that rect can't be read (the canvas HWND is
+     already destroyed when the dispatched resize runs), the resize
+     is skipped. The supplied w, h are AWT user-space units,
      which are smaller than the device pixels Win32 and WebView2
      expect whenever display scaling is above 100%.
 

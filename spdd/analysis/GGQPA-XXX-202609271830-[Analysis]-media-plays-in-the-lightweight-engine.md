@@ -59,6 +59,9 @@ See `requirements/[User-story-9]media-plays-in-the-lightweight-engine.md` → **
   the engine already drives rendering on demand, so this is expected to be neutral.
 - **Compositors / XWayland**: an override-redirect window at negative coordinates is off every
   output; verified under Xvfb only.
+- **Display scaling** (found after release, Canvas 33 D2 amended): GTK multiplies the position by
+  the window scale before X11 stores it as a signed 16-bit coordinate, so at 2x `-32000` wraps to
+  `+1536` and the popup is visible. The offset is now `-32000` divided by that scale.
 - **Input and focus**: unchanged code paths (`gtk_main_do_event`, synthetic focus), but not
   exercised by the smoke test; run the existing interactive demos (`run-linux-demo.sh`) to check
   typing, clicking and scrolling by hand.
