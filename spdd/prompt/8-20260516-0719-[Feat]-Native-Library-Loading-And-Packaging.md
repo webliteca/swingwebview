@@ -498,9 +498,24 @@ Files: `src_c/webkit_loader.h`, `src_c/webkit_loader.cpp`,
    - On any failure — either library not `dlopen`able, or a
      required symbol missing — fail with a clear message naming
      **both** candidate SONAMEs of the library that could not be
-     satisfied. Runs from `JNI_OnLoad`; returning `JNI_ERR` makes
-     `System.load` throw with that message (same load-time failure
-     point as before, now diagnosable on both 4.0 and 4.1 hosts).
+     satisfied, **each with its own `dlerror()` text** (the 4.1
+     attempt's reason is captured before the 4.0 attempt overwrites
+     it). Without the first reason, a host whose 4.1 library is
+     installed but fails to load (a missing dependency, a broken
+     install) reads exactly like a host with no WebKitGTK at all.
+     The message buffer is large enough (1024 bytes) to hold both
+     reasons.
+   - Runs from `JNI_OnLoad`, which returns `JNI_ERR`. The JVM then
+     throws a **generic** `UnsatisfiedLinkError` ("unsupported JNI
+     version 0xFFFFFFFF") — it does not carry the loader's message.
+     So, before returning `JNI_ERR`, the loader both prints the
+     message to stderr and publishes it to Java as the system
+     property `ca.weblite.webview.nativeLoadError` (via
+     `vm->GetEnv` and `System.setProperty`; any JNI failure while
+     publishing is cleared and ignored, so publishing can never
+     change the outcome). On a successful load the property is never
+     set. This is the one way an embedder can tell the user *why*
+     the WebView is unavailable rather than only *that* it is.
 
 3. Call-site routing (`webkit_shim.h`): included by `webview.h` and
    `webview_embed.cpp` immediately after the WebKit/JSC/GTK headers,
@@ -749,8 +764,12 @@ Files: `pom.xml`, `.github/workflows/maven-release.yml`
   neither `libwebkit2gtk-4.1.so.0` nor `libwebkit2gtk-4.0.so.37`
   (respectively the two JavaScriptCore SONAMEs) can be `dlopen`ed,
   or a required symbol is missing, `JNI_OnLoad` returns `JNI_ERR`
-  and `System.load` throws `UnsatisfiedLinkError` with a message
-  naming both candidate SONAMEs. This replaces the old
+  and `System.load` throws `UnsatisfiedLinkError`. The loader's own
+  message — naming both candidate SONAMEs, each with its own
+  `dlerror()` reason — goes to stderr and to the system property
+  `ca.weblite.webview.nativeLoadError`, because the JVM's exception
+  text is generic. The property name is public contract: embedders
+  read it to explain the failure, so it is never renamed. This replaces the old
   dynamic-linker error — which named only the 4.1 SONAME and made a
   4.0 host look broken — with a message that makes the
   missing-runtime case obvious on either host.

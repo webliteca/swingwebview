@@ -176,8 +176,10 @@ extern WkFns g_wk;
 
 // Resolve the WebKit/JSC runtime once (idempotent, thread-safe). Returns true
 // on success. On failure, if errbuf/errlen are non-null, copies a diagnostic
-// message naming the candidate SONAMEs. Invoked from JNI_OnLoad; callers do
-// not normally need it directly.
+// message naming the candidate SONAMEs, each with its own dlerror() reason
+// (pass a buffer of at least 1024 bytes). Invoked from JNI_OnLoad, which also
+// publishes the message as the system property
+// ca.weblite.webview.nativeLoadError; callers do not normally need it directly.
 bool webkit_loader_ensure(char *errbuf, size_t errlen);
 
 #endif  // WEBVIEW_GTK || __linux__
