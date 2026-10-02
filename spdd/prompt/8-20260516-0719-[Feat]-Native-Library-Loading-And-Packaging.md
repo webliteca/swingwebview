@@ -32,6 +32,18 @@ generated_at: 2026-05-16T07:19:13-07:00
   `.github/workflows/build.yml:171`). The system Microsoft Edge
   WebView2 Runtime provides the actual Chromium binaries
   (`README.md ("Platform support" section)`).
+- The shipped Linux natives (`linux_64` and `linux_arm64`) must load
+  on any host with **glibc 2.31 or newer** and a **libstdc++ from
+  GCC 10 or newer** — Ubuntu 20.04, Debian 11 and everything after.
+  This is the same floor the runtime WebKit loader already assumes
+  (WebKitGTK 4.0 on Ubuntu 20.04, Operation 7). Building the natives
+  on the CI runner's own toolchain broke it unnoticed: on
+  `ubuntu-24.04` (glibc 2.39, GCC 13) the library picked up
+  `__isoc23_sscanf@GLIBC_2.38` (glibc ≥ 2.38 headers redirect
+  `sscanf`) and `std::ios_base_library_init@GLIBCXX_3.4.32`
+  (GCC 13's `<iostream>`), so `System.load` failed on Ubuntu 22.04
+  and 20.04 with `version 'GLIBC_2.38' not found` and no window
+  opened.
 - Publish each tagged release of the assembled six-platform jar
   to **two** repositories: GitHub Packages first, then Maven
   Central. Both receive the same coordinates and the same
@@ -108,6 +120,33 @@ generated_at: 2026-05-16T07:19:13-07:00
   on a stock JDK. Both CI workflows already build this way, and CI
   produces the shipped artifact, so the developer scripts were the
   outlier rather than CI.
+- **Old libc, new WebKit headers: build the Linux natives in a
+  Debian 11 (bullseye) container.** A binary's glibc / libstdc++
+  floor is set by the system it is built on, so the shipped Linux
+  natives are compiled inside a `debian:11` container rather than on
+  the runner's host toolchain. Bullseye is chosen because it is old
+  in exactly the right place and new in the other: glibc 2.31 and
+  GCC 10 give the 2.31 / GCC 10 floor, while its
+  `libwebkit2gtk-4.0-dev` headers are a recent WebKitGTK (2.44 in the
+  final bullseye point release), so every `WEBKIT_CHECK_VERSION`-gated
+  optional symbol group (2.12, 2.36, 2.40 — Operation 7) still
+  compiles in. Bullseye is end-of-life and its suites are being
+  retired: the `bullseye-security` pool has already been emptied while
+  its index still lists packages, so an unpinned `apt-get` fails with
+  404s. The container therefore replaces its apt sources with the
+  single, permanent `bullseye main` suite on `archive.debian.org`
+  (apt still verifies the archive signatures; only the expired
+  `Valid-Until` check is waived). Only headers and the compiler come
+  from there — none of those packages ship inside the jar. Building on an older
+  distro with old WebKit headers would lower the floor too, but would
+  silently compile those optional features out of every build,
+  including the one new distros receive. Compiling against the 4.0
+  headers does not restrict runtime: WebKit is `dlopen`ed, 4.1
+  preferred, and the 4.0 and 4.1 API used here are the same. The
+  runners stay `ubuntu-24.04` / `ubuntu-24.04-arm` (native arch, no
+  cross-compilation); only the compiler runs in the container. The
+  JNI / JAWT headers come from the same JDK 11 the rest of the matrix
+  uses, mounted read-only into the container.
 - **Per-architecture directory inside the jar.** The Maven
   resource configuration explicitly packages native
   subdirectories (`linux_64/**`, `linux_arm64/**`, `osx_64/**`,
@@ -207,7 +246,9 @@ generated_at: 2026-05-16T07:19:13-07:00
   lays them into `natives/<arch>/`, asserts all six are present,
   and runs `mvn package`/`deploy`. This is the only path that
   produces the cross-platform fat jar shipped to GitHub Packages
-  and Maven Central.
+  and Maven Central. Its Linux `native` steps compile inside a
+  `debian:11` container (Approach) and then gate the result on its
+  glibc / libstdc++ symbol versions (Operation 6).
 
 ## O · Operations
 
@@ -383,6 +424,37 @@ Files: `.github/workflows/build.yml`,
      — a machine-checked guarantee of the single-portable-binary
      property (Operation 7). A hard WebKit/JSC link dependency
      fails the build.
+   - The Linux `native` job (both workflows, both arches) compiles
+     inside a `debian:11` container via `docker run` on the
+     existing `ubuntu-24.04` / `ubuntu-24.04-arm` runner — a step,
+     not a job-level `container:`, because the matrix job is shared
+     with macOS and Windows. The container first points apt at
+     `http://archive.debian.org/debian bullseye main` only (no
+     `-security` or `-updates` suite), with
+     `Acquire::Check-Valid-Until=false`, and pins that origin at
+     priority 1001 so the image's newer security builds of base
+     packages (e.g. `libc6`) are downgraded to the archive's versions
+     — otherwise their `-dev` packages are unsatisfiable. It then
+     installs, with downgrades allowed, `g++`,
+     `pkg-config`, `libgtk-3-dev`, `libwebkit2gtk-4.0-dev`,
+     `libx11-dev` and `libxt-dev`; the runner's `$JAVA_HOME`
+     (JDK 11 from `setup-java`) is mounted read-only and used for the
+     JNI include paths; the repository is mounted as the working
+     directory. The compiler command line — flags, sources, link
+     libraries — is otherwise unchanged from Operation 7.4, and the
+     `pkg-config` WebKit module selection (4.1 if present, else 4.0)
+     stays, resolving to 4.0 in bullseye.
+   - **glibc / libstdc++ floor gate.** After the build, the Linux
+     `native` job lists the library's dynamic symbol versions
+     (`objdump -T`) and fails if any `GLIBC_` version is newer than
+     **2.31**, any `GLIBCXX_` version newer than **3.4.28**, or any
+     `CXXABI_` version newer than **1.3.12** (the GCC 10 values),
+     printing the offending symbols. It runs on the runner, next to
+     the `readelf` WebKit gate, and on both arches. This is the
+     machine-checked form of the Requirements floor: a future change
+     of container image, or a newly used libc / libstdc++ function,
+     fails the build instead of shipping a library that will not
+     load on older hosts.
 
 ### 7. Runtime WebKitGTK / JavaScriptCore Resolution (Linux)
 Files: `src_c/webkit_loader.h`, `src_c/webkit_loader.cpp`,
@@ -464,7 +536,8 @@ Files: `src_c/webkit_loader.h`, `src_c/webkit_loader.cpp`,
    `libwebview.so` loads on either WebKitGTK **4.1** (Ubuntu 22.04+)
    or **4.0** (Ubuntu 20.04) present at load time, with no separate
    per-version build, alongside the existing Windows WebView2-Runtime
-   note.
+   note. The same bullet states the libc floor: glibc 2.31 or newer
+   (Ubuntu 20.04, Debian 11 and later), x64 and arm64.
 
 ### 8. Developer Build Scripts Match the CI Recipe
 Files: `build-mac.sh`, `build-linux.sh`
@@ -502,7 +575,15 @@ Files: `build-mac.sh`, `build-linux.sh`
    `uname -m` and select `osx_arm64` for `arm64`/`aarch64` and
    `osx_64` for `x86_64`.
 
-5. **Known remaining gap, deliberately not closed here:**
+5. **Toolchain floor is CI-only.** `build-linux.sh` compiles with
+   the developer's host toolchain, so its library carries the
+   **host's** glibc / libstdc++ floor, not the 2.31 / GCC 10 floor of
+   the shipped artifact (Operation 6). Its linkage and translation
+   units still match CI, which is all a local smoke test needs. The
+   script states this in a comment so a locally built jar is not
+   mistaken for one that runs on older distros.
+
+6. **Known remaining gap, deliberately not closed here:**
    `build-linux.sh` still hardcodes `natives/linux_64` and
    `build-windows.sh` still hardcodes `natives/windows_64`, so both
    mis-place the library on an arm64 host. Only the JAWT flag is
@@ -629,6 +710,15 @@ Files: `pom.xml`, `.github/workflows/maven-release.yml`
   diverge, the script is wrong, not CI — CI builds the artifact that
   ships, so a local smoke test against a differently-linked library
   proves nothing about the release.
+- **The Linux natives are never built on a runner's host
+  toolchain (never-relax).** The shipped `libwebview.so` (both
+  arches) is compiled inside the `debian:11` container of
+  Operation 6, and the glibc / libstdc++ floor gate runs on every
+  build. Do not move the Linux build back onto the runner, raise the
+  gate's version limits, or swap the container for a newer image
+  without first raising the floor stated in Requirements and the
+  README — a GitHub runner-image upgrade otherwise silently drops
+  every older distro, which is how 2.38 shipped.
 - **A release publishes to both targets or to neither.** The
   six-platform presence assertion runs before either deploy, so a
   jar missing a platform never reaches GitHub Packages or Maven

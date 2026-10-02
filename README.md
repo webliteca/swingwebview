@@ -34,7 +34,8 @@ web engine:
 * **Linux** requires a system WebKitGTK — either **4.1** (Ubuntu 22.04+)
   or **4.0** (Ubuntu 20.04).  The bundled `libwebview.so` resolves
   whichever is present at load time (no `webkit2gtk` SONAME is
-  hard-linked), so a single jar runs on both.
+  hard-linked), so a single jar runs on both.  It needs **glibc 2.31 or
+  newer** (Ubuntu 20.04, Debian 11 and later), on x64 and arm64.
 * **macOS** needs nothing extra — WKWebView ships with the OS.
 
 ### Early access via GitHub Packages

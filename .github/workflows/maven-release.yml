@@ -97,35 +97,59 @@ jobs:
               -Wl,-undefined,dynamic_lookup
           file "natives/${{ matrix.native_dir }}/${{ matrix.lib_name }}"
 
-      - name: Install Linux deps
-        if: runner.os == 'Linux'
-        shell: bash
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-              g++ pkg-config \
-              libgtk-3-dev libwebkit2gtk-4.1-dev libx11-dev libxt-dev
-
-      - name: Build Linux native
+      # The Linux natives are compiled inside a Debian 11 (bullseye) container,
+      # never on the runner's own toolchain (Canvas 8, Operation 6).  A
+      # binary's glibc / libstdc++ floor is that of the system it is built on:
+      # bullseye's glibc 2.31 + GCC 10 let the .so load on Ubuntu 20.04,
+      # Debian 11 and newer, while its WebKitGTK 2.44 headers keep every
+      # WEBKIT_CHECK_VERSION-gated optional feature compiled in.  Built on
+      # ubuntu-24.04 directly, the .so needed GLIBC_2.38 / GLIBCXX_3.4.32 and
+      # would not load on Ubuntu 22.04 or 20.04.  The runner's JDK 11 is
+      # mounted read-only for the JNI/JAWT headers.
+      - name: Build Linux native (debian:11 container)
         if: runner.os == 'Linux'
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "natives/${{ matrix.native_dir }}"
-          if pkg-config --exists webkit2gtk-4.1; then
-            WEBKIT_PKG=webkit2gtk-4.1
-          else
-            WEBKIT_PKG=webkit2gtk-4.0
-          fi
-          g++ -fPIC -std=c++11 -Wall \
-              -DWEBVIEW_GTK=1 \
-              -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/linux" \
-              -I./src_c \
-              $(pkg-config --cflags gtk+-3.0 "$WEBKIT_PKG") \
-              src_c/webview.c src_c/webview_embed.cpp src_c/webkit_loader.cpp \
-              $(pkg-config --libs gtk+-3.0) \
-              -lX11 -ldl \
-              -shared -o "natives/${{ matrix.native_dir }}/${{ matrix.lib_name }}"
+          # Bullseye is EOL: its -security pool is already emptied, so the
+          # container uses only the permanent "bullseye main" suite on
+          # archive.debian.org (signatures still verified; only the expired
+          # Valid-Until is waived).  The pin downgrades the image's newer
+          # security builds of base packages (libc6, ...) to the archive's,
+          # or their -dev packages cannot be installed.  Keep comments out
+          # of the single-quoted script below: an apostrophe would end it.
+          docker run --rm \
+              -v "$GITHUB_WORKSPACE:/src" -w /src \
+              -v "$JAVA_HOME:/jdk:ro" -e JAVA_HOME=/jdk \
+              -e OUT="natives/${{ matrix.native_dir }}/${{ matrix.lib_name }}" \
+              -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
+              debian:11 bash -euo pipefail -c '
+                export DEBIAN_FRONTEND=noninteractive
+                echo "deb http://archive.debian.org/debian bullseye main" > /etc/apt/sources.list
+                rm -f /etc/apt/sources.list.d/*
+                printf "Package: *\nPin: origin \"archive.debian.org\"\nPin-Priority: 1001\n" \
+                    > /etc/apt/preferences.d/archive-bullseye
+                apt-get -o Acquire::Check-Valid-Until=false update -qq
+                apt-get install -y -qq --allow-downgrades --no-install-recommends \
+                    g++ pkg-config \
+                    libgtk-3-dev libwebkit2gtk-4.0-dev libx11-dev libxt-dev >/dev/null
+                if pkg-config --exists webkit2gtk-4.1; then
+                  WEBKIT_PKG=webkit2gtk-4.1
+                else
+                  WEBKIT_PKG=webkit2gtk-4.0
+                fi
+                g++ -fPIC -std=c++11 -Wall \
+                    -DWEBVIEW_GTK=1 \
+                    -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/linux" \
+                    -I./src_c \
+                    $(pkg-config --cflags gtk+-3.0 "$WEBKIT_PKG") \
+                    src_c/webview.c src_c/webview_embed.cpp src_c/webkit_loader.cpp \
+                    $(pkg-config --libs gtk+-3.0) \
+                    -lX11 -ldl \
+                    -shared -o "$OUT"
+                chown "$HOST_UID:$HOST_GID" "$OUT"
+              '
           file "natives/${{ matrix.native_dir }}/${{ matrix.lib_name }}"
           # Portability gate: the released artifact MUST NOT hard-link any
           # WebKitGTK / JavaScriptCore SONAME — those are dlopen'd at runtime
@@ -137,6 +161,25 @@ jobs:
             exit 1
           fi
           echo "OK: no webkit2gtk/javascriptcoregtk NEEDED entries."
+
+          # glibc / libstdc++ floor gate (Canvas 8, Operation 6): the shipped
+          # .so must load on glibc 2.31 with GCC 10's libstdc++.  Fail on any
+          # symbol version newer than GLIBC_2.31, GLIBCXX_3.4.28 or CXXABI_1.3.12.
+          LIB="natives/${{ matrix.native_dir }}/${{ matrix.lib_name }}"
+          SYMS="$(objdump -T "$LIB")"
+          too_new=0
+          for limit in GLIBC_2.31 GLIBCXX_3.4.28 CXXABI_1.3.12; do
+            prefix="${limit%_*}"; max="${limit##*_}"
+            for v in $(grep -oE "\(${prefix}_[0-9][0-9.]*\)" <<<"$SYMS" | tr -d '()' | sed "s/^${prefix}_//" | sort -Vu); do
+              if [ "$(printf '%s\n%s\n' "$max" "$v" | sort -V | tail -n1)" != "$max" ]; then
+                echo "ERROR: $LIB needs ${prefix}_$v (floor is $limit):" >&2
+                grep -F "(${prefix}_$v)" <<<"$SYMS" >&2
+                too_new=1
+              fi
+            done
+          done
+          if [ "$too_new" -ne 0 ]; then exit 1; fi
+          echo "OK: no symbol newer than GLIBC_2.31 / GLIBCXX_3.4.28 / CXXABI_1.3.12."
 
       - name: Set up MSVC environment
         if: runner.os == 'Windows'
