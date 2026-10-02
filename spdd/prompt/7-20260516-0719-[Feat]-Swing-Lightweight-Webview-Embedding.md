@@ -315,6 +315,26 @@ generated_at: 2026-05-16T07:19:13-07:00
   also makes the pump thread the one that creates the default
   context. WebKit symbols are already resolved at
   `JNI_OnLoad`, so the call is always safe there.
+- **Xlib threads are never switched on late.** Xlib requires
+  `XInitThreads()` to be the first Xlib call in a process: on
+  libX11 1.7.x (Ubuntu 22.04) a display — and its resource
+  database — opened before it has no locks, and once the call is
+  made Xlib starts locking every display, so the lock-less one is
+  locked through a NULL mutex. The jDeploy launcher initialises
+  GTK in-process for its splash before the JVM starts; the pump's
+  `gtk_init` then reuses that display, and the first cursor WebKit
+  loads (the I-beam on a text-field focus: Xcursor → `XGetDefault`
+  → `XrmQGetResource`) kills the process with SIGSEGV. So
+  `GtkPump::ensure_started` calls `XInitThreads()` only when no
+  GDK display is open yet in the process — checked with
+  `gdk_display_get_default()` before `gtk_init`. When the host has
+  already initialised GTK, the pump leaves Xlib exactly as the
+  host set it up and reuses the host's display (if the host made
+  Xlib thread-safe first, as the jDeploy launcher now does, the
+  display is already locked; if not, it stays lock-less, which is
+  the state the process already ran in). On libX11 ≥ 1.8 every
+  display is thread-safe by default and both branches are
+  equivalent.
 - **DevTools call is single-shot.** No state added on the
   Java side.  The native `webview_offscreen_open_devtools`
   returns 0 if `enable_developer_extras` is FALSE on the
@@ -451,7 +471,9 @@ generated_at: 2026-05-16T07:19:13-07:00
   exported via `Java_..._webview_1offscreen_1execute_1editing_1command`.
   `embed::GtkPump::ensure_started` holds the never-released
   reference on the default `WebKitWebContext` (see Approach,
-  issue #64).
+  issue #64), and calls `XInitThreads()` only when no GDK display
+  is open yet (see Approach, "Xlib threads are never switched on
+  late").
 - `demos/WebViewExitSmokeTest/src/ca/weblite/webview/demos/WebViewExitSmokeTest.java`
   and `run-linux-exit-smoketest.sh` — regression smoke test for
   issue #64: creates a LIGHTWEIGHT component, loads a `data:` page,
@@ -1197,6 +1219,15 @@ Files:
   messages (e.g. WebKit `load-failed`) still print unconditionally.
 
 ## S · Safeguards
+- **Never call `XInitThreads()` after a GDK display exists
+  (never-relax).** `GtkPump::ensure_started` makes the call only
+  when `gdk_display_get_default()` is NULL before `gtk_init`.
+  Calling it unconditionally re-introduces the SIGSEGV in
+  `pthread_mutex_lock` (Xcursor → `XGetDefault`) on libX11 1.7.x
+  whenever the host process initialised GTK first — every
+  jDeploy-launched app with a launcher older than the fix.
+  *Added 2026-10-02, from a defect: Ubuntu 22.04 / libX11 1.7.5 /
+  WebKitGTK 2.50.4, core dump from the affected VM.*
 - **The default `WebKitWebContext` is never finalized.** The
   pump-thread reference taken in `GtkPump::ensure_started` is
   intentionally leaked — never unref it, and never route views
