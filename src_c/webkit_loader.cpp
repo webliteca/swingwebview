@@ -29,25 +29,35 @@ const char *const kJsc40 = "libjavascriptcoregtk-4.0.so.18";
 
 void *g_webkit_handle = nullptr;
 void *g_jsc_handle = nullptr;
-char g_err[512] = {0};
+char g_err[1024] = {0};
 
 // Resolve everything exactly once. Returns true on success; on failure writes
 // a diagnostic to g_err and returns false. Called only through the C++11
 // thread-safe function-local static in webkit_loader_ensure().
 bool do_init() {
+  // dlerror() only reports the most recent failure, so each attempt's reason
+  // is copied out before the next dlopen overwrites it. Without the first
+  // reason, a 4.1 library that is installed but fails to load reads exactly
+  // like a host with no WebKitGTK at all.
+  char first_err[384] = {0};
+  const char *e = nullptr;
+
   // 1. WebKit: prefer 4.1, fall back to 4.0.
   bool is_41 = true;
   g_webkit_handle = dlopen(kWebKit41, RTLD_NOW | RTLD_GLOBAL);
   if (!g_webkit_handle) {
+    e = dlerror();
+    std::snprintf(first_err, sizeof(first_err), "%s", e ? e : "unknown error");
     g_webkit_handle = dlopen(kWebKit40, RTLD_NOW | RTLD_GLOBAL);
     is_41 = false;
   }
   if (!g_webkit_handle) {
+    e = dlerror();
     std::snprintf(g_err, sizeof(g_err),
                   "swingwebview: unable to load the WebKitGTK runtime — tried "
-                  "'%s' then '%s' (%s). Install libwebkit2gtk-4.1-0 (Ubuntu "
-                  "22.04+) or libwebkit2gtk-4.0-37 (Ubuntu 20.04).",
-                  kWebKit41, kWebKit40, dlerror());
+                  "'%s' (%s) then '%s' (%s). Install libwebkit2gtk-4.1-0 "
+                  "(Ubuntu 22.04+) or libwebkit2gtk-4.0-37 (Ubuntu 20.04).",
+                  kWebKit41, first_err, kWebKit40, e ? e : "unknown error");
     return false;
   }
 
@@ -56,13 +66,17 @@ bool do_init() {
   const char *jsc_secondary = is_41 ? kJsc40 : kJsc41;
   g_jsc_handle = dlopen(jsc_primary, RTLD_NOW | RTLD_GLOBAL);
   if (!g_jsc_handle) {
+    e = dlerror();
+    std::snprintf(first_err, sizeof(first_err), "%s", e ? e : "unknown error");
     g_jsc_handle = dlopen(jsc_secondary, RTLD_NOW | RTLD_GLOBAL);
   }
   if (!g_jsc_handle) {
+    e = dlerror();
     std::snprintf(g_err, sizeof(g_err),
                   "swingwebview: unable to load the JavaScriptCore runtime — "
-                  "tried '%s' then '%s' (%s).",
-                  kJsc41, kJsc40, dlerror());
+                  "tried '%s' (%s) then '%s' (%s).",
+                  jsc_primary, first_err, jsc_secondary,
+                  e ? e : "unknown error");
     return false;
   }
 
@@ -114,14 +128,52 @@ bool webkit_loader_ensure(char *errbuf, size_t errlen) {
   return ok;
 }
 
-// Resolve at library load time. Returning JNI_ERR makes System.load throw an
-// UnsatisfiedLinkError carrying our diagnostic — the same load-time failure
-// point as the old hard DT_NEEDED, but now naming both candidate SONAMEs.
+namespace {
+
+// Publish the loader's diagnostic as the system property
+// ca.weblite.webview.nativeLoadError. Returning JNI_ERR makes the JVM throw a
+// generic UnsatisfiedLinkError ("unsupported JNI version 0xFFFFFFFF") that
+// does not carry our message, so this property is how an embedder learns WHY
+// the WebView is unavailable. Best effort: any JNI failure here is cleared and
+// ignored, so publishing can never change the outcome of the load.
+void publish_load_error(JavaVM *vm, const char *msg) {
+  JNIEnv *env = nullptr;
+  if (!vm || vm->GetEnv(reinterpret_cast<void **>(&env), JNI_VERSION_1_6) !=
+                 JNI_OK || !env) {
+    return;
+  }
+  jclass system = env->FindClass("java/lang/System");
+  jmethodID set_property =
+      system ? env->GetStaticMethodID(
+                   system, "setProperty",
+                   "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;")
+             : nullptr;
+  jstring key =
+      set_property ? env->NewStringUTF("ca.weblite.webview.nativeLoadError")
+                   : nullptr;
+  jstring value = key ? env->NewStringUTF(msg) : nullptr;
+  if (value) {
+    jobject previous =
+        env->CallStaticObjectMethod(system, set_property, key, value);
+    if (previous) env->DeleteLocalRef(previous);
+  }
+  if (env->ExceptionCheck()) env->ExceptionClear();
+  if (value) env->DeleteLocalRef(value);
+  if (key) env->DeleteLocalRef(key);
+  if (system) env->DeleteLocalRef(system);
+}
+
+}  // namespace
+
+// Resolve at library load time. Returning JNI_ERR makes System.load fail at
+// the same load-time point as the old hard DT_NEEDED. The JVM's exception text
+// is generic, so the diagnostic — both candidate SONAMEs, each with its own
+// dlerror() reason — goes to stderr and to ca.weblite.webview.nativeLoadError.
 extern "C" JNIEXPORT jint JNICALL JNI_OnLoad(JavaVM *vm, void * /*reserved*/) {
-  (void)vm;
-  char err[512];
+  char err[1024];
   if (!webkit_loader_ensure(err, sizeof(err))) {
     std::fprintf(stderr, "%s\n", err);
+    publish_load_error(vm, err);
     return JNI_ERR;
   }
   return JNI_VERSION_1_6;

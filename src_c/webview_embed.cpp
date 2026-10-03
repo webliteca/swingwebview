@@ -526,13 +526,27 @@ private:
         std::condition_variable ready_cv;
         bool ready = false;
         thread = std::thread([&] {
-            // X11 must be told we're going to use it from multiple threads.
-            XInitThreads();
             // Embedding via XReparentWindow requires a real X11 GdkDisplay
             // on both sides.  Force the X11 backend in case GTK would
             // otherwise pick Wayland or some other backend (e.g. in a
             // Parallels / virtual desktop session that exposes both).
+            // Must precede the first gdk_display_manager_get(), which the
+            // gdk_display_get_default() check below performs; it makes no
+            // Xlib call.
             gdk_set_allowed_backends("x11");
+            // X11 must be told we're going to use it from multiple threads --
+            // but only if no display exists yet (Canvas 7, "Xlib threads are
+            // never switched on late").  Xlib requires XInitThreads() to be
+            // the first Xlib call: on libX11 1.7.x a display opened before it
+            // has no locks, and calling it afterwards makes Xlib lock that
+            // display through a NULL mutex.  The jDeploy launcher initialises
+            // GTK for its splash before the JVM starts, and gtk_init below
+            // would reuse that display -- the first cursor WebKit then loads
+            // (Xcursor -> XGetDefault) crashes the process.  When the host
+            // already opened a GDK display, leave Xlib as the host set it up.
+            if (gdk_display_get_default() == nullptr) {
+                XInitThreads();
+            }
             // Use the simple input-method module rather than the system
             // default (ibus / fcitx / etc.).  On the offscreen embed
             // path the system IMs were observed to commit special-key
