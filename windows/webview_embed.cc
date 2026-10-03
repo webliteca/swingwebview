@@ -57,6 +57,9 @@ namespace embed_win {
 
 static const UINT WM_EMBED_DISPATCH = WM_APP + 1;
 static const UINT WM_EMBED_QUIT     = WM_APP + 2;
+// Posted to the child HWND when the canvas HWND changes size (Canvas 6
+// operation 17); EmbedWndProc refits the child to the canvas.
+static const UINT WM_EMBED_FIT_PARENT = WM_APP + 3;
 
 using DispatchFn = std::function<void()>;
 
@@ -254,6 +257,9 @@ struct Binding {
 struct Engine {
     HWND parent = nullptr;
     HWND child = nullptr;
+    // Thread whose parent-resize hook this engine holds a reference on
+    // (Canvas 6 operation 17); 0 when none was acquired.
+    DWORD parent_hook_tid = 0;
     DWORD thread_id = 0;
     HANDLE thread = nullptr;
     ICoreWebView2Controller *controller = nullptr;
@@ -3071,8 +3077,29 @@ static void engine_on_message(Engine *e, LPCWSTR msg) {
     if (detach) e->jvm->DetachCurrentThread();
 }
 
+// Size the child HWND and the controller to the canvas HWND's client rect
+// (Canvas 6 operation 17).  Runs on the WebView2 worker thread, which owns
+// e->child.  A failed GetClientRect (the canvas peer's HWND is already gone
+// when a late op runs) leaves both untouched rather than driving garbage
+// bounds into them.
+static void fit_child_to_parent(Engine *e) {
+    RECT r{};
+    if (!e->parent || !GetClientRect(e->parent, &r)) return;
+    if (e->child) {
+        SetWindowPos(e->child, nullptr, 0, 0, r.right, r.bottom,
+                     SWP_NOZORDER | SWP_NOACTIVATE);
+    }
+    if (e->controller) {
+        e->controller->put_Bounds(r);
+    }
+}
+
 static LRESULT CALLBACK EmbedWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     Engine *e = (Engine *)GetWindowLongPtr(hwnd, GWLP_USERDATA);
+    if (msg == WM_EMBED_FIT_PARENT) {
+        if (e) fit_child_to_parent(e);
+        return 0;
+    }
     switch (msg) {
     case WM_SIZE:
         if (e && e->controller) {
@@ -3121,6 +3148,70 @@ static ATOM ensure_class_registered() {
     wc.hCursor = LoadCursor(nullptr, IDC_ARROW);
     atom = RegisterClassEx(&wc);
     return atom;
+}
+
+// Parent-resize hook (Canvas 6 operation 17).  AWT can reshape the canvas
+// HWND without Java firing componentResized -- e.g. the frame is dragged to
+// a monitor with a different scale, so the canvas's device size changes but
+// its user-space size does not -- and nothing in Win32 tells a child that its
+// parent changed size.  A thread-specific WH_CALLWNDPROCRET hook on the
+// canvas's owning (AWT toolkit) thread sees the canvas's WM_SIZE /
+// WM_WINDOWPOSCHANGED and posts WM_EMBED_FIT_PARENT to our child, whose
+// worker thread then refits it.  AWT's window procedure is never replaced,
+// and the hook only posts: the AWT thread never blocks on the worker.
+static std::mutex parent_hook_mutex;
+static std::map<DWORD, std::pair<HHOOK, int>> parent_hooks;
+
+static LRESULT CALLBACK parent_resize_hook(int code, WPARAM wp, LPARAM lp) {
+    if (code >= 0) {
+        auto *cwp = (CWPRETSTRUCT *)lp;
+        bool resized = cwp->message == WM_SIZE;
+        if (cwp->message == WM_WINDOWPOSCHANGED && cwp->lParam) {
+            resized = !(((WINDOWPOS *)cwp->lParam)->flags & SWP_NOSIZE);
+        }
+        if (resized) {
+            HWND child = FindWindowEx(cwp->hwnd, nullptr,
+                                      "WebViewEmbedChild", nullptr);
+            if (child) PostMessage(child, WM_EMBED_FIT_PARENT, 0, 0);
+        }
+    }
+    return CallNextHookEx(nullptr, code, wp, lp);
+}
+
+// Take a reference on the hook for the thread that owns `parent`, installing
+// it on first use.  Returns that thread id, or 0 when the hook could not be
+// installed.
+static DWORD acquire_parent_resize_hook(HWND parent) {
+    DWORD tid = GetWindowThreadProcessId(parent, nullptr);
+    if (tid == 0) return 0;
+    std::lock_guard<std::mutex> lk(parent_hook_mutex);
+    auto it = parent_hooks.find(tid);
+    if (it != parent_hooks.end()) {
+        it->second.second++;
+        return tid;
+    }
+    HHOOK hook = SetWindowsHookEx(WH_CALLWNDPROCRET, parent_resize_hook,
+                                  nullptr, tid);
+    if (!hook) {
+        WV_LOG("SetWindowsHookEx(WH_CALLWNDPROCRET) failed: "
+               "GetLastError=%lu", GetLastError());
+        return 0;
+    }
+    parent_hooks[tid] = std::make_pair(hook, 1);
+    return tid;
+}
+
+// Drop a reference taken by acquire_parent_resize_hook, unhooking when the
+// last engine on that thread goes.  A tid of 0 is a no-op.
+static void release_parent_resize_hook(DWORD tid) {
+    if (tid == 0) return;
+    std::lock_guard<std::mutex> lk(parent_hook_mutex);
+    auto it = parent_hooks.find(tid);
+    if (it == parent_hooks.end()) return;
+    if (--it->second.second == 0) {
+        UnhookWindowsHookEx(it->second.first);
+        parent_hooks.erase(it);
+    }
 }
 
 static void engine_thread(Engine *e, HWND /*parent*/, int width, int height,
@@ -3417,11 +3508,14 @@ static Engine *create_engine(JNIEnv *env, jobject component, int debug) {
         delete e;
         return nullptr;
     }
+    e->parent_hook_tid = acquire_parent_resize_hook(parent);
     return e;
 }
 
 static void destroy_engine(Engine *e) {
     if (!e) return;
+    release_parent_resize_hook(e->parent_hook_tid);
+    e->parent_hook_tid = 0;
     if (e->shared_thread) {
         // Canvas 20: an ADOPTED engine shares the opener's WebView2 worker
         // thread.  Posting WM_EMBED_QUIT here would exit the opener's message
@@ -3655,6 +3749,7 @@ static Engine *adopt_retained_popup(JNIEnv *env, HWND parent, RetainedPopup *rp,
     e->environment = rp->environment;        // transferred (already AddRef'd)
     e->popup_callback = rp->popup_callback;  // inherited global refs transferred
     e->dialog_callback = rp->dialog_callback;
+    e->parent_hook_tid = acquire_parent_resize_hook(parent);
 
     // Everything below touches WebView2 objects, so it MUST run on the
     // controller's apartment thread (the opener's worker thread).
@@ -3834,7 +3929,7 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1des
 }
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1bounds
-  (JNIEnv *, jclass, jlong wv, jint /*x*/, jint /*y*/, jint w, jint h) {
+  (JNIEnv *, jclass, jlong wv, jint /*x*/, jint /*y*/, jint /*w*/, jint /*h*/) {
     auto *e = (Engine *)wv;
     if (!e) return;
     // The Java side sends x,y in AWT-window content-pane coordinates (used
@@ -3842,15 +3937,12 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
     // Windows our child HWND is parented directly under the canvas's HWND,
     // so it should always sit at (0,0) relative to its parent -- using the
     // window-relative x,y would offset us by the canvas's own position.
-    embed_win::dispatch_to_thread(e, [e, w, h] {
-        if (e->child) {
-            SetWindowPos(e->child, nullptr, 0, 0, w, h,
-                         SWP_NOZORDER | SWP_NOACTIVATE);
-        }
-        if (e->controller) {
-            RECT r{0, 0, w, h};
-            e->controller->put_Bounds(r);
-        }
+    // The size comes from the canvas HWND's client rect, as at creation:
+    // the Java w,h are AWT user-space units, which are smaller than the
+    // device pixels Win32 and WebView2 expect whenever display scaling is
+    // above 100%.
+    embed_win::dispatch_to_thread(e, [e] {
+        embed_win::fit_child_to_parent(e);
     });
 }
 

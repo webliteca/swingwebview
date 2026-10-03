@@ -1430,6 +1430,17 @@ File: `src/ca/weblite/webview/swing/WebViewHeavyweightComponent.java`
      exactly over the canvas region rather than over the
      entire window (comment at
      `WebViewHeavyweightComponent.java:171`).
+   - On Windows the native side ignores the supplied x, y, w, h:
+     the child HWND sits at `(0,0)` under the canvas HWND and
+     takes the canvas HWND's client rect as its size, as it does
+     at creation. The supplied w, h are AWT user-space units,
+     which are smaller than the device pixels Win32 and WebView2
+     expect whenever display scaling is above 100%. The resize
+     itself is `fit_child_to_parent` (operation 17), so a failed
+     `GetClientRect` leaves the child and controller untouched.
+   - `sizeNative` is not the only trigger on Windows: operation
+     17 also refits the child whenever the canvas HWND changes
+     size, including when no `componentResized` fires.
 
 ### 7. Preferred Size — getPreferredSize
 File: `src/ca/weblite/webview/swing/WebViewHeavyweightComponent.java`
@@ -2612,6 +2623,54 @@ Files: `src/ca/weblite/webview/WebViewCookieCallback.java`,
    The demo prints PASS/FAIL per check but never prints cookie values beyond
    the fixed test values it set itself.
 
+### 17. Follow the Canvas HWND's Device Size on Windows
+File: `windows/webview_embed.cc`
+
+1. Responsibility: keep the child HWND (`WebViewEmbedChild`) and the
+   WebView2 controller the size of the canvas HWND's client area at all
+   times. A window dragged to a monitor with a different scale makes AWT
+   reshape the canvas HWND to new device pixels while its user-space size
+   is unchanged, so Java fires no `componentResized` and `sizeNative`
+   (operation 6) never runs.
+2. `fit_child_to_parent(Engine *e): void`, called only on the WebView2
+   worker thread (the thread that owns `e->child`).
+   - Zero-initialise a `RECT`; if `e->parent` is null or
+     `GetClientRect(e->parent, &r)` fails (the canvas peer's HWND is
+     already gone when a late op runs), return without touching the child
+     or the controller.
+   - Otherwise `SetWindowPos(e->child, nullptr, 0, 0, r.right, r.bottom,
+     SWP_NOZORDER | SWP_NOACTIVATE)` when `e->child` is set, and
+     `e->controller->put_Bounds(r)` when `e->controller` is set.
+   - `webview_embed_set_bounds` dispatches `fit_child_to_parent(e)` to the
+     worker thread; it still ignores the Java x, y, w, h.
+3. Message `WM_EMBED_FIT_PARENT = WM_APP + 3`, posted to the child HWND.
+   `EmbedWndProc` handles it by calling `fit_child_to_parent` with the
+   engine read from `GWLP_USERDATA` (skipped when null) and returns 0.
+4. Parent-resize hook: a thread-specific `WH_CALLWNDPROCRET` hook on the
+   thread that owns the canvas HWND (the AWT toolkit thread, from
+   `GetWindowThreadProcessId(parent)`), installed with a null module
+   handle (in-process, thread-specific).
+   - `parent_resize_hook(int code, WPARAM, LPARAM)`: when `code >= 0` and
+     the `CWPRETSTRUCT` message is `WM_SIZE`, or `WM_WINDOWPOSCHANGED`
+     whose `WINDOWPOS` flags lack `SWP_NOSIZE`, look up a direct child of
+     that HWND with class `WebViewEmbedChild` via `FindWindowEx`; if one
+     exists, `PostMessage(child, WM_EMBED_FIT_PARENT, 0, 0)`. Always
+     return `CallNextHookEx`.
+   - Hooks are refcounted per thread id in a mutex-guarded map:
+     `acquire_parent_resize_hook(HWND parent): DWORD` installs on the first
+     engine for that thread (logging and returning 0 on failure) and
+     returns the thread id; `release_parent_resize_hook(DWORD tid): void`
+     unhooks when the count reaches zero (no-op for 0).
+   - `create_engine` and `adopt_retained_popup` acquire after the engine
+     exists and store the thread id in `Engine::parent_hook_tid`;
+     `destroy_engine` releases it before tearing the engine down.
+5. The hook never replaces AWT's window procedure (no subclassing) and
+   never sends a message across threads: it only posts, so the AWT
+   toolkit thread can never block on the WebView2 worker.
+6. Verify on Windows at a scale above 100%: drag the frame between monitors
+   of different scale and confirm the page still fills the canvas without
+   resizing the frame.
+
 ## N · Norms
 - Cookie values returned by `getCookies` are credentials: never print them
   in diagnostics or error strings; JNI completion releases its global ref.
@@ -2816,6 +2875,12 @@ Files: `src/ca/weblite/webview/WebViewCookieCallback.java`,
   native peer is freed before AWT destroys the canvas peer
   (`WebViewHeavyweightComponent.java:236`). Inverting this
   order would leak native peers attached to dead AWT windows.
+- Windows parent-resize hook (operation 17): AWT's window
+  procedure is never replaced, and the hook only ever posts to
+  the child HWND (never `SendMessage`, never touches WebView2 on
+  the AWT thread). Every installed hook is removed when the last
+  engine on that thread is destroyed. A failed `GetClientRect`
+  never drives garbage bounds into the child or the controller.
 - `sizeNative()` no-ops on non-positive dimensions so a
   collapsed split-pane region doesn't drive negative bounds
   into the native side (`WebViewHeavyweightComponent.java:167`).

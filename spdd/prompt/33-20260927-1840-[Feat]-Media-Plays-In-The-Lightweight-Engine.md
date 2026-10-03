@@ -28,12 +28,21 @@ implements:
   `UIProcess/gtk/GtkUtilities.cpp`). In the lightweight engine every media element therefore waits
   forever — no `loadstart`, no `error`.
 - **D2 · The toplevel.** `gtk_off_create_engine` creates `gtk_window_new(GTK_WINDOW_POPUP)` instead of
-  `gtk_offscreen_window_new()`, and before it is shown sets: `gtk_window_move(win, -32000, -32000)`,
+  `gtk_offscreen_window_new()`, and before it is shown sets: `gtk_window_move(win, -32000 / scale, -32000 / scale)`,
   `gtk_window_set_accept_focus(win, FALSE)`, `gtk_window_set_focus_on_map(win, FALSE)`,
   `gtk_window_set_skip_taskbar_hint(win, TRUE)`, `gtk_window_set_skip_pager_hint(win, TRUE)`,
   `gtk_window_set_decorated(win, FALSE)`. A popup is override-redirect on X11 (the only backend the
   pump allows): no window-manager decoration, taskbar entry or focus, and its position is honoured, so
-  it is mapped but outside every monitor.
+  it is mapped but outside every monitor. `scale` is the display's window scale
+  (`gdk_window_get_scale_factor` of the screen's root window): GTK multiplies a window position by it
+  and X11 stores the result as a signed 16-bit device coordinate, so an unscaled `-32000` overflows at
+  2x and wraps to `+1536`, on-screen. The move is made by one helper,
+  `gtk_off_park_offscreen(GtkWindow *win)`, which reads the scale at the moment it runs and moves the
+  window to `-32000 / scale` on both axes. It runs once before the window is shown, and again from a
+  `notify::scale-factor` handler connected on the popup (`gtk_off_on_scale_factor`, no user data; the
+  connection dies with the window). The window scale can change while the engine lives (X settings
+  `Gdk/WindowScaling`); GTK then re-applies the old logical offset at the new scale, which can wrap on
+  screen, and the handler re-parks it at the new scale.
 - **D3 · Nothing else changes.** `gtk_widget_show_all`, the synthetic `GDK_FOCUS_CHANGE`,
   `gtk_off_snapshot_into` (`gtk_widget_draw` into our own image surface), input synthesis through
   `gtk_main_do_event`, `gtk_window_resize`, destruction, and popup adoption (Canvas 19, which goes
@@ -96,7 +105,10 @@ WebViewMediaSmokeTest --> OffEngine : via WebViewComponent LIGHTWEIGHT
 
 ### 1. `gtk_off_create_engine`
 - Replace `e->window = gtk_offscreen_window_new();` with a popup window configured per D2, before the
-  existing `gtk_container_add` / `gtk_widget_show_all`. The `OffEngine::window` field comment and the
+  existing `gtk_container_add` / `gtk_widget_show_all`. The position comes from
+  `gtk_off_park_offscreen`, and `notify::scale-factor` on the window is connected to
+  `gtk_off_on_scale_factor(GObject *, GParamSpec *, gpointer)`, which calls `gtk_off_park_offscreen`
+  on the window (it runs on the pump thread, as every GTK signal does). The `OffEngine::window` field comment and the
   section comment say "hidden popup toplevel (Canvas 33)"; the snapshot comment keeps its rationale
   for not using `gtk_offscreen_window_get_surface`, reworded for a popup.
 
@@ -119,6 +131,7 @@ WebViewMediaSmokeTest --> OffEngine : via WebViewComponent LIGHTWEIGHT
 ## S · Safeguards
 
 1. The engine's window is never on a visible monitor, never decorated, never focused by the window
-   manager, never in a taskbar.
+   manager, never in a taskbar. This holds at every integer window scale and across a runtime change of
+   that scale: the device-pixel position is always about `-32000`, inside X11's signed 16-bit range.
 2. Only the lightweight engine's toplevel changes; the heavyweight engine, macOS and Windows are
    untouched.
