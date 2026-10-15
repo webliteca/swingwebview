@@ -18,6 +18,7 @@ import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewClickCallback;
 import ca.weblite.webview.WebViewDialogCallback;
 import ca.weblite.webview.WebViewNavigationCallback;
+import ca.weblite.webview.WebViewPermissionCallback;
 import ca.weblite.webview.WebViewPopupCallback;
 import ca.weblite.webview.WebViewFocusCallback;
 import ca.weblite.webview.WebViewAttachListener;
@@ -261,6 +262,7 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         dialogDispatcher.disposeAll();
         popupDispatcher.disposeAll();
         navigationDispatcher.disposeAll();
+        permissionDispatcher.disposeAll();
         downloadDispatcher.disposeAll();
         passwordDispatcher.disposeAll();
         failPendingPdf();
@@ -643,6 +645,17 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
             public boolean onNavigationRequested(String url, String currentUrl,
                                                  int cause) {
                 return navigationDispatcher.dispatch(url, currentUrl, cause);
+            }
+        });
+        // Canvas 35 D5: the media-capture permission bridge, installed with
+        // the navigation bridge so the first page's requests are routed.  It
+        // answers at once (no handler: the engine decides) or PENDING, and
+        // the handler runs later on the EDT.
+        embedded.setPermissionCallback(new WebViewPermissionCallback() {
+            @Override
+            public int onPermissionRequested(long id, String origin,
+                                             String url, int kinds) {
+                return permissionDispatcher.dispatch(id, origin, url, kinds);
             }
         });
         // An adopted popup already carries the engine's own in-flight

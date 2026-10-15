@@ -1,8 +1,13 @@
 #!/bin/bash
 # One-shot script: build the Linux native lib, build WebView.jar, compile
-# and run the media smoke test (Canvas 33).  No Ant required.  Exits with the
-# test's own code: 0 when HTML media plays in the lightweight engine, 1 when
-# it does not.  Runs headless under Xvfb, e.g.:
+# and run the media smoke tests.  No Ant required.
+#   1. WebViewMediaSmokeTest (Canvas 33): HTML media plays in the lightweight
+#      engine.
+#   2. WebViewMediaPermissionSmokeTest (Canvas 35): camera / microphone /
+#      screen-capture requests reach a WebViewPermissionHandler, DENY gives
+#      NotAllowedError and ALLOW gives a stream -- against WebKitGTK's mock
+#      capture devices (WEBVIEW_MOCK_CAPTURE_DEVICES=1), so no camera needed.
+# Exits 0 when both pass, 1 when either fails.  Runs headless under Xvfb, e.g.:
 #   xvfb-run -a ./run-linux-media-smoketest.sh
 #
 # Usage:    ./run-linux-media-smoketest.sh
@@ -161,20 +166,36 @@ cp "$SO" "$STAGE/$NATIVE_DIR/libwebview.so"
 echo "Built $WV_JAR"
 
 # ---------------------------------------------------------------------------
-# 6. Compile and run the media smoke test
+# 6. Compile and run the media smoke tests
 # ---------------------------------------------------------------------------
 DEMO_DIR="$REPO_DIR/demos/WebViewMediaSmokeTest"
 DEMO_CLASSES="$BUILD_DIR/classes-media-smoke"
 mkdir -p "$DEMO_CLASSES"
-echo "Compiling smoke test ..."
+echo "Compiling smoke tests ..."
 "$JAVAC" -d "$DEMO_CLASSES" -classpath "$WV_JAR" \
-    "$DEMO_DIR/src/ca/weblite/webview/demos/WebViewMediaSmokeTest.java"
+    "$DEMO_DIR/src/ca/weblite/webview/demos/WebViewMediaSmokeTest.java" \
+    "$DEMO_DIR/src/ca/weblite/webview/demos/WebViewMediaPermissionSmokeTest.java"
 
-echo "Running smoke test ..."
 # Force the X11 GDK backend (the native pump does too) and disable the
 # DMA-BUF renderer, which fails silently in virtualized environments.
 export GDK_BACKEND=x11
 export WEBKIT_DISABLE_DMABUF_RENDERER=1
-exec "$JAVA" \
-    -cp "$DEMO_CLASSES:$WV_JAR" \
-    ca.weblite.webview.demos.WebViewMediaSmokeTest
+
+echo "Running media playback smoke test (Canvas 33) ..."
+set +e
+"$JAVA" -cp "$DEMO_CLASSES:$WV_JAR" ca.weblite.webview.demos.WebViewMediaSmokeTest
+PLAYBACK=$?
+
+echo "Running media permission smoke test (Canvas 35) ..."
+# Canvas 35 D7c: a test-only switch that turns on WebKitGTK's mock camera,
+# microphone and screen devices.
+WEBVIEW_MOCK_CAPTURE_DEVICES=1 \
+    "$JAVA" -cp "$DEMO_CLASSES:$WV_JAR" ca.weblite.webview.demos.WebViewMediaPermissionSmokeTest
+PERMISSION=$?
+set -e
+
+echo "playback smoke test: exit $PLAYBACK; permission smoke test: exit $PERMISSION"
+if [ "$PLAYBACK" -ne 0 ] || [ "$PERMISSION" -ne 0 ]; then
+    exit 1
+fi
+exit 0

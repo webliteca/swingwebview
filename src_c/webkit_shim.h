@@ -109,6 +109,18 @@
 #define webkit_uri_scheme_request_get_http_body (::g_wk.fn_webkit_uri_scheme_request_get_http_body)
 #endif
 
+// Media-capture permission requests (Canvas 35 D7a): optional -- test WK_HAS.
+#if WEBKIT_CHECK_VERSION(2, 8, 0)
+#define webkit_permission_request_allow (::g_wk.fn_webkit_permission_request_allow)
+#define webkit_permission_request_deny (::g_wk.fn_webkit_permission_request_deny)
+#define webkit_user_media_permission_request_get_type (::g_wk.fn_webkit_user_media_permission_request_get_type)
+#define webkit_user_media_permission_is_for_audio_device (::g_wk.fn_webkit_user_media_permission_is_for_audio_device)
+#define webkit_user_media_permission_is_for_video_device (::g_wk.fn_webkit_user_media_permission_is_for_video_device)
+#endif
+#if WEBKIT_CHECK_VERSION(2, 42, 0)
+#define webkit_user_media_permission_is_for_display_device (::g_wk.fn_webkit_user_media_permission_is_for_display_device)
+#endif
+
 // JS-result readers — gate identically to webkit_loader.h / webview.h.
 #if WEBKIT_MAJOR_VERSION >= 2 && WEBKIT_MINOR_VERSION >= 22
 #define webkit_javascript_result_get_js_value (::g_wk.fn_webkit_javascript_result_get_js_value)

@@ -18,6 +18,7 @@ import ca.weblite.webview.WebViewPasswordCallback;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewDialogCallback;
 import ca.weblite.webview.WebViewNavigationCallback;
+import ca.weblite.webview.WebViewPermissionCallback;
 import ca.weblite.webview.WebViewPopupCallback;
 import ca.weblite.webview.WebViewMouseDispatcher;
 
@@ -479,6 +480,17 @@ public class WebViewLightweightComponent extends WebViewComponent {
                 return navigationDispatcher.dispatch(url, currentUrl, cause);
             }
         });
+        // Canvas 35 D5: the media-capture permission bridge, installed with
+        // the navigation bridge so the first page's requests are routed.  It
+        // answers at once (no handler: the engine decides) or PENDING, and
+        // the handler runs later on the EDT.
+        engine.setPermissionCallback(new WebViewPermissionCallback() {
+            @Override
+            public int onPermissionRequested(long id, String origin,
+                                             String url, int kinds) {
+                return permissionDispatcher.dispatch(id, origin, url, kinds);
+            }
+        });
         // An adopted popup already carries the engine's own in-flight
         // navigation (the original request WebKit drove into the child, POST
         // body intact); navigating pendingUrl here would clobber it.  Only
@@ -513,6 +525,7 @@ public class WebViewLightweightComponent extends WebViewComponent {
         dialogDispatcher.disposeAll();
         popupDispatcher.disposeAll();
         navigationDispatcher.disposeAll();
+        permissionDispatcher.disposeAll();
         downloadDispatcher.disposeAll();
         passwordDispatcher.disposeAll();
         failPendingPdf();

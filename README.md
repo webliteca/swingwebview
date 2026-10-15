@@ -1006,6 +1006,69 @@ wv.setNavigationHandler(e ->
   popups of a page you restrict. See
   [`demos/WebViewNavigationDemo/`](demos/WebViewNavigationDemo/README.md).
 
+## Camera, microphone and screen capture
+
+A page's `getUserMedia` / `getDisplayMedia` request is put to a permission
+handler, which answers **allow**, **deny** or **default** (let the engine
+decide) — at once, or later from any thread, for example after asking the
+user:
+
+```java
+wv.setPermissionHandler(req -> {          // runs on the EDT
+    if (!req.origin().equals("demo://app")) { req.deny(); return; }
+    int r = JOptionPane.showConfirmDialog(frame,
+        req.origin() + " wants " + req.kinds(), "Permission", JOptionPane.YES_NO_OPTION);
+    if (r == JOptionPane.YES_OPTION) req.allow(); else req.deny();
+});
+```
+
+* **The request** gives `origin()` (`scheme://host[:port]`), `url()` and
+  `kinds()` — a set of `MediaCaptureKind.CAMERA`, `MICROPHONE` and `DISPLAY`.
+  Answer with `allow()`, `deny()`, `useDefault()` or `answer(PermissionDecision)`;
+  only the first answer counts (each returns whether it was the first).
+* **Threading.** The handler runs on the Swing EDT, delivered with
+  `invokeLater`; no engine thread waits for it, so a modal dialog is fine.
+  The page's promise stays pending until the answer arrives. A handler that
+  throws denies; a request still unanswered when the component is disposed
+  is denied.
+* **No handler, no change.** Without a handler (the default, or
+  `setPermissionHandler(null)`), and for `useDefault()`, each engine does what
+  it did before:
+
+  | Engine | Default |
+  |---|---|
+  | Linux (WebKitGTK) | refuses (`NotAllowedError`) |
+  | Windows (WebView2) | WebView2's own permission prompt |
+  | macOS (WKWebView) | WebKit's own permission prompt |
+
+* **Platform coverage.** `WebViewComponent.isPermissionHandlerSupported()`
+  says whether the loaded native routes requests.
+  * **Linux** (lightweight): camera and microphone, and screen capture with
+    WebKitGTK 2.42+, through `permission-request`. Every view has
+    `enable-media-stream` and `enable-webrtc` switched on where the WebKitGTK
+    version has them. The origin is the top page's (WebKitGTK reports no
+    frame origin).
+  * **Windows**: camera and microphone through `PermissionRequested`. Screen
+    capture has no permission kind in the WebView2 SDK this library builds
+    against, so WebView2's own picker decides it.
+  * **macOS 12+**: camera and microphone through the UI delegate's
+    `requestMediaCapturePermissionForOrigin…`; screen capture keeps WebKit's
+    own behaviour. Before macOS 12, nothing changes.
+* **macOS Info.plist.** The host application must declare
+  `NSCameraUsageDescription` and `NSMicrophoneUsageDescription`; without them
+  macOS terminates the process the first time a page uses the device. macOS's
+  own one-time consent prompt still appears on top of your handler's answer.
+* **WebRTC.** Whether `RTCPeerConnection` exists depends on how the engine was
+  built — Ubuntu 24.04's WebKitGTK has none, even with `enable-webrtc` on. A
+  page detects it with `typeof RTCPeerConnection === 'function'` and falls
+  back (for example, to opening the page in the user's browser).
+* **Media capture needs a secure context**: `https:`, `localhost`, or a custom
+  scheme registered with `WebViewSchemes`.
+* **Testing on Linux without a camera.** `WEBVIEW_MOCK_CAPTURE_DEVICES=1`
+  turns on WebKitGTK's mock camera, microphone and screen (a test-only switch).
+  `xvfb-run -a ./run-linux-media-smoketest.sh` runs the pass/fail check. See
+  [`demos/WebViewMediaPermissionDemo/`](demos/WebViewMediaPermissionDemo/README.md).
+
 ## Demo
 
 See [`demos/WebViewHeavyweightDemo/`](demos/WebViewHeavyweightDemo/README.md)
@@ -1048,6 +1111,9 @@ Additional demos:
 * `demos/WebViewNavigationDemo/` — a page that tries every way to navigate
   away to a local listener, each refused by a navigation handler before
   anything is sent (`run-*-navigation-demo`).
+* `demos/WebViewMediaPermissionDemo/` — camera, microphone and screen
+  sharing decided by a permission handler that asks you in a Swing dialog
+  (`run-*-media-permission-demo`).
 
 ## Building from source
 

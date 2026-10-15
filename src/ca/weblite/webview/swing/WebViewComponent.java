@@ -11,6 +11,7 @@ import ca.weblite.webview.DialogDispatcher;
 import ca.weblite.webview.DownloadDispatcher;
 import ca.weblite.webview.PasswordDispatcher;
 import ca.weblite.webview.NavigationDispatcher;
+import ca.weblite.webview.PermissionDispatcher;
 import ca.weblite.webview.PopupDispatcher;
 import ca.weblite.webview.JavaScriptEvalException;
 import ca.weblite.webview.PdfOptions;
@@ -22,6 +23,7 @@ import ca.weblite.webview.WebViewDialogHandler;
 import ca.weblite.webview.WebViewDownloadHandler;
 import ca.weblite.webview.WebViewFillPasswordHandler;
 import ca.weblite.webview.WebViewNavigationHandler;
+import ca.weblite.webview.WebViewPermissionHandler;
 import ca.weblite.webview.WebViewPopupHandler;
 import ca.weblite.webview.WebViewMouseDispatcher;
 import ca.weblite.webview.WebViewMouseListener;
@@ -111,6 +113,14 @@ public abstract class WebViewComponent extends JComponent {
      *  native navigate they make. */
     protected final NavigationDispatcher navigationDispatcher =
         new NavigationDispatcher(this);
+
+    /** Per-component hub for media-capture permission requests (Canvas 35).
+     *  Subclasses install a {@link ca.weblite.webview.WebViewPermissionCallback}
+     *  on their native peer at attach time, before the first navigation, that
+     *  delegates to {@link PermissionDispatcher#dispatch}, and dispose it with
+     *  the component. */
+    protected final PermissionDispatcher permissionDispatcher =
+        new PermissionDispatcher(this);
 
     /** Per-component fan-out hub for browser-initiated file downloads
      *  ({@code <a download>}, a {@code Content-Disposition: attachment}
@@ -995,6 +1005,46 @@ public abstract class WebViewComponent extends JComponent {
      */
     public static boolean isNavigationHandlerSupported() {
         return NavigationDispatcher.isAvailable();
+    }
+
+    // ---------------------------------------------------------------------
+    // Camera, microphone and screen-capture requests (Canvas 35).
+    // ---------------------------------------------------------------------
+
+    /**
+     * Install the handler that decides the page's camera, microphone and
+     * screen-capture requests (Canvas 35 D1).  It runs on the EDT and answers
+     * through the {@link ca.weblite.webview.WebViewPermissionRequest} — now,
+     * or later from any thread.  Passing {@code null} removes it: requests
+     * then go to the engine exactly as without this feature (WebKitGTK
+     * refuses; WebView2 and WKWebView show their own prompts).
+     *
+     * <p>See {@link WebViewPermissionHandler} for the contract, and
+     * {@link #isPermissionHandlerSupported()} for whether the loaded native
+     * library routes requests at all.  On macOS the host application must
+     * declare {@code NSCameraUsageDescription} and
+     * {@code NSMicrophoneUsageDescription} in its Info.plist.
+     *
+     * @return {@code this} for chaining
+     */
+    public final WebViewComponent setPermissionHandler(WebViewPermissionHandler handler) {
+        permissionDispatcher.setHandler(handler);
+        return this;
+    }
+
+    /** @return the installed {@link WebViewPermissionHandler}, or
+     *  {@code null} when none is (the engine decides). */
+    public final WebViewPermissionHandler getPermissionHandler() {
+        return permissionDispatcher.getHandler();
+    }
+
+    /**
+     * Whether the loaded native library routes media-capture requests to a
+     * {@link WebViewPermissionHandler} (Canvas 35 D6).  {@code false} against
+     * a native built before the feature, or without natives at all.
+     */
+    public static boolean isPermissionHandlerSupported() {
+        return PermissionDispatcher.isAvailable();
     }
 
     // ---------------------------------------------------------------------
