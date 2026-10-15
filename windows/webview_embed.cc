@@ -4736,7 +4736,7 @@ JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1permis
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1permission_1respond
   (JNIEnv *, jclass, jlong id, jint decision) {
-    win_perm_respond((long long)id, (int)decision);
+    embed_win::win_perm_respond((long long)id, (int)decision);
 }
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1permission_1callback
