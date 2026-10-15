@@ -47,7 +47,7 @@ builds_on:
   resolves optionally) and `src_c/webkit_shim.h`: optional media-permission symbol groups (D7a).
 - **Edited** `src_c/webview_embed.cpp`: the GTK `permission-request` handler and media settings on
   `Engine` and `OffEngine` (D7); the Cocoa `requestMediaCapturePermissionForOrigin…` selector (D8) and
-  its Info.plist usage-description safeguard (D13); the WKWebView media preferences on the
+  its Info.plist usage-description safeguard, main bundle and responsible ancestor (D13); the WKWebView media preferences on the
   configuration, for the engine and popup children (D12); the shared JNI bridges (D5, D13).
 - **Edited** `windows/webview_embed.cc`: `PermissionRequested` on the engine and an adopted child, and the
   JNI bridges (D9).
@@ -59,7 +59,8 @@ builds_on:
 - **New** `demos/WebViewMediaPermissionDemo/` (source + README), `run-linux-media-permission-demo.sh`,
   `run-mac-media-permission-demo.sh`, `run-windows-media-permission-demo.bat`.
 - **New** `demos/WebViewMediaPermissionDemo/mac/launcher.c`: the in-process launcher of the demo's
-  minimal `.app` bundle (D14); `run-mac-media-permission-demo.sh` builds and uses it.
+  minimal `.app` bundle, with its `--swingwebview-env=` arguments (D14); `run-mac-media-permission-demo.sh`
+  builds it and launches it through LaunchServices (`open`).
 - **New** `demos/WebViewMediaSmokeTest/src/ca/weblite/webview/demos/WebViewMediaPermissionSmokeTest.java`.
 - **Edited** `run-linux-media-smoketest.sh` and `demos/WebViewMediaSmokeTest/README.md` (D11).
 - **Edited** `README.md` (a "Camera, microphone and screen capture" section and a demo entry, including
@@ -299,6 +300,39 @@ builds_on:
     `NSMicrophoneUsageDescription` (camera-and-microphone needs both). A key counts as present only
     when `[[NSBundle mainBundle] objectForInfoDictionaryKey:]` is an `NSString` of non-zero length
     (TCC wants a string). It is evaluated per request (one dictionary lookup per key).
+  - **Responsible process.** Observed second (macOS 15.4.1, arm64): the D14 bundle — whose main
+    bundle has both keys — `exec`'d straight from a shell still died, `zsh: abort`, after "Always
+    allow". TCC attributes a request to the *responsible* process, not to the requesting one: the app
+    that launchd started and that spawned the process chain (a terminal, an IDE — the earlier crash
+    report read `Responsible: Client4JLauncher`), and it checks *that* app's Info.plist. A process
+    launched through LaunchServices (`open`, Finder, the Dock, a jDeploy or jpackage install) is
+    its own responsible process, so the main-bundle check is right for it; one started from a shell
+    is not. The exact attribution is private (`responsibility_get_pid_responsible_for_pid`), so it is
+    **not** used. The public approximation:
+    - **Launched by launchd** (`getppid() == 1`): the process is its own responsible process; only the
+      main bundle is checked, as before.
+    - **Otherwise** walk the parent chain with `sysctl(KERN_PROC_PID)` (public BSD API; at most 64
+      steps) to the *top ancestor* — the last process before pid 1 — and take it as the responsible
+      process. Its executable path comes from `proc_pidpath` (`<libproc.h>`, public). Its Info.plist
+      is the bundle's when the path contains `.app/Contents/MacOS/` (the first such `.app`, i.e. the
+      outermost application, read with `CFBundleCopyInfoDictionaryForURL` on the bundle directory),
+      otherwise the executable's own embedded `__info_plist` (the same call on the file). A key counts
+      as present only as a non-empty `CFString`. When the walk or the path lookup fails, or the
+      ancestor has no Info.plist, every requested key counts as missing (fail closed).
+    - **Combined result:** `cocoa_media_missing_kinds` returns the union of what the main bundle lacks
+      and what the responsible ancestor lacks. Both are required because, when they differ, which of
+      the two TCC consults has been seen only one way on one machine; the cost of a wrong allow is a
+      killed host, the cost of a wrong deny is `NotAllowedError`.
+    - **Decision (recorded): deny on the heuristic, not just document it.** A process not started by
+      launchd is denied when its top ancestor lacks the key, even though its own bundle has it.
+      Accepted false positives, all "deny instead of maybe-crash": a host that runs the JVM as a
+      *child* of a properly configured app (its main bundle, `java`, lacks the keys anyway — run the
+      JVM in-process, as jpackage and jDeploy do); an ancestor that disclaims responsibility for its
+      children (TCC would ask about our bundle, we check the ancestor); a process left running after
+      its launcher was daemonized (`tmux`, `nohup`), whose top ancestor is not the app TCC remembers.
+      Terminals and IDEs that declare the keys (Terminal, iTerm2, JetBrains IDEs do) keep working from
+      a shell, with macOS's prompt naming that app. Not caught: a process reparented to launchd after
+      its parent exited still counts as launched by launchd — documented.
   - **Where.** In D8's delegate, right after the kinds are computed and before the no-handler test.
     When anything is missing it answers `WKPermissionDecisionDeny` at once, writes one line to stderr,
     and **does not call Java**. It never answers Prompt there: WebKit's prompt-then-grant reaches the
@@ -308,16 +342,22 @@ builds_on:
     front from `missingMacUsageDescriptions()` and, per request, from the stderr line.
   - **Second line of defence.** Each pending entry also records its kinds, and the function that calls
     the decision block re-checks: any non-deny answer (`ALLOW` or `DEFAULT`) for kinds with a missing
-    key is turned into Deny with the same stderr line. The main bundle does not change during a
-    process, so this is normally unreachable; it is kept because it costs one lookup and it guards
+    key is turned into Deny with the same stderr line. The main bundle and the parent chain normally
+    do not change during a process, so this is normally unreachable; it is kept because it costs one lookup and it guards
     the later dispatch (`cocoa_perm_respond`) as well as the immediate answer.
   - **Message**, one line, per denied request, naming the requested devices and the missing keys:
     `swingwebview: camera access denied — this app's Info.plist has no NSCameraUsageDescription (macOS
     would terminate the app)`; the device words are `camera`, `microphone`, or `camera and microphone`,
-    and several missing keys are joined with ` and `.
+    and several missing keys are joined with ` and `. When the main bundle has the keys and only the
+    responsible ancestor lacks them, the line names it instead: `swingwebview: camera access denied —
+    macOS attributes this process to <ancestor path>, which launched it, and that app's Info.plist has
+    no NSCameraUsageDescription (macOS would terminate the app); launch the .app through LaunchServices
+    (open, Finder or the Dock)`; `<ancestor path>` is the `.app` directory when there is one, the
+    executable path otherwise, or `an unidentified parent process` when the lookup failed.
   - **Java helper.** `WebViewComponent.missingMacUsageDescriptions()` (static) returns an unmodifiable
-    `List<String>` of the usage-description key names the running process's main bundle lacks, camera
-    key first; empty when not on macOS or when the loaded native predates the probe. It delegates to
+    `List<String>` of the usage-description key names the running process lacks — in its main bundle
+    or, when it was not launched by launchd, in its responsible ancestor's Info.plist — camera key
+    first; empty when not on macOS or when the loaded native predates the probe. It delegates to
     `PermissionDispatcher.missingMacUsageDescriptions()`, which calls
     `WebViewNative.webview_mac_missing_usage_descriptions()` only when `os.name` starts with `Mac`
     (`int`, the `MediaCaptureKind` bits whose key is missing — the same native helper as the
@@ -349,17 +389,39 @@ builds_on:
     ergonomics). libjli re-enters the executable's `main` on its new thread; `main` is re-entrant
     (same lookups, libjli's own guard stops the recursion). Any failure prints one
     `swingwebview-launcher:` line to stderr and exits 1.
+  - **Environment through arguments.** A LaunchServices launch does not inherit the shell's
+    environment, so before anything else the launcher consumes *leading* arguments of the form
+    `--swingwebview-env=NAME=VALUE`, `setenv`s each (overwriting), and passes the remaining arguments
+    to `JLI_Launch` (argv[0] kept). Because the variables are set in-process before `JLI_Launch`,
+    libjli's re-entry of `main` (which sees the stripped arguments) and any re-exec still have them.
+    An argument of that form without `=` after the name is a launcher error (one line, exit 1).
+    Chosen over `open --env` because that flag exists only on macOS 13+ and the bundle supports 12.
   - **Bundle,** built by `run-mac-media-permission-demo.sh` under
     `build/WebViewMediaPermissionDemo.app`: `Contents/Info.plist` (`CFBundleIdentifier`
     `ca.weblite.webview.demos.mediapermission`, `CFBundleExecutable`, `CFBundleName`,
     `CFBundlePackageType` `APPL`, `LSMinimumSystemVersion` 12.0, `NSHighResolutionCapable`,
-    `NSCameraUsageDescription`, `NSMicrophoneUsageDescription`) and `Contents/MacOS/` holding the
+    `NSCameraUsageDescription`, `NSMicrophoneUsageDescription`, and `NSCameraUseContinuityCameraDeviceType`
+    `true` — which silences AVFoundation's "AVCaptureDeviceTypeExternal is deprecated for Continuity
+    Cameras" warning) and `Contents/MacOS/` holding the
     launcher, linked with the same plist as `-sectcreate __TEXT __info_plist` (so the keys are present
     even if the executable is copied out of the bundle). Then `codesign --force --sign -` on the bundle
-    when `codesign` exists. Rebuilt when `launcher.c` or the script is newer than the executable.
-  - **Run.** The script `exec`s `Contents/MacOS/<launcher>` directly (not `open`), so the terminal
-    keeps stdout/stderr and the environment, with the demo's classpath and main class.
-  - **Flags.** `--no-bundle` keeps the old plain-`java` launch, to demo D13: Camera is denied with the
+    when `codesign` exists, and LaunchServices' `lsregister -f` on it when that tool exists (so a
+    rebuilt Info.plist is not shadowed by a cached registration). Rebuilt when `launcher.c` or the
+    script is newer than the executable.
+  - **Run: through LaunchServices.** The script launches the bundle with `open -n -W --stdout <out>
+    --stderr <err> <app> --args …` so the demo is its **own responsible process** (D13): `exec`ing
+    `Contents/MacOS/<launcher>` from a shell makes the terminal or IDE the responsible process, and
+    TCC then kills the demo when that app lacks the usage description, whatever our bundle says.
+    `-n` forces a new instance, `-W` waits until the demo quits (Ctrl-C stops only the wait; quit the
+    demo with ⌘Q). Output: when stdout (stderr) is a terminal, its device (`tty` on that descriptor)
+    so the user still sees the output in place; otherwise `build/WebViewMediaPermissionDemo.out.log`
+    (`.err.log`), truncated first, and the script prints where the logs are. (`--stdout`/`--stderr`
+    need macOS 10.15+, below the bundle's 12.) Arguments after `--args`: one
+    `--swingwebview-env=NAME=VALUE` for `JAVA_HOME` (always) and for each of
+    `WEBVIEW_MOCK_CAPTURE_DEVICES`, `DEBUG_WEBVIEW_EMBED`, `WEBVIEW_DEBUG_SHORTCUT` that is set, then
+    `-cp` with the demo's absolute classpath (a LaunchServices process starts in `/`) and the main
+    class. The demo itself takes no arguments; its policy is chosen in the window.
+  - **Flags.** `--no-bundle` keeps the old plain-`java` launch (`exec`, from the terminal), to demo D13: Camera is denied with the
     stderr line and `NotAllowedError` instead of a crash. `--print-info-plist` prints the generated
     Info.plist and exits; it runs on any OS (the plist generation is checked on Linux). Unknown
     arguments print the usage and exit 2.
@@ -480,12 +542,17 @@ OffscreenWebView ..> WebViewPermissionCallback
 7. **Demo, smoke test, run scripts, README, docs**, per D10 and D11; the macOS launcher and bundle per
    D14. The README and the demo's README state the macOS host-app requirements as a checklist: the two
    Info.plist keys, with jDeploy and jpackage examples; what happens without them (a clean deny with
-   the stderr line, no crash); `missingMacUsageDescriptions()`; screen recording needing no key; and
-   the private-preference note.
+   the stderr line, no crash); `missingMacUsageDescriptions()`; screen recording needing no key; the
+   private-preference note; and the responsible-process rule of D13 (TCC attributes a host started
+   from a terminal or IDE to that app, so the host must be launched through LaunchServices — Finder,
+   the Dock, `open`, a jDeploy or jpackage install — or that app must declare the keys; otherwise the
+   library denies). The demo's README gives the `open` launch, where its output goes, and the
+   `NSCameraUseContinuityCameraDeviceType` key.
 8. **Verification recorded in the PR:** the Linux native built and the smoke test run under Xvfb **in
    the lightweight component, the only Linux mode**; `mvn test`; Windows and macOS natives compiled by CI
    only — untested on device. For D13/D14 on Linux: the macOS section syntax-checked against stub
-   headers, the run script checked with `bash -n`, and `--print-info-plist` parsed as a plist.
+   headers, the run script checked with `bash -n`, `--print-info-plist` parsed as a plist, and
+   `launcher.c` checked with `clang -fsyntax-only`.
 
 ## N · Norms
 1. The navigation Canvas's norms hold: Javadoc on every public type states the threading contract;
@@ -514,5 +581,6 @@ OffscreenWebView ..> WebViewPermissionCallback
    is left to the engine untouched.
 7. **Test-only switch:** mock capture devices only when `WEBVIEW_MOCK_CAPTURE_DEVICES=1`.
 8. **Never crash the host for a page (macOS, D13):** a camera or microphone request whose usage
-   description is missing from the main bundle is denied — with a handler or without one, before Java
+   description is missing from the main bundle — or, for a process not launched by launchd, from its
+   responsible ancestor's Info.plist — is denied — with a handler or without one, before Java
    is asked, and again at the moment any answer is applied — and never answered Grant or Prompt.

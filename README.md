@@ -1075,9 +1075,24 @@ wv.setPermissionHandler(req -> {          // runs on the EDT
     * **Hardened runtime / notarized apps** also need the
       `com.apple.security.device.camera` and
       `com.apple.security.device.audio-input` entitlements.
+    * Optionally `NSCameraUseContinuityCameraDeviceType` (`true`), which
+      silences AVFoundation's "AVCaptureDeviceTypeExternal is deprecated for
+      Continuity Cameras" warning.
+  * [ ] **Launch the app through LaunchServices.** macOS's privacy system
+    (TCC) attributes a request to the *responsible* process. An app started
+    from Finder, the Dock, `open` or an installed jDeploy / jpackage bundle is
+    its own, so its Info.plist counts. An app whose binary is run from a
+    terminal or an IDE is attributed to *that* app (Terminal, iTerm2, your
+    IDE), and macOS kills it when that app's Info.plist lacks the key — even
+    though your bundle has it. During development, start the bundle with
+    `open -n -W --stdout "$(tty)" --stderr "$(tty)" MyApp.app --args …`
+    (environment variables do not pass through `open` before macOS 13), or
+    run from a terminal or IDE that declares the keys.
   * [ ] **Check at start-up** with
     `WebViewComponent.missingMacUsageDescriptions()`, which lists the keys the
-    running process's main bundle lacks (empty off macOS). Warn, or hide video
+    running process lacks (empty off macOS): in its main bundle or, when it
+    was not launched by launchd, in the Info.plist of the app it is
+    attributed to. Warn, or hide video
     features, when it isn't empty.
   * [ ] **Know what happens without them: a clean deny, not a crash.** macOS
     terminates a process that opens the camera or microphone without the key
@@ -1086,7 +1101,13 @@ wv.setPermissionHandler(req -> {          // runs on the EDT
     installed, and without asking the handler — the page gets
     `NotAllowedError`, and one line goes to stderr, e.g.
     `swingwebview: camera access denied — this app's Info.plist has no
-    NSCameraUsageDescription (macOS would terminate the app)`.
+    NSCameraUsageDescription (macOS would terminate the app)`. When only the
+    launching app lacks it, the line names that app and suggests launching
+    through LaunchServices. The library finds that app as the topmost
+    ancestor process below launchd (public APIs only; the exact attribution is
+    private), so it may deny where macOS would have prompted — a JVM spawned as
+    a child of a configured app, or a parent that disclaims responsibility —
+    but it does not let a request through that macOS would kill the app for.
   * [ ] **Screen sharing needs no key.** `getDisplayMedia` uses macOS's Screen
     Recording permission, which has no usage-description key and does not
     terminate the app; macOS asks the user, or the user allows it in System

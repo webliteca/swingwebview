@@ -13,7 +13,13 @@
 # this script builds build/WebViewMediaPermissionDemo.app -- an Info.plist with
 # both keys, and a tiny clang-built launcher (demos/WebViewMediaPermissionDemo/
 # mac/launcher.c) that runs the JVM in its own process through the JDK's
-# JLI_Launch -- and runs the demo from it.  --no-bundle runs a plain `java`
+# JLI_Launch -- and launches it through LaunchServices (`open`), so that the
+# demo is its own TCC "responsible process".  exec'ing the bundle's binary
+# from this shell would make the terminal (or IDE) responsible, and macOS
+# would check *that* app's Info.plist and kill the demo when it lacks the key.
+# The demo's output still comes to this terminal (open --stdout/--stderr), or
+# to build/WebViewMediaPermissionDemo.{out,err}.log when not on a terminal.
+# --no-bundle runs a plain `java`
 # instead: camera / microphone requests are then denied by the library, with a
 # "swingwebview: ... access denied" line on stderr, rather than crashing.
 # See demos/WebViewMediaPermissionDemo/README.md.
@@ -68,6 +74,8 @@ info_plist() {
     <string>The media permission demo shows your camera in a web page.</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>The media permission demo records from your microphone in a web page.</string>
+    <key>NSCameraUseContinuityCameraDeviceType</key>
+    <true/>
 </dict>
 </plist>
 PLIST
@@ -243,14 +251,41 @@ if [ "$NEED_APP" = "1" ]; then
         codesign --force --sign - "$APP" >/dev/null 2>&1 \
             || echo "warning: ad-hoc codesign of $APP failed; continuing" >&2
     fi
+    # Re-register, so LaunchServices does not keep a stale Info.plist.
+    LSREGISTER=/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
+    if [ -x "$LSREGISTER" ]; then
+        "$LSREGISTER" -f "$APP" >/dev/null 2>&1 || true
+    fi
     echo "Built $APP"
 else
     echo "$APP up to date."
 fi
 
-# exec the launcher itself (not `open`), so this terminal keeps stdout/stderr
-# and the environment; JAVA_HOME tells it which JDK's libjli to load.
-echo "Launching WebViewMediaPermissionDemo from $APP ..."
-exec "$APP_EXE" \
-    -cp "$DEMO_CLASSES:$WV_JAR" \
-    ca.weblite.webview.demos.WebViewMediaPermissionDemo
+# Launch through LaunchServices (Canvas 35 D13, D14): the demo becomes its own
+# responsible process, so TCC checks *its* Info.plist, not this terminal's.
+# A LaunchServices launch starts in / with launchd's environment, so the
+# classpath is absolute and the variables the demo needs go as leading
+# --swingwebview-env= arguments, which the launcher sets before starting the
+# JVM (`open --env` needs macOS 13; the bundle supports 12).
+LOG_OUT="$BUILD_DIR/$APP_NAME.out.log"
+LOG_ERR="$BUILD_DIR/$APP_NAME.err.log"
+OUT=""
+ERR=""
+if [ -t 1 ]; then OUT="$(tty <&1 2>/dev/null || true)"; fi
+if [ -t 2 ]; then ERR="$(tty <&2 2>/dev/null || true)"; fi
+case "$OUT" in /dev/*) ;; *) OUT="$LOG_OUT"; : > "$LOG_OUT" ;; esac
+case "$ERR" in /dev/*) ;; *) ERR="$LOG_ERR"; : > "$LOG_ERR" ;; esac
+
+LAUNCH_ARGS=("--swingwebview-env=JAVA_HOME=$JAVA_HOME")
+for var in WEBVIEW_MOCK_CAPTURE_DEVICES DEBUG_WEBVIEW_EMBED WEBVIEW_DEBUG_SHORTCUT; do
+    if [ -n "${!var+x}" ]; then
+        LAUNCH_ARGS+=("--swingwebview-env=$var=${!var}")
+    fi
+done
+LAUNCH_ARGS+=(-cp "$DEMO_CLASSES:$WV_JAR" ca.weblite.webview.demos.WebViewMediaPermissionDemo)
+
+echo "Launching WebViewMediaPermissionDemo from $APP (open -n -W) ..."
+echo "  stdout -> $OUT"
+echo "  stderr -> $ERR"
+echo "  Quit the demo (Cmd-Q) to return; Ctrl-C here stops waiting but not the demo."
+exec open -n -W --stdout "$OUT" --stderr "$ERR" "$APP" --args "${LAUNCH_ARGS[@]}"

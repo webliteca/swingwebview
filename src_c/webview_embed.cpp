@@ -58,6 +58,9 @@
 #include <dispatch/dispatch.h>
 #include <objc/objc-runtime.h>
 #include <objc/runtime.h>
+#include <libproc.h>      // proc_pidpath (Canvas 35 D13)
+#include <sys/sysctl.h>   // KERN_PROC_PID (Canvas 35 D13)
+#include <unistd.h>       // getppid (Canvas 35 D13)
 #endif
 
 namespace embed {
@@ -6936,19 +6939,19 @@ struct CocoaPermPending {
 static std::mutex g_cocoa_perm_mutex;
 static std::map<long long, CocoaPermPending> g_cocoa_perm;
 
+struct CocoaUsageKey { int kind; const char *key; };
+static const CocoaUsageKey kCocoaUsageKeys[] = {
+    { PERM_KIND_CAMERA, "NSCameraUsageDescription" },
+    { PERM_KIND_MICROPHONE, "NSMicrophoneUsageDescription" },
+};
+
 // Canvas 35 D13: the subset of `kinds` (camera, microphone) whose Info.plist
-// usage description the main bundle lacks.  macOS's privacy system (TCC)
-// terminates a process that opens the device without it, so such a request
-// must never be granted or prompted.  A key counts only as a non-empty
-// NSString.  Screen capture (Screen Recording) has no usage-description key.
-static int cocoa_media_missing_kinds(int kinds) {
+// usage description the main bundle lacks.  A key counts only as a non-empty
+// NSString.
+static int cocoa_main_bundle_missing_kinds(int kinds) {
     int missing = 0;
     id bundle = msg(objc_cls("NSBundle"), sel("mainBundle"));
-    struct { int kind; const char *key; } const kKeys[] = {
-        { PERM_KIND_CAMERA, "NSCameraUsageDescription" },
-        { PERM_KIND_MICROPHONE, "NSMicrophoneUsageDescription" },
-    };
-    for (const auto &k : kKeys) {
+    for (const auto &k : kCocoaUsageKeys) {
         if (!(kinds & k.kind)) continue;
         id v = bundle ? msg<id, id>(bundle, sel("objectForInfoDictionaryKey:"),
                                     ns_str(k.key))
@@ -6961,22 +6964,126 @@ static int cocoa_media_missing_kinds(int kinds) {
     return missing;
 }
 
-// Canvas 35 D13: the one stderr line for a request denied for a missing key.
-static void cocoa_media_report_denied(int kinds, int missing) {
-    const char *what =
-        (kinds & PERM_KIND_CAMERA) && (kinds & PERM_KIND_MICROPHONE)
-            ? "camera and microphone"
-            : (kinds & PERM_KIND_CAMERA) ? "camera" : "microphone";
+// Canvas 35 D13: the parent of `pid`, through the public sysctl; -1 on error.
+static pid_t cocoa_parent_pid(pid_t pid) {
+    struct kinfo_proc info;
+    size_t size = sizeof(info);
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)pid };
+    memset(&info, 0, sizeof(info));
+    if (sysctl(mib, 4, &info, &size, nullptr, 0) != 0 || size == 0) return -1;
+    return info.kp_eproc.e_ppid;
+}
+
+// Canvas 35 D13: TCC attributes a request to the *responsible* process.  A
+// process launchd started (parent pid 1) is its own; otherwise approximate it
+// (the exact attribution is private API) by the top ancestor -- the last
+// process before pid 1, i.e. the app launchd started that spawned this chain:
+// a terminal, an IDE.  Returns false when this process is its own responsible
+// process.  Otherwise true, with `label` set to the ancestor's .app directory
+// or executable path (empty when it could not be identified) and `missing`
+// to the subset of `kinds` whose key the ancestor's Info.plist lacks (all of
+// `kinds` when there is no readable Info.plist -- fail closed).
+static bool cocoa_responsible_missing_kinds(int kinds, int *missing,
+                                            std::string *label) {
+    *missing = 0;
+    label->clear();
+    pid_t parent = getppid();
+    if (parent <= 1) return false;
+    pid_t top = parent;
+    bool found = false;
+    for (int step = 0; step < 64; step++) {
+        pid_t pp = cocoa_parent_pid(top);
+        if (pp < 0) break;
+        if (pp <= 1) { found = true; break; }
+        top = pp;
+    }
+    *missing = kinds & (PERM_KIND_CAMERA | PERM_KIND_MICROPHONE);
+    if (!found) return true;
+    char path[PROC_PIDPATHINFO_MAXSIZE];
+    if (proc_pidpath(top, path, sizeof(path)) <= 0) return true;
+    std::string p(path);
+    const std::string marker = ".app/Contents/MacOS/";
+    size_t at = p.find(marker);
+    std::string target = at == std::string::npos ? p : p.substr(0, at + 4);
+    *label = target;
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(
+        kCFAllocatorDefault, (const UInt8 *)target.c_str(),
+        (CFIndex)target.size(), at != std::string::npos);
+    if (!url) return true;
+    CFDictionaryRef dict = CFBundleCopyInfoDictionaryForURL(url);
+    CFRelease(url);
+    if (!dict) return true;
+    for (const auto &k : kCocoaUsageKeys) {
+        if (!(*missing & k.kind)) continue;
+        CFStringRef key = CFStringCreateWithCString(kCFAllocatorDefault, k.key,
+                                                    kCFStringEncodingUTF8);
+        CFTypeRef v = key ? CFDictionaryGetValue(dict, key) : nullptr;
+        if (key) CFRelease(key);
+        if (v && CFGetTypeID(v) == CFStringGetTypeID()
+                && CFStringGetLength((CFStringRef)v) > 0) {
+            *missing &= ~k.kind;
+        }
+    }
+    CFRelease(dict);
+    return true;
+}
+
+// Canvas 35 D13: the subset of `kinds` (camera, microphone) whose Info.plist
+// usage description is missing -- from the main bundle, or, when this process
+// was not launched by launchd, from its responsible ancestor's Info.plist.
+// macOS's privacy system (TCC) terminates a process that opens the device
+// without it, so such a request must never be granted or prompted.  Screen
+// capture (Screen Recording) has no usage-description key.  `resp_missing` /
+// `resp_label` (optional) receive the ancestor's part, for the stderr line.
+static int cocoa_media_missing_kinds(int kinds, int *main_missing = nullptr,
+                                     int *resp_missing = nullptr,
+                                     std::string *resp_label = nullptr) {
+    int mm = cocoa_main_bundle_missing_kinds(kinds);
+    int rm = 0;
+    std::string label;
+    cocoa_responsible_missing_kinds(kinds, &rm, &label);
+    if (main_missing) *main_missing = mm;
+    if (resp_missing) *resp_missing = rm;
+    if (resp_label) *resp_label = label;
+    return mm | rm;
+}
+
+static std::string cocoa_usage_key_names(int missing) {
     std::string keys;
     if (missing & PERM_KIND_CAMERA) keys = "NSCameraUsageDescription";
     if (missing & PERM_KIND_MICROPHONE) {
         if (!keys.empty()) keys += " and ";
         keys += "NSMicrophoneUsageDescription";
     }
-    fprintf(stderr,
-            "swingwebview: %s access denied \xE2\x80\x94 this app's Info.plist has "
-            "no %s (macOS would terminate the app)\n",
-            what, keys.c_str());
+    return keys;
+}
+
+// Canvas 35 D13: the one stderr line for a request denied for a missing key.
+// Names the main bundle when it lacks a key, otherwise the responsible
+// ancestor.
+static void cocoa_media_report_denied(int kinds) {
+    int mm = 0, rm = 0;
+    std::string label;
+    cocoa_media_missing_kinds(kinds, &mm, &rm, &label);
+    const char *what =
+        (kinds & PERM_KIND_CAMERA) && (kinds & PERM_KIND_MICROPHONE)
+            ? "camera and microphone"
+            : (kinds & PERM_KIND_CAMERA) ? "camera" : "microphone";
+    if (mm || !rm) {
+        fprintf(stderr,
+                "swingwebview: %s access denied \xE2\x80\x94 this app's Info.plist has "
+                "no %s (macOS would terminate the app)\n",
+                what, cocoa_usage_key_names(mm ? mm : rm).c_str());
+    } else {
+        fprintf(stderr,
+                "swingwebview: %s access denied \xE2\x80\x94 macOS attributes this "
+                "process to %s, which launched it, and that app's Info.plist has "
+                "no %s (macOS would terminate the app); launch the .app through "
+                "LaunchServices (open, Finder or the Dock)\n",
+                what,
+                label.empty() ? "an unidentified parent process" : label.c_str(),
+                cocoa_usage_key_names(rm).c_str());
+    }
     fflush(stderr);
 }
 
@@ -6989,7 +7096,7 @@ static void cocoa_perm_call(id handler, int decision, int kinds) {
     if (decision != PERM_DENY) {
         int missing = cocoa_media_missing_kinds(kinds);
         if (missing) {
-            cocoa_media_report_denied(kinds, missing);
+            cocoa_media_report_denied(kinds);
             decision = PERM_DENY;
         }
     }
@@ -7019,7 +7126,7 @@ static void impl_request_media_capture_permission(
     if (kinds != 0) {
         int missing = cocoa_media_missing_kinds(kinds);
         if (missing) {
-            cocoa_media_report_denied(kinds, missing);
+            cocoa_media_report_denied(kinds);
             ((void (^)(long))decisionHandler)(2L);   // WKPermissionDecisionDeny
             return;
         }
@@ -10524,7 +10631,8 @@ JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1permis
 }
 
 // Canvas 35 D13: the camera / microphone bits whose Info.plist usage
-// description the main bundle lacks; 0 on every non-macOS native.
+// description is missing (main bundle, or the responsible ancestor when not
+// launched by launchd); 0 on every non-macOS native.
 JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1mac_1missing_1usage_1descriptions
   (JNIEnv *, jclass) {
 #ifdef WEBVIEW_COCOA

@@ -23,8 +23,16 @@
  * re-entrant (the same lookups again, and libjli's own guard stops the
  * recursion).
  *
- * Usage (as `java`):  <launcher> -cp <classpath> <main class> [args...]
+ * Usage (as `java`):  <launcher> [--swingwebview-env=NAME=VALUE ...]
+ *                                -cp <classpath> <main class> [args...]
  * Needs JAVA_HOME pointing at the JDK whose libjli is to be loaded.
+ *
+ * The run script starts the bundle through LaunchServices (`open`), so that
+ * the demo is its own TCC responsible process (Canvas 35 D13); such a launch
+ * does not inherit the shell's environment.  Leading --swingwebview-env=
+ * arguments are therefore set in this process's environment and removed
+ * before JLI_Launch sees the rest (Canvas 35 D14).  libjli's re-entry of
+ * main gets the stripped arguments and finds the variables already set.
  */
 
 #include <dlfcn.h>
@@ -49,7 +57,36 @@ static void fail(const char *what, const char *detail) {
             detail ? ": " : "", detail ? detail : "");
 }
 
+#define ENV_PREFIX "--swingwebview-env="
+
 int main(int argc, char **argv) {
+    /* Canvas 35 D14: consume leading --swingwebview-env=NAME=VALUE. */
+    int first = 1;
+    while (first < argc
+           && strncmp(argv[first], ENV_PREFIX, sizeof(ENV_PREFIX) - 1) == 0) {
+        char *spec = argv[first] + sizeof(ENV_PREFIX) - 1;
+        char *eq = strchr(spec, '=');
+        if (!eq || eq == spec) {
+            fail("malformed argument (want " ENV_PREFIX "NAME=VALUE)", argv[first]);
+            return 1;
+        }
+        *eq = '\0';
+        int rc = setenv(spec, eq + 1, 1);
+        *eq = '=';
+        if (rc != 0) {
+            fail("setenv failed for", argv[first]);
+            return 1;
+        }
+        first++;
+    }
+    if (first > 1) {
+        /* Drop the consumed arguments, keeping argv[0]. */
+        int i, n = 1;
+        for (i = first; i < argc; i++) argv[n++] = argv[i];
+        argv[n] = NULL;
+        argc = n;
+    }
+
     const char *home = getenv("JAVA_HOME");
     if (!home || !*home) {
         fail("JAVA_HOME is not set (it must name the JDK to run)", NULL);

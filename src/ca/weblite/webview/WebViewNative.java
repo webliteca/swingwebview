@@ -584,7 +584,9 @@ native static void webview_offscreen_set_permission_callback(long peer, WebViewP
 // Canvas 35 D13: the MediaCaptureKind bits (CAMERA, MICROPHONE) whose
 // Info.plist usage description -- NSCameraUsageDescription,
 // NSMicrophoneUsageDescription -- the process's main bundle lacks.  The macOS
-// native answers from [NSBundle mainBundle]; every other native answers 0.
+// native answers from [NSBundle mainBundle] and, when the process was not
+// launched by launchd, from its responsible ancestor's Info.plist (the app TCC
+// attributes it to); every other native answers 0.
 // Called only on macOS (PermissionDispatcher.missingMacUsageDescriptions()),
 // which absorbs the UnsatisfiedLinkError of a native that predates it.
 native static int webview_mac_missing_usage_descriptions();

@@ -1049,8 +1049,16 @@ public abstract class WebViewComponent extends JComponent {
 
     /**
      * The Info.plist usage-description keys ({@code NSCameraUsageDescription},
-     * {@code NSMicrophoneUsageDescription}) that this process's main bundle
-     * lacks on macOS, camera key first (Canvas 35 D13).
+     * {@code NSMicrophoneUsageDescription}) that this process lacks on macOS,
+     * camera key first (Canvas 35 D13).
+     *
+     * <p>macOS's privacy system checks the <em>responsible</em> process.  A
+     * process launched through LaunchServices (Finder, the Dock, {@code open},
+     * an installed jDeploy or jpackage app) is its own, so its main bundle
+     * counts.  A process started from a terminal or an IDE is attributed to
+     * that app, so the app's Info.plist must carry the keys as well; the
+     * library approximates the responsible app by the topmost ancestor below
+     * launchd and reports what either lacks.
      *
      * <p>macOS terminates a process that opens the camera or microphone
      * without the matching key, so the library denies such a request — with

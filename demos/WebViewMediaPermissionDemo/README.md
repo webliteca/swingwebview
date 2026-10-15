@@ -45,6 +45,12 @@ The log shows each request's origin, kinds and address, and the thread the handl
     carries both keys (see the jDeploy documentation for how); a notarized app with the
     hardened runtime also needs the `com.apple.security.device.camera` and
     `com.apple.security.device.audio-input` entitlements.
+  - [ ] **Launched through LaunchServices.** macOS's privacy system (TCC) checks the Info.plist of
+    the *responsible* process. An app opened from Finder, the Dock, `open` or an installed jDeploy /
+    jpackage bundle is its own responsible process. A binary run from a terminal or an IDE is
+    attributed to that app, and macOS kills it when that app lacks the key, whatever its own bundle
+    says. The library checks both (it takes the topmost ancestor below launchd as the responsible
+    app) and denies, naming the app, rather than let that happen.
   - [ ] **Without them: a clean deny, not a crash.** macOS kills a process that opens the camera or
     microphone without the key (`SIGABRT`, "Namespace TCC"). The library therefore denies such a
     request itself — handler or not, without asking the handler — the page gets `NotAllowedError`, and
@@ -63,11 +69,22 @@ The log shows each request's origin, kinds and address, and the thread the handl
   follows the executable, so by default the script builds `build/WebViewMediaPermissionDemo.app`: an
   `Info.plist` with both keys and a small launcher (`mac/launcher.c`, built with `clang`, the same
   plist embedded in its `__TEXT,__info_plist`) that runs the JVM *in its own process* through the
-  JDK's `JLI_Launch`, as the `java` command does. It needs the Xcode command line tools
+  JDK's `JLI_Launch`, as the `java` command does. The Info.plist also sets
+  `NSCameraUseContinuityCameraDeviceType`, which silences AVFoundation's Continuity Camera warning.
+  The script then launches the bundle **through LaunchServices** — `open -n -W --stdout … --stderr …
+  build/WebViewMediaPermissionDemo.app --args …` — so the demo is its own responsible process; running
+  the bundle's binary straight from the shell would make the terminal responsible, and macOS would
+  abort the demo when the terminal's Info.plist has no camera key. The demo's output still appears in
+  the terminal (its tty), or in `build/WebViewMediaPermissionDemo.out.log` / `.err.log` when the
+  script's output is not a terminal; the script prints which. `JAVA_HOME` and, when set,
+  `WEBVIEW_MOCK_CAPTURE_DEVICES`, `DEBUG_WEBVIEW_EMBED` and `WEBVIEW_DEBUG_SHORTCUT` are passed to the
+  launcher as `--swingwebview-env=NAME=VALUE` arguments, because `open` does not pass the shell's
+  environment (and its `--env` needs macOS 13). The script waits until the demo quits (⌘Q); Ctrl-C
+  stops only the wait. It needs the Xcode command line tools
   (`xcode-select --install`) and a JDK in `JAVA_HOME`. `--no-bundle` runs a plain `java` to show the
   safeguard: Camera is denied with the stderr line above instead of crashing.
   `--print-info-plist` prints the bundle's Info.plist. macOS's own one-time consent prompt still
-  appears on top of the handler's answer (it may name your terminal).
+  appears on top of the handler's answer, naming the demo.
 - **Windows**: camera and microphone only. Windows' own privacy settings still apply.
 - **Linux**: the lightweight component is the only Linux mode. Ubuntu 24.04's WebKitGTK is built
   without WebRTC, so `RTCPeerConnection` is missing there even though capture works.

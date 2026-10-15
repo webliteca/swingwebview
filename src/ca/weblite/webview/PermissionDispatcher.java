@@ -101,8 +101,9 @@ public final class PermissionDispatcher {
     static final String MICROPHONE_USAGE_KEY = "NSMicrophoneUsageDescription";
 
     /**
-     * Canvas 35 D13: the usage-description keys the running process's main
-     * bundle lacks, camera key first — the keys without which the macOS
+     * Canvas 35 D13: the usage-description keys the running process lacks —
+     * in its main bundle or, when it was not launched by launchd, in the
+     * Info.plist of the ancestor app macOS attributes it to — camera key first — the keys without which the macOS
      * native denies camera or microphone requests (macOS would otherwise
      * terminate the process).  Unmodifiable; empty when not on macOS, or when
      * the loaded native predates the probe.  Any thread.
