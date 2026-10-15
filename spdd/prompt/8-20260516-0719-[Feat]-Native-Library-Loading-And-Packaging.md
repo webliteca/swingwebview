@@ -431,9 +431,11 @@ Files: `.github/workflows/build.yml`,
      with macOS and Windows. The container first points apt at
      `http://archive.debian.org/debian bullseye main` only (no
      `-security` or `-updates` suite), with
-     `Acquire::Check-Valid-Until=false` and `Acquire::Retries=5` on both
-     `update` and `install` (the archive's CDN intermittently answers 404
-     for files its index lists; a retry fetches them), and pins that origin at
+     an apt config of `Acquire::Check-Valid-Until "false"`,
+     `Acquire::Retries "5"` and `Acquire::http::No-Cache "true"` (the
+     archive's CDN serves stale 404s to the runners for files its index
+     lists; no-cache asks it to refetch), retries the whole `install` up to
+     four times with a fresh `update` between attempts, and pins that origin at
      priority 1001 so the image's newer security builds of base
      packages (e.g. `libc6`) are downgraded to the archive's versions
      — otherwise their `-dev` packages are unsatisfiable. It then

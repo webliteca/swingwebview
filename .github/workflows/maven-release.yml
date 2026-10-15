@@ -130,10 +130,20 @@ jobs:
                 rm -f /etc/apt/sources.list.d/*
                 printf "Package: *\nPin: origin \"archive.debian.org\"\nPin-Priority: 1001\n" \
                     > /etc/apt/preferences.d/archive-bullseye
-                apt-get -o Acquire::Retries=5 -o Acquire::Check-Valid-Until=false update -qq
-                apt-get -o Acquire::Retries=5 install -y -qq --allow-downgrades --no-install-recommends \
-                    g++ pkg-config \
-                    libgtk-3-dev libwebkit2gtk-4.0-dev libx11-dev libxt-dev >/dev/null
+                printf "Acquire::Retries \"5\";\nAcquire::http::No-Cache \"true\";\nAcquire::Check-Valid-Until \"false\";\n" \
+                    > /etc/apt/apt.conf.d/80ci
+                apt-get update -qq
+                for attempt in 1 2 3 4; do
+                  if apt-get install -y -qq --allow-downgrades --no-install-recommends \
+                      g++ pkg-config \
+                      libgtk-3-dev libwebkit2gtk-4.0-dev libx11-dev libxt-dev >/dev/null; then
+                    break
+                  fi
+                  if [ "$attempt" = 4 ]; then exit 1; fi
+                  echo "apt-get install failed (attempt $attempt), retrying" >&2
+                  sleep $((attempt * 15))
+                  apt-get update -qq
+                done
                 if pkg-config --exists webkit2gtk-4.1; then
                   WEBKIT_PKG=webkit2gtk-4.1
                 else
