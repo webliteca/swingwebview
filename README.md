@@ -1061,12 +1061,38 @@ wv.setPermissionHandler(req -> {          // runs on the EDT
   for every web view and popup, each only where the running WebKit has it.
   With no handler, WebKit's own permission prompt decides, as WebView2's does
   on Windows. To keep a page off the camera and microphone, deny in your handler.
-* **macOS Info.plist — required.** Because any page can now ask for the
-  camera or microphone, the host application must declare
-  `NSCameraUsageDescription` and `NSMicrophoneUsageDescription`. Without them,
-  WebKit refuses the request (`NotAllowedError`), or macOS's privacy system
-  terminates the process the first time a page uses the device. macOS's own
-  one-time consent prompt still appears on top of your handler's answer.
+* **macOS host-app checklist.** Because any page can now ask for the camera
+  or microphone, a macOS host application needs:
+  * [ ] **`NSCameraUsageDescription` and `NSMicrophoneUsageDescription`** in
+    the Info.plist of the bundle whose executable runs the JVM — your `.app`,
+    not the JDK's `java`. Each value is the sentence macOS shows the user.
+    * **jpackage:** put a complete `Info.plist` with both keys in a folder and
+      pass it with `--resource-dir <folder>`; jpackage uses it in place of its
+      default.
+    * **jDeploy:** make sure the app bundle jDeploy generates carries both
+      keys in its Info.plist; check the jDeploy documentation for your version
+      for how to add usage descriptions.
+    * **Hardened runtime / notarized apps** also need the
+      `com.apple.security.device.camera` and
+      `com.apple.security.device.audio-input` entitlements.
+  * [ ] **Check at start-up** with
+    `WebViewComponent.missingMacUsageDescriptions()`, which lists the keys the
+    running process's main bundle lacks (empty off macOS). Warn, or hide video
+    features, when it isn't empty.
+  * [ ] **Know what happens without them: a clean deny, not a crash.** macOS
+    terminates a process that opens the camera or microphone without the key
+    (`SIGABRT`, "Namespace TCC"), so the library never lets such a request
+    through: it is answered *deny* — whether or not a permission handler is
+    installed, and without asking the handler — the page gets
+    `NotAllowedError`, and one line goes to stderr, e.g.
+    `swingwebview: camera access denied — this app's Info.plist has no
+    NSCameraUsageDescription (macOS would terminate the app)`.
+  * [ ] **Screen sharing needs no key.** `getDisplayMedia` uses macOS's Screen
+    Recording permission, which has no usage-description key and does not
+    terminate the app; macOS asks the user, or the user allows it in System
+    Settings › Privacy & Security › Screen & System Audio Recording.
+  * [ ] macOS's own one-time consent prompt still appears on top of your
+    handler's answer.
 * **macOS private API.** These preferences are private WebKit API, the same
   kind as `developerExtrasEnabled`, which debug mode already uses. They're
   fine for applications distributed outside the Mac App Store, but App Store

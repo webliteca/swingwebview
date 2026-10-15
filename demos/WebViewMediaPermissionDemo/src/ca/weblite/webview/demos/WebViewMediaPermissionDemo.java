@@ -129,6 +129,13 @@ public class WebViewMediaPermissionDemo {
         wv.setUrl("demo://app/");
         log("mode=" + WebViewComponent.resolveDefaultMode()
                 + "  isPermissionHandlerSupported=" + WebViewComponent.isPermissionHandlerSupported());
+        // Canvas 35 D13: on macOS, a key missing here means camera / microphone
+        // requests are denied (macOS would otherwise terminate the process).
+        java.util.List<String> missing = WebViewComponent.missingMacUsageDescriptions();
+        if (!missing.isEmpty()) {
+            log("WARNING: this process's Info.plist lacks " + missing
+                    + " -- those devices will be denied (see README)");
+        }
     }
 
     private static void answer(WebViewPermissionRequest req, PermissionDecision d) {

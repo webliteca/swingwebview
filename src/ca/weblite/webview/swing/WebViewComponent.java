@@ -1047,6 +1047,25 @@ public abstract class WebViewComponent extends JComponent {
         return PermissionDispatcher.isAvailable();
     }
 
+    /**
+     * The Info.plist usage-description keys ({@code NSCameraUsageDescription},
+     * {@code NSMicrophoneUsageDescription}) that this process's main bundle
+     * lacks on macOS, camera key first (Canvas 35 D13).
+     *
+     * <p>macOS terminates a process that opens the camera or microphone
+     * without the matching key, so the library denies such a request — with
+     * or without a {@link WebViewPermissionHandler}, which is not asked — and
+     * logs one line to stderr; the page sees {@code NotAllowedError}.  Check
+     * this at start-up to warn, or to hide video features.
+     *
+     * @return an unmodifiable list; empty when not on macOS, when every key is
+     *         present, or when the loaded native predates the check.  Any
+     *         thread.
+     */
+    public static List<String> missingMacUsageDescriptions() {
+        return PermissionDispatcher.missingMacUsageDescriptions();
+    }
+
     // ---------------------------------------------------------------------
     // Browser-initiated download handler API.
     //

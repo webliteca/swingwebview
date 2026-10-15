@@ -33,9 +33,12 @@ builds_on:
 - **Edited:**
   - `WebViewNative`: `webview_permission_available`, `webview_permission_respond`,
     `webview_embed_set_permission_callback`, `webview_offscreen_set_permission_callback` (D5);
+    `webview_mac_missing_usage_descriptions` (D13);
+  - `PermissionDispatcher`: static `missingMacUsageDescriptions()` and its package-private key mapping
+    (D13);
   - `EmbeddedWebView` and `OffscreenWebView`: `setPermissionCallback` (D5);
   - `swing/WebViewComponent`: `setPermissionHandler`, `getPermissionHandler`,
-    `isPermissionHandlerSupported()` (D1, D6);
+    `isPermissionHandlerSupported()` (D1, D6), `missingMacUsageDescriptions()` (D13);
   - `swing/WebViewHeavyweightComponent` and `swing/WebViewLightweightComponent`: install the callback at
     attach, before the first navigation; dispose the dispatcher (D5).
 
@@ -43,9 +46,9 @@ builds_on:
 - **Edited** `src_c/webkit_loader.h` (added to `WK_WEBKIT_OPT_SYMS`, which `webkit_loader.cpp` already
   resolves optionally) and `src_c/webkit_shim.h`: optional media-permission symbol groups (D7a).
 - **Edited** `src_c/webview_embed.cpp`: the GTK `permission-request` handler and media settings on
-  `Engine` and `OffEngine` (D7); the Cocoa `requestMediaCapturePermissionForOrigin…` selector (D8); the
-  WKWebView media preferences on the configuration, for the engine and popup children (D12); the
-  shared JNI bridges (D5).
+  `Engine` and `OffEngine` (D7); the Cocoa `requestMediaCapturePermissionForOrigin…` selector (D8) and
+  its Info.plist usage-description safeguard (D13); the WKWebView media preferences on the
+  configuration, for the engine and popup children (D12); the shared JNI bridges (D5, D13).
 - **Edited** `windows/webview_embed.cc`: `PermissionRequested` on the engine and an adopted child, and the
   JNI bridges (D9).
 
@@ -55,11 +58,15 @@ builds_on:
 **Demo, smoke test and docs**
 - **New** `demos/WebViewMediaPermissionDemo/` (source + README), `run-linux-media-permission-demo.sh`,
   `run-mac-media-permission-demo.sh`, `run-windows-media-permission-demo.bat`.
+- **New** `demos/WebViewMediaPermissionDemo/mac/launcher.c`: the in-process launcher of the demo's
+  minimal `.app` bundle (D14); `run-mac-media-permission-demo.sh` builds and uses it.
 - **New** `demos/WebViewMediaSmokeTest/src/ca/weblite/webview/demos/WebViewMediaPermissionSmokeTest.java`.
 - **Edited** `run-linux-media-smoketest.sh` and `demos/WebViewMediaSmokeTest/README.md` (D11).
 - **Edited** `README.md` (a "Camera, microphone and screen capture" section and a demo entry, including
-  the macOS private-preference and Info.plist notes of D12) and `docs/index.html` (a demo card).
-- **Edited** `demos/WebViewMediaPermissionDemo/README.md` (macOS notes of D12).
+  the macOS private-preference notes of D12 and the host-app checklist of D13) and `docs/index.html`
+  (a demo card).
+- **Edited** `demos/WebViewMediaPermissionDemo/README.md` (macOS notes of D12, the host-app checklist
+  of D13, the bundled and `--no-bundle` runs of D14).
 
 ## Decisions (resolved here)
 
@@ -183,6 +190,8 @@ builds_on:
     Prompt at once.
   - Origin from the `WKSecurityOrigin`: `protocol://host` plus `:port` when `port` is non-zero; url from
     `frame.request.URL.absoluteString`.
+  - **D13's usage-description check runs first**, for every camera or microphone request, handler or
+    not; a host missing a required key is denied there and nothing below runs.
   - With no engine, no callback, or a destroyed engine → `decisionHandler(WKPermissionDecisionPrompt)` —
     exactly what WebKit does when the delegate doesn't implement the selector.
   - Otherwise D5 with the handler block `copy`'d into the table; Java is called on AppKit main (the
@@ -192,10 +201,10 @@ builds_on:
   - **Screen capture** has no public WKWebView hook; `getDisplayMedia` keeps WebKit's own behaviour
     (D12 only makes the API available where WebKit has the private switch).
   - **Info.plist:** a host app must declare `NSCameraUsageDescription` and
-    `NSMicrophoneUsageDescription`; without them macOS terminates the process when the page first uses
-    the device. The OS's own consent prompt still appears once per app, on top of the handler's answer.
-    Documented in the README and the demo's README; the mac run script launches through a plain `java`,
-    whose own bundle governs (documented).
+    `NSMicrophoneUsageDescription`; without them macOS terminates the process (TCC, `SIGABRT`) when
+    WebKit first opens the device. D13 turns that into a clean deny; D14 gives the demo a bundle that
+    declares both. The OS's own consent prompt still appears once per app, on top of the handler's
+    answer.
 
 - **D9 · Windows (WebView2, SDK 1.0.2592.51).**
   - `PermissionRequestedHandler` (`ICoreWebView2PermissionRequestedEventHandler`, `Engine*`) registered
@@ -220,7 +229,8 @@ builds_on:
   `JOptionPane` (Allow / Deny / Default) for each request — answered asynchronously after the dialog —
   and logs origin, url and kinds. The page shows the stream in a `<video>`, the error name on refusal,
   and whether `RTCPeerConnection` exists. Run scripts per OS mirror the navigation demo's;
-  `WEBVIEW_MOCK_CAPTURE_DEVICES=1` is exported by the Linux script when `MOCK=1` is set.
+  `WEBVIEW_MOCK_CAPTURE_DEVICES=1` is exported by the Linux script when `MOCK=1` is set. At start the
+  demo also logs `missingMacUsageDescriptions()` (D13); the macOS script runs it from a bundle (D14).
 
 - **D11 · Linux smoke test.** `WebViewMediaPermissionSmokeTest` (exits 0 on pass, 1 on fail, one line
   per check), run by `run-linux-media-smoketest.sh` after Canvas 33's test, with
@@ -264,10 +274,10 @@ builds_on:
     Windows, where WebView2's prompt is the default. An opt-in would leave the documented default
     ("WebKit's own permission prompt") unreachable. The cost, recorded: a page can now reach the
     capture devices in any host, so the **host must declare `NSCameraUsageDescription` and
-    `NSMicrophoneUsageDescription`**. WebKit checks the host bundle for them and refuses the request
-    (`NotAllowedError`) when one is missing; where that check does not apply, macOS's privacy system
-    may terminate the process on first access. An application that must never expose the devices
-    denies in its handler.
+    `NSMicrophoneUsageDescription`**. Observed on macOS 15.4.1 (arm64) from a plain `java`: WebKit does
+    *not* refuse a host that lacks them; after a grant it opens the camera and macOS's privacy system
+    kills the process (`SIGABRT`, namespace TCC). D13 is the safeguard. An application that must never
+    expose the devices denies in its handler.
   - **Screen capture.** `_setScreenCaptureEnabled:` makes `getDisplayMedia` available where WebKit has
     it; whether a request then reaches D8's delegate depends on the WebKit version (there is no public
     display-capture hook), so screen capture stays WebKit's decision as D8 says.
@@ -277,6 +287,85 @@ builds_on:
   - **Private API.** These are private WebKit preferences, the same category as the existing
     `developerExtrasEnabled` used in debug mode: fine for applications distributed outside the Mac App
     Store; App Store review may reject private API use. Documented in the README and the demo's README.
+
+- **D13 · macOS: never let a page reach a device the host has no usage description for.**
+  - **Why.** Observed on macOS 15.4.1 (arm64), demo run through a plain `java` with "Always allow":
+    D8 granted, WebKit opened the camera on a dispatch-queue thread, and macOS terminated the process
+    (`EXC_CRASH (SIGABRT)`, termination namespace TCC, "…must contain an NSCameraUsageDescription
+    key"). The `java` launcher's main bundle has no usage strings, and neither has any host that
+    forgot them. A crash is never an acceptable answer to a web page.
+  - **Check.** Native helper `cocoa_media_missing_kinds(int kinds)` returns the subset of `kinds` whose
+    key the main bundle lacks: `CAMERA` needs `NSCameraUsageDescription`, `MICROPHONE` needs
+    `NSMicrophoneUsageDescription` (camera-and-microphone needs both). A key counts as present only
+    when `[[NSBundle mainBundle] objectForInfoDictionaryKey:]` is an `NSString` of non-zero length
+    (TCC wants a string). It is evaluated per request (one dictionary lookup per key).
+  - **Where.** In D8's delegate, right after the kinds are computed and before the no-handler test.
+    When anything is missing it answers `WKPermissionDecisionDeny` at once, writes one line to stderr,
+    and **does not call Java**. It never answers Prompt there: WebKit's prompt-then-grant reaches the
+    same TCC kill, so the **no-handler path is covered too**. The page sees `NotAllowedError`.
+  - **Why Java is not asked.** No answer could change the outcome; a handler that asks the user would
+    show a dialog whose "Allow" is then silently overruled. The host learns about the problem up
+    front from `missingMacUsageDescriptions()` and, per request, from the stderr line.
+  - **Second line of defence.** Each pending entry also records its kinds, and the function that calls
+    the decision block re-checks: any non-deny answer (`ALLOW` or `DEFAULT`) for kinds with a missing
+    key is turned into Deny with the same stderr line. The main bundle does not change during a
+    process, so this is normally unreachable; it is kept because it costs one lookup and it guards
+    the later dispatch (`cocoa_perm_respond`) as well as the immediate answer.
+  - **Message**, one line, per denied request, naming the requested devices and the missing keys:
+    `swingwebview: camera access denied — this app's Info.plist has no NSCameraUsageDescription (macOS
+    would terminate the app)`; the device words are `camera`, `microphone`, or `camera and microphone`,
+    and several missing keys are joined with ` and `.
+  - **Java helper.** `WebViewComponent.missingMacUsageDescriptions()` (static) returns an unmodifiable
+    `List<String>` of the usage-description key names the running process's main bundle lacks, camera
+    key first; empty when not on macOS or when the loaded native predates the probe. It delegates to
+    `PermissionDispatcher.missingMacUsageDescriptions()`, which calls
+    `WebViewNative.webview_mac_missing_usage_descriptions()` only when `os.name` starts with `Mac`
+    (`int`, the `MediaCaptureKind` bits whose key is missing — the same native helper as the
+    delegate, asked about camera and microphone; `0` on every other native) and maps the bits with a
+    package-private `usageDescriptionKeys(int)`; any `Throwable` gives the empty list. A host can
+    check at start and warn, or hide its video features.
+  - **Screen capture** is not checked: `getDisplayMedia` uses macOS's Screen Recording privacy
+    service, which has no Info.plist usage-description key and does not terminate a process that
+    lacks one (macOS asks the user, or the user grants it in System Settings › Privacy & Security ›
+    Screen & System Audio Recording). It also never reaches D8 with a public type; the delegate's
+    unknown-type branch keeps answering Prompt.
+
+- **D14 · macOS demo launcher: a minimal `.app` whose main bundle carries the keys.**
+  - **Why a native launcher.** `NSBundle mainBundle` follows the executable, so a shell-script `.app`
+    that execs the system `java` still gets `java`'s (empty) bundle, and a launcher that spawns `java`
+    as a child makes a separate process with the same problem. The JVM must run **in** a process whose
+    executable belongs to the bundle.
+  - **Choice: a clang-built launcher with an embedded `__info_plist`, calling the JDK's `JLI_Launch`
+    in-process.** Rejected: `jpackage` (JDK 14+ only, slow, copies or links a runtime, needs a
+    `--resource-dir` Info.plist override — more moving parts for a demo) and a raw
+    `JNI_CreateJavaVM` launcher (it would have to reproduce what libjli does on macOS: start the JVM
+    on a second thread and park the first thread in the Cocoa run loop for AWT, parse `-cp` and the
+    other options, find the JDK). `JLI_Launch` is the entry point the `java` command and jpackage's own
+    launcher use, so the process starts exactly like `java` does.
+  - **`demos/WebViewMediaPermissionDemo/mac/launcher.c`:** reads `JAVA_HOME` from the environment,
+    `dlopen`s the first existing of `$JAVA_HOME/lib/libjli.dylib`, `$JAVA_HOME/lib/jli/libjli.dylib`,
+    `$JAVA_HOME/jre/lib/jli/libjli.dylib`, looks up `JLI_Launch`, and calls it with its own `argc`/`argv`
+    as the `java` command would (no extra JVM args, wildcard classpath on, not `javaw`, default
+    ergonomics). libjli re-enters the executable's `main` on its new thread; `main` is re-entrant
+    (same lookups, libjli's own guard stops the recursion). Any failure prints one
+    `swingwebview-launcher:` line to stderr and exits 1.
+  - **Bundle,** built by `run-mac-media-permission-demo.sh` under
+    `build/WebViewMediaPermissionDemo.app`: `Contents/Info.plist` (`CFBundleIdentifier`
+    `ca.weblite.webview.demos.mediapermission`, `CFBundleExecutable`, `CFBundleName`,
+    `CFBundlePackageType` `APPL`, `LSMinimumSystemVersion` 12.0, `NSHighResolutionCapable`,
+    `NSCameraUsageDescription`, `NSMicrophoneUsageDescription`) and `Contents/MacOS/` holding the
+    launcher, linked with the same plist as `-sectcreate __TEXT __info_plist` (so the keys are present
+    even if the executable is copied out of the bundle). Then `codesign --force --sign -` on the bundle
+    when `codesign` exists. Rebuilt when `launcher.c` or the script is newer than the executable.
+  - **Run.** The script `exec`s `Contents/MacOS/<launcher>` directly (not `open`), so the terminal
+    keeps stdout/stderr and the environment, with the demo's classpath and main class.
+  - **Flags.** `--no-bundle` keeps the old plain-`java` launch, to demo D13: Camera is denied with the
+    stderr line and `NotAllowedError` instead of a crash. `--print-info-plist` prints the generated
+    Info.plist and exits; it runs on any OS (the plist generation is checked on Linux). Unknown
+    arguments print the usage and exit 2.
+  - **Defensive.** Not macOS → an error (except `--print-info-plist`); no `clang` → an error that
+    suggests `xcode-select --install` or `--no-bundle`; a `JAVA_HOME` without `javac` or without
+    libjli → an error naming the path; `plutil -lint` checks the plist when present.
 
 ## R · Requirements
 - Let an application decide every camera, microphone and screen-capture request from the pages it hosts —
@@ -326,6 +415,7 @@ class PermissionDispatcher {
     +int dispatch(id, origin, url, kinds)
     +disposeAll()
     +isAvailable()$
+    +missingMacUsageDescriptions()$
 }
 class WebViewPermissionCallback {
     <<interface>>
@@ -369,7 +459,7 @@ OffscreenWebView ..> WebViewPermissionCallback
 3. **`WebViewNative`, `EmbeddedWebView`, `OffscreenWebView`**, per D5.
 4. **`WebViewComponent`** (field `permissionDispatcher`, setter, getter, `isPermissionHandlerSupported`)
    and **both components** (attach, dispose), per D5 and D6.
-5. **Linux**, per D7; **macOS**, per D8 and D12; **Windows**, per D9.
+5. **Linux**, per D7; **macOS**, per D8, D12 and D13; **Windows**, per D9.
 6. **`PermissionDispatcherTest`:**
    - no handler → `DEFAULT`, nothing pending, handler never built;
    - disposed → `DENY`;
@@ -382,11 +472,20 @@ OffscreenWebView ..> WebViewPermissionCallback
    - a throwing handler denies and reaches the uncaught handler;
    - an answer from another thread after a delay reaches the sink;
    - `disposeAll()` denies every pending request;
-   - `MediaCaptureKind.fromBits` ignores unknown bits.
-7. **Demo, smoke test, run scripts, README, docs**, per D10 and D11.
+   - `MediaCaptureKind.fromBits` ignores unknown bits;
+   - `usageDescriptionKeys`: 0 → empty; 1 → `[NSCameraUsageDescription]`; 2 →
+     `[NSMicrophoneUsageDescription]`; 3 and 7 → both, camera first; the list is unmodifiable;
+   - `missingMacUsageDescriptions()` is empty off macOS (the test JVM's `os.name` decides; skipped on a
+     Mac).
+7. **Demo, smoke test, run scripts, README, docs**, per D10 and D11; the macOS launcher and bundle per
+   D14. The README and the demo's README state the macOS host-app requirements as a checklist: the two
+   Info.plist keys, with jDeploy and jpackage examples; what happens without them (a clean deny with
+   the stderr line, no crash); `missingMacUsageDescriptions()`; screen recording needing no key; and
+   the private-preference note.
 8. **Verification recorded in the PR:** the Linux native built and the smoke test run under Xvfb **in
    the lightweight component, the only Linux mode**; `mvn test`; Windows and macOS natives compiled by CI
-   only — untested on device.
+   only — untested on device. For D13/D14 on Linux: the macOS section syntax-checked against stub
+   headers, the run script checked with `bash -n`, and `--print-info-plist` parsed as a plist.
 
 ## N · Norms
 1. The navigation Canvas's norms hold: Javadoc on every public type states the threading contract;
@@ -401,8 +500,9 @@ OffscreenWebView ..> WebViewPermissionCallback
 1. **No change without a handler:** with no handler installed, every engine receives the request exactly
    as before (the GTK handler returns FALSE, releasing the transient table ref it took, so WebKit's own
    handler runs; WebView2 leaves the args untouched; WKWebView answers Prompt, its documented default).
-   The one deliberate exception is D12: on macOS `navigator.mediaDevices` now exists, so the request
-   reaches WebKit's default at all.
+   The deliberate exceptions are D12 (on macOS `navigator.mediaDevices` now exists, so the request
+   reaches WebKit's default at all) and D13 (on macOS a host without the usage description is denied
+   instead of prompted, because the prompt would end in a crash).
 2. **Never block an engine thread or the EDT** waiting for the application.
 3. **Exactly one answer reaches the engine** per request: first answer wins in Java; native removes the
    entry before applying it; drain and respond race safely because both remove under the table lock.
@@ -413,3 +513,6 @@ OffscreenWebView ..> WebViewPermissionCallback
 6. **Scope:** only camera, microphone and screen-capture requests are routed; every other permission kind
    is left to the engine untouched.
 7. **Test-only switch:** mock capture devices only when `WEBVIEW_MOCK_CAPTURE_DEVICES=1`.
+8. **Never crash the host for a page (macOS, D13):** a camera or microphone request whose usage
+   description is missing from the main bundle is denied — with a handler or without one, before Java
+   is asked, and again at the moment any answer is applied — and never answered Grant or Prompt.

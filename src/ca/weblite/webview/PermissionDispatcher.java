@@ -8,6 +8,8 @@ package ca.weblite.webview;
 import ca.weblite.webview.swing.WebViewComponent;
 
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.List;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executor;
@@ -89,6 +91,39 @@ public final class PermissionDispatcher {
         } catch (Throwable t) {
             return false;
         }
+    }
+
+    /** Info.plist key the macOS main bundle needs before the camera may be
+     *  opened (Canvas 35 D13). */
+    static final String CAMERA_USAGE_KEY = "NSCameraUsageDescription";
+    /** Info.plist key the macOS main bundle needs before the microphone may
+     *  be opened (Canvas 35 D13). */
+    static final String MICROPHONE_USAGE_KEY = "NSMicrophoneUsageDescription";
+
+    /**
+     * Canvas 35 D13: the usage-description keys the running process's main
+     * bundle lacks, camera key first — the keys without which the macOS
+     * native denies camera or microphone requests (macOS would otherwise
+     * terminate the process).  Unmodifiable; empty when not on macOS, or when
+     * the loaded native predates the probe.  Any thread.
+     */
+    public static List<String> missingMacUsageDescriptions() {
+        String os = System.getProperty("os.name", "");
+        if (!os.startsWith("Mac")) return Collections.emptyList();
+        try {
+            return usageDescriptionKeys(WebViewNative.webview_mac_missing_usage_descriptions());
+        } catch (Throwable t) {
+            return Collections.emptyList();
+        }
+    }
+
+    /** Canvas 35 D13: {@link MediaCaptureKind} bits → the Info.plist keys
+     *  they need, camera first; {@code DISPLAY} and unknown bits need none. */
+    static List<String> usageDescriptionKeys(int bits) {
+        List<String> keys = new ArrayList<String>(2);
+        if ((bits & MediaCaptureKind.CAMERA.bit()) != 0) keys.add(CAMERA_USAGE_KEY);
+        if ((bits & MediaCaptureKind.MICROPHONE.bit()) != 0) keys.add(MICROPHONE_USAGE_KEY);
+        return Collections.unmodifiableList(keys);
     }
 
     /** Replace the handler; {@code null} removes it, so the engine decides

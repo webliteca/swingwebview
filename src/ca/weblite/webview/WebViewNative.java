@@ -581,6 +581,14 @@ native static void webview_permission_respond(long id, int decision);
 native static void webview_embed_set_permission_callback(long w, WebViewPermissionCallback cb);
 native static void webview_offscreen_set_permission_callback(long peer, WebViewPermissionCallback cb);
 
+// Canvas 35 D13: the MediaCaptureKind bits (CAMERA, MICROPHONE) whose
+// Info.plist usage description -- NSCameraUsageDescription,
+// NSMicrophoneUsageDescription -- the process's main bundle lacks.  The macOS
+// native answers from [NSBundle mainBundle]; every other native answers 0.
+// Called only on macOS (PermissionDispatcher.missingMacUsageDescriptions()),
+// which absorbs the UnsatisfiedLinkError of a native that predates it.
+native static int webview_mac_missing_usage_descriptions();
+
 // Offscreen (lightweight) twin of webview_embed_set_download_callback.  Same
 // contract; Linux-only in practice, since the offscreen engine exists only on
 // the GTK backend.  Passing 0 for peer is a silent no-op.

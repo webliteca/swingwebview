@@ -17,6 +17,7 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 import java.util.ArrayList;
 import java.util.EnumSet;
@@ -224,5 +225,31 @@ public class PermissionDispatcherTest {
         assertEquals(EnumSet.of(MediaCaptureKind.DISPLAY), MediaCaptureKind.fromBits(4 | 8 | 128));
         assertTrue(MediaCaptureKind.fromBits(0).isEmpty());
         assertEquals(EnumSet.allOf(MediaCaptureKind.class), MediaCaptureKind.fromBits(7));
+    }
+
+    @Test
+    public void usageDescriptionKeysMapKindBits() {
+        assertTrue(PermissionDispatcher.usageDescriptionKeys(0).isEmpty());
+        assertTrue(PermissionDispatcher.usageDescriptionKeys(4).isEmpty());
+        assertEquals(java.util.Arrays.asList("NSCameraUsageDescription"),
+                PermissionDispatcher.usageDescriptionKeys(1));
+        assertEquals(java.util.Arrays.asList("NSMicrophoneUsageDescription"),
+                PermissionDispatcher.usageDescriptionKeys(2));
+        java.util.List<String> both = java.util.Arrays.asList(
+                "NSCameraUsageDescription", "NSMicrophoneUsageDescription");
+        assertEquals(both, PermissionDispatcher.usageDescriptionKeys(3));
+        assertEquals(both, PermissionDispatcher.usageDescriptionKeys(7));
+        try {
+            PermissionDispatcher.usageDescriptionKeys(3).add("x");
+            fail("expected an unmodifiable list");
+        } catch (UnsupportedOperationException expected) {
+            // unmodifiable
+        }
+    }
+
+    @Test
+    public void missingMacUsageDescriptionsIsEmptyOffMacOs() {
+        org.junit.Assume.assumeFalse(System.getProperty("os.name", "").startsWith("Mac"));
+        assertTrue(PermissionDispatcher.missingMacUsageDescriptions().isEmpty());
     }
 }

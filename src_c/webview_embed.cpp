@@ -6931,14 +6931,68 @@ static bool cocoa_fire_navigation(JavaVM *jvm, jobject cb, const char *url,
 struct CocoaPermPending {
     id handler;     // a -copy of the WKPermissionDecision block
     void *engine;
+    int kinds;      // PERM_KIND_* bits, re-checked by cocoa_perm_call (D13)
 };
 static std::mutex g_cocoa_perm_mutex;
 static std::map<long long, CocoaPermPending> g_cocoa_perm;
 
+// Canvas 35 D13: the subset of `kinds` (camera, microphone) whose Info.plist
+// usage description the main bundle lacks.  macOS's privacy system (TCC)
+// terminates a process that opens the device without it, so such a request
+// must never be granted or prompted.  A key counts only as a non-empty
+// NSString.  Screen capture (Screen Recording) has no usage-description key.
+static int cocoa_media_missing_kinds(int kinds) {
+    int missing = 0;
+    id bundle = msg(objc_cls("NSBundle"), sel("mainBundle"));
+    struct { int kind; const char *key; } const kKeys[] = {
+        { PERM_KIND_CAMERA, "NSCameraUsageDescription" },
+        { PERM_KIND_MICROPHONE, "NSMicrophoneUsageDescription" },
+    };
+    for (const auto &k : kKeys) {
+        if (!(kinds & k.kind)) continue;
+        id v = bundle ? msg<id, id>(bundle, sel("objectForInfoDictionaryKey:"),
+                                    ns_str(k.key))
+                      : nullptr;
+        bool ok = v
+            && msg<BOOL, id>(v, sel("isKindOfClass:"), objc_cls("NSString"))
+            && msg<unsigned long>(v, sel("length")) > 0;
+        if (!ok) missing |= k.kind;
+    }
+    return missing;
+}
+
+// Canvas 35 D13: the one stderr line for a request denied for a missing key.
+static void cocoa_media_report_denied(int kinds, int missing) {
+    const char *what =
+        (kinds & PERM_KIND_CAMERA) && (kinds & PERM_KIND_MICROPHONE)
+            ? "camera and microphone"
+            : (kinds & PERM_KIND_CAMERA) ? "camera" : "microphone";
+    std::string keys;
+    if (missing & PERM_KIND_CAMERA) keys = "NSCameraUsageDescription";
+    if (missing & PERM_KIND_MICROPHONE) {
+        if (!keys.empty()) keys += " and ";
+        keys += "NSMicrophoneUsageDescription";
+    }
+    fprintf(stderr,
+            "swingwebview: %s access denied \xE2\x80\x94 this app's Info.plist has "
+            "no %s (macOS would terminate the app)\n",
+            what, keys.c_str());
+    fflush(stderr);
+}
+
 // Call (and release) a copied decision handler: ALLOW -> Grant (1),
-// DENY -> Deny (2), DEFAULT -> Prompt (0).  AppKit main only.
-static void cocoa_perm_call(id handler, int decision) {
+// DENY -> Deny (2), DEFAULT -> Prompt (0).  AppKit main only.  Canvas 35
+// D13's second line of defence: Grant or Prompt for a kind whose usage
+// description is missing becomes Deny.
+static void cocoa_perm_call(id handler, int decision, int kinds) {
     if (!handler) return;
+    if (decision != PERM_DENY) {
+        int missing = cocoa_media_missing_kinds(kinds);
+        if (missing) {
+            cocoa_media_report_denied(kinds, missing);
+            decision = PERM_DENY;
+        }
+    }
     long wk = decision == PERM_ALLOW ? 1L : (decision == PERM_DENY ? 2L : 0L);
     ((void (^)(long))handler)(wk);
     msg(handler, sel("release"));
@@ -6957,6 +7011,18 @@ static void impl_request_media_capture_permission(
         case 1: kinds = PERM_KIND_MICROPHONE; break;                      // WKMediaCaptureTypeMicrophone
         case 2: kinds = PERM_KIND_CAMERA | PERM_KIND_MICROPHONE; break;   // CameraAndMicrophone
         default: break;
+    }
+    // Canvas 35 D13: a host without the usage description would be killed by
+    // macOS once WebKit opens the device -- deny now, handler or not, and
+    // never Prompt (WebKit's prompt-then-grant ends the same way).  Java is
+    // not asked: no answer could change this.
+    if (kinds != 0) {
+        int missing = cocoa_media_missing_kinds(kinds);
+        if (missing) {
+            cocoa_media_report_denied(kinds, missing);
+            ((void (^)(long))decisionHandler)(2L);   // WKPermissionDecisionDeny
+            return;
+        }
     }
     if (!e || !e->permission_callback || e->destroyed.load() || kinds == 0) {
         // What WebKit does when the delegate lacks this selector: prompt.
@@ -6986,7 +7052,7 @@ static void impl_request_media_capture_permission(
     long long pid = ++g_perm_next_id;
     {
         std::lock_guard<std::mutex> lk(g_cocoa_perm_mutex);
-        g_cocoa_perm[pid] = CocoaPermPending{handler, e};
+        g_cocoa_perm[pid] = CocoaPermPending{handler, e, kinds};
     }
     // Java never blocks here (the handler runs later on the EDT).
     int d = perm_upcall(e->jvm, e->permission_callback, pid, o.c_str(),
@@ -6996,21 +7062,23 @@ static void impl_request_media_capture_permission(
         std::lock_guard<std::mutex> lk(g_cocoa_perm_mutex);
         g_cocoa_perm.erase(pid);
     }
-    cocoa_perm_call(handler, d);
+    cocoa_perm_call(handler, d, kinds);
 }
 
 // Canvas 35 D8: a later answer, from any thread; looked up on AppKit main.
 static void cocoa_perm_respond(long long pid, int decision) {
     dispatch_async(dispatch_get_main_queue(), ^{
         id handler = nullptr;
+        int kinds = 0;
         {
             std::lock_guard<std::mutex> lk(g_cocoa_perm_mutex);
             auto it = g_cocoa_perm.find(pid);
             if (it == g_cocoa_perm.end()) return;
             handler = it->second.handler;
+            kinds = it->second.kinds;
             g_cocoa_perm.erase(it);
         }
-        cocoa_perm_call(handler, decision);
+        cocoa_perm_call(handler, decision, kinds);
     });
 }
 
@@ -7028,7 +7096,7 @@ static void cocoa_perm_drain(void *engine) {
             }
         }
     }
-    for (id h : mine) cocoa_perm_call(h, PERM_DENY);
+    for (id h : mine) cocoa_perm_call(h, PERM_DENY, 0);
 }
 
 static void impl_decide_policy_for_navigation_action(
@@ -10452,6 +10520,18 @@ JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1permis
     return JNI_TRUE;
 #else
     return JNI_FALSE;
+#endif
+}
+
+// Canvas 35 D13: the camera / microphone bits whose Info.plist usage
+// description the main bundle lacks; 0 on every non-macOS native.
+JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1mac_1missing_1usage_1descriptions
+  (JNIEnv *, jclass) {
+#ifdef WEBVIEW_COCOA
+    return (jint)embed::cocoa_media_missing_kinds(
+        embed::PERM_KIND_CAMERA | embed::PERM_KIND_MICROPHONE);
+#else
+    return 0;
 #endif
 }
 
