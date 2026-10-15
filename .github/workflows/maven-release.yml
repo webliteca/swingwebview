@@ -113,11 +113,13 @@ jobs:
           set -euo pipefail
           mkdir -p "natives/${{ matrix.native_dir }}"
           # Bullseye is EOL: its -security pool is already emptied, so the
-          # container uses only the permanent "bullseye main" suite on
-          # archive.debian.org (signatures still verified; only the expired
-          # Valid-Until is waived).  The pin downgrades the image's newer
-          # security builds of base packages (libc6, ...) to the archive's,
-          # or their -dev packages cannot be installed.  Keep comments out
+          # container uses only the "bullseye main" suite, from deb.debian.org
+          # first and archive.debian.org as the fallback (apt mirror+file:
+          # the archive is missing some files its own index lists).
+          # Signatures are still verified; only an expired Valid-Until is
+          # waived.  The pin downgrades the image's newer security builds of
+          # base packages (libc6, ...) to bullseye main's, or their -dev
+          # packages cannot be installed.  Keep comments out
           # of the single-quoted script below: an apostrophe would end it.
           docker run --rm \
               -v "$GITHUB_WORKSPACE:/src" -w /src \
@@ -126,9 +128,11 @@ jobs:
               -e HOST_UID="$(id -u)" -e HOST_GID="$(id -g)" \
               debian:11 bash -euo pipefail -c '
                 export DEBIAN_FRONTEND=noninteractive
-                echo "deb http://archive.debian.org/debian bullseye main" > /etc/apt/sources.list
+                printf "http://deb.debian.org/debian\nhttp://archive.debian.org/debian\n" \
+                    > /etc/apt/bullseye-mirrors.txt
+                echo "deb mirror+file:/etc/apt/bullseye-mirrors.txt bullseye main" > /etc/apt/sources.list
                 rm -f /etc/apt/sources.list.d/*
-                printf "Package: *\nPin: origin \"archive.debian.org\"\nPin-Priority: 1001\n" \
+                printf "Package: *\nPin: release n=bullseye\nPin-Priority: 1001\n" \
                     > /etc/apt/preferences.d/archive-bullseye
                 printf "Acquire::Retries \"5\";\nAcquire::http::No-Cache \"true\";\nAcquire::Check-Valid-Until \"false\";\n" \
                     > /etc/apt/apt.conf.d/80ci
