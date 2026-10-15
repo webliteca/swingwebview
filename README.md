@@ -1054,10 +1054,23 @@ wv.setPermissionHandler(req -> {          // runs on the EDT
   * **macOS 12+**: camera and microphone through the UI delegate's
     `requestMediaCapturePermissionForOrigin…`; screen capture keeps WebKit's
     own behaviour. Before macOS 12, nothing changes.
-* **macOS Info.plist.** The host application must declare
-  `NSCameraUsageDescription` and `NSMicrophoneUsageDescription`; without them
-  macOS terminates the process the first time a page uses the device. macOS's
-  own one-time consent prompt still appears on top of your handler's answer.
+* **macOS: `navigator.mediaDevices` is always exposed.** An embedded WKWebView
+  hides `navigator.mediaDevices` unless WebKit's private preferences are on
+  (Safari turns them on; ordinary apps don't). The library turns on
+  `_mediaDevicesEnabled`, `_mediaStreamEnabled` and `_screenCaptureEnabled`
+  for every web view and popup, each only where the running WebKit has it.
+  With no handler, WebKit's own permission prompt decides, as WebView2's does
+  on Windows. To keep a page off the camera and microphone, deny in your handler.
+* **macOS Info.plist — required.** Because any page can now ask for the
+  camera or microphone, the host application must declare
+  `NSCameraUsageDescription` and `NSMicrophoneUsageDescription`. Without them,
+  WebKit refuses the request (`NotAllowedError`), or macOS's privacy system
+  terminates the process the first time a page uses the device. macOS's own
+  one-time consent prompt still appears on top of your handler's answer.
+* **macOS private API.** These preferences are private WebKit API, the same
+  kind as `developerExtrasEnabled`, which debug mode already uses. They're
+  fine for applications distributed outside the Mac App Store, but App Store
+  review may reject an app that uses private API.
 * **WebRTC.** Whether `RTCPeerConnection` exists depends on how the engine was
   built — Ubuntu 24.04's WebKitGTK has none, even with `enable-webrtc` on. A
   page detects it with `typeof RTCPeerConnection === 'function'` and falls

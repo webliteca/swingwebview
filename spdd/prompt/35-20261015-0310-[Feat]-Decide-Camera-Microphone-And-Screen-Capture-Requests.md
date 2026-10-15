@@ -44,6 +44,7 @@ builds_on:
   resolves optionally) and `src_c/webkit_shim.h`: optional media-permission symbol groups (D7a).
 - **Edited** `src_c/webview_embed.cpp`: the GTK `permission-request` handler and media settings on
   `Engine` and `OffEngine` (D7); the Cocoa `requestMediaCapturePermissionForOrigin…` selector (D8); the
+  WKWebView media preferences on the configuration, for the engine and popup children (D12); the
   shared JNI bridges (D5).
 - **Edited** `windows/webview_embed.cc`: `PermissionRequested` on the engine and an adopted child, and the
   JNI bridges (D9).
@@ -56,8 +57,9 @@ builds_on:
   `run-mac-media-permission-demo.sh`, `run-windows-media-permission-demo.bat`.
 - **New** `demos/WebViewMediaSmokeTest/src/ca/weblite/webview/demos/WebViewMediaPermissionSmokeTest.java`.
 - **Edited** `run-linux-media-smoketest.sh` and `demos/WebViewMediaSmokeTest/README.md` (D11).
-- **Edited** `README.md` (a "Camera, microphone and screen capture" section and a demo entry) and
-  `docs/index.html` (a demo card).
+- **Edited** `README.md` (a "Camera, microphone and screen capture" section and a demo entry, including
+  the macOS private-preference and Info.plist notes of D12) and `docs/index.html` (a demo card).
+- **Edited** `demos/WebViewMediaPermissionDemo/README.md` (macOS notes of D12).
 
 ## Decisions (resolved here)
 
@@ -187,7 +189,8 @@ builds_on:
     dispatcher never blocks). Decisions: `ALLOW` → Grant (1), `DENY` → Deny (2), `DEFAULT` → Prompt (0).
     Respond and drain run with `dispatch_async` on the main queue; the block is released after it is
     called.
-  - **Screen capture** has no public WKWebView hook; `getDisplayMedia` keeps WebKit's own behaviour.
+  - **Screen capture** has no public WKWebView hook; `getDisplayMedia` keeps WebKit's own behaviour
+    (D12 only makes the API available where WebKit has the private switch).
   - **Info.plist:** a host app must declare `NSCameraUsageDescription` and
     `NSMicrophoneUsageDescription`; without them macOS terminates the process when the page first uses
     the device. The OS's own consent prompt still appears once per app, on top of the handler's answer.
@@ -237,6 +240,43 @@ builds_on:
      handler saw `[DISPLAY]`, SKIP (not a failure) when no request reached it within 5 s, e.g. with
      WebKitGTK < 2.42 or no display-capture backend under Xvfb.
   7. **webrtc** (informational) — prints `typeof RTCPeerConnection`.
+
+- **D12 · macOS: expose `navigator.mediaDevices` in the embedded WKWebView.**
+  - **Why.** A WKWebView in an ordinary embedding app (not Safari) leaves WebKit's private preference
+    `_mediaDevicesEnabled` off, so `navigator.mediaDevices` is `undefined`: `getUserMedia` throws a
+    `TypeError` in the page and D8's delegate is never reached. Observed on a Mac with the demo in
+    the heavyweight component: secure context true, `RTCPeerConnection` present, handler supported,
+    `md.getUserMedia` undefined.
+  - **What.** One native helper takes a `WKWebViewConfiguration`, reads its `preferences`, and turns on,
+    each only if the preferences object `respondsToSelector:` the setter:
+    `_setMediaDevicesEnabled:` (exposes `navigator.mediaDevices`), `_setMediaStreamEnabled:`
+    (`getUserMedia` itself) and `_setScreenCaptureEnabled:` (`getDisplayMedia`). A missing selector is
+    skipped silently, leaving that WebKit version exactly as before (no `mediaDevices`). Never
+    key-value coding on these keys: `setValue:forKey:` on a key the class doesn't have throws
+    `NSUnknownKeyException` and would crash the app on a WebKit without it.
+  - **When.** On the engine's configuration **before** `initWithFrame:configuration:` (the web view
+    takes its preferences from the configuration at init), right after the custom schemes are
+    installed. Popup children are created from the configuration WebKit hands the UI delegate, which
+    is derived from the opener's and carries its preferences; the helper is applied to it as well,
+    before the child's `initWithFrame:configuration:`, so a child is covered whatever WebKit copies.
+  - **Always on, not opt-in.** `mediaDevices` is exposed whether or not a permission handler is set.
+    With no handler, D8 answers Prompt and WebKit shows its own permission prompt — the same as
+    Windows, where WebView2's prompt is the default. An opt-in would leave the documented default
+    ("WebKit's own permission prompt") unreachable. The cost, recorded: a page can now reach the
+    capture devices in any host, so the **host must declare `NSCameraUsageDescription` and
+    `NSMicrophoneUsageDescription`**. WebKit checks the host bundle for them and refuses the request
+    (`NotAllowedError`) when one is missing; where that check does not apply, macOS's privacy system
+    may terminate the process on first access. An application that must never expose the devices
+    denies in its handler.
+  - **Screen capture.** `_setScreenCaptureEnabled:` makes `getDisplayMedia` available where WebKit has
+    it; whether a request then reaches D8's delegate depends on the WebKit version (there is no public
+    display-capture hook), so screen capture stays WebKit's decision as D8 says.
+  - **Other macOS paths.** macOS has no offscreen engine (the lightweight entry points are stubs
+    there) and creates no other `WKWebViewConfiguration`; the engine and popup children are the only
+    places.
+  - **Private API.** These are private WebKit preferences, the same category as the existing
+    `developerExtrasEnabled` used in debug mode: fine for applications distributed outside the Mac App
+    Store; App Store review may reject private API use. Documented in the README and the demo's README.
 
 ## R · Requirements
 - Let an application decide every camera, microphone and screen-capture request from the pages it hosts —
@@ -329,7 +369,7 @@ OffscreenWebView ..> WebViewPermissionCallback
 3. **`WebViewNative`, `EmbeddedWebView`, `OffscreenWebView`**, per D5.
 4. **`WebViewComponent`** (field `permissionDispatcher`, setter, getter, `isPermissionHandlerSupported`)
    and **both components** (attach, dispose), per D5 and D6.
-5. **Linux**, per D7; **macOS**, per D8; **Windows**, per D9.
+5. **Linux**, per D7; **macOS**, per D8 and D12; **Windows**, per D9.
 6. **`PermissionDispatcherTest`:**
    - no handler → `DEFAULT`, nothing pending, handler never built;
    - disposed → `DENY`;
@@ -361,12 +401,15 @@ OffscreenWebView ..> WebViewPermissionCallback
 1. **No change without a handler:** with no handler installed, every engine receives the request exactly
    as before (the GTK handler returns FALSE, releasing the transient table ref it took, so WebKit's own
    handler runs; WebView2 leaves the args untouched; WKWebView answers Prompt, its documented default).
+   The one deliberate exception is D12: on macOS `navigator.mediaDevices` now exists, so the request
+   reaches WebKit's default at all.
 2. **Never block an engine thread or the EDT** waiting for the application.
 3. **Exactly one answer reaches the engine** per request: first answer wins in Java; native removes the
    entry before applying it; drain and respond race safely because both remove under the table lock.
 4. **Fail closed:** a throwing handler, a JNI exception, a failed deferral, or disposal denies.
 5. **No new mandatory dependency:** Linux symbols are optional through the runtime loader; settings by
-   property lookup; macOS selector added only on 12+.
+   property lookup; macOS selector added only on 12+; macOS private preference setters called only
+   when `respondsToSelector:` says they exist (D12), never by key-value coding.
 6. **Scope:** only camera, microphone and screen-capture requests are routed; every other permission kind
    is left to the engine untouched.
 7. **Test-only switch:** mock capture devices only when `WEBVIEW_MOCK_CAPTURE_DEVICES=1`.

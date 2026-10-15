@@ -5029,6 +5029,33 @@ static void cocoa_install_schemes(id config) {
     }
 }
 
+// Canvas 35 D12: expose navigator.mediaDevices (and getUserMedia /
+// getDisplayMedia) in an embedded WKWebView.  An embedding app, unlike Safari,
+// gets WebKit's private _mediaDevicesEnabled preference off, so the page sees
+// navigator.mediaDevices === undefined and the D8 delegate is never reached.
+// Called on a configuration BEFORE initWithFrame:configuration:, since the web
+// view takes its preferences from the configuration at init.  Each private
+// setter is called only when the preferences object responds to it; a missing
+// one is skipped, leaving that WebKit exactly as before.  Never key-value
+// coding here: setValue:forKey: on an unknown key throws NSUnknownKeyException.
+// Private WebKit API, like developerExtrasEnabled (see the README).
+static void cocoa_enable_media_capture(id config) {
+    if (!config) return;
+    id prefs = msg(config, sel("preferences"));
+    if (!prefs) return;
+    static const char *const kSetters[] = {
+        "_setMediaDevicesEnabled:",   // navigator.mediaDevices
+        "_setMediaStreamEnabled:",    // getUserMedia
+        "_setScreenCaptureEnabled:",  // getDisplayMedia
+    };
+    for (const char *name : kSetters) {
+        SEL setter = sel(name);
+        if (msg<BOOL, SEL>(prefs, sel("respondsToSelector:"), setter)) {
+            msg<void, BOOL>(prefs, setter, YES);
+        }
+    }
+}
+
 // Apply a response on AppKit main, if its task is still pending (D13).
 static void cocoa_scheme_respond(long long rid, int status,
                                  std::vector<std::string> pairs,
@@ -6303,6 +6330,11 @@ static id impl_create_web_view(id self, SEL, id webView, id configuration,
     // WebKit drives the ORIGINAL navigation-action request (POST verb + body)
     // into this child regardless of disposition, which is what preserves POST
     // and window.opener for both NATIVE_WINDOW and ADOPT.
+    //
+    // Canvas 35 D12: the configuration derives from the opener's and should
+    // carry its media preferences; set them again before init so the child
+    // exposes navigator.mediaDevices whatever WebKit copied.
+    cocoa_enable_media_capture(configuration);
     id child = msg(objc_cls("WKWebView"), sel("alloc"));
     child = msg<id, CGRect, id>(child, sel("initWithFrame:configuration:"),
                                 CGRectMake(0, 0, W, H), configuration);
@@ -8100,6 +8132,8 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
         // Canvas 30 D13: custom schemes must be on the configuration before
         // the WKWebView is created from it; popups inherit them from it.
         cocoa_install_schemes(e->config);
+        // Canvas 35 D12: media preferences, also before the WKWebView exists.
+        cocoa_enable_media_capture(e->config);
         e->manager = msg(e->config, sel("userContentController"));
         id wv = msg(objc_cls("WKWebView"), sel("alloc"));
         wv = msg<id, CGRect, id>(

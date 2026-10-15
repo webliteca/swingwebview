@@ -40,6 +40,12 @@ The log shows each request's origin, kinds and address, and the thread the handl
   it on first access. This script runs a plain `java`, so macOS attributes the request to your terminal
   or JDK; a packaged application must declare both keys itself. macOS's own one-time consent prompt
   still appears on top of the handler's answer.
+  The library turns on WebKit's private `_mediaDevicesEnabled` / `_mediaStreamEnabled` /
+  `_screenCaptureEnabled` preferences (where the WebKit has them) so that `navigator.mediaDevices`
+  exists in the embedded view; without them the page reports
+  `TypeError … evaluating 'md.getUserMedia'`. A host missing the two Info.plist keys gets
+  `NotAllowedError` from WebKit, or is terminated by macOS. These are private WebKit API: fine
+  outside the Mac App Store, but App Store review may object.
 - **Windows**: camera and microphone only. Windows' own privacy settings still apply.
 - **Linux**: the lightweight component is the only Linux mode. Ubuntu 24.04's WebKitGTK is built
   without WebRTC, so `RTCPeerConnection` is missing there even though capture works.
