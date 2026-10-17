@@ -293,6 +293,28 @@ jobs:
           java-version: '11'
           cache: maven
 
+      # Pin Maven instead of taking the runner image's.  v1.11.0's Central
+      # upload was rejected ("Bundle has content that does NOT have a .pom
+      # file: ca/weblite/webview") after the image moved to a Maven whose
+      # install plugin (3.2.0) and resolver leave
+      # maven-metadata-central-staging.xml where central-publishing 0.7.0
+      # no longer deletes it.  3.9.11 is the last Maven these releases
+      # published with (install 3.1.4), and its bundle holds only the
+      # versioned directory.  Verified against the published .sha512.
+      - name: Install pinned Maven
+        shell: bash
+        env:
+          MAVEN_VERSION: 3.9.11
+        run: |
+          set -euo pipefail
+          base="https://repo1.maven.org/maven2/org/apache/maven/apache-maven/${MAVEN_VERSION}"
+          tgz="apache-maven-${MAVEN_VERSION}-bin.tar.gz"
+          curl -fsSL --retry 5 -o "$RUNNER_TEMP/$tgz" "$base/$tgz"
+          echo "$(curl -fsSL --retry 5 "$base/$tgz.sha512")  $RUNNER_TEMP/$tgz" | sha512sum -c -
+          tar xzf "$RUNNER_TEMP/$tgz" -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/apache-maven-${MAVEN_VERSION}/bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/apache-maven-${MAVEN_VERSION}/bin/mvn" -v
+
       # setup-java's server-id input configures exactly one server; this
       # release authenticates two, so write the settings file directly.
       # Credentials stay as ${env.*} lookups resolved per deploy step.

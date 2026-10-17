@@ -634,6 +634,11 @@ Files: `pom.xml`, `.github/workflows/maven-release.yml`
      repository token, and `central`, with the portal API token
      credentials. The job requests `packages: write` permission
      in addition to `contents: read`.
+   - The deploy job runs a pinned Maven (3.9.11), not the runner
+     image's: an "Install pinned Maven" step downloads the
+     distribution from Maven Central, checks it against the
+     published `.sha512`, and puts its `bin/` first on `PATH`
+     before any `mvn` step runs.
    - After the version is set from the tag, the job deploys twice
      over the same tree: first `github-deploy`, then
      `central-deploy` with the `sign-artifacts` profile and the
@@ -747,6 +752,17 @@ Files: `pom.xml`, `.github/workflows/maven-release.yml`
   Central. Do not move a deploy step ahead of that assertion, and
   do not add a deploy step to `build.yml` — publication belongs to
   tag-triggered releases only.
+- **The release job's Maven is pinned, not inherited.** The runner
+  image's Maven moves under the workflow. v1.11.0's Central upload
+  was rejected ("Bundle has content that does NOT have a .pom file:
+  ca/weblite/webview") after the image moved to a Maven whose
+  install plugin (3.2.0) and resolver leave
+  `maven-metadata-central-staging.xml` in the group/artifact
+  directory, where `central-publishing-maven-plugin` 0.7.0 no
+  longer deletes it. 3.9.11 (install plugin 3.1.4) bundles only
+  the versioned directory. Raise the pin only together with a check
+  that the Central bundle still holds nothing outside
+  `ca/weblite/webview/<version>/`.
 - **Deploy targets stay inside their profiles (never-relax).**
   Moving `central-publishing-maven-plugin` back into the top-level
   build silently re-breaks the GitHub Packages leg: with its
