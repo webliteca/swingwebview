@@ -354,6 +354,13 @@ struct Engine {
     EventRegistrationToken frame_navigation_starting_token{};
     bool navigation_registered = false;
 
+    // Canvas 35 D9: JNI global ref to the WebViewPermissionCallback, or
+    // nullptr, read by PermissionRequestedHandler on the WebView2 thread; and
+    // the PermissionRequested token, removed in destroy_engine.
+    jobject permission_callback = nullptr;
+    EventRegistrationToken permission_token{};
+    bool permission_registered = false;
+
     // The ICoreWebView2Environment this engine was created from, AddRef'd at
     // environment-ready and Release'd in destroy_engine (Canvas 17).  The
     // NewWindowRequested handler creates the child popup controller from THIS
@@ -2688,6 +2695,198 @@ static void win_register_navigation(Engine *e, ICoreWebView2 *wv) {
     e->navigation_registered = ok;
 }
 
+// ---------------------------------------------------------------------------
+// Canvas 35 D9: camera and microphone permission requests (WebView2).  The
+// args (AddRef'd) and, once pending, the deferral are kept in one table keyed
+// by id and tagged with the engine and its worker thread; every touch of them
+// happens on that thread.  SDK 1.0.2592.51 has no screen-capture kind, so
+// getDisplayMedia keeps WebView2's own picker.
+// ---------------------------------------------------------------------------
+struct WinPermPending {
+    ICoreWebView2PermissionRequestedEventArgs *args = nullptr;
+    ICoreWebView2Deferral *deferral = nullptr;
+    Engine *engine = nullptr;
+    DWORD thread_id = 0;
+};
+static std::mutex g_win_perm_mutex;
+static std::map<long long, WinPermPending> g_win_perm;
+static std::atomic<long long> g_win_perm_next_id(0);
+
+// Apply a decision and release: ALLOW / DENY set the state, DEFAULT leaves it
+// at COREWEBVIEW2_PERMISSION_STATE_DEFAULT (WebView2's own behaviour).
+static void win_perm_finish(const WinPermPending &p, int decision) {
+    if (p.args) {
+        if (decision == 1) p.args->put_State(COREWEBVIEW2_PERMISSION_STATE_ALLOW);
+        else if (decision == 2) p.args->put_State(COREWEBVIEW2_PERMISSION_STATE_DENY);
+    }
+    if (p.deferral) {
+        p.deferral->Complete();
+        p.deferral->Release();
+    }
+    if (p.args) p.args->Release();
+}
+
+// WebViewPermissionCallback.onPermissionRequested on the WebView2 thread:
+// -1 (pending) or a PermissionDecision ordinal; any JNI failure denies.
+static int win_perm_upcall(JavaVM *jvm, jobject cb, long long id,
+                           const std::string &url, int kinds) {
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return 2;
+        detach = true;
+    }
+    int answer = 2;
+    jstring jo = env->NewStringUTF("");   // WebView2 reports no origin; Java derives it
+    jstring ju = env->NewStringUTF(url.c_str());
+    jclass cls = env->GetObjectClass(cb);
+    if (cls) {
+        jmethodID mid = env->GetMethodID(cls, "onPermissionRequested",
+            "(JLjava/lang/String;Ljava/lang/String;I)I");
+        if (mid) {
+            answer = (int)env->CallIntMethod(cb, mid, (jlong)id, jo, ju, (jint)kinds);
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        answer = 2;
+    }
+    if (jo) env->DeleteLocalRef(jo);
+    if (ju) env->DeleteLocalRef(ju);
+    if (detach) jvm->DetachCurrentThread();
+    if (answer < -1 || answer > 2) answer = 2;
+    return answer;
+}
+
+class PermissionRequestedHandler : public CallbackBase<
+    ICoreWebView2PermissionRequestedEventHandler> {
+public:
+    explicit PermissionRequestedHandler(Engine *e) : m_engine(e) {}
+    HRESULT STDMETHODCALLTYPE Invoke(
+        ICoreWebView2 *,
+        ICoreWebView2PermissionRequestedEventArgs *args) override {
+        if (!args || !m_engine) return S_OK;
+        jobject cb = m_engine->permission_callback;
+        JavaVM *jvm = m_engine->jvm;
+        if (!cb || !jvm) return S_OK;          // no handler: WebView2's own prompt
+        COREWEBVIEW2_PERMISSION_KIND kind = COREWEBVIEW2_PERMISSION_KIND_UNKNOWN_PERMISSION;
+        if (FAILED(args->get_PermissionKind(&kind))) return S_OK;
+        int kinds = 0;
+        if (kind == COREWEBVIEW2_PERMISSION_KIND_CAMERA) kinds = 1;            // CAMERA
+        else if (kind == COREWEBVIEW2_PERMISSION_KIND_MICROPHONE) kinds = 2;   // MICROPHONE
+        if (kinds == 0) return S_OK;           // every other kind: untouched
+
+        LPWSTR uri_w = nullptr;
+        args->get_Uri(&uri_w);
+        std::string uri = wide_to_utf8(uri_w);
+        if (uri_w) CoTaskMemFree(uri_w);
+
+        long long id = ++g_win_perm_next_id;
+        args->AddRef();
+        {
+            std::lock_guard<std::mutex> lk(g_win_perm_mutex);
+            WinPermPending &p = g_win_perm[id];
+            p.args = args;
+            p.engine = m_engine;
+            p.thread_id = GetCurrentThreadId();
+        }
+        int d = win_perm_upcall(jvm, cb, id, uri, kinds);
+        if (d == -1) {
+            ICoreWebView2Deferral *deferral = nullptr;
+            HRESULT hr = args->GetDeferral(&deferral);
+            WinPermPending p;
+            {
+                std::lock_guard<std::mutex> lk(g_win_perm_mutex);
+                auto it = g_win_perm.find(id);
+                if (it == g_win_perm.end()) {
+                    // Cannot happen (answers and drains run on this thread,
+                    // after we return); complete defensively.
+                    if (deferral) { deferral->Complete(); deferral->Release(); }
+                    return S_OK;
+                }
+                if (SUCCEEDED(hr) && deferral) {
+                    it->second.deferral = deferral;
+                    return S_OK;
+                }
+                p = it->second;
+                g_win_perm.erase(it);
+            }
+            WV_LOG("permission GetDeferral failed: HRESULT=0x%08lx", (unsigned long)hr);
+            win_perm_finish(p, 2);             // fail closed
+            return S_OK;
+        }
+        WinPermPending p;
+        {
+            std::lock_guard<std::mutex> lk(g_win_perm_mutex);
+            auto it = g_win_perm.find(id);
+            if (it == g_win_perm.end()) return S_OK;
+            p = it->second;
+            g_win_perm.erase(it);
+        }
+        win_perm_finish(p, d);
+        return S_OK;
+    }
+
+private:
+    Engine *m_engine;
+};
+
+// Canvas 35 D9: register the permission handler on `wv` for `e`.  Called
+// beside win_register_navigation, for a fresh engine and an adopted child.
+static void win_register_permission(Engine *e, ICoreWebView2 *wv) {
+    if (!e || !wv) return;
+    auto *ph = new PermissionRequestedHandler(e);
+    e->permission_registered =
+        SUCCEEDED(wv->add_PermissionRequested(ph, &e->permission_token));
+    ph->Release();
+}
+
+// Canvas 35 D5: a later answer, from any thread; looked up on the request's
+// worker thread when the posted op runs (after the handler returned).
+static void win_perm_respond(long long id, int decision) {
+    DWORD tid = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_win_perm_mutex);
+        auto it = g_win_perm.find(id);
+        if (it == g_win_perm.end()) return;
+        tid = it->second.thread_id;
+    }
+    // If the worker thread has already exited, the post fails and the COM
+    // references are leaked rather than released on the wrong apartment.
+    post_to_worker_thread(tid, [id, decision] {
+        WinPermPending p;
+        {
+            std::lock_guard<std::mutex> lk(g_win_perm_mutex);
+            auto it = g_win_perm.find(id);
+            if (it == g_win_perm.end()) return;
+            p = it->second;
+            g_win_perm.erase(it);
+        }
+        win_perm_finish(p, decision);
+    });
+}
+
+// Canvas 35 D5: deny every request still pending for `e`.  Runs on e's
+// worker thread; compares the pointer only, never dereferences it.
+static void win_perm_drain(Engine *e) {
+    std::vector<WinPermPending> mine;
+    {
+        std::lock_guard<std::mutex> lk(g_win_perm_mutex);
+        for (auto it = g_win_perm.begin(); it != g_win_perm.end();) {
+            if (it->second.engine == e) {
+                mine.push_back(it->second);
+                it = g_win_perm.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (const WinPermPending &p : mine) win_perm_finish(p, 2);
+}
+
 // NewWindowRequested -> allow/deny via Java, then create the linked child in an
 // engine-owned top-level window.  Deferral pattern; see the block comment.
 class NewWindowRequestedHandler : public CallbackBase<
@@ -3372,6 +3571,8 @@ static void engine_thread(Engine *e, HWND /*parent*/, int width, int height,
 
                     // Navigation decisions (Canvas 34 D9).
                     win_register_navigation(e, e->webview);
+                    // Camera / microphone requests (Canvas 35 D9).
+                    win_register_permission(e, e->webview);
 
                     // Custom URL schemes (Canvas 32 D3); a no-op when none
                     // are registered.
@@ -3516,6 +3717,12 @@ static void destroy_engine(Engine *e) {
     if (!e) return;
     release_parent_resize_hook(e->parent_hook_tid);
     e->parent_hook_tid = 0;
+    // Canvas 35 D9: deny every camera / microphone request still pending, on
+    // the worker thread, queued ahead of the Close / WM_EMBED_QUIT below.
+    if (e->thread_id) {
+        Engine *eng = e;
+        post_to_worker_thread(e->thread_id, [eng] { win_perm_drain(eng); });
+    }
     if (e->shared_thread) {
         // Canvas 20: an ADOPTED engine shares the opener's WebView2 worker
         // thread.  Posting WM_EMBED_QUIT here would exit the opener's message
@@ -3650,6 +3857,23 @@ static void destroy_engine(Engine *e) {
         }
         if (env) env->DeleteGlobalRef(e->navigation_callback);
         e->navigation_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
+    // Canvas 35 D9: stop asking, then drop the permission callback's global
+    // ref, the same way.
+    if (e->permission_registered && e->webview) {
+        e->webview->remove_PermissionRequested(e->permission_token);
+        e->permission_registered = false;
+    }
+    if (e->permission_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->permission_callback);
+        e->permission_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
     // Symmetric cleanup for the popup callback global ref (Canvas 17).  The
@@ -3824,6 +4048,8 @@ static Engine *adopt_retained_popup(JNIEnv *env, HWND parent, RetainedPopup *rp,
 
             // Navigation decisions (Canvas 34 D9) on the adopted child.
             win_register_navigation(e, child);
+            // Camera / microphone requests (Canvas 35 D9) on the adopted child.
+            win_register_permission(e, child);
         }
 
         // The hidden holder top-level window is no longer needed once the
@@ -4498,6 +4724,35 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
 }
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1navigation_1callback
+  (JNIEnv *, jclass, jlong, jobject) {
+    // Windows has no offscreen engine; stub for link-symmetry.
+}
+
+// Camera / microphone permission requests (Canvas 35 D5, D9).
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1permission_1available
+  (JNIEnv *, jclass) {
+    return JNI_TRUE;
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1permission_1respond
+  (JNIEnv *, jclass, jlong id, jint decision) {
+    embed_win::win_perm_respond((long long)id, (int)decision);
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1permission_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    auto *e = (Engine *)wv;
+    if (!e) return;
+    if (e->permission_callback) {
+        env->DeleteGlobalRef(e->permission_callback);
+        e->permission_callback = nullptr;
+    }
+    if (cb) {
+        e->permission_callback = env->NewGlobalRef(cb);
+    }
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1permission_1callback
   (JNIEnv *, jclass, jlong, jobject) {
     // Windows has no offscreen engine; stub for link-symmetry.
 }

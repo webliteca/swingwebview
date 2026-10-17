@@ -511,6 +511,31 @@ public class OffscreenWebView {
         }
         return this;
     }
+
+    /**
+     * Register the media-capture permission callback (Canvas 35 D5): the
+     * engine calls it on its UI thread for each camera, microphone or
+     * screen-capture request, and it answers at once or later through
+     * {@code WebViewNative.webview_permission_respond}.  Anchors {@code cb}
+     * in {@link #heap} so the JVM does not collect the adapter while the
+     * native side holds a global ref.  An older native library without the
+     * feature leaves requests to the engine;
+     * {@code WebViewComponent.isPermissionHandlerSupported()} says so.
+     *
+     * @return {@code this} for chaining
+     */
+    public OffscreenWebView setPermissionCallback(WebViewPermissionCallback cb) {
+        checkAlive();
+        if (cb != null) {
+            heap.add(cb);
+        }
+        try {
+            WebViewNative.webview_offscreen_set_permission_callback(peer, cb);
+        } catch (UnsatisfiedLinkError ule) {
+            // Native library predates Canvas 35.
+        }
+        return this;
+    }
     /**
      * Register the download callback for browser-initiated file
      * downloads.  Anchors {@code cb} in {@link #heap} so the JVM does not

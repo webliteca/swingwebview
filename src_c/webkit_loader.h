@@ -148,7 +148,25 @@
 #else
 #define WK_OPT_2_40(X)
 #endif
-#define WK_WEBKIT_OPT_SYMS(X) WK_OPT_2_12(X) WK_OPT_2_36(X) WK_OPT_2_40(X)
+// Media-capture permission requests (Canvas 35 D7a): optional, so a runtime
+// without them still loads and leaves every request to WebKit.
+#if WEBKIT_CHECK_VERSION(2, 8, 0)
+#define WK_OPT_MEDIA(X)                                                        \
+  X(webkit_permission_request_allow)                                          \
+  X(webkit_permission_request_deny)                                           \
+  X(webkit_user_media_permission_request_get_type)                            \
+  X(webkit_user_media_permission_is_for_audio_device)                         \
+  X(webkit_user_media_permission_is_for_video_device)
+#else
+#define WK_OPT_MEDIA(X)
+#endif
+#if WEBKIT_CHECK_VERSION(2, 42, 0)
+#define WK_OPT_2_42(X) X(webkit_user_media_permission_is_for_display_device)
+#else
+#define WK_OPT_2_42(X)
+#endif
+#define WK_WEBKIT_OPT_SYMS(X)                                                  \
+  WK_OPT_2_12(X) WK_OPT_2_36(X) WK_OPT_2_40(X) WK_OPT_MEDIA(X) WK_OPT_2_42(X)
 
 // The pointer table. Member types are taken from the real declarations via
 // decltype — unevaluated, so this creates no link-time dependency on the

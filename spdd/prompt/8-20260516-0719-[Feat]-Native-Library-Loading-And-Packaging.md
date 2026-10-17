@@ -134,9 +134,10 @@ generated_at: 2026-05-16T07:19:13-07:00
   retired: the `bullseye-security` pool has already been emptied while
   its index still lists packages, so an unpinned `apt-get` fails with
   404s. The container therefore replaces its apt sources with the
-  single, permanent `bullseye main` suite on `archive.debian.org`
-  (apt still verifies the archive signatures; only the expired
-  `Valid-Until` check is waived). Only headers and the compiler come
+  single `bullseye main` suite, fetched from `deb.debian.org` first and
+  `archive.debian.org` as the fallback, because the archive is missing some
+  files its own index lists (apt still verifies the signatures; only an
+  expired `Valid-Until` check is waived). Only headers and the compiler come
   from there — none of those packages ship inside the jar. Building on an older
   distro with old WebKit headers would lower the floor too, but would
   silently compile those optional features out of every build,
@@ -429,9 +430,15 @@ Files: `.github/workflows/build.yml`,
      existing `ubuntu-24.04` / `ubuntu-24.04-arm` runner — a step,
      not a job-level `container:`, because the matrix job is shared
      with macOS and Windows. The container first points apt at
-     `http://archive.debian.org/debian bullseye main` only (no
-     `-security` or `-updates` suite), with
-     `Acquire::Check-Valid-Until=false`, and pins that origin at
+     `bullseye main` only (no `-security` or `-updates` suite), through
+     `mirror+file:` with `http://deb.debian.org/debian` first and
+     `http://archive.debian.org/debian` as the fallback (the archive is
+     missing some files its own index lists), with
+     an apt config of `Acquire::Check-Valid-Until "false"`,
+     `Acquire::Retries "5"` and `Acquire::http::No-Cache "true"` (the
+     archive's CDN serves stale 404s to the runners for files its index
+     lists; no-cache asks it to refetch), retries the whole `install` up to
+     four times with a fresh `update` between attempts, and pins release `n=bullseye` at
      priority 1001 so the image's newer security builds of base
      packages (e.g. `libc6`) are downgraded to the archive's versions
      — otherwise their `-dev` packages are unsatisfiable. It then

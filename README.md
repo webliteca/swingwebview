@@ -1006,6 +1006,129 @@ wv.setNavigationHandler(e ->
   popups of a page you restrict. See
   [`demos/WebViewNavigationDemo/`](demos/WebViewNavigationDemo/README.md).
 
+## Camera, microphone and screen capture
+
+A page's `getUserMedia` / `getDisplayMedia` request is put to a permission
+handler, which answers **allow**, **deny** or **default** (let the engine
+decide) — at once, or later from any thread, for example after asking the
+user:
+
+```java
+wv.setPermissionHandler(req -> {          // runs on the EDT
+    if (!req.origin().equals("demo://app")) { req.deny(); return; }
+    int r = JOptionPane.showConfirmDialog(frame,
+        req.origin() + " wants " + req.kinds(), "Permission", JOptionPane.YES_NO_OPTION);
+    if (r == JOptionPane.YES_OPTION) req.allow(); else req.deny();
+});
+```
+
+* **The request** gives `origin()` (`scheme://host[:port]`), `url()` and
+  `kinds()` — a set of `MediaCaptureKind.CAMERA`, `MICROPHONE` and `DISPLAY`.
+  Answer with `allow()`, `deny()`, `useDefault()` or `answer(PermissionDecision)`;
+  only the first answer counts (each returns whether it was the first).
+* **Threading.** The handler runs on the Swing EDT, delivered with
+  `invokeLater`; no engine thread waits for it, so a modal dialog is fine.
+  The page's promise stays pending until the answer arrives. A handler that
+  throws denies; a request still unanswered when the component is disposed
+  is denied.
+* **No handler, no change.** Without a handler (the default, or
+  `setPermissionHandler(null)`), and for `useDefault()`, each engine does what
+  it did before:
+
+  | Engine | Default |
+  |---|---|
+  | Linux (WebKitGTK) | refuses (`NotAllowedError`) |
+  | Windows (WebView2) | WebView2's own permission prompt |
+  | macOS (WKWebView) | WebKit's own permission prompt |
+
+* **Platform coverage.** `WebViewComponent.isPermissionHandlerSupported()`
+  says whether the loaded native routes requests.
+  * **Linux** (lightweight): camera and microphone, and screen capture with
+    WebKitGTK 2.42+, through `permission-request`. Every view has
+    `enable-media-stream` and `enable-webrtc` switched on where the WebKitGTK
+    version has them. The origin is the top page's (WebKitGTK reports no
+    frame origin).
+  * **Windows**: camera and microphone through `PermissionRequested`. Screen
+    capture has no permission kind in the WebView2 SDK this library builds
+    against, so WebView2's own picker decides it.
+  * **macOS 12+**: camera and microphone through the UI delegate's
+    `requestMediaCapturePermissionForOrigin…`; screen capture keeps WebKit's
+    own behaviour. Before macOS 12, nothing changes.
+* **macOS: `navigator.mediaDevices` is always exposed.** An embedded WKWebView
+  hides `navigator.mediaDevices` unless WebKit's private preferences are on
+  (Safari turns them on; ordinary apps don't). The library turns on
+  `_mediaDevicesEnabled`, `_mediaStreamEnabled` and `_screenCaptureEnabled`
+  for every web view and popup, each only where the running WebKit has it.
+  With no handler, WebKit's own permission prompt decides, as WebView2's does
+  on Windows. To keep a page off the camera and microphone, deny in your handler.
+* **macOS host-app checklist.** Because any page can now ask for the camera
+  or microphone, a macOS host application needs:
+  * [ ] **`NSCameraUsageDescription` and `NSMicrophoneUsageDescription`** in
+    the Info.plist of the bundle whose executable runs the JVM — your `.app`,
+    not the JDK's `java`. Each value is the sentence macOS shows the user.
+    * **jpackage:** put a complete `Info.plist` with both keys in a folder and
+      pass it with `--resource-dir <folder>`; jpackage uses it in place of its
+      default.
+    * **jDeploy:** make sure the app bundle jDeploy generates carries both
+      keys in its Info.plist; check the jDeploy documentation for your version
+      for how to add usage descriptions.
+    * **Hardened runtime / notarized apps** also need the
+      `com.apple.security.device.camera` and
+      `com.apple.security.device.audio-input` entitlements.
+    * Optionally `NSCameraUseContinuityCameraDeviceType` (`true`), which
+      silences AVFoundation's "AVCaptureDeviceTypeExternal is deprecated for
+      Continuity Cameras" warning.
+  * [ ] **Launch the app through LaunchServices.** macOS's privacy system
+    (TCC) attributes a request to the *responsible* process. An app started
+    from Finder, the Dock, `open` or an installed jDeploy / jpackage bundle is
+    its own, so its Info.plist counts. An app whose binary is run from a
+    terminal or an IDE is attributed to *that* app (Terminal, iTerm2, your
+    IDE), and macOS kills it when that app's Info.plist lacks the key — even
+    though your bundle has it. During development, start the bundle with
+    `open -n -W --stdout "$(tty)" --stderr "$(tty)" MyApp.app --args …`
+    (environment variables do not pass through `open` before macOS 13), or
+    run from a terminal or IDE that declares the keys.
+  * [ ] **Check at start-up** with
+    `WebViewComponent.missingMacUsageDescriptions()`, which lists the keys the
+    running process lacks (empty off macOS): in its main bundle or, when it
+    was not launched by launchd, in the Info.plist of the app it is
+    attributed to. Warn, or hide video
+    features, when it isn't empty.
+  * [ ] **Know what happens without them: a clean deny, not a crash.** macOS
+    terminates a process that opens the camera or microphone without the key
+    (`SIGABRT`, "Namespace TCC"), so the library never lets such a request
+    through: it is answered *deny* — whether or not a permission handler is
+    installed, and without asking the handler — the page gets
+    `NotAllowedError`, and one line goes to stderr, e.g.
+    `swingwebview: camera access denied — this app's Info.plist has no
+    NSCameraUsageDescription (macOS would terminate the app)`. When only the
+    launching app lacks it, the line names that app and suggests launching
+    through LaunchServices. The library finds that app as the topmost
+    ancestor process below launchd (public APIs only; the exact attribution is
+    private), so it may deny where macOS would have prompted — a JVM spawned as
+    a child of a configured app, or a parent that disclaims responsibility —
+    but it does not let a request through that macOS would kill the app for.
+  * [ ] **Screen sharing needs no key.** `getDisplayMedia` uses macOS's Screen
+    Recording permission, which has no usage-description key and does not
+    terminate the app; macOS asks the user, or the user allows it in System
+    Settings › Privacy & Security › Screen & System Audio Recording.
+  * [ ] macOS's own one-time consent prompt still appears on top of your
+    handler's answer.
+* **macOS private API.** These preferences are private WebKit API, the same
+  kind as `developerExtrasEnabled`, which debug mode already uses. They're
+  fine for applications distributed outside the Mac App Store, but App Store
+  review may reject an app that uses private API.
+* **WebRTC.** Whether `RTCPeerConnection` exists depends on how the engine was
+  built — Ubuntu 24.04's WebKitGTK has none, even with `enable-webrtc` on. A
+  page detects it with `typeof RTCPeerConnection === 'function'` and falls
+  back (for example, to opening the page in the user's browser).
+* **Media capture needs a secure context**: `https:`, `localhost`, or a custom
+  scheme registered with `WebViewSchemes`.
+* **Testing on Linux without a camera.** `WEBVIEW_MOCK_CAPTURE_DEVICES=1`
+  turns on WebKitGTK's mock camera, microphone and screen (a test-only switch).
+  `xvfb-run -a ./run-linux-media-smoketest.sh` runs the pass/fail check. See
+  [`demos/WebViewMediaPermissionDemo/`](demos/WebViewMediaPermissionDemo/README.md).
+
 ## Demo
 
 See [`demos/WebViewHeavyweightDemo/`](demos/WebViewHeavyweightDemo/README.md)
@@ -1048,6 +1171,9 @@ Additional demos:
 * `demos/WebViewNavigationDemo/` — a page that tries every way to navigate
   away to a local listener, each refused by a navigation handler before
   anything is sent (`run-*-navigation-demo`).
+* `demos/WebViewMediaPermissionDemo/` — camera, microphone and screen
+  sharing decided by a permission handler that asks you in a Swing dialog
+  (`run-*-media-permission-demo`).
 
 ## Building from source
 

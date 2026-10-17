@@ -11,6 +11,7 @@ import ca.weblite.webview.DialogDispatcher;
 import ca.weblite.webview.DownloadDispatcher;
 import ca.weblite.webview.PasswordDispatcher;
 import ca.weblite.webview.NavigationDispatcher;
+import ca.weblite.webview.PermissionDispatcher;
 import ca.weblite.webview.PopupDispatcher;
 import ca.weblite.webview.JavaScriptEvalException;
 import ca.weblite.webview.PdfOptions;
@@ -22,6 +23,7 @@ import ca.weblite.webview.WebViewDialogHandler;
 import ca.weblite.webview.WebViewDownloadHandler;
 import ca.weblite.webview.WebViewFillPasswordHandler;
 import ca.weblite.webview.WebViewNavigationHandler;
+import ca.weblite.webview.WebViewPermissionHandler;
 import ca.weblite.webview.WebViewPopupHandler;
 import ca.weblite.webview.WebViewMouseDispatcher;
 import ca.weblite.webview.WebViewMouseListener;
@@ -111,6 +113,14 @@ public abstract class WebViewComponent extends JComponent {
      *  native navigate they make. */
     protected final NavigationDispatcher navigationDispatcher =
         new NavigationDispatcher(this);
+
+    /** Per-component hub for media-capture permission requests (Canvas 35).
+     *  Subclasses install a {@link ca.weblite.webview.WebViewPermissionCallback}
+     *  on their native peer at attach time, before the first navigation, that
+     *  delegates to {@link PermissionDispatcher#dispatch}, and dispose it with
+     *  the component. */
+    protected final PermissionDispatcher permissionDispatcher =
+        new PermissionDispatcher(this);
 
     /** Per-component fan-out hub for browser-initiated file downloads
      *  ({@code <a download>}, a {@code Content-Disposition: attachment}
@@ -995,6 +1005,73 @@ public abstract class WebViewComponent extends JComponent {
      */
     public static boolean isNavigationHandlerSupported() {
         return NavigationDispatcher.isAvailable();
+    }
+
+    // ---------------------------------------------------------------------
+    // Camera, microphone and screen-capture requests (Canvas 35).
+    // ---------------------------------------------------------------------
+
+    /**
+     * Install the handler that decides the page's camera, microphone and
+     * screen-capture requests (Canvas 35 D1).  It runs on the EDT and answers
+     * through the {@link ca.weblite.webview.WebViewPermissionRequest} — now,
+     * or later from any thread.  Passing {@code null} removes it: requests
+     * then go to the engine exactly as without this feature (WebKitGTK
+     * refuses; WebView2 and WKWebView show their own prompts).
+     *
+     * <p>See {@link WebViewPermissionHandler} for the contract, and
+     * {@link #isPermissionHandlerSupported()} for whether the loaded native
+     * library routes requests at all.  On macOS the host application must
+     * declare {@code NSCameraUsageDescription} and
+     * {@code NSMicrophoneUsageDescription} in its Info.plist.
+     *
+     * @return {@code this} for chaining
+     */
+    public final WebViewComponent setPermissionHandler(WebViewPermissionHandler handler) {
+        permissionDispatcher.setHandler(handler);
+        return this;
+    }
+
+    /** @return the installed {@link WebViewPermissionHandler}, or
+     *  {@code null} when none is (the engine decides). */
+    public final WebViewPermissionHandler getPermissionHandler() {
+        return permissionDispatcher.getHandler();
+    }
+
+    /**
+     * Whether the loaded native library routes media-capture requests to a
+     * {@link WebViewPermissionHandler} (Canvas 35 D6).  {@code false} against
+     * a native built before the feature, or without natives at all.
+     */
+    public static boolean isPermissionHandlerSupported() {
+        return PermissionDispatcher.isAvailable();
+    }
+
+    /**
+     * The Info.plist usage-description keys ({@code NSCameraUsageDescription},
+     * {@code NSMicrophoneUsageDescription}) that this process lacks on macOS,
+     * camera key first (Canvas 35 D13).
+     *
+     * <p>macOS's privacy system checks the <em>responsible</em> process.  A
+     * process launched through LaunchServices (Finder, the Dock, {@code open},
+     * an installed jDeploy or jpackage app) is its own, so its main bundle
+     * counts.  A process started from a terminal or an IDE is attributed to
+     * that app, so the app's Info.plist must carry the keys as well; the
+     * library approximates the responsible app by the topmost ancestor below
+     * launchd and reports what either lacks.
+     *
+     * <p>macOS terminates a process that opens the camera or microphone
+     * without the matching key, so the library denies such a request — with
+     * or without a {@link WebViewPermissionHandler}, which is not asked — and
+     * logs one line to stderr; the page sees {@code NotAllowedError}.  Check
+     * this at start-up to warn, or to hide video features.
+     *
+     * @return an unmodifiable list; empty when not on macOS, when every key is
+     *         present, or when the loaded native predates the check.  Any
+     *         thread.
+     */
+    public static List<String> missingMacUsageDescriptions() {
+        return PermissionDispatcher.missingMacUsageDescriptions();
     }
 
     // ---------------------------------------------------------------------

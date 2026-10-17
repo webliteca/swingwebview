@@ -58,6 +58,9 @@
 #include <dispatch/dispatch.h>
 #include <objc/objc-runtime.h>
 #include <objc/runtime.h>
+#include <libproc.h>      // proc_pidpath (Canvas 35 D13)
+#include <sys/sysctl.h>   // KERN_PROC_PID (Canvas 35 D13)
+#include <unistd.h>       // getppid (Canvas 35 D13)
 #endif
 
 namespace embed {
@@ -455,6 +458,53 @@ static void scheme_upcall_cancelled(long long id) {
 // one byte, so an over-cap body is still recognised and answered 413.
 static const size_t kSchemeMaxRequestRead = 16u * 1024u * 1024u + 1u;
 
+// ---------------------------------------------------------------------------
+// Canvas 35: media-capture permission requests -- what every engine shares.
+// Ids come from one process-wide counter; each backend keeps its own table of
+// pending engine requests under its own lock (D5).  The wire values mirror
+// PermissionDecision's ordinals and MediaCaptureKind's bits.
+// ---------------------------------------------------------------------------
+enum { PERM_PENDING = -1, PERM_DEFAULT = 0, PERM_ALLOW = 1, PERM_DENY = 2 };
+enum { PERM_KIND_CAMERA = 1, PERM_KIND_MICROPHONE = 2, PERM_KIND_DISPLAY = 4 };
+static std::atomic<long long> g_perm_next_id(0);
+
+// Canvas 35 D5: WebViewPermissionCallback.onPermissionRequested, on the
+// engine's UI thread.  Returns PERM_PENDING or a decision; a JNI failure or a
+// pending exception is a refusal.
+static int perm_upcall(JavaVM *jvm, jobject cb, long long id,
+                       const char *origin, const char *url, int kinds) {
+    if (!jvm || !cb) return PERM_DEFAULT;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env)
+            return PERM_DENY;
+        detach = true;
+    }
+    int answer = PERM_DENY;
+    jstring jo = env->NewStringUTF(origin ? origin : "");
+    jstring ju = env->NewStringUTF(url ? url : "");
+    jclass cls = env->GetObjectClass(cb);
+    if (cls) {
+        jmethodID mid = env->GetMethodID(cls, "onPermissionRequested",
+            "(JLjava/lang/String;Ljava/lang/String;I)I");
+        if (mid) {
+            answer = (int)env->CallIntMethod(cb, mid, (jlong)id, jo, ju, (jint)kinds);
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        answer = PERM_DENY;
+    }
+    if (jo) env->DeleteLocalRef(jo);
+    if (ju) env->DeleteLocalRef(ju);
+    if (detach) jvm->DetachCurrentThread();
+    if (answer < PERM_PENDING || answer > PERM_DENY) answer = PERM_DENY;
+    return answer;
+}
+
 #ifdef WEBVIEW_GTK
 // =========================================================================
 // Linux / GTK / X11
@@ -799,6 +849,11 @@ struct Engine {
     // "decide-policy" handler on every navigation; freed in
     // gtk_destroy_engine.
     jobject navigation_callback = nullptr;
+    // Canvas 35 D5: JNI global ref to the WebViewPermissionCallback, or
+    // nullptr.  Read by the media-capture permission hook on the engine's UI
+    // thread; set by the permission-callback setter; freed on destroy after
+    // the engine's pending requests are drained.
+    jobject permission_callback = nullptr;
     // Canvas 21 (1.5.0): per-destination User-Agent resolver
     // (java.util.function.Function<String,String>) as a JNI global ref.
     // Consulted at the popup-child creation site with the CHILD's target
@@ -1443,6 +1498,140 @@ static gboolean gtk_decide_navigation(JavaVM *jvm, jobject cb,
     return TRUE;
 }
 
+// ---------------------------------------------------------------------------
+// Canvas 35 D7: media-capture permission requests (WebKitGTK).  Pending
+// requests are kept, each with a ref, in one table keyed by id and tagged
+// with their engine.  Every access to a WebKitPermissionRequest is on the GTK
+// pump thread.
+// ---------------------------------------------------------------------------
+struct GtkPermPending {
+    WebKitPermissionRequest *req;
+    void *engine;
+};
+static std::mutex g_gtk_perm_mutex;
+static std::map<long long, GtkPermPending> g_gtk_perm;
+
+// Apply a decision.  DEFAULT, once the signal was claimed, is what
+// WebKitGTK's own handler does: deny (D7b).
+static void gtk_perm_apply(WebKitPermissionRequest *req, int decision) {
+#if WEBKIT_CHECK_VERSION(2, 8, 0)
+    if (!req) return;
+    if (decision == PERM_ALLOW) {
+        if (WK_HAS(webkit_permission_request_allow)) webkit_permission_request_allow(req);
+    } else {
+        if (WK_HAS(webkit_permission_request_deny)) webkit_permission_request_deny(req);
+    }
+#else
+    (void)req; (void)decision;
+#endif
+}
+
+// Canvas 35 D7b: the "permission-request" decision shared by Engine and
+// OffEngine.  FALSE leaves the request to WebKit (which denies); TRUE means
+// it was answered here or is pending an answer from Java.
+static gboolean gtk_handle_permission_request(JavaVM *jvm, jobject cb,
+                                              void *engine,
+                                              WebKitWebView *view,
+                                              WebKitPermissionRequest *request) {
+#if WEBKIT_CHECK_VERSION(2, 8, 0)
+    if (!request || !jvm || !cb) return FALSE;
+    if (!WK_HAS(webkit_permission_request_allow)
+            || !WK_HAS(webkit_permission_request_deny)
+            || !WK_HAS(webkit_user_media_permission_request_get_type)
+            || !WK_HAS(webkit_user_media_permission_is_for_audio_device)
+            || !WK_HAS(webkit_user_media_permission_is_for_video_device)) {
+        return FALSE;
+    }
+    // The type check goes through the loader: the WEBKIT_IS_* macro would
+    // reference *_get_type at link time.
+    if (!G_TYPE_CHECK_INSTANCE_TYPE(request,
+            webkit_user_media_permission_request_get_type())) {
+        return FALSE;
+    }
+    WebKitUserMediaPermissionRequest *um =
+        (WebKitUserMediaPermissionRequest *)request;
+    int kinds = 0;
+#if WEBKIT_CHECK_VERSION(2, 42, 0)
+    if (WK_HAS(webkit_user_media_permission_is_for_display_device)
+            && webkit_user_media_permission_is_for_display_device(um)) {
+        kinds = PERM_KIND_DISPLAY;
+    }
+#endif
+    if (kinds == 0) {
+        if (webkit_user_media_permission_is_for_video_device(um))
+            kinds |= PERM_KIND_CAMERA;
+        if (webkit_user_media_permission_is_for_audio_device(um))
+            kinds |= PERM_KIND_MICROPHONE;
+    }
+    if (kinds == 0) return FALSE;
+    const char *url = view ? webkit_web_view_get_uri(view) : nullptr;
+
+    long long id = ++g_perm_next_id;
+    g_object_ref(request);
+    {
+        std::lock_guard<std::mutex> lk(g_gtk_perm_mutex);
+        g_gtk_perm[id] = GtkPermPending{request, engine};
+    }
+    // WebKitGTK reports no origin; Java derives it from the page address.
+    int d = perm_upcall(jvm, cb, id, "", url ? url : "", kinds);
+    if (d == PERM_PENDING) return TRUE;
+    {
+        std::lock_guard<std::mutex> lk(g_gtk_perm_mutex);
+        g_gtk_perm.erase(id);
+    }
+    if (d == PERM_DEFAULT) {
+        g_object_unref(request);
+        return FALSE;
+    }
+    gtk_perm_apply(request, d);
+    g_object_unref(request);
+    return TRUE;
+#else
+    (void)jvm; (void)cb; (void)engine; (void)view; (void)request;
+    return FALSE;
+#endif
+}
+
+// Canvas 35 D7e: deny and release every request still pending for `engine`.
+// Runs on the GTK pump thread, before the engine's view is destroyed.
+static void gtk_perm_drain(void *engine) {
+    std::vector<WebKitPermissionRequest *> mine;
+    {
+        std::lock_guard<std::mutex> lk(g_gtk_perm_mutex);
+        for (auto it = g_gtk_perm.begin(); it != g_gtk_perm.end();) {
+            if (it->second.engine == engine) {
+                mine.push_back(it->second.req);
+                it = g_gtk_perm.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (WebKitPermissionRequest *r : mine) {
+        gtk_perm_apply(r, PERM_DENY);
+        g_object_unref(r);
+    }
+}
+
+// Canvas 35 D7c: switch on media streams and WebRTC (and, for tests only,
+// WebKit's mock capture devices).  By property lookup, so a WebKitGTK without
+// a property skips it silently and no loader symbol is needed.
+static void gtk_set_bool_setting_if_present(WebKitSettings *s, const char *name) {
+    if (!s) return;
+    if (g_object_class_find_property(G_OBJECT_GET_CLASS(s), name)) {
+        g_object_set(G_OBJECT(s), name, TRUE, NULL);
+    }
+}
+
+static void gtk_apply_media_settings(WebKitSettings *s) {
+    gtk_set_bool_setting_if_present(s, "enable-media-stream");
+    gtk_set_bool_setting_if_present(s, "enable-webrtc");
+    const char *mock = getenv("WEBVIEW_MOCK_CAPTURE_DEVICES");
+    if (mock && strcmp(mock, "1") == 0) {
+        gtk_set_bool_setting_if_present(s, "enable-mock-capture-devices");
+    }
+}
+
 // Canvas 19: synchronous DISPOSITION hop into Java on the GTK main thread.
 // Calls WebViewPopupCallback.onPopupDisposition and returns the
 // PopupDisposition ordinal (0 = BLOCK, 1 = NATIVE_WINDOW, 2 = ADOPT).  Mirrors
@@ -1964,6 +2153,16 @@ static gboolean on_decide_policy_engine(WebKitWebView *web,
                                  decision, type);
 }
 
+// Canvas 35 D7b: per-Engine wrapper for "permission-request" (heavyweight,
+// and an adopted popup's view).
+static gboolean on_permission_request_engine(WebKitWebView *web,
+        WebKitPermissionRequest *request, gpointer user_data) {
+    Engine *e = static_cast<Engine *>(user_data);
+    if (!e) return FALSE;
+    return gtk_handle_permission_request(e->jvm, e->permission_callback, e,
+                                         web, request);
+}
+
 // Per-Engine wrapper for the `create` signal (heavyweight).  Mirrors
 // on_script_dialog_engine — the divergence is the shared inner it delegates to.
 static GtkWidget *on_create_web_view_engine(WebKitWebView *web,
@@ -2235,6 +2434,8 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug,
                 webkit_web_view_get_settings(WEBKIT_WEB_VIEW(e->web));
             webkit_settings_set_hardware_acceleration_policy(
                 s, WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER);
+            // Canvas 35 D7c: media streams and WebRTC.
+            gtk_apply_media_settings(s);
         }
 
         // Force an opaque white background so a failure to render leaves
@@ -2301,6 +2502,9 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug,
         // popup, whose child view arrives here as `childw`.
         g_signal_connect(WEBKIT_WEB_VIEW(e->web), "decide-policy",
                          (GCallback)on_decide_policy_engine, e);
+        // Canvas 35 D7b: camera, microphone and screen-capture requests.
+        g_signal_connect(WEBKIT_WEB_VIEW(e->web), "permission-request",
+                         (GCallback)on_permission_request_engine, e);
 
         // Wire up the "external" message handler.
         g_signal_connect(
@@ -2637,6 +2841,13 @@ static void gtk_destroy_engine(Engine *e) {
         if (detach && e->jvm) e->jvm->DetachCurrentThread();
     }
     GtkPump::instance().run_sync([&] {
+        // Canvas 35 D7e: stop asking, and deny what is still pending, before
+        // the view goes -- on the pump thread, so no request is mid-flight.
+        if (e->web) {
+            g_signal_handlers_disconnect_by_func(G_OBJECT(e->web),
+                (gpointer)on_permission_request_engine, e);
+        }
+        gtk_perm_drain(e);
         if (e->redraw_timer_id) {
             g_source_remove(e->redraw_timer_id);
             e->redraw_timer_id = 0;
@@ -2647,6 +2858,19 @@ static void gtk_destroy_engine(Engine *e) {
             e->web = nullptr;
         }
     });
+    // Canvas 35 D5: the permission callback's global ref goes after the
+    // drain, when nothing can read it any more.
+    if (e->permission_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm && e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->permission_callback);
+        e->permission_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     for (auto &kv : e->bindings) {
         Binding *b = kv.second;
         JNIEnv *env = nullptr;
@@ -3175,6 +3399,19 @@ static void gtk_set_navigation_callback(Engine *e, JNIEnv *env, jobject cb) {
     }
 }
 
+// Canvas 35 D5: register (or clear, when cb is null) the permission callback.
+// Mirrors gtk_set_navigation_callback.
+static void gtk_set_permission_callback(Engine *e, JNIEnv *env, jobject cb) {
+    if (!e) return;
+    if (e->permission_callback) {
+        env->DeleteGlobalRef(e->permission_callback);
+        e->permission_callback = nullptr;
+    }
+    if (cb) {
+        e->permission_callback = env->NewGlobalRef(cb);
+    }
+}
+
 // Canvas 21: override the WebKitGTK User-Agent (changes the HTTP header).
 // ua == nullptr restores the engine default.  Takes effect on the next
 // navigation.
@@ -3582,6 +3819,11 @@ struct OffEngine {
     // Set by gtk_off_set_navigation_callback; freed in
     // gtk_off_destroy_engine.
     jobject navigation_callback = nullptr;
+    // Canvas 35 D5: JNI global ref to the WebViewPermissionCallback, or
+    // nullptr.  Read by the media-capture permission hook on the engine's UI
+    // thread; set by the permission-callback setter; freed on destroy after
+    // the engine's pending requests are drained.
+    jobject permission_callback = nullptr;
     // Canvas 21 (1.5.0): per-destination User-Agent resolver
     // (java.util.function.Function<String,String>) as a JNI global ref.
     // Consulted at the popup-child creation site with the CHILD's target
@@ -3639,6 +3881,15 @@ static gboolean on_decide_policy_off_engine(WebKitWebView *web,
     if (!e) return FALSE;
     return gtk_decide_navigation(e->jvm, e->navigation_callback, web,
                                  decision, type);
+}
+
+// Canvas 35 D7b: per-OffEngine wrapper for "permission-request".
+static gboolean on_permission_request_off_engine(WebKitWebView *web,
+        WebKitPermissionRequest *request, gpointer user_data) {
+    OffEngine *e = static_cast<OffEngine *>(user_data);
+    if (!e) return FALSE;
+    return gtk_handle_permission_request(e->jvm, e->permission_callback, e,
+                                         web, request);
 }
 
 // Parallel of engine_on_message for OffEngine: parse the {name, seq, args}
@@ -3748,6 +3999,8 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
             webkit_web_view_get_settings(WEBKIT_WEB_VIEW(e->web));
         webkit_settings_set_hardware_acceleration_policy(
             s, WEBKIT_HARDWARE_ACCELERATION_POLICY_NEVER);
+        // Canvas 35 D7c: media streams and WebRTC.
+        gtk_apply_media_settings(s);
         if (e->debug) {
             webkit_settings_set_enable_developer_extras(s, TRUE);
             webkit_settings_set_enable_write_console_messages_to_stdout(s, TRUE);
@@ -3804,6 +4057,9 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
         // Canvas 34 D7: the navigation decision, as for Engine.
         g_signal_connect(WEBKIT_WEB_VIEW(e->web), "decide-policy",
                          (GCallback)on_decide_policy_off_engine, e);
+        // Canvas 35 D7b: camera, microphone and screen-capture requests.
+        g_signal_connect(WEBKIT_WEB_VIEW(e->web), "permission-request",
+                         (GCallback)on_permission_request_off_engine, e);
 
         webkit_user_content_manager_add_script(
             e->manager,
@@ -3938,12 +4194,32 @@ static void gtk_off_destroy_engine(OffEngine *e) {
         if (detach && e->jvm) e->jvm->DetachCurrentThread();
     }
     GtkPump::instance().run_sync([&] {
+        // Canvas 35 D7e: stop asking, and deny what is still pending, before
+        // the view goes -- on the pump thread, so no request is mid-flight.
+        if (e->web) {
+            g_signal_handlers_disconnect_by_func(G_OBJECT(e->web),
+                (gpointer)on_permission_request_off_engine, e);
+        }
+        gtk_perm_drain(e);
         if (e->window) {
             gtk_widget_destroy(e->window);
             e->window = nullptr;
             e->web = nullptr;
         }
     });
+    // Canvas 35 D5: the permission callback's global ref goes after the
+    // drain, when nothing can read it any more.
+    if (e->permission_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->permission_callback);
+        e->permission_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     if (e->dialog_callback) {
         JNIEnv *env = nullptr;
         bool detach = false;
@@ -4057,6 +4333,36 @@ static void gtk_off_set_navigation_callback(OffEngine *e, JNIEnv *env,
     if (cb) {
         e->navigation_callback = env->NewGlobalRef(cb);
     }
+}
+
+// Canvas 35 D5: offscreen counterpart to gtk_set_permission_callback.
+static void gtk_off_set_permission_callback(OffEngine *e, JNIEnv *env,
+                                            jobject cb) {
+    if (!e) return;
+    if (e->permission_callback) {
+        env->DeleteGlobalRef(e->permission_callback);
+        e->permission_callback = nullptr;
+    }
+    if (cb) {
+        e->permission_callback = env->NewGlobalRef(cb);
+    }
+}
+
+// Canvas 35 D7e: apply a later answer on the pump thread.  GtkPump is
+// defined by now; the entry is looked up when the lambda runs.
+static void gtk_perm_respond(long long id, int decision) {
+    GtkPump::instance().run_async([id, decision] {
+        WebKitPermissionRequest *req = nullptr;
+        {
+            std::lock_guard<std::mutex> lk(g_gtk_perm_mutex);
+            auto it = g_gtk_perm.find(id);
+            if (it == g_gtk_perm.end()) return;
+            req = it->second.req;
+            g_gtk_perm.erase(it);
+        }
+        gtk_perm_apply(req, decision);
+        g_object_unref(req);
+    });
 }
 
 // Canvas 21: offscreen counterpart to gtk_set_user_agent.
@@ -4726,6 +5032,33 @@ static void cocoa_install_schemes(id config) {
     }
 }
 
+// Canvas 35 D12: expose navigator.mediaDevices (and getUserMedia /
+// getDisplayMedia) in an embedded WKWebView.  An embedding app, unlike Safari,
+// gets WebKit's private _mediaDevicesEnabled preference off, so the page sees
+// navigator.mediaDevices === undefined and the D8 delegate is never reached.
+// Called on a configuration BEFORE initWithFrame:configuration:, since the web
+// view takes its preferences from the configuration at init.  Each private
+// setter is called only when the preferences object responds to it; a missing
+// one is skipped, leaving that WebKit exactly as before.  Never key-value
+// coding here: setValue:forKey: on an unknown key throws NSUnknownKeyException.
+// Private WebKit API, like developerExtrasEnabled (see the README).
+static void cocoa_enable_media_capture(id config) {
+    if (!config) return;
+    id prefs = msg(config, sel("preferences"));
+    if (!prefs) return;
+    static const char *const kSetters[] = {
+        "_setMediaDevicesEnabled:",   // navigator.mediaDevices
+        "_setMediaStreamEnabled:",    // getUserMedia
+        "_setScreenCaptureEnabled:",  // getDisplayMedia
+    };
+    for (const char *name : kSetters) {
+        SEL setter = sel(name);
+        if (msg<BOOL, SEL>(prefs, sel("respondsToSelector:"), setter)) {
+            msg<void, BOOL>(prefs, setter, YES);
+        }
+    }
+}
+
 // Apply a response on AppKit main, if its task is still pending (D13).
 static void cocoa_scheme_respond(long long rid, int status,
                                  std::vector<std::string> pairs,
@@ -4886,6 +5219,11 @@ struct Engine {
     // nullptr.  Read by decidePolicyForNavigationAction on AppKit main;
     // set by cocoa_set_navigation_callback; freed in cocoa_destroy_engine.
     jobject navigation_callback = nullptr;
+    // Canvas 35 D5: JNI global ref to the WebViewPermissionCallback, or
+    // nullptr.  Read by the media-capture permission hook on the engine's UI
+    // thread; set by the permission-callback setter; freed on destroy after
+    // the engine's pending requests are drained.
+    jobject permission_callback = nullptr;
     // Canvas 21 (1.5.0): per-destination User-Agent resolver
     // (java.util.function.Function<String,String>) as a JNI global ref.
     // Consulted at the popup-child creation site with the CHILD's target
@@ -5995,6 +6333,11 @@ static id impl_create_web_view(id self, SEL, id webView, id configuration,
     // WebKit drives the ORIGINAL navigation-action request (POST verb + body)
     // into this child regardless of disposition, which is what preserves POST
     // and window.opener for both NATIVE_WINDOW and ADOPT.
+    //
+    // Canvas 35 D12: the configuration derives from the opener's and should
+    // carry its media preferences; set them again before init so the child
+    // exposes navigator.mediaDevices whatever WebKit copied.
+    cocoa_enable_media_capture(configuration);
     id child = msg(objc_cls("WKWebView"), sel("alloc"));
     child = msg<id, CGRect, id>(child, sel("initWithFrame:configuration:"),
                                 CGRectMake(0, 0, W, H), configuration);
@@ -6267,6 +6610,19 @@ static void cocoa_set_navigation_callback(Engine *e, JNIEnv *env, jobject cb) {
     }
     if (cb) {
         e->navigation_callback = env->NewGlobalRef(cb);
+    }
+}
+
+// Canvas 35 D5: register (or clear, when cb is null) the permission callback.
+// Mirrors cocoa_set_navigation_callback.
+static void cocoa_set_permission_callback(Engine *e, JNIEnv *env, jobject cb) {
+    if (!e) return;
+    if (e->permission_callback) {
+        env->DeleteGlobalRef(e->permission_callback);
+        e->permission_callback = nullptr;
+    }
+    if (cb) {
+        e->permission_callback = env->NewGlobalRef(cb);
     }
 }
 
@@ -6570,6 +6926,286 @@ static bool cocoa_fire_navigation(JavaVM *jvm, jobject cb, const char *url,
 // shouldPerformDownload and used otherwise; anything else is opened with
 // NSWorkspace (never a file URL) and ignored.  about:, data:, blob: and
 // javascript: are treated as loadable.
+// ---------------------------------------------------------------------------
+// Canvas 35 D8: media-capture permission requests (WKWebView, macOS 12+).
+// The decision handler block is copied into one table keyed by id and tagged
+// with its engine; every block call happens on AppKit main.
+// ---------------------------------------------------------------------------
+struct CocoaPermPending {
+    id handler;     // a -copy of the WKPermissionDecision block
+    void *engine;
+    int kinds;      // PERM_KIND_* bits, re-checked by cocoa_perm_call (D13)
+};
+static std::mutex g_cocoa_perm_mutex;
+static std::map<long long, CocoaPermPending> g_cocoa_perm;
+
+struct CocoaUsageKey { int kind; const char *key; };
+static const CocoaUsageKey kCocoaUsageKeys[] = {
+    { PERM_KIND_CAMERA, "NSCameraUsageDescription" },
+    { PERM_KIND_MICROPHONE, "NSMicrophoneUsageDescription" },
+};
+
+// Canvas 35 D13: the subset of `kinds` (camera, microphone) whose Info.plist
+// usage description the main bundle lacks.  A key counts only as a non-empty
+// NSString.
+static int cocoa_main_bundle_missing_kinds(int kinds) {
+    int missing = 0;
+    id bundle = msg(objc_cls("NSBundle"), sel("mainBundle"));
+    for (const auto &k : kCocoaUsageKeys) {
+        if (!(kinds & k.kind)) continue;
+        id v = bundle ? msg<id, id>(bundle, sel("objectForInfoDictionaryKey:"),
+                                    ns_str(k.key))
+                      : nullptr;
+        bool ok = v
+            && msg<BOOL, id>(v, sel("isKindOfClass:"), objc_cls("NSString"))
+            && msg<unsigned long>(v, sel("length")) > 0;
+        if (!ok) missing |= k.kind;
+    }
+    return missing;
+}
+
+// Canvas 35 D13: the parent of `pid`, through the public sysctl; -1 on error.
+static pid_t cocoa_parent_pid(pid_t pid) {
+    struct kinfo_proc info;
+    size_t size = sizeof(info);
+    int mib[4] = { CTL_KERN, KERN_PROC, KERN_PROC_PID, (int)pid };
+    memset(&info, 0, sizeof(info));
+    if (sysctl(mib, 4, &info, &size, nullptr, 0) != 0 || size == 0) return -1;
+    return info.kp_eproc.e_ppid;
+}
+
+// Canvas 35 D13: TCC attributes a request to the *responsible* process.  A
+// process launchd started (parent pid 1) is its own; otherwise approximate it
+// (the exact attribution is private API) by the top ancestor -- the last
+// process before pid 1, i.e. the app launchd started that spawned this chain:
+// a terminal, an IDE.  Returns false when this process is its own responsible
+// process.  Otherwise true, with `label` set to the ancestor's .app directory
+// or executable path (empty when it could not be identified) and `missing`
+// to the subset of `kinds` whose key the ancestor's Info.plist lacks (all of
+// `kinds` when there is no readable Info.plist -- fail closed).
+static bool cocoa_responsible_missing_kinds(int kinds, int *missing,
+                                            std::string *label) {
+    *missing = 0;
+    label->clear();
+    pid_t parent = getppid();
+    if (parent <= 1) return false;
+    pid_t top = parent;
+    bool found = false;
+    for (int step = 0; step < 64; step++) {
+        pid_t pp = cocoa_parent_pid(top);
+        if (pp < 0) break;
+        if (pp <= 1) { found = true; break; }
+        top = pp;
+    }
+    *missing = kinds & (PERM_KIND_CAMERA | PERM_KIND_MICROPHONE);
+    if (!found) return true;
+    char path[PROC_PIDPATHINFO_MAXSIZE];
+    if (proc_pidpath(top, path, sizeof(path)) <= 0) return true;
+    std::string p(path);
+    const std::string marker = ".app/Contents/MacOS/";
+    size_t at = p.find(marker);
+    std::string target = at == std::string::npos ? p : p.substr(0, at + 4);
+    *label = target;
+    CFURLRef url = CFURLCreateFromFileSystemRepresentation(
+        kCFAllocatorDefault, (const UInt8 *)target.c_str(),
+        (CFIndex)target.size(), at != std::string::npos);
+    if (!url) return true;
+    CFDictionaryRef dict = CFBundleCopyInfoDictionaryForURL(url);
+    CFRelease(url);
+    if (!dict) return true;
+    for (const auto &k : kCocoaUsageKeys) {
+        if (!(*missing & k.kind)) continue;
+        CFStringRef key = CFStringCreateWithCString(kCFAllocatorDefault, k.key,
+                                                    kCFStringEncodingUTF8);
+        CFTypeRef v = key ? CFDictionaryGetValue(dict, key) : nullptr;
+        if (key) CFRelease(key);
+        if (v && CFGetTypeID(v) == CFStringGetTypeID()
+                && CFStringGetLength((CFStringRef)v) > 0) {
+            *missing &= ~k.kind;
+        }
+    }
+    CFRelease(dict);
+    return true;
+}
+
+// Canvas 35 D13: the subset of `kinds` (camera, microphone) whose Info.plist
+// usage description is missing -- from the main bundle, or, when this process
+// was not launched by launchd, from its responsible ancestor's Info.plist.
+// macOS's privacy system (TCC) terminates a process that opens the device
+// without it, so such a request must never be granted or prompted.  Screen
+// capture (Screen Recording) has no usage-description key.  `resp_missing` /
+// `resp_label` (optional) receive the ancestor's part, for the stderr line.
+static int cocoa_media_missing_kinds(int kinds, int *main_missing = nullptr,
+                                     int *resp_missing = nullptr,
+                                     std::string *resp_label = nullptr) {
+    int mm = cocoa_main_bundle_missing_kinds(kinds);
+    int rm = 0;
+    std::string label;
+    cocoa_responsible_missing_kinds(kinds, &rm, &label);
+    if (main_missing) *main_missing = mm;
+    if (resp_missing) *resp_missing = rm;
+    if (resp_label) *resp_label = label;
+    return mm | rm;
+}
+
+static std::string cocoa_usage_key_names(int missing) {
+    std::string keys;
+    if (missing & PERM_KIND_CAMERA) keys = "NSCameraUsageDescription";
+    if (missing & PERM_KIND_MICROPHONE) {
+        if (!keys.empty()) keys += " and ";
+        keys += "NSMicrophoneUsageDescription";
+    }
+    return keys;
+}
+
+// Canvas 35 D13: the one stderr line for a request denied for a missing key.
+// Names the main bundle when it lacks a key, otherwise the responsible
+// ancestor.
+static void cocoa_media_report_denied(int kinds) {
+    int mm = 0, rm = 0;
+    std::string label;
+    cocoa_media_missing_kinds(kinds, &mm, &rm, &label);
+    const char *what =
+        (kinds & PERM_KIND_CAMERA) && (kinds & PERM_KIND_MICROPHONE)
+            ? "camera and microphone"
+            : (kinds & PERM_KIND_CAMERA) ? "camera" : "microphone";
+    if (mm || !rm) {
+        fprintf(stderr,
+                "swingwebview: %s access denied \xE2\x80\x94 this app's Info.plist has "
+                "no %s (macOS would terminate the app)\n",
+                what, cocoa_usage_key_names(mm ? mm : rm).c_str());
+    } else {
+        fprintf(stderr,
+                "swingwebview: %s access denied \xE2\x80\x94 macOS attributes this "
+                "process to %s, which launched it, and that app's Info.plist has "
+                "no %s (macOS would terminate the app); launch the .app through "
+                "LaunchServices (open, Finder or the Dock)\n",
+                what,
+                label.empty() ? "an unidentified parent process" : label.c_str(),
+                cocoa_usage_key_names(rm).c_str());
+    }
+    fflush(stderr);
+}
+
+// Call (and release) a copied decision handler: ALLOW -> Grant (1),
+// DENY -> Deny (2), DEFAULT -> Prompt (0).  AppKit main only.  Canvas 35
+// D13's second line of defence: Grant or Prompt for a kind whose usage
+// description is missing becomes Deny.
+static void cocoa_perm_call(id handler, int decision, int kinds) {
+    if (!handler) return;
+    if (decision != PERM_DENY) {
+        int missing = cocoa_media_missing_kinds(kinds);
+        if (missing) {
+            cocoa_media_report_denied(kinds);
+            decision = PERM_DENY;
+        }
+    }
+    long wk = decision == PERM_ALLOW ? 1L : (decision == PERM_DENY ? 2L : 0L);
+    ((void (^)(long))handler)(wk);
+    msg(handler, sel("release"));
+}
+
+// IMP: -[WebviewEmbedUIDelegate webView:requestMediaCapturePermissionForOrigin:
+//        initiatedByFrame:type:decisionHandler:]  (Canvas 35 D8)
+static void impl_request_media_capture_permission(
+        id self, SEL, id /*webView*/, id origin, id frame, long type,
+        id decisionHandler) {
+    if (!decisionHandler) return;
+    Engine *e = (Engine *)objc_getAssociatedObject(self, "eng");
+    int kinds = 0;
+    switch (type) {
+        case 0: kinds = PERM_KIND_CAMERA; break;                          // WKMediaCaptureTypeCamera
+        case 1: kinds = PERM_KIND_MICROPHONE; break;                      // WKMediaCaptureTypeMicrophone
+        case 2: kinds = PERM_KIND_CAMERA | PERM_KIND_MICROPHONE; break;   // CameraAndMicrophone
+        default: break;
+    }
+    // Canvas 35 D13: a host without the usage description would be killed by
+    // macOS once WebKit opens the device -- deny now, handler or not, and
+    // never Prompt (WebKit's prompt-then-grant ends the same way).  Java is
+    // not asked: no answer could change this.
+    if (kinds != 0) {
+        int missing = cocoa_media_missing_kinds(kinds);
+        if (missing) {
+            cocoa_media_report_denied(kinds);
+            ((void (^)(long))decisionHandler)(2L);   // WKPermissionDecisionDeny
+            return;
+        }
+    }
+    if (!e || !e->permission_callback || e->destroyed.load() || kinds == 0) {
+        // What WebKit does when the delegate lacks this selector: prompt.
+        ((void (^)(long))decisionHandler)(0L);
+        return;
+    }
+    std::string o;
+    if (origin) {
+        id proto = msg(origin, sel("protocol"));
+        id host = msg(origin, sel("host"));
+        long port = msg<long>(origin, sel("port"));
+        std::string ps = proto ? ns_string_to_utf8(proto) : std::string();
+        std::string hs = host ? ns_string_to_utf8(host) : std::string();
+        if (!ps.empty() && !hs.empty()) {
+            o = ps + "://" + hs;
+            if (port != 0) o += ":" + std::to_string(port);
+        }
+    }
+    std::string u;
+    if (frame) {
+        id req = msg(frame, sel("request"));
+        id url = req ? msg(req, sel("URL")) : nullptr;
+        id abs = url ? msg(url, sel("absoluteString")) : nullptr;
+        if (abs) u = ns_string_to_utf8(abs);
+    }
+    id handler = msg(decisionHandler, sel("copy"));
+    long long pid = ++g_perm_next_id;
+    {
+        std::lock_guard<std::mutex> lk(g_cocoa_perm_mutex);
+        g_cocoa_perm[pid] = CocoaPermPending{handler, e, kinds};
+    }
+    // Java never blocks here (the handler runs later on the EDT).
+    int d = perm_upcall(e->jvm, e->permission_callback, pid, o.c_str(),
+                        u.c_str(), kinds);
+    if (d == PERM_PENDING) return;
+    {
+        std::lock_guard<std::mutex> lk(g_cocoa_perm_mutex);
+        g_cocoa_perm.erase(pid);
+    }
+    cocoa_perm_call(handler, d, kinds);
+}
+
+// Canvas 35 D8: a later answer, from any thread; looked up on AppKit main.
+static void cocoa_perm_respond(long long pid, int decision) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        id handler = nullptr;
+        int kinds = 0;
+        {
+            std::lock_guard<std::mutex> lk(g_cocoa_perm_mutex);
+            auto it = g_cocoa_perm.find(pid);
+            if (it == g_cocoa_perm.end()) return;
+            handler = it->second.handler;
+            kinds = it->second.kinds;
+            g_cocoa_perm.erase(it);
+        }
+        cocoa_perm_call(handler, decision, kinds);
+    });
+}
+
+// Canvas 35 D5: deny every request still pending for `engine`.  AppKit main.
+static void cocoa_perm_drain(void *engine) {
+    std::vector<id> mine;
+    {
+        std::lock_guard<std::mutex> lk(g_cocoa_perm_mutex);
+        for (auto it = g_cocoa_perm.begin(); it != g_cocoa_perm.end();) {
+            if (it->second.engine == engine) {
+                mine.push_back(it->second.handler);
+                it = g_cocoa_perm.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (id h : mine) cocoa_perm_call(h, PERM_DENY, 0);
+}
+
 static void impl_decide_policy_for_navigation_action(
         id self, SEL, id webView, id navigationAction, id decisionHandler) {
     Engine *e = (Engine *)objc_getAssociatedObject(self, "eng");
@@ -6922,6 +7558,15 @@ static Class get_webview_embed_ui_delegate_cls() {
             sel("webView:decidePolicyForNavigationAction:"
                 "decisionHandler:"),
             (IMP)impl_decide_policy_for_navigation_action, "v@:@@@");
+        // Canvas 35 D8: camera and microphone requests, macOS 12+ only; on
+        // older macOS the selector is never added and WebKit is unchanged.
+        if (__builtin_available(macOS 12.0, *)) {
+            class_addMethod(
+                c,
+                sel("webView:requestMediaCapturePermissionForOrigin:"
+                    "initiatedByFrame:type:decisionHandler:"),
+                (IMP)impl_request_media_capture_permission, "v@:@@@q@");
+        }
         class_addMethod(
             c,
             sel("webView:navigationAction:didBecomeDownload:"),
@@ -7662,6 +8307,8 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
         // Canvas 30 D13: custom schemes must be on the configuration before
         // the WKWebView is created from it; popups inherit them from it.
         cocoa_install_schemes(e->config);
+        // Canvas 35 D12: media preferences, also before the WKWebView exists.
+        cocoa_enable_media_capture(e->config);
         e->manager = msg(e->config, sel("userContentController"));
         id wv = msg(objc_cls("WKWebView"), sel("alloc"));
         wv = msg<id, CGRect, id>(
@@ -8408,6 +9055,20 @@ static void cocoa_destroy_engine(Engine *e) {
         e->download_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
+    // Canvas 35 D8: the permission-callback global ref goes the same way;
+    // the hook reads it only on AppKit main, where requests still pending are
+    // denied by the teardown below.
+    if (e->permission_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->permission_callback);
+        e->permission_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     // Canvas 34 D8: the navigation-callback global ref goes the same way.
     if (e->navigation_callback) {
         JNIEnv *env = nullptr;
@@ -8469,6 +9130,9 @@ static void cocoa_destroy_engine(Engine *e) {
         // "later" impossible in normal operation but the flag is the
         // canvas-mandated belt-and-suspenders.
         e->destroyed.store(true);
+
+        // Canvas 35 D8: deny every media-capture request still pending.
+        cocoa_perm_drain(e);
 
         // KVO observer unregistration MUST happen BEFORE any view
         // release -- AppKit warns (and may crash) if an observed object
@@ -9947,6 +10611,66 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
     if (peer == 0) return;
 #ifdef WEBVIEW_GTK
     embed::gtk_off_set_navigation_callback((embed::OffEngine *)peer, env, cb);
+#else
+    // No offscreen engine on macOS or Windows.
+    (void)env; (void)cb;
+#endif
+}
+
+// Media-capture permission requests — Canvas 35 D5.  webview_permission_available
+// is the support probe (an older native lacks the symbol); respond answers a
+// pending request from any thread, applied on the engine's own thread; the
+// setters install the WebViewPermissionCallback each engine asks.
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1permission_1available
+  (JNIEnv *, jclass) {
+#if defined(WEBVIEW_GTK) || defined(WEBVIEW_COCOA)
+    return JNI_TRUE;
+#else
+    return JNI_FALSE;
+#endif
+}
+
+// Canvas 35 D13: the camera / microphone bits whose Info.plist usage
+// description is missing (main bundle, or the responsible ancestor when not
+// launched by launchd); 0 on every non-macOS native.
+JNIEXPORT jint JNICALL Java_ca_weblite_webview_WebViewNative_webview_1mac_1missing_1usage_1descriptions
+  (JNIEnv *, jclass) {
+#ifdef WEBVIEW_COCOA
+    return (jint)embed::cocoa_media_missing_kinds(
+        embed::PERM_KIND_CAMERA | embed::PERM_KIND_MICROPHONE);
+#else
+    return 0;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1permission_1respond
+  (JNIEnv *, jclass, jlong id, jint decision) {
+#ifdef WEBVIEW_GTK
+    embed::gtk_perm_respond((long long)id, (int)decision);
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_perm_respond((long long)id, (int)decision);
+#else
+    (void)id; (void)decision;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1permission_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    if (wv == 0) return;
+#ifdef WEBVIEW_GTK
+    embed::gtk_set_permission_callback((embed::Engine *)wv, env, cb);
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_set_permission_callback((embed::Engine *)wv, env, cb);
+#else
+    (void)env; (void)cb;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1permission_1callback
+  (JNIEnv *env, jclass, jlong peer, jobject cb) {
+    if (peer == 0) return;
+#ifdef WEBVIEW_GTK
+    embed::gtk_off_set_permission_callback((embed::OffEngine *)peer, env, cb);
 #else
     // No offscreen engine on macOS or Windows.
     (void)env; (void)cb;
