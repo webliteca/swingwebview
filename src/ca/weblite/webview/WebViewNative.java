@@ -566,6 +566,21 @@ native static boolean webview_navigation_available();
 native static void webview_embed_set_navigation_callback(long w, WebViewNavigationCallback cb);
 native static void webview_offscreen_set_navigation_callback(long peer, WebViewNavigationCallback cb);
 
+// Canvas 36: application items in the engine's own context menu.
+// webview_context_menu_available is present only in natives built with the
+// feature (WebViewComponent.isContextMenuContributionSupported() absorbs the
+// UnsatisfiedLinkError an older native raises).  The set_context_menu_callback
+// bridges hand the engine a WebViewContextMenuCallback it asks, synchronously
+// on its UI thread, for items just before it opens its menu, and calls when
+// the user chooses one; null removes it.  set_screen_origin tells the Linux
+// offscreen engine where its Swing component is on screen, so the engine's
+// menu opens at the pointer.  The offscreen bridges are no-ops on macOS and
+// Windows, which have no offscreen engine.
+native static boolean webview_context_menu_available();
+native static void webview_embed_set_context_menu_callback(long w, WebViewContextMenuCallback cb);
+native static void webview_offscreen_set_context_menu_callback(long peer, WebViewContextMenuCallback cb);
+native static void webview_offscreen_set_screen_origin(long peer, int x, int y);
+
 // Canvas 35: media-capture permission requests.  webview_permission_available
 // is present only in natives built with the feature (WebViewComponent.
 // isPermissionHandlerSupported() absorbs the UnsatisfiedLinkError an older

@@ -18,6 +18,7 @@ import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewClickCallback;
 import ca.weblite.webview.WebViewDialogCallback;
 import ca.weblite.webview.WebViewNavigationCallback;
+import ca.weblite.webview.WebViewContextMenuCallback;
 import ca.weblite.webview.WebViewPermissionCallback;
 import ca.weblite.webview.WebViewPopupCallback;
 import ca.weblite.webview.WebViewFocusCallback;
@@ -262,6 +263,7 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         dialogDispatcher.disposeAll();
         popupDispatcher.disposeAll();
         navigationDispatcher.disposeAll();
+        contextMenuDispatcher.dispose();
         permissionDispatcher.disposeAll();
         downloadDispatcher.disposeAll();
         passwordDispatcher.disposeAll();
@@ -645,6 +647,22 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
             public boolean onNavigationRequested(String url, String currentUrl,
                                                  int cause) {
                 return navigationDispatcher.dispatch(url, currentUrl, cause);
+            }
+        });
+        // Canvas 36 D6: the context-menu bridge.  The engine asks it, on its
+        // UI thread, for application items just before it opens its own
+        // menu, and calls it when the user chooses one.
+        embedded.setContextMenuCallback(new WebViewContextMenuCallback() {
+            @Override
+            public String[] onContextMenuRequested(int flags, String linkUrl,
+                    String imageUrl, String mediaUrl, String selectionText,
+                    int x, int y) {
+                return contextMenuDispatcher.requested(flags, linkUrl, imageUrl,
+                    mediaUrl, selectionText, x, y);
+            }
+            @Override
+            public void onContextMenuItemSelected(long token, int index) {
+                contextMenuDispatcher.selected(token, index);
             }
         });
         // Canvas 35 D5: the media-capture permission bridge, installed with

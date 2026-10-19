@@ -18,6 +18,7 @@ import ca.weblite.webview.WebViewPasswordCallback;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewDialogCallback;
 import ca.weblite.webview.WebViewNavigationCallback;
+import ca.weblite.webview.WebViewContextMenuCallback;
 import ca.weblite.webview.WebViewPermissionCallback;
 import ca.weblite.webview.WebViewPopupCallback;
 import ca.weblite.webview.WebViewMouseDispatcher;
@@ -124,9 +125,20 @@ public class WebViewLightweightComponent extends WebViewComponent {
 
     private void installMouseListeners() {
         MouseAdapter ma = new MouseAdapter() {
+            // Canvas 36 D9b: a held secondary-button press, forwarded at
+            // release.  While the button is down the X server's implicit
+            // grab belongs to this window, so GTK could not grab the pointer
+            // for WebKit's own context menu and would skip it.
+            private MouseEvent heldSecondaryPress;
+
             @Override public void mousePressed(MouseEvent e) {
                 if (engine == null) return;
                 requestFocusInWindow();
+                reportScreenOrigin();
+                if (e.getButton() == MouseEvent.BUTTON3) {
+                    heldSecondaryPress = e;
+                    return;
+                }
                 engine.mouseButton(true, e.getX(), e.getY(),
                     GdkInput.translateButton(e.getButton()),
                     GdkInput.translateModifiers(e.getModifiersEx()),
@@ -134,6 +146,15 @@ public class WebViewLightweightComponent extends WebViewComponent {
             }
             @Override public void mouseReleased(MouseEvent e) {
                 if (engine == null) return;
+                if (e.getButton() == MouseEvent.BUTTON3) {
+                    MouseEvent p = heldSecondaryPress;
+                    heldSecondaryPress = null;
+                    if (p == null) return;
+                    engine.mouseButton(true, p.getX(), p.getY(),
+                        GdkInput.translateButton(p.getButton()),
+                        GdkInput.translateModifiers(p.getModifiersEx()),
+                        p.getClickCount());
+                }
                 engine.mouseButton(false, e.getX(), e.getY(),
                     GdkInput.translateButton(e.getButton()),
                     GdkInput.translateModifiers(e.getModifiersEx()),
@@ -172,6 +193,23 @@ public class WebViewLightweightComponent extends WebViewComponent {
         });
     }
 
+    /**
+     * Canvas 36 D9: tell the offscreen engine where this component is on
+     * screen before forwarding a press, so the engine's own context menu
+     * (which WebKitGTK would anchor to its parked, off-screen window) opens
+     * at the pointer.  EDT only.
+     */
+    private void reportScreenOrigin() {
+        OffscreenWebView e = engine;
+        if (e == null || !isShowing()) return;
+        try {
+            java.awt.Point p = getLocationOnScreen();
+            e.setScreenOrigin(p.x, p.y);
+        } catch (RuntimeException ignored) {
+            // Not on screen (IllegalComponentStateException) or peer gone.
+        }
+    }
+
     private void installKeyListener() {
         // Don't traverse focus on Tab/Shift-Tab -- let WebKit see them
         // so the user can tab through form fields inside the page.
@@ -185,6 +223,7 @@ public class WebViewLightweightComponent extends WebViewComponent {
                 int keyval = GdkInput.translateKeyCode(
                     e.getKeyCode(), e.getKeyChar());
                 if (keyval == 0) return;
+                if (press) reportScreenOrigin();
                 engine.keyEvent(press, keyval,
                     GdkInput.translateModifiers(e.getModifiersEx()),
                     GdkInput.isModifierKey(e.getKeyCode()));
@@ -480,6 +519,22 @@ public class WebViewLightweightComponent extends WebViewComponent {
                 return navigationDispatcher.dispatch(url, currentUrl, cause);
             }
         });
+        // Canvas 36 D6: the context-menu bridge.  The engine asks it, on its
+        // UI thread, for application items just before it opens its own
+        // menu, and calls it when the user chooses one.
+        engine.setContextMenuCallback(new WebViewContextMenuCallback() {
+            @Override
+            public String[] onContextMenuRequested(int flags, String linkUrl,
+                    String imageUrl, String mediaUrl, String selectionText,
+                    int x, int y) {
+                return contextMenuDispatcher.requested(flags, linkUrl, imageUrl,
+                    mediaUrl, selectionText, x, y);
+            }
+            @Override
+            public void onContextMenuItemSelected(long token, int index) {
+                contextMenuDispatcher.selected(token, index);
+            }
+        });
         // Canvas 35 D5: the media-capture permission bridge, installed with
         // the navigation bridge so the first page's requests are routed.  It
         // answers at once (no handler: the engine decides) or PENDING, and
@@ -525,6 +580,7 @@ public class WebViewLightweightComponent extends WebViewComponent {
         dialogDispatcher.disposeAll();
         popupDispatcher.disposeAll();
         navigationDispatcher.disposeAll();
+        contextMenuDispatcher.dispose();
         permissionDispatcher.disposeAll();
         downloadDispatcher.disposeAll();
         passwordDispatcher.disposeAll();

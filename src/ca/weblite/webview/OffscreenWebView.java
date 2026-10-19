@@ -244,6 +244,20 @@ public class OffscreenWebView {
             peer, press ? 1 : 0, x, y, button, modifiers, clickCount);
     }
 
+    /**
+     * Tell the engine where its Swing component's top-left corner is on
+     * screen (Canvas 36 D9), so the engine's own context menu opens at the
+     * pointer.  Ignored by an older native library.
+     */
+    public void setScreenOrigin(int x, int y) {
+        checkAlive();
+        try {
+            WebViewNative.webview_offscreen_set_screen_origin(peer, x, y);
+        } catch (UnsatisfiedLinkError ule) {
+            // Native library predates Canvas 36.
+        }
+    }
+
     /** Inject a mouse-move event. */
     public void mouseMotion(int x, int y, int modifiers) {
         checkAlive();
@@ -486,6 +500,29 @@ public class OffscreenWebView {
         return this;
     }
 
+
+    /**
+     * Register the context-menu callback (Canvas 36 D6): the engine asks it,
+     * synchronously on its UI thread, for application items just before it
+     * opens its own menu, and calls it when the user chooses one.  Anchors
+     * {@code cb} in {@link #heap}.  An older native library without the
+     * feature leaves the menu unchanged;
+     * {@code WebViewComponent.isContextMenuContributionSupported()} says so.
+     *
+     * @return {@code this} for chaining
+     */
+    public OffscreenWebView setContextMenuCallback(WebViewContextMenuCallback cb) {
+        checkAlive();
+        if (cb != null) {
+            heap.add(cb);
+        }
+        try {
+            WebViewNative.webview_offscreen_set_context_menu_callback(peer, cb);
+        } catch (UnsatisfiedLinkError ule) {
+            // Native library predates Canvas 36.
+        }
+        return this;
+    }
 
     /**
      * Register the navigation callback (Canvas 34 D5): the engine calls it

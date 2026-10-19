@@ -121,6 +121,17 @@
 #define webkit_user_media_permission_is_for_display_device (::g_wk.fn_webkit_user_media_permission_is_for_display_device)
 #endif
 
+// Context-menu items (Canvas 36 D9): optional -- test WK_HAS.
+#if WEBKIT_CHECK_VERSION(2, 18, 0)
+#define webkit_context_menu_append (::g_wk.fn_webkit_context_menu_append)
+#define webkit_context_menu_item_new_from_gaction (::g_wk.fn_webkit_context_menu_item_new_from_gaction)
+#define webkit_context_menu_item_new_separator (::g_wk.fn_webkit_context_menu_item_new_separator)
+#define webkit_hit_test_result_get_context (::g_wk.fn_webkit_hit_test_result_get_context)
+#define webkit_hit_test_result_get_link_uri (::g_wk.fn_webkit_hit_test_result_get_link_uri)
+#define webkit_hit_test_result_get_image_uri (::g_wk.fn_webkit_hit_test_result_get_image_uri)
+#define webkit_hit_test_result_get_media_uri (::g_wk.fn_webkit_hit_test_result_get_media_uri)
+#endif
+
 // JS-result readers — gate identically to webkit_loader.h / webview.h.
 #if WEBKIT_MAJOR_VERSION >= 2 && WEBKIT_MINOR_VERSION >= 22
 #define webkit_javascript_result_get_js_value (::g_wk.fn_webkit_javascript_result_get_js_value)

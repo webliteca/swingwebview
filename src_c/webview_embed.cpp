@@ -849,6 +849,9 @@ struct Engine {
     // "decide-policy" handler on every navigation; freed in
     // gtk_destroy_engine.
     jobject navigation_callback = nullptr;
+    // Canvas 36 D6: JNI global ref to the WebViewContextMenuCallback, or
+    // nullptr.  Read by the "context-menu" handler; freed on destroy.
+    jobject context_menu_callback = nullptr;
     // Canvas 35 D5: JNI global ref to the WebViewPermissionCallback, or
     // nullptr.  Read by the media-capture permission hook on the engine's UI
     // thread; set by the permission-callback setter; freed on destroy after
@@ -1632,6 +1635,197 @@ static void gtk_apply_media_settings(WebKitSettings *s) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Canvas 36 D9: application items in WebKitGTK's own context menu.  The
+// "context-menu" handler asks the WebViewContextMenuCallback for items and
+// appends a separator and one GAction item per answer element; WebKit then
+// shows its menu as usual (the handler always returns FALSE).  Each item's
+// action owns what activation needs (its own global ref, token, index), so
+// choosing it never touches an engine that may be gone.
+// ---------------------------------------------------------------------------
+enum {
+    CM_FLAG_LINK = 1, CM_FLAG_IMAGE = 2, CM_FLAG_MEDIA = 4,
+    CM_FLAG_EDITABLE = 8, CM_FLAG_SELECTION = 16, CM_FLAG_NATIVE = 256
+};
+
+static JNIEnv *gtk_ctx_env(JavaVM *jvm, bool *detach) {
+    *detach = false;
+    if (!jvm) return nullptr;
+    JNIEnv *env = nullptr;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK) return nullptr;
+        *detach = true;
+    }
+    return env;
+}
+
+#if WEBKIT_CHECK_VERSION(2, 18, 0)
+struct GtkCtxItem {
+    JavaVM *jvm;
+    jobject cb;        // own global ref to the WebViewContextMenuCallback
+    long long token;
+    int index;
+};
+
+static void gtk_ctx_item_free(gpointer data, GClosure *) {
+    GtkCtxItem *it = static_cast<GtkCtxItem *>(data);
+    if (!it) return;
+    bool detach = false;
+    JNIEnv *env = gtk_ctx_env(it->jvm, &detach);
+    if (env && it->cb) env->DeleteGlobalRef(it->cb);
+    if (detach) it->jvm->DetachCurrentThread();
+    delete it;
+}
+
+static void gtk_ctx_item_activate(GSimpleAction *, GVariant *, gpointer data) {
+    GtkCtxItem *it = static_cast<GtkCtxItem *>(data);
+    if (!it || !it->cb) return;
+    bool detach = false;
+    JNIEnv *env = gtk_ctx_env(it->jvm, &detach);
+    if (!env) return;
+    jclass cls = env->GetObjectClass(it->cb);
+    if (cls) {
+        jmethodID mid = env->GetMethodID(cls, "onContextMenuItemSelected", "(JI)V");
+        if (mid) env->CallVoidMethod(it->cb, mid, (jlong)it->token, (jint)it->index);
+        env->DeleteLocalRef(cls);
+    }
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+    }
+    if (detach) it->jvm->DetachCurrentThread();
+}
+
+// UTF-16 element of the wire answer -> UTF-8 (Canvas 36 D6: GetStringChars,
+// never GetStringUTFChars, so characters outside the BMP survive).  `skip`
+// drops leading code units (the enabled marker).
+static std::string gtk_ctx_utf8(JNIEnv *env, jstring s, jsize skip) {
+    std::string out;
+    if (!s) return out;
+    jsize n = env->GetStringLength(s);
+    const jchar *chars = env->GetStringChars(s, nullptr);
+    if (!chars) return out;
+    if (n > skip) {
+        gchar *u = g_utf16_to_utf8((const gunichar2 *)(chars + skip),
+                                   (glong)(n - skip), nullptr, nullptr, nullptr);
+        if (u) { out = u; g_free(u); }
+    }
+    env->ReleaseStringChars(s, chars);
+    return out;
+}
+#endif
+
+static void gtk_handle_context_menu(JavaVM *jvm, jobject cb,
+                                    WebKitContextMenu *menu, GdkEvent *event,
+                                    WebKitHitTestResult *hit) {
+#if WEBKIT_CHECK_VERSION(2, 18, 0)
+    if (!jvm || !cb || !menu) return;
+    if (!WK_HAS(webkit_context_menu_append)
+            || !WK_HAS(webkit_context_menu_item_new_from_gaction)
+            || !WK_HAS(webkit_context_menu_item_new_separator)
+            || !WK_HAS(webkit_hit_test_result_get_context)
+            || !WK_HAS(webkit_hit_test_result_get_link_uri)
+            || !WK_HAS(webkit_hit_test_result_get_image_uri)
+            || !WK_HAS(webkit_hit_test_result_get_media_uri)) {
+        return;
+    }
+    int flags = CM_FLAG_NATIVE;
+    const gchar *link = nullptr, *image = nullptr, *media = nullptr;
+    if (hit) {
+        guint c = webkit_hit_test_result_get_context(hit);
+        if (c & WEBKIT_HIT_TEST_RESULT_CONTEXT_LINK) flags |= CM_FLAG_LINK;
+        if (c & WEBKIT_HIT_TEST_RESULT_CONTEXT_IMAGE) flags |= CM_FLAG_IMAGE;
+        if (c & WEBKIT_HIT_TEST_RESULT_CONTEXT_MEDIA) flags |= CM_FLAG_MEDIA;
+        if (c & WEBKIT_HIT_TEST_RESULT_CONTEXT_EDITABLE) flags |= CM_FLAG_EDITABLE;
+        if (c & WEBKIT_HIT_TEST_RESULT_CONTEXT_SELECTION) flags |= CM_FLAG_SELECTION;
+        if (flags & CM_FLAG_LINK) link = webkit_hit_test_result_get_link_uri(hit);
+        if (flags & CM_FLAG_IMAGE) image = webkit_hit_test_result_get_image_uri(hit);
+        if (flags & CM_FLAG_MEDIA) media = webkit_hit_test_result_get_media_uri(hit);
+    }
+    int x = -1, y = -1;
+    gdouble ex = 0, ey = 0;
+    if (event && gdk_event_get_coords(event, &ex, &ey)) {
+        x = (int)ex;
+        y = (int)ey;
+    }
+
+    bool detach = false;
+    JNIEnv *env = gtk_ctx_env(jvm, &detach);
+    if (!env) return;
+    jobjectArray answer = nullptr;
+    jclass cls = env->GetObjectClass(cb);
+    if (cls) {
+        jmethodID mid = env->GetMethodID(cls, "onContextMenuRequested",
+            "(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;"
+            "Ljava/lang/String;II)[Ljava/lang/String;");
+        if (mid) {
+            jstring jl = link ? env->NewStringUTF(link) : nullptr;
+            jstring ji = image ? env->NewStringUTF(image) : nullptr;
+            jstring jm = media ? env->NewStringUTF(media) : nullptr;
+            answer = (jobjectArray)env->CallObjectMethod(cb, mid, (jint)flags,
+                jl, ji, jm, (jstring)nullptr, (jint)x, (jint)y);
+            if (jl) env->DeleteLocalRef(jl);
+            if (ji) env->DeleteLocalRef(ji);
+            if (jm) env->DeleteLocalRef(jm);
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        answer = nullptr;
+    }
+    jsize n = answer ? env->GetArrayLength(answer) : 0;
+    if (n >= 2) {
+        long long token = 0;
+        jstring jt = (jstring)env->GetObjectArrayElement(answer, 0);
+        if (jt) {
+            std::string ts = gtk_ctx_utf8(env, jt, 0);
+            token = std::strtoll(ts.c_str(), nullptr, 10);
+            env->DeleteLocalRef(jt);
+        }
+        webkit_context_menu_append(menu, webkit_context_menu_item_new_separator());
+        for (jsize i = 1; i < n; i++) {
+            jstring js = (jstring)env->GetObjectArrayElement(answer, i);
+            if (!js) continue;
+            bool enabled = false;
+            if (env->GetStringLength(js) > 0) {
+                const jchar *c0 = env->GetStringChars(js, nullptr);
+                if (c0) { enabled = c0[0] == '1'; env->ReleaseStringChars(js, c0); }
+            }
+            std::string raw = gtk_ctx_utf8(env, js, 1);
+            env->DeleteLocalRef(js);
+            // WebKit's GTK menu treats '_' as a mnemonic: double it.
+            std::string label;
+            for (char ch : raw) {
+                label += ch;
+                if (ch == '_') label += '_';
+            }
+            char name[96];
+            std::snprintf(name, sizeof name, "weblite-ctx-%lld-%d", token, (int)(i - 1));
+            GSimpleAction *action = g_simple_action_new(name, nullptr);
+            g_simple_action_set_enabled(action, enabled ? TRUE : FALSE);
+            GtkCtxItem *data = new GtkCtxItem();
+            data->jvm = jvm;
+            data->cb = env->NewGlobalRef(cb);
+            data->token = token;
+            data->index = (int)(i - 1);
+            g_signal_connect_data(action, "activate",
+                                  G_CALLBACK(gtk_ctx_item_activate), data,
+                                  gtk_ctx_item_free, (GConnectFlags)0);
+            webkit_context_menu_append(menu,
+                webkit_context_menu_item_new_from_gaction(G_ACTION(action),
+                                                          label.c_str(), nullptr));
+            g_object_unref(action);
+        }
+    }
+    if (answer) env->DeleteLocalRef(answer);
+    if (detach) jvm->DetachCurrentThread();
+#else
+    (void)jvm; (void)cb; (void)menu; (void)event; (void)hit;
+#endif
+}
+
 // Canvas 19: synchronous DISPOSITION hop into Java on the GTK main thread.
 // Calls WebViewPopupCallback.onPopupDisposition and returns the
 // PopupDisposition ordinal (0 = BLOCK, 1 = NATIVE_WINDOW, 2 = ADOPT).  Mirrors
@@ -2153,6 +2347,15 @@ static gboolean on_decide_policy_engine(WebKitWebView *web,
                                  decision, type);
 }
 
+// Canvas 36 D9: per-Engine wrapper for "context-menu" (heavyweight, and an
+// adopted popup's view).  Never run on Linux (D9a); kept like the OffEngine's.
+static gboolean on_context_menu_engine(WebKitWebView *, WebKitContextMenu *menu,
+        GdkEvent *event, WebKitHitTestResult *hit, gpointer user_data) {
+    Engine *e = static_cast<Engine *>(user_data);
+    if (e) gtk_handle_context_menu(e->jvm, e->context_menu_callback, menu, event, hit);
+    return FALSE;
+}
+
 // Canvas 35 D7b: per-Engine wrapper for "permission-request" (heavyweight,
 // and an adopted popup's view).
 static gboolean on_permission_request_engine(WebKitWebView *web,
@@ -2505,6 +2708,9 @@ static Engine *gtk_create_engine(JNIEnv *env, jobject component, jint debug,
         // Canvas 35 D7b: camera, microphone and screen-capture requests.
         g_signal_connect(WEBKIT_WEB_VIEW(e->web), "permission-request",
                          (GCallback)on_permission_request_engine, e);
+        // Canvas 36 D9: application items in WebKit's own context menu.
+        g_signal_connect(WEBKIT_WEB_VIEW(e->web), "context-menu",
+                         (GCallback)on_context_menu_engine, e);
 
         // Wire up the "external" message handler.
         g_signal_connect(
@@ -2740,6 +2946,22 @@ static void gtk_destroy_engine(Engine *e) {
     if (e->web) {
         g_signal_handlers_disconnect_by_func(G_OBJECT(e->web),
             (gpointer)on_decide_policy_engine, e);
+    }
+    // Canvas 36 D6: stop asking for menu items, then drop the callback.
+    if (e->web) {
+        g_signal_handlers_disconnect_by_func(G_OBJECT(e->web),
+            (gpointer)on_context_menu_engine, e);
+    }
+    if (e->context_menu_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm && e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->context_menu_callback);
+        e->context_menu_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
     }
     if (e->navigation_callback) {
         JNIEnv *env = nullptr;
@@ -3399,6 +3621,19 @@ static void gtk_set_navigation_callback(Engine *e, JNIEnv *env, jobject cb) {
     }
 }
 
+// Canvas 36 D6: register (or clear, when cb is null) the context-menu callback.
+// Mirrors gtk_set_navigation_callback.
+static void gtk_set_context_menu_callback(Engine *e, JNIEnv *env, jobject cb) {
+    if (!e) return;
+    if (e->context_menu_callback) {
+        env->DeleteGlobalRef(e->context_menu_callback);
+        e->context_menu_callback = nullptr;
+    }
+    if (cb) {
+        e->context_menu_callback = env->NewGlobalRef(cb);
+    }
+}
+
 // Canvas 35 D5: register (or clear, when cb is null) the permission callback.
 // Mirrors gtk_set_navigation_callback.
 static void gtk_set_permission_callback(Engine *e, JNIEnv *env, jobject cb) {
@@ -3819,6 +4054,15 @@ struct OffEngine {
     // Set by gtk_off_set_navigation_callback; freed in
     // gtk_off_destroy_engine.
     jobject navigation_callback = nullptr;
+    // Canvas 36 D6: JNI global ref to the WebViewContextMenuCallback, or
+    // nullptr.  Read by the "context-menu" handler; freed on destroy.
+    jobject context_menu_callback = nullptr;
+    // Canvas 36 D9: the Swing component's screen origin, reported by Java
+    // before each forwarded press; written and read on the GTK thread only.
+    // Used to move WebKit's own menu from the parked window to the pointer.
+    int screen_x = 0;
+    int screen_y = 0;
+    bool screen_known = false;
     // Canvas 35 D5: JNI global ref to the WebViewPermissionCallback, or
     // nullptr.  Read by the media-capture permission hook on the engine's UI
     // thread; set by the permission-callback setter; freed on destroy after
@@ -3890,6 +4134,80 @@ static gboolean on_permission_request_off_engine(WebKitWebView *web,
     if (!e) return FALSE;
     return gtk_handle_permission_request(e->jvm, e->permission_callback, e,
                                          web, request);
+}
+
+// Canvas 36 D9: per-OffEngine wrapper for "context-menu".
+static gboolean on_context_menu_off_engine(WebKitWebView *, WebKitContextMenu *menu,
+        GdkEvent *event, WebKitHitTestResult *hit, gpointer user_data) {
+    OffEngine *e = static_cast<OffEngine *>(user_data);
+    if (e) gtk_handle_context_menu(e->jvm, e->context_menu_callback, menu, event, hit);
+    return FALSE;
+}
+
+// Canvas 36 D9: object-data key on an OffEngine's view, naming its engine for
+// the menu-placement hook; cleared on destroy.
+static const char *const OFF_ENGINE_KEY = "weblite-off-engine";
+
+// Canvas 36 D9: lightweight menu placement.  WebKitGTK anchors its GtkMenu to
+// the view, whose window is parked far off-screen (Canvas 33 D2), so GTK slides
+// the menu to a monitor corner.  Once GTK has placed it, take the pre-slide
+// ("flipped") rectangle, make it relative to the view, re-base it on the Swing
+// component's screen origin, keep it inside the monitor's work area, and move
+// the menu there.  Acts only on menus attached to an OffEngine's view.
+static gboolean gtk_off_menu_popped_up(GSignalInvocationHint *, guint n_params,
+                                       const GValue *params, gpointer) {
+    if (n_params < 3) return TRUE;
+    GObject *obj = static_cast<GObject *>(g_value_get_object(&params[0]));
+    if (!obj || !GTK_IS_MENU(obj)) return TRUE;
+    GtkWidget *att = gtk_menu_get_attach_widget(GTK_MENU(obj));
+    if (!att) return TRUE;
+    OffEngine *e = static_cast<OffEngine *>(
+        g_object_get_data(G_OBJECT(att), OFF_ENGINE_KEY));
+    if (!e || !e->screen_known) return TRUE;
+    const GdkRectangle *flipped =
+        static_cast<const GdkRectangle *>(g_value_get_pointer(&params[1]));
+    const GdkRectangle *final_rect =
+        static_cast<const GdkRectangle *>(g_value_get_pointer(&params[2]));
+    if (!flipped) return TRUE;
+    GtkWidget *top = gtk_widget_get_toplevel(GTK_WIDGET(obj));
+    GdkWindow *mw = top ? gtk_widget_get_window(top) : nullptr;
+    GdkWindow *vw = gtk_widget_get_window(att);
+    if (!mw || !vw) return TRUE;
+    int ox = 0, oy = 0;
+    gdk_window_get_origin(vw, &ox, &oy);
+    int w = final_rect ? final_rect->width : gdk_window_get_width(mw);
+    int h = final_rect ? final_rect->height : gdk_window_get_height(mw);
+    int ax = e->screen_x + (flipped->x - ox);
+    int ay = e->screen_y + (flipped->y - oy);
+    int tx = ax, ty = ay;
+    GdkMonitor *mon = gdk_display_get_monitor_at_point(
+        gdk_window_get_display(mw), ax, ay);
+    if (mon) {
+        GdkRectangle wa;
+        gdk_monitor_get_workarea(mon, &wa);
+        if (tx + w > wa.x + wa.width) tx = ax - w;
+        if (ty + h > wa.y + wa.height) ty = ay - h;
+        if (tx + w > wa.x + wa.width) tx = wa.x + wa.width - w;
+        if (ty + h > wa.y + wa.height) ty = wa.y + wa.height - h;
+        if (tx < wa.x) tx = wa.x;
+        if (ty < wa.y) ty = wa.y;
+    }
+    gdk_window_move(mw, tx, ty);
+    return TRUE;
+}
+
+// Canvas 36 D9: install the placement hook once, on the GTK thread.  The
+// GtkMenu class is referenced (and kept) so its "popped-up" signal exists;
+// a GTK older than 3.22 has no such signal and keeps GTK's own placement.
+static void gtk_off_install_menu_placement_once() {
+    static bool installed = false;
+    if (installed) return;
+    installed = true;
+    g_type_class_ref(GTK_TYPE_MENU);
+    guint sig = g_signal_lookup("popped-up", GTK_TYPE_MENU);
+    if (sig != 0) {
+        g_signal_add_emission_hook(sig, 0, gtk_off_menu_popped_up, nullptr, nullptr);
+    }
 }
 
 // Parallel of engine_on_message for OffEngine: parse the {name, seq, args}
@@ -4060,6 +4378,12 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
         // Canvas 35 D7b: camera, microphone and screen-capture requests.
         g_signal_connect(WEBKIT_WEB_VIEW(e->web), "permission-request",
                          (GCallback)on_permission_request_off_engine, e);
+        // Canvas 36 D9: application items in WebKit's own context menu, and
+        // the menu opened at the pointer rather than at the parked window.
+        g_signal_connect(WEBKIT_WEB_VIEW(e->web), "context-menu",
+                         (GCallback)on_context_menu_off_engine, e);
+        g_object_set_data(G_OBJECT(e->web), OFF_ENGINE_KEY, e);
+        gtk_off_install_menu_placement_once();
 
         webkit_user_content_manager_add_script(
             e->manager,
@@ -4150,6 +4474,23 @@ static void gtk_off_destroy_engine(OffEngine *e) {
     if (e->web) {
         g_signal_handlers_disconnect_by_func(G_OBJECT(e->web),
             (gpointer)on_decide_policy_off_engine, e);
+    }
+    // Canvas 36 D6: stop asking for menu items, then drop the callback.
+    if (e->web) {
+        g_signal_handlers_disconnect_by_func(G_OBJECT(e->web),
+            (gpointer)on_context_menu_off_engine, e);
+        g_object_set_data(G_OBJECT(e->web), OFF_ENGINE_KEY, nullptr);
+    }
+    if (e->context_menu_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm && e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->context_menu_callback);
+        e->context_menu_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
     }
     if (e->navigation_callback) {
         JNIEnv *env = nullptr;
@@ -4333,6 +4674,30 @@ static void gtk_off_set_navigation_callback(OffEngine *e, JNIEnv *env,
     if (cb) {
         e->navigation_callback = env->NewGlobalRef(cb);
     }
+}
+
+// Canvas 36 D6: offscreen counterpart to gtk_set_context_menu_callback.
+static void gtk_off_set_context_menu_callback(OffEngine *e, JNIEnv *env,
+                                              jobject cb) {
+    if (!e) return;
+    if (e->context_menu_callback) {
+        env->DeleteGlobalRef(e->context_menu_callback);
+        e->context_menu_callback = nullptr;
+    }
+    if (cb) {
+        e->context_menu_callback = env->NewGlobalRef(cb);
+    }
+}
+
+// Canvas 36 D9: record the Swing component's screen origin on the GTK thread,
+// ahead of the press Java forwards next (same queue, so in order).
+static void gtk_off_set_screen_origin(OffEngine *e, int x, int y) {
+    if (!e) return;
+    GtkPump::instance().run_async([=] {
+        e->screen_x = x;
+        e->screen_y = y;
+        e->screen_known = true;
+    });
 }
 
 // Canvas 35 D5: offscreen counterpart to gtk_set_permission_callback.
@@ -5219,6 +5584,10 @@ struct Engine {
     // nullptr.  Read by decidePolicyForNavigationAction on AppKit main;
     // set by cocoa_set_navigation_callback; freed in cocoa_destroy_engine.
     jobject navigation_callback = nullptr;
+    // Canvas 36 D10: JNI global ref to the WebViewContextMenuCallback, or
+    // nullptr.  Read by the willOpenMenu:withEvent: hook on AppKit main; set
+    // by cocoa_set_context_menu_callback; freed in cocoa_destroy_engine.
+    jobject context_menu_callback = nullptr;
     // Canvas 35 D5: JNI global ref to the WebViewPermissionCallback, or
     // nullptr.  Read by the media-capture permission hook on the engine's UI
     // thread; set by the permission-callback setter; freed on destroy after
@@ -7873,6 +8242,256 @@ static void install_click_swizzle() {
     });
 }
 
+// ---------------------------------------------------------------------------
+// Canvas 36 D10: application items in WKWebView's own context menu.  A
+// class-wide hook on -[WKWebView willOpenMenu:withEvent:] runs the original
+// first, then (for views this library owns, with a callback set) asks Java on
+// AppKit main for items and appends a separator and one NSMenuItem each.
+// Activation goes through a shared WebliteContextMenuTarget and a table keyed
+// by a native-unique id (token -> engine, own global ref), purged when the
+// engine builds a newer menu and when it is destroyed.
+// ---------------------------------------------------------------------------
+typedef void (*VoidFromIdSelIdId)(id, SEL, id, id);
+static VoidFromIdSelIdId g_orig_willOpenMenu = nullptr;
+static bool g_willOpenMenu_added = false;
+static std::once_flag g_ctx_menu_swizzle_once;
+static id g_ctx_menu_target = nil;
+
+struct CocoaCtxEntry {
+    Engine *engine;
+    jobject cb;          // own global ref to the WebViewContextMenuCallback
+    long long token;
+};
+static std::mutex g_cocoa_ctx_mutex;
+static std::map<long long, CocoaCtxEntry> g_cocoa_ctx;   // uid -> entry
+static long long g_cocoa_ctx_next_uid = 1;
+
+// Remove (and return the refs of) every entry of `engine`; caller deletes the
+// refs outside the lock.
+static std::vector<jobject> cocoa_ctx_purge_locked(Engine *engine) {
+    std::vector<jobject> refs;
+    for (auto it = g_cocoa_ctx.begin(); it != g_cocoa_ctx.end();) {
+        if (it->second.engine == engine) {
+            refs.push_back(it->second.cb);
+            it = g_cocoa_ctx.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    return refs;
+}
+
+static void cocoa_ctx_purge(JNIEnv *env, Engine *engine) {
+    std::vector<jobject> refs;
+    {
+        std::lock_guard<std::mutex> lk(g_cocoa_ctx_mutex);
+        refs = cocoa_ctx_purge_locked(engine);
+    }
+    if (env) for (jobject r : refs) if (r) env->DeleteGlobalRef(r);
+}
+
+static void impl_ctx_menu_item(id, SEL, id item) {
+    if (!item) return;
+    id ro = msg<id>(item, sel("representedObject"));
+    if (!ro) return;
+    long long uid = msg<long long>(ro, sel("longLongValue"));
+    long index = msg<long>(item, sel("tag"));
+    JavaVM *jvm = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_cocoa_ctx_mutex);
+        auto it = g_cocoa_ctx.find(uid);
+        if (it == g_cocoa_ctx.end() || !it->second.engine) return;
+        jvm = it->second.engine->jvm;
+    }
+    bool attached = false;
+    JNIEnv *env = ensure_jni_env(jvm, &attached);
+    if (!env) return;
+    jobject cb = nullptr;
+    long long token = 0;
+    {
+        std::lock_guard<std::mutex> lk(g_cocoa_ctx_mutex);
+        auto it = g_cocoa_ctx.find(uid);
+        if (it != g_cocoa_ctx.end()) {
+            // A local ref keeps the callback alive past a concurrent purge.
+            cb = env->NewLocalRef(it->second.cb);
+            token = it->second.token;
+        }
+    }
+    if (cb) {
+        jclass cls = env->GetObjectClass(cb);
+        if (cls) {
+            jmethodID mid = env->GetMethodID(cls, "onContextMenuItemSelected", "(JI)V");
+            if (mid) env->CallVoidMethod(cb, mid, (jlong)token, (jint)index);
+            env->DeleteLocalRef(cls);
+        }
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+        }
+        env->DeleteLocalRef(cb);
+    }
+    if (attached) jvm->DetachCurrentThread();
+}
+
+static BOOL impl_ctx_menu_validate(id, SEL, id item) {
+    return item ? msg<BOOL>(item, sel("isEnabled")) : NO;
+}
+
+static id cocoa_ctx_menu_target() {
+    if (g_ctx_menu_target) return g_ctx_menu_target;
+    Class cls = (Class)objc_getClass("WebliteContextMenuTarget");
+    if (!cls) {
+        cls = objc_allocateClassPair((Class)objc_cls("NSObject"),
+                                     "WebliteContextMenuTarget", 0);
+        if (!cls) return nil;
+        class_addMethod(cls, sel("webliteContextMenuItem:"),
+                        (IMP)impl_ctx_menu_item, "v@:@");
+        class_addMethod(cls, sel("validateMenuItem:"),
+                        (IMP)impl_ctx_menu_validate, "c@:@");
+        objc_registerClassPair(cls);
+    }
+    g_ctx_menu_target = msg(msg((id)cls, sel("alloc")), sel("init"));
+    return g_ctx_menu_target;
+}
+
+static void cocoa_append_context_items(Engine *e, id webView, id menu, id event) {
+    if (!e || !e->context_menu_callback || !menu || e->destroyed.load()) return;
+    int x = -1, y = -1;
+    if (event) {
+        CGPoint loc = msg<CGPoint>(event, sel("locationInWindow"));
+        CGPoint p = msg<CGPoint, CGPoint, id>(webView, sel("convertPoint:fromView:"),
+                                              loc, (id)nil);
+        if (!msg<BOOL>(webView, sel("isFlipped"))) {
+            CGRect b = msg_stret<CGRect>(webView, sel("bounds"));
+            p.y = b.size.height - p.y;
+        }
+        x = (int)p.x;
+        y = (int)p.y;
+    }
+    bool attached = false;
+    JNIEnv *env = ensure_jni_env(e->jvm, &attached);
+    if (!env) return;
+    jobjectArray answer = nullptr;
+    jclass cls = env->GetObjectClass(e->context_menu_callback);
+    if (cls) {
+        jmethodID mid = env->GetMethodID(cls, "onContextMenuRequested",
+            "(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;"
+            "Ljava/lang/String;II)[Ljava/lang/String;");
+        if (mid) {
+            // flags 0: no native hit test; the Canvas 9 record describes it.
+            answer = (jobjectArray)env->CallObjectMethod(e->context_menu_callback,
+                mid, (jint)0, (jstring)nullptr, (jstring)nullptr,
+                (jstring)nullptr, (jstring)nullptr, (jint)x, (jint)y);
+        }
+        env->DeleteLocalRef(cls);
+    }
+    if (env->ExceptionCheck()) {
+        env->ExceptionDescribe();
+        env->ExceptionClear();
+        answer = nullptr;
+    }
+    // A newer menu of this engine makes the older one's items dead.
+    cocoa_ctx_purge(env, e);
+    jsize n = answer ? env->GetArrayLength(answer) : 0;
+    id target = n >= 2 ? cocoa_ctx_menu_target() : nil;
+    if (n >= 2 && target) {
+        long long token = 0;
+        jstring jt = (jstring)env->GetObjectArrayElement(answer, 0);
+        if (jt) {
+            const char *ts = env->GetStringUTFChars(jt, nullptr);
+            if (ts) { token = std::strtoll(ts, nullptr, 10); env->ReleaseStringUTFChars(jt, ts); }
+            env->DeleteLocalRef(jt);
+        }
+        long long uid;
+        {
+            std::lock_guard<std::mutex> lk(g_cocoa_ctx_mutex);
+            uid = g_cocoa_ctx_next_uid++;
+            g_cocoa_ctx[uid] = CocoaCtxEntry{e, env->NewGlobalRef(e->context_menu_callback), token};
+        }
+        id number = msg<id, long long>(objc_cls("NSNumber"), sel("numberWithLongLong:"), uid);
+        msg<void, id>(menu, sel("addItem:"),
+                      msg(objc_cls("NSMenuItem"), sel("separatorItem")));
+        for (jsize i = 1; i < n; i++) {
+            jstring js = (jstring)env->GetObjectArrayElement(answer, i);
+            if (!js) continue;
+            jsize len = env->GetStringLength(js);
+            const jchar *chars = env->GetStringChars(js, nullptr);
+            if (!chars || len < 1) {
+                if (chars) env->ReleaseStringChars(js, chars);
+                env->DeleteLocalRef(js);
+                continue;
+            }
+            bool enabled = chars[0] == '1';
+            // Titles are literal on macOS: no escaping (D10).
+            id title = msg<id, const unsigned short *, unsigned long>(
+                objc_cls("NSString"), sel("stringWithCharacters:length:"),
+                (const unsigned short *)(chars + 1), (unsigned long)(len - 1));
+            env->ReleaseStringChars(js, chars);
+            env->DeleteLocalRef(js);
+            id item = msg(objc_cls("NSMenuItem"), sel("alloc"));
+            item = msg<id, id, SEL, id>(item, sel("initWithTitle:action:keyEquivalent:"),
+                                        title, sel("webliteContextMenuItem:"), ns_str(""));
+            if (!item) continue;
+            msg<void, id>(item, sel("setTarget:"), target);
+            msg<void, long>(item, sel("setTag:"), (long)(i - 1));
+            msg<void, id>(item, sel("setRepresentedObject:"), number);
+            msg<void, BOOL>(item, sel("setEnabled:"), enabled ? YES : NO);
+            msg<void, id>(menu, sel("addItem:"), item);
+            msg<void>(item, sel("release"));
+        }
+    }
+    if (answer) env->DeleteLocalRef(answer);
+    if (attached) e->jvm->DetachCurrentThread();
+}
+
+static void impl_will_open_menu(id self, SEL _cmd, id menu, id event) {
+    if (g_willOpenMenu_added) {
+        Class sup = class_getSuperclass((Class)objc_cls("WKWebView"));
+        Method m = sup ? class_getInstanceMethod(sup, _cmd) : nullptr;
+        if (m) ((VoidFromIdSelIdId)method_getImplementation(m))(self, _cmd, menu, event);
+    } else if (g_orig_willOpenMenu) {
+        g_orig_willOpenMenu(self, _cmd, menu, event);
+    }
+    Engine *eng = nullptr;
+    {
+        std::lock_guard<std::mutex> lk(g_webview_map_mutex);
+        auto it = g_webview_map.find(self);
+        if (it != g_webview_map.end()) eng = it->second;
+    }
+    if (eng) cocoa_append_context_items(eng, self, menu, event);
+}
+
+static void install_context_menu_swizzle() {
+    std::call_once(g_ctx_menu_swizzle_once, [] {
+        Class wk = (Class)objc_cls("WKWebView");
+        if (!wk) return;
+        SEL s = sel("willOpenMenu:withEvent:");
+        // Add it when WKWebView does not implement it itself (the hook then
+        // calls NSView's); otherwise replace WKWebView's own.
+        if (class_addMethod(wk, s, (IMP)impl_will_open_menu, "v@:@@")) {
+            g_willOpenMenu_added = true;
+        } else {
+            Method m = class_getInstanceMethod(wk, s);
+            if (m) {
+                g_orig_willOpenMenu = (VoidFromIdSelIdId)method_setImplementation(
+                    m, (IMP)impl_will_open_menu);
+            }
+        }
+    });
+}
+
+// Canvas 36 D6: register (or clear, when cb is null) the context-menu callback.
+static void cocoa_set_context_menu_callback(Engine *e, JNIEnv *env, jobject cb) {
+    if (!e) return;
+    if (e->context_menu_callback) {
+        env->DeleteGlobalRef(e->context_menu_callback);
+        e->context_menu_callback = nullptr;
+    }
+    if (cb) {
+        e->context_menu_callback = env->NewGlobalRef(cb);
+    }
+}
+
 // Walk the responder chain from [window firstResponder] upward through
 // superview looking for e->webview.  Runs on the AppKit main thread
 // (invoked from the KVO observer below and from the post-window-attach
@@ -8302,6 +8921,8 @@ static Engine *cocoa_create_engine(JNIEnv *env, jobject parentComponent,
         // back to Swing (used for outside-click popup dismissal -- see
         // Operation 13 of the heavyweight-embedding Canvas).
         install_click_swizzle();
+        // Canvas 36 D10: application items in WebKit's own context menu.
+        install_context_menu_swizzle();
 
         e->config = msg(objc_cls("WKWebViewConfiguration"), sel("new"));
         // Canvas 30 D13: custom schemes must be on the configuration before
@@ -9067,6 +9688,20 @@ static void cocoa_destroy_engine(Engine *e) {
         }
         if (env) env->DeleteGlobalRef(e->permission_callback);
         e->permission_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
+    // Canvas 36 D10: the context-menu callback and every menu item's entry go
+    // the same way (the map entry above already stops new menus).
+    {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        cocoa_ctx_purge(env, e);
+        if (env && e->context_menu_callback) env->DeleteGlobalRef(e->context_menu_callback);
+        e->context_menu_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
     // Canvas 34 D8: the navigation-callback global ref goes the same way.
@@ -10614,6 +11249,53 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
 #else
     // No offscreen engine on macOS or Windows.
     (void)env; (void)cb;
+#endif
+}
+
+// Context-menu items — Canvas 36 D6.  webview_context_menu_available is the
+// support probe (an older native lacks the symbol); the setters install the
+// WebViewContextMenuCallback each engine asks before it opens its menu;
+// set_screen_origin places the Linux offscreen engine's menu (D9).
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1context_1menu_1available
+  (JNIEnv *, jclass) {
+#if defined(WEBVIEW_GTK) || defined(WEBVIEW_COCOA)
+    return JNI_TRUE;
+#else
+    return JNI_FALSE;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1context_1menu_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    if (wv == 0) return;
+#ifdef WEBVIEW_GTK
+    embed::gtk_set_context_menu_callback((embed::Engine *)wv, env, cb);
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_set_context_menu_callback((embed::Engine *)wv, env, cb);
+#else
+    (void)env; (void)cb;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1context_1menu_1callback
+  (JNIEnv *env, jclass, jlong peer, jobject cb) {
+    if (peer == 0) return;
+#ifdef WEBVIEW_GTK
+    embed::gtk_off_set_context_menu_callback((embed::OffEngine *)peer, env, cb);
+#else
+    // No offscreen engine on macOS or Windows.
+    (void)env; (void)cb;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1screen_1origin
+  (JNIEnv *, jclass, jlong peer, jint x, jint y) {
+    if (peer == 0) return;
+#ifdef WEBVIEW_GTK
+    embed::gtk_off_set_screen_origin((embed::OffEngine *)peer, (int)x, (int)y);
+#else
+    // No offscreen engine on macOS or Windows.
+    (void)x; (void)y;
 #endif
 }
 

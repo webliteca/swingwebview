@@ -191,11 +191,15 @@ snapshots `cairo_image_surface_t` pixels at ~30Hz into a
   **not** available in the lightweight component on Linux today.  Dead
   keys and Compose key sequences (e.g. `é`, `ñ`) work for
   ASCII-Latin-1 layouts but not for IME-driven layouts.
-* Right-click context menus and `<select>` dropdowns from inside the
-  page log a `gdk_window_move_to_rect: assertion 'window->transient_for'`
-  warning and don't visibly appear — WebKit tries to position them
-  relative to a toplevel that doesn't exist in our offscreen model.
-  Not fatal; just a missing piece of UI for those interactions.
+* The engine's own right-click menu (WebKit's `GtkMenu`) opens at the
+  pointer: the component reports its screen position to the engine, which
+  moves the menu there from the hidden engine window, and a right-button
+  press is forwarded at release so GTK can grab the pointer for the menu
+  (so a page's right-button `mousedown` fires at release). Applications can
+  add their own items to it — see
+  [Adding items to the native context menu](#adding-items-to-the-native-context-menu).
+  `<select>` dropdowns are still positioned by GTK relative to the hidden
+  engine window.
 * Heavyweight popup interop is *not* needed in lightweight mode —
   Swing components like `JComboBox` and tooltips composite over the
   WebView with their normal lightweight rendering.
@@ -1006,6 +1010,55 @@ wv.setNavigationHandler(e ->
   popups of a page you restrict. See
   [`demos/WebViewNavigationDemo/`](demos/WebViewNavigationDemo/README.md).
 
+## Adding items to the native context menu
+
+The engine's own right-click menu — Copy, Look Up, spelling suggestions,
+Back/Reload, Inspect Element when debugging — can carry your items too.
+Every native item stays; yours are appended after them, below a separator:
+
+```java
+if (WebViewComponent.isContextMenuContributionSupported()) {
+    wv.addContextMenuContributor(ctx -> {
+        // Engine UI thread, off the EDT: decide quickly, don't touch Swing.
+        if (!ctx.hasSelection()) return null;
+        return Collections.singletonList(
+            WebViewContextMenuItem.of("ask", "Ask", chosen -> {
+                // EDT: the context of the right-click that opened the menu.
+                String text = chosen.selectionText();
+                Rectangle where = chosen.selectionBounds();   // component coords, or null
+                Point screen = chosen.toScreenPoint();        // the click, on screen
+                assistant.ask(text, where, screen);
+            }));
+    });
+}
+```
+
+* **The context** says what the click hit: `selectionText()` (never null),
+  `linkUrl()`, `imageUrl()`, `mediaUrl()`, `isEditable()`, the click
+  `point()` and the selection's `selectionBounds()` in component coordinates,
+  and the Canvas 9 `target()` descriptor when available. It describes page
+  content, so treat it as untrusted input.
+* **Items** are plain text, shown exactly as written (no mnemonics, no
+  markup); `withEnabled(false)` greys one out. Contributors are asked in the
+  order they were added; one that throws is skipped (the error goes to the
+  uncaught-exception handler) and the menu still opens.
+* **Choosing** an item runs its action once, on the EDT. Only the menu the
+  user was shown can fire, and only by the user choosing the item; a page
+  can't trigger it.
+* **Threading.** Like the popup and navigation decisions, contributors run on
+  the engine's UI thread, synchronously, while the menu waits for them.
+* **With a `WebViewMouseListener`** (the replace model) the engine's menu is
+  suppressed, so contributors aren't asked. Call
+  `setDefaultContextMenuEnabled(true)` to get both.
+* **Platform coverage.** Linux (lightweight) through WebKitGTK's
+  `context-menu` signal, with the menu now opening at the pointer; macOS
+  (heavyweight) through `-[WKWebView willOpenMenu:withEvent:]`; Windows
+  (heavyweight) through WebView2's `ContextMenuRequested` (runtime
+  1.0.1185 or newer). On Linux and macOS the selected text comes from the
+  page's right-click event, on Windows from WebView2. On Linux the menu
+  placement assumes GTK and Java use the same display scale. See
+  [`demos/WebViewNativeContextMenuDemo/`](demos/WebViewNativeContextMenuDemo/README.md).
+
 ## Camera, microphone and screen capture
 
 A page's `getUserMedia` / `getDisplayMedia` request is put to a permission
@@ -1171,6 +1224,10 @@ Additional demos:
 * `demos/WebViewNavigationDemo/` — a page that tries every way to navigate
   away to a local listener, each refused by a navigation handler before
   anything is sent (`run-*-navigation-demo`).
+* `demos/WebViewNativeContextMenuDemo/` — the engine's own right-click menu
+  with application items appended (Ask on a selection, Open Link
+  Externally on a link, a disabled item, a literal label), each choice
+  logged with what the click hit (`run-*-native-context-menu-demo`).
 * `demos/WebViewMediaPermissionDemo/` — camera, microphone and screen
   sharing decided by a permission handler that asks you in a Swing dialog
   (`run-*-media-permission-demo`).

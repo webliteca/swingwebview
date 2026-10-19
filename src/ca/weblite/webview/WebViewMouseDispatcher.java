@@ -14,6 +14,8 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.atomic.AtomicReference;
+import java.awt.Rectangle;
 import javax.swing.SwingUtilities;
 
 /**
@@ -145,6 +147,29 @@ public final class WebViewMouseDispatcher {
       + "      var s=window.getSelection?window.getSelection().toString():'';"
       + "      sel=(s.length>65536)?(s.substring(0,65536)+'...'):s;"
       + "    }catch(e){}"
+      + "    var sx='',sy='',sw='',sh='',cs='';"
+      // Canvas 36 D7: the selection's client rectangle (fields 22-25) and a
+      // text-control selection (field 26), appended for the context menu.
+      + "    try{"
+      + "      var gs=window.getSelection?window.getSelection():null;"
+      + "      if(gs&&gs.rangeCount>0&&!gs.isCollapsed){"
+      + "        var rr=gs.getRangeAt(0).getBoundingClientRect();"
+      + "        sx=Math.round(rr.left);sy=Math.round(rr.top);"
+      + "        sw=Math.round(rr.width);sh=Math.round(rr.height);"
+      + "      }"
+      + "    }catch(e){}"
+      + "    try{"
+      + "      if((tag==='TEXTAREA'||(tag==='INPUT'&&!isPwd))&&"
+      + "         typeof t.selectionStart==='number'&&t.selectionStart<t.selectionEnd){"
+      + "        cs=String(t.value).substring(t.selectionStart,t.selectionEnd);"
+      + "        if(cs.length>65536){cs=cs.substring(0,65536)+'...';}"
+      + "        if(sx===''){"
+      + "          var cr=t.getBoundingClientRect();"
+      + "          sx=Math.round(cr.left);sy=Math.round(cr.top);"
+      + "          sw=Math.round(cr.width);sh=Math.round(cr.height);"
+      + "        }"
+      + "      }"
+      + "    }catch(e){}"
       + "    var modBits=(ev.shiftKey?1:0)|(ev.ctrlKey?2:0)|(ev.altKey?4:0)|(ev.metaKey?8:0);"
       + "    var record='1|contextmenu|'+(ev.button+1)+'|'+modBits+'|'+"
       + "      (ev.clientX|0)+'|'+(ev.clientY|0)+'|'+"
@@ -153,7 +178,8 @@ public final class WebViewMouseDispatcher {
       + "      ((ev.timeStamp|0))+'|'+"
       + "      tag+'|'+enc(id)+'|'+enc(classes)+'|'+enc(attrs.join(','))+'|'+"
       + "      enc(linkHref)+'|'+enc(imageSrc)+'|'+enc(mediaSrc)+'|'+"
-      + "      (ce?'1':'0')+'|'+enc(sel)+'|'+enc(topUrl())+'|'+enc(document.location.href);"
+      + "      (ce?'1':'0')+'|'+enc(sel)+'|'+enc(topUrl())+'|'+enc(document.location.href)+'|'+"
+      + "      sx+'|'+sy+'|'+sw+'|'+sh+'|'+enc(cs);"
       + "    var b64=enc(record);"
       + "    if(window.__webview_dom_event){window.__webview_dom_event(b64);}"
       + "  }catch(e){}"
@@ -191,6 +217,32 @@ public final class WebViewMouseDispatcher {
     // Guarded by `this`.  Populated only while flagSink == null; drained
     // verbatim into the sink on attachFlagSink.
     private final List<String> pendingPreloads = new ArrayList<String>();
+
+    /**
+     * Canvas 36 D7: the newest parsed record, kept for the context-menu
+     * dispatcher whether or not any listener is registered.  Set on the
+     * native message thread before the EDT hop; taken (and cleared) by
+     * {@link #takeRecent(long)}.
+     */
+    private final AtomicReference<Recent> recent = new AtomicReference<Recent>();
+
+    /** Canvas 36 D7: one parsed record with its arrival time. */
+    static final class Recent {
+        final WebViewMouseEvent event;
+        /** Selection (or text-control) client rectangle, or null. */
+        final Rectangle selectionBounds;
+        /** Selected substring of an input / textarea, never null. */
+        final String controlSelection;
+        final long nanos;
+
+        Recent(WebViewMouseEvent event, Rectangle selectionBounds,
+               String controlSelection, long nanos) {
+            this.event = event;
+            this.selectionBounds = selectionBounds;
+            this.controlSelection = controlSelection == null ? "" : controlSelection;
+            this.nanos = nanos;
+        }
+    }
 
     public WebViewMouseDispatcher(WebViewComponent source) {
         if (source == null) throw new NullPointerException("source");
@@ -291,7 +343,53 @@ public final class WebViewMouseDispatcher {
         if (record == null) return;
         WebViewMouseEvent event = parseRecord(record);
         if (event == null) return;
+        recent.set(parseRecent(event, record, System.nanoTime()));
         deliverOnEdt(event);
+    }
+
+    /**
+     * Canvas 36 D7: take the newest record if it is no older than
+     * {@code maxAgeMillis}, clearing it either way so it is used once.
+     *
+     * @return the record, or null when absent or too old
+     */
+    Recent takeRecent(long maxAgeMillis) {
+        Recent r = recent.getAndSet(null);
+        if (r == null) return null;
+        long age = System.nanoTime() - r.nanos;
+        if (age < 0 || age > maxAgeMillis * 1000000L) return null;
+        return r;
+    }
+
+    /** Test hook: store a record as if it had just been dispatched. */
+    void storeRecent(Recent r) {
+        recent.set(r);
+    }
+
+    /**
+     * Read the Canvas 36 trailing fields (22-26) of a record whose first 22
+     * fields parsed into {@code event}.  Missing or malformed trailing
+     * fields read as "none".
+     */
+    private static Recent parseRecent(WebViewMouseEvent event, String record,
+                                      long nanos) {
+        String[] parts = splitOnPipe(record);
+        Rectangle bounds = null;
+        String control = "";
+        if (parts.length >= 27) {
+            try {
+                if (!parts[22].isEmpty() && !parts[23].isEmpty()
+                        && !parts[24].isEmpty() && !parts[25].isEmpty()) {
+                    bounds = new Rectangle(Integer.parseInt(parts[22]),
+                        Integer.parseInt(parts[23]), Integer.parseInt(parts[24]),
+                        Integer.parseInt(parts[25]));
+                }
+            } catch (NumberFormatException e) {
+                bounds = null;
+            }
+            control = decodeStringField(parts[26]);
+        }
+        return new Recent(event, bounds, control, nanos);
     }
 
     private void deliverOnEdt(final WebViewMouseEvent event) {
@@ -358,7 +456,8 @@ public final class WebViewMouseDispatcher {
      * fully-constructed {@link WebViewMouseEvent}.  Returns {@code null} if
      * the format doesn't match or the schema version is unexpected.
      *
-     * <p>Field layout (22 fields):
+     * <p>Field layout (22 fields read here; Canvas 36 appends 22-26, read by
+     * {@code parseRecent}):
      * <pre>
      * 0  schema-version ("1")
      * 1  eventType ("contextmenu")
@@ -379,6 +478,8 @@ public final class WebViewMouseDispatcher {
      * 19 selectionText (base64)
      * 20 pageUrl (base64)
      * 21 frameUrl (base64)
+     * 22-25 selection client rect x, y, width, height (Canvas 36 D7; empty = none)
+     * 26 text-control selection (base64; Canvas 36 D7)
      * </pre>
      */
     private WebViewMouseEvent parseRecord(String record) {
