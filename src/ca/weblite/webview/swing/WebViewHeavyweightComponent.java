@@ -43,6 +43,7 @@ import java.awt.event.ComponentEvent;
 import java.awt.event.FocusAdapter;
 import java.awt.event.FocusEvent;
 import java.awt.event.HierarchyEvent;
+import java.awt.event.HierarchyBoundsListener;
 import java.awt.event.HierarchyListener;
 import java.awt.event.KeyEvent;
 import java.awt.event.MouseAdapter;
@@ -966,6 +967,24 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
                 }
             };
             addComponentListener(ca);
+
+            // Fix 3: follow the canvas when an ancestor moves or resizes.
+            // The native view is positioned in window-content coordinates,
+            // but dragging an ancestor (a JInternalFrame across a
+            // JDesktopPane, a split pane's divider moving our container)
+            // changes where the canvas sits in the window without moving it
+            // within its parent -- so AWT fires no componentMoved on it, and
+            // on macOS the WKWebView would stay where it was.
+            addHierarchyBoundsListener(new HierarchyBoundsListener() {
+                @Override
+                public void ancestorMoved(HierarchyEvent e) {
+                    if (isShowing()) sizeNative();
+                }
+                @Override
+                public void ancestorResized(HierarchyEvent e) {
+                    if (isShowing()) sizeNative();
+                }
+            });
 
             // Track visibility transitions so the native WebView hides when
             // its tab in a JTabbedPane is deselected, when an ancestor is

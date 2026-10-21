@@ -3211,3 +3211,30 @@ by timing).
 - Safeguards: `onAttachFailed` is a no-op (the engine is unusable and
   discarded by existing paths). Idempotent with the existing
   resize/move-driven `sizeNative()` calls.
+
+### Fix 3 · follow the canvas when an ancestor moves or resizes
+
+`sizeNative()` positions the native WebView in the AWT window's content
+coordinates, but it ran only on the canvas's own `componentResized` /
+`componentMoved` (and on showing and attach). When an **ancestor** moves —
+the canvas inside a `JInternalFrame` dragged across a `JDesktopPane`, or a
+split pane's divider moving the container the canvas sits in without
+resizing it — the canvas's position *within its parent* is unchanged, so
+AWT fires neither event on it, and on macOS (where the WKWebView is a
+subview of `NSWindow.contentView`, not of the canvas) the native view stays
+where it was until something resizes the canvas or re-shows it. Reported
+from a desktop built of internal frames: "When I move a window, the webview
+isn't moved."
+
+- Requirement: whenever the canvas's position in its window changes —
+  including through any ancestor moving or resizing — the native WebView
+  MUST be re-positioned to the canvas's new bounds.
+- Approach: the `EmbeddedCanvas` constructor also installs a
+  `HierarchyBoundsListener` whose `ancestorMoved` and `ancestorResized`
+  call `sizeNative()` when the canvas is showing. AWT delivers these on
+  the EDT for every ancestor up to the window.
+- Safeguards: idempotent with the existing `sizeNative()` triggers; a
+  no-op while not showing (the `HierarchyListener` re-sizes on show) and,
+  as before, on non-positive sizes or before the engine exists. No native
+  change: `sizeNative()` already sends window-content coordinates on every
+  platform, so the same call is correct wherever it is made.
