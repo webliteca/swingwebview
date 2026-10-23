@@ -6,6 +6,7 @@
 package ca.weblite.webview.swing;
 
 import ca.weblite.webview.ConsoleDispatcher;
+import ca.weblite.webview.ContextMenuDispatcher;
 import ca.weblite.webview.ConsoleListener;
 import ca.weblite.webview.DialogDispatcher;
 import ca.weblite.webview.DownloadDispatcher;
@@ -27,6 +28,7 @@ import ca.weblite.webview.WebViewPermissionHandler;
 import ca.weblite.webview.WebViewPopupHandler;
 import ca.weblite.webview.WebViewMouseDispatcher;
 import ca.weblite.webview.WebViewMouseListener;
+import ca.weblite.webview.WebViewContextMenuContributor;
 import ca.weblite.webview.WebViewPdfCallback;
 import ca.weblite.webview.WebViewSavePasswordHandler;
 
@@ -121,6 +123,13 @@ public abstract class WebViewComponent extends JComponent {
      *  the component. */
     protected final PermissionDispatcher permissionDispatcher =
         new PermissionDispatcher(this);
+
+    /** Per-component hub for application items in the engine's own
+     *  context menu (Canvas 36).  Subclasses install a
+     *  {@link ca.weblite.webview.WebViewContextMenuCallback} that forwards
+     *  to it at attach. */
+    protected final ContextMenuDispatcher contextMenuDispatcher =
+        new ContextMenuDispatcher(this, mouseDispatcher);
 
     /** Per-component fan-out hub for browser-initiated file downloads
      *  ({@code <a download>}, a {@code Content-Disposition: attachment}
@@ -869,6 +878,58 @@ public abstract class WebViewComponent extends JComponent {
      */
     public final boolean isDefaultContextMenuEnabled() {
         return mouseDispatcher.isDefaultEnabled();
+    }
+
+    // ---------------------------------------------------------------------
+    // Application items in the engine's own context menu (Canvas 36).
+    // ---------------------------------------------------------------------
+
+    /**
+     * Add items to the engine's <em>own</em> right-click menu (Canvas 36
+     * D1).  The engine keeps every item it shows anyway; the contributor's
+     * items are appended after them, below one separator.  Contributors are
+     * asked in registration order, on the engine's UI thread, off the EDT
+     * (see {@link WebViewContextMenuContributor}); the chosen item's action
+     * runs on the EDT.
+     *
+     * <p>While a {@link WebViewMouseListener} suppresses the engine menu
+     * (Canvas 9's replace model), no engine menu opens and contributors are
+     * not asked; call {@link #setDefaultContextMenuEnabled(boolean)
+     * setDefaultContextMenuEnabled(true)} to have both.  May be called
+     * before or after the component is displayed.
+     *
+     * @param contributor the contributor; non-null
+     * @return {@code this}
+     * @throws NullPointerException if {@code contributor} is null
+     * @see #isContextMenuContributionSupported()
+     */
+    public final WebViewComponent addContextMenuContributor(
+            WebViewContextMenuContributor contributor) {
+        contextMenuDispatcher.add(contributor);
+        return this;
+    }
+
+    /**
+     * Remove a contributor added with
+     * {@link #addContextMenuContributor}; {@code null} is ignored.  Takes
+     * effect from the next right-click.
+     *
+     * @return {@code this}
+     */
+    public final WebViewComponent removeContextMenuContributor(
+            WebViewContextMenuContributor contributor) {
+        contextMenuDispatcher.remove(contributor);
+        return this;
+    }
+
+    /**
+     * Whether the loaded native library can add application items to the
+     * engine's context menu (Canvas 36 D8).  {@code false} against a native
+     * built before the feature, or without natives at all.  On Windows a
+     * WebView2 runtime older than 1.0.1185 still shows its menu unchanged.
+     */
+    public static boolean isContextMenuContributionSupported() {
+        return ContextMenuDispatcher.isAvailable();
     }
 
     // ---------------------------------------------------------------------

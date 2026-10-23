@@ -165,8 +165,23 @@
 #else
 #define WK_OPT_2_42(X)
 #endif
+// Application items in the engine's context menu (Canvas 36 D9): optional,
+// so a runtime without them still loads and shows WebKit's menu unchanged.
+#if WEBKIT_CHECK_VERSION(2, 18, 0)
+#define WK_OPT_CTXMENU(X)                                                      \
+  X(webkit_context_menu_append)                                               \
+  X(webkit_context_menu_item_new_from_gaction)                                \
+  X(webkit_context_menu_item_new_separator)                                   \
+  X(webkit_hit_test_result_get_context)                                       \
+  X(webkit_hit_test_result_get_link_uri)                                      \
+  X(webkit_hit_test_result_get_image_uri)                                     \
+  X(webkit_hit_test_result_get_media_uri)
+#else
+#define WK_OPT_CTXMENU(X)
+#endif
 #define WK_WEBKIT_OPT_SYMS(X)                                                  \
-  WK_OPT_2_12(X) WK_OPT_2_36(X) WK_OPT_2_40(X) WK_OPT_MEDIA(X) WK_OPT_2_42(X)
+  WK_OPT_2_12(X) WK_OPT_2_36(X) WK_OPT_2_40(X) WK_OPT_MEDIA(X) WK_OPT_2_42(X) \
+  WK_OPT_CTXMENU(X)
 
 // The pointer table. Member types are taken from the real declarations via
 // decltype — unevaluated, so this creates no link-time dependency on the

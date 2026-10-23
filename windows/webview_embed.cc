@@ -354,6 +354,13 @@ struct Engine {
     EventRegistrationToken frame_navigation_starting_token{};
     bool navigation_registered = false;
 
+    // Canvas 36 D11: JNI global ref to the WebViewContextMenuCallback, or
+    // nullptr, read by ContextMenuRequestedHandler on the WebView2 thread; and
+    // the ContextMenuRequested token, removed in destroy_engine.
+    jobject context_menu_callback = nullptr;
+    EventRegistrationToken context_menu_token{};
+    bool context_menu_registered = false;
+
     // Canvas 35 D9: JNI global ref to the WebViewPermissionCallback, or
     // nullptr, read by PermissionRequestedHandler on the WebView2 thread; and
     // the PermissionRequested token, removed in destroy_engine.
@@ -2696,6 +2703,255 @@ static void win_register_navigation(Engine *e, ICoreWebView2 *wv) {
 }
 
 // ---------------------------------------------------------------------------
+// Canvas 36 D11: application items in WebView2's own context menu.  The
+// ContextMenuRequested handler asks the WebViewContextMenuCallback (on the
+// WebView2 thread) for items and appends a separator and one COMMAND item per
+// answer element to the menu WebView2 built.  Each item's CustomItemSelected
+// handler owns what activation needs (its own global ref, token, index).
+// ---------------------------------------------------------------------------
+enum {
+    CM_FLAG_LINK = 1, CM_FLAG_IMAGE = 2, CM_FLAG_MEDIA = 4,
+    CM_FLAG_EDITABLE = 8, CM_FLAG_SELECTION = 16, CM_FLAG_NATIVE = 256
+};
+
+class CustomItemSelectedHandler : public CallbackBase<
+    ICoreWebView2CustomItemSelectedEventHandler> {
+public:
+    CustomItemSelectedHandler(JavaVM *jvm, jobject cb, long long token, int index)
+        : m_jvm(jvm), m_cb(cb), m_token(token), m_index(index) {}
+    HRESULT STDMETHODCALLTYPE Invoke(ICoreWebView2ContextMenuItem *,
+                                     IUnknown *) override {
+        if (!m_jvm || !m_cb) return S_OK;
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (m_jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            if (m_jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK) return S_OK;
+            detach = true;
+        }
+        jclass cls = env->GetObjectClass(m_cb);
+        if (cls) {
+            jmethodID mid = env->GetMethodID(cls, "onContextMenuItemSelected", "(JI)V");
+            if (mid) env->CallVoidMethod(m_cb, mid, (jlong)m_token, (jint)m_index);
+            env->DeleteLocalRef(cls);
+        }
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+        }
+        if (detach) m_jvm->DetachCurrentThread();
+        return S_OK;
+    }
+
+protected:
+    ~CustomItemSelectedHandler() override {
+        if (!m_jvm || !m_cb) return;
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (m_jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            if (m_jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK) return;
+            detach = true;
+        }
+        env->DeleteGlobalRef(m_cb);
+        if (detach) m_jvm->DetachCurrentThread();
+    }
+
+private:
+    JavaVM *m_jvm;
+    jobject m_cb;        // own global ref
+    long long m_token;
+    int m_index;
+};
+
+// A COM string getter's result as a Java string (UTF-16, NewString), or null.
+static jstring win_ctx_jstring(JNIEnv *env, LPWSTR w) {
+    if (!w) return nullptr;
+    jstring js = env->NewString((const jchar *)w, (jsize)wcslen(w));
+    return js;
+}
+
+class ContextMenuRequestedHandler : public CallbackBase<
+    ICoreWebView2ContextMenuRequestedEventHandler> {
+public:
+    explicit ContextMenuRequestedHandler(Engine *e) : m_engine(e) {}
+    HRESULT STDMETHODCALLTYPE Invoke(
+        ICoreWebView2 *,
+        ICoreWebView2ContextMenuRequestedEventArgs *args) override {
+        if (!args || !m_engine) return S_OK;
+        jobject cb = m_engine->context_menu_callback;
+        JavaVM *jvm = m_engine->jvm;
+        if (!cb || !jvm) return S_OK;
+
+        int flags = CM_FLAG_NATIVE;
+        LPWSTR link_w = nullptr, source_w = nullptr, sel_w = nullptr;
+        ICoreWebView2ContextMenuTarget *target = nullptr;
+        if (SUCCEEDED(args->get_ContextMenuTarget(&target)) && target) {
+            COREWEBVIEW2_CONTEXT_MENU_TARGET_KIND kind =
+                COREWEBVIEW2_CONTEXT_MENU_TARGET_KIND_PAGE;
+            target->get_Kind(&kind);
+            BOOL b = FALSE;
+            if (SUCCEEDED(target->get_IsEditable(&b)) && b) flags |= CM_FLAG_EDITABLE;
+            b = FALSE;
+            if (SUCCEEDED(target->get_HasLinkUri(&b)) && b) {
+                flags |= CM_FLAG_LINK;
+                target->get_LinkUri(&link_w);
+            }
+            b = FALSE;
+            if (SUCCEEDED(target->get_HasSourceUri(&b)) && b) {
+                if (kind == COREWEBVIEW2_CONTEXT_MENU_TARGET_KIND_IMAGE) {
+                    flags |= CM_FLAG_IMAGE;
+                    target->get_SourceUri(&source_w);
+                } else if (kind == COREWEBVIEW2_CONTEXT_MENU_TARGET_KIND_AUDIO ||
+                           kind == COREWEBVIEW2_CONTEXT_MENU_TARGET_KIND_VIDEO) {
+                    flags |= CM_FLAG_MEDIA;
+                    target->get_SourceUri(&source_w);
+                }
+            }
+            b = FALSE;
+            if (SUCCEEDED(target->get_HasSelection(&b)) && b) {
+                flags |= CM_FLAG_SELECTION;
+                target->get_SelectionText(&sel_w);
+            }
+            target->Release();
+        }
+        POINT pt{-1, -1};
+        args->get_Location(&pt);
+
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK) env = nullptr;
+            else detach = true;
+        }
+        jobjectArray answer = nullptr;
+        if (env) {
+            jstring jl = win_ctx_jstring(env, link_w);
+            jstring jimg = (flags & CM_FLAG_IMAGE) ? win_ctx_jstring(env, source_w) : nullptr;
+            jstring jmed = (flags & CM_FLAG_MEDIA) ? win_ctx_jstring(env, source_w) : nullptr;
+            jstring jsel = (flags & CM_FLAG_SELECTION)
+                ? win_ctx_jstring(env, sel_w ? sel_w : const_cast<LPWSTR>(L""))
+                : nullptr;
+            jclass cls = env->GetObjectClass(cb);
+            if (cls) {
+                jmethodID mid = env->GetMethodID(cls, "onContextMenuRequested",
+                    "(ILjava/lang/String;Ljava/lang/String;Ljava/lang/String;"
+                    "Ljava/lang/String;II)[Ljava/lang/String;");
+                if (mid) {
+                    answer = (jobjectArray)env->CallObjectMethod(cb, mid, (jint)flags,
+                        jl, jimg, jmed, jsel, (jint)pt.x, (jint)pt.y);
+                }
+                env->DeleteLocalRef(cls);
+            }
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+                answer = nullptr;
+            }
+            if (jl) env->DeleteLocalRef(jl);
+            if (jimg) env->DeleteLocalRef(jimg);
+            if (jmed) env->DeleteLocalRef(jmed);
+            if (jsel) env->DeleteLocalRef(jsel);
+            jsize n = answer ? env->GetArrayLength(answer) : 0;
+            if (n >= 2) append_items(env, args, cb, answer, n);
+            if (answer) env->DeleteLocalRef(answer);
+            if (detach) jvm->DetachCurrentThread();
+        }
+        if (link_w) CoTaskMemFree(link_w);
+        if (source_w) CoTaskMemFree(source_w);
+        if (sel_w) CoTaskMemFree(sel_w);
+        return S_OK;
+    }
+
+private:
+    void append_items(JNIEnv *env, ICoreWebView2ContextMenuRequestedEventArgs *args,
+                      jobject cb, jobjectArray answer, jsize n) {
+        if (!m_engine->environment) return;
+        ICoreWebView2Environment9 *env9 = nullptr;
+        if (FAILED(m_engine->environment->QueryInterface(
+                __uuidof(ICoreWebView2Environment9),
+                reinterpret_cast<void **>(&env9))) || !env9) {
+            return;
+        }
+        ICoreWebView2ContextMenuItemCollection *items = nullptr;
+        if (FAILED(args->get_MenuItems(&items)) || !items) {
+            env9->Release();
+            return;
+        }
+        long long token = 0;
+        jstring jt = (jstring)env->GetObjectArrayElement(answer, 0);
+        if (jt) {
+            const char *ts = env->GetStringUTFChars(jt, nullptr);
+            if (ts) { token = _strtoi64(ts, nullptr, 10); env->ReleaseStringUTFChars(jt, ts); }
+            env->DeleteLocalRef(jt);
+        }
+        UINT32 count = 0;
+        ICoreWebView2ContextMenuItem *sep = nullptr;
+        if (SUCCEEDED(env9->CreateContextMenuItem(L"", nullptr,
+                COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_SEPARATOR, &sep)) && sep) {
+            items->get_Count(&count);
+            items->InsertValueAtIndex(count, sep);
+            sep->Release();
+        }
+        for (jsize i = 1; i < n; i++) {
+            jstring js = (jstring)env->GetObjectArrayElement(answer, i);
+            if (!js) continue;
+            jsize len = env->GetStringLength(js);
+            const jchar *chars = env->GetStringChars(js, nullptr);
+            if (!chars || len < 1) {
+                if (chars) env->ReleaseStringChars(js, chars);
+                env->DeleteLocalRef(js);
+                continue;
+            }
+            bool enabled = chars[0] == '1';
+            // WebView2 labels mark access keys with '&': double it.
+            std::wstring label;
+            for (jsize k = 1; k < len; k++) {
+                wchar_t ch = (wchar_t)chars[k];
+                label += ch;
+                if (ch == L'&') label += L'&';
+            }
+            env->ReleaseStringChars(js, chars);
+            env->DeleteLocalRef(js);
+            ICoreWebView2ContextMenuItem *item = nullptr;
+            if (FAILED(env9->CreateContextMenuItem(label.c_str(), nullptr,
+                    COREWEBVIEW2_CONTEXT_MENU_ITEM_KIND_COMMAND, &item)) || !item) {
+                continue;
+            }
+            item->put_IsEnabled(enabled ? TRUE : FALSE);
+            auto *h = new CustomItemSelectedHandler(m_engine->jvm,
+                env->NewGlobalRef(cb), token, (int)(i - 1));
+            EventRegistrationToken tok{};
+            item->add_CustomItemSelected(h, &tok);
+            h->Release();
+            count = 0;
+            items->get_Count(&count);
+            items->InsertValueAtIndex(count, item);
+            item->Release();
+        }
+        items->Release();
+        env9->Release();
+    }
+
+    Engine *m_engine;
+};
+
+// Canvas 36 D11: register the context-menu handler on `wv` for `e`.  Called
+// beside win_register_navigation, for a fresh engine and an adopted child.  A
+// runtime without ICoreWebView2_11 leaves it unregistered.
+static void win_register_context_menu(Engine *e, ICoreWebView2 *wv) {
+    if (!e || !wv) return;
+    ICoreWebView2_11 *wv11 = nullptr;
+    if (FAILED(wv->QueryInterface(__uuidof(ICoreWebView2_11),
+                                  reinterpret_cast<void **>(&wv11))) || !wv11) {
+        return;
+    }
+    auto *h = new ContextMenuRequestedHandler(e);
+    e->context_menu_registered =
+        SUCCEEDED(wv11->add_ContextMenuRequested(h, &e->context_menu_token));
+    h->Release();
+    wv11->Release();
+}
+
+// ---------------------------------------------------------------------------
 // Canvas 35 D9: camera and microphone permission requests (WebView2).  The
 // args (AddRef'd) and, once pending, the deferral are kept in one table keyed
 // by id and tagged with the engine and its worker thread; every touch of them
@@ -3571,6 +3827,7 @@ static void engine_thread(Engine *e, HWND /*parent*/, int width, int height,
 
                     // Navigation decisions (Canvas 34 D9).
                     win_register_navigation(e, e->webview);
+                    win_register_context_menu(e, e->webview);   // Canvas 36 D11
                     // Camera / microphone requests (Canvas 35 D9).
                     win_register_permission(e, e->webview);
 
@@ -3859,6 +4116,27 @@ static void destroy_engine(Engine *e) {
         e->navigation_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
+    // Canvas 36 D11: stop asking for menu items, then drop the callback.
+    if (e->context_menu_registered && e->webview) {
+        ICoreWebView2_11 *wv11 = nullptr;
+        if (SUCCEEDED(e->webview->QueryInterface(__uuidof(ICoreWebView2_11),
+                reinterpret_cast<void **>(&wv11))) && wv11) {
+            wv11->remove_ContextMenuRequested(e->context_menu_token);
+            wv11->Release();
+        }
+        e->context_menu_registered = false;
+    }
+    if (e->context_menu_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->context_menu_callback);
+        e->context_menu_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
     // Canvas 35 D9: stop asking, then drop the permission callback's global
     // ref, the same way.
     if (e->permission_registered && e->webview) {
@@ -4048,6 +4326,7 @@ static Engine *adopt_retained_popup(JNIEnv *env, HWND parent, RetainedPopup *rp,
 
             // Navigation decisions (Canvas 34 D9) on the adopted child.
             win_register_navigation(e, child);
+            win_register_context_menu(e, child);   // Canvas 36 D11
             // Camera / microphone requests (Canvas 35 D9) on the adopted child.
             win_register_permission(e, child);
         }
@@ -4725,6 +5004,35 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
 
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1navigation_1callback
   (JNIEnv *, jclass, jlong, jobject) {
+    // Windows has no offscreen engine; stub for link-symmetry.
+}
+
+// Context-menu items (Canvas 36 D6, D11).
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1context_1menu_1available
+  (JNIEnv *, jclass) {
+    return JNI_TRUE;
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1context_1menu_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    auto *e = (Engine *)wv;
+    if (!e) return;
+    if (e->context_menu_callback) {
+        env->DeleteGlobalRef(e->context_menu_callback);
+        e->context_menu_callback = nullptr;
+    }
+    if (cb) {
+        e->context_menu_callback = env->NewGlobalRef(cb);
+    }
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1context_1menu_1callback
+  (JNIEnv *, jclass, jlong, jobject) {
+    // Windows has no offscreen engine; stub for link-symmetry.
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1screen_1origin
+  (JNIEnv *, jclass, jlong, jint, jint) {
     // Windows has no offscreen engine; stub for link-symmetry.
 }
 

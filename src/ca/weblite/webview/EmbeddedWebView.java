@@ -622,6 +622,29 @@ public class EmbeddedWebView {
 
 
     /**
+     * Register the context-menu callback (Canvas 36 D6): the engine asks it,
+     * synchronously on its UI thread, for application items just before it
+     * opens its own menu, and calls it when the user chooses one.  Anchors
+     * {@code cb} in {@link #heap}.  An older native library without the
+     * feature leaves the menu unchanged;
+     * {@code WebViewComponent.isContextMenuContributionSupported()} says so.
+     *
+     * @return {@code this} for chaining
+     */
+    public EmbeddedWebView setContextMenuCallback(WebViewContextMenuCallback cb) {
+        checkAlive();
+        if (cb != null) {
+            heap.add(cb);
+        }
+        try {
+            WebViewNative.webview_embed_set_context_menu_callback(peer, cb);
+        } catch (UnsatisfiedLinkError ule) {
+            // Native library predates Canvas 36.
+        }
+        return this;
+    }
+
+    /**
      * Register the navigation callback (Canvas 34 D5): the engine calls it
      * synchronously, on its UI thread, before each navigation of the view
      * or its frames, and refuses the navigation when it answers
