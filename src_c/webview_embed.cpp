@@ -6776,7 +6776,15 @@ static id impl_create_web_view(id self, SEL, id webView, id configuration,
     Engine *child_e = new Engine();
     child_e->webview = child;
     child_e->jvm = jvm;
-    child_e->config = configuration;
+    // Canvas 18 safeguard "An engine owns every object it releases": WebKit
+    // only lends `configuration` for this delegate call (+0) and frees it soon
+    // after; the child WKWebView keeps its own copy.  Every teardown path
+    // releases e->config, so the engine must hold its own +1 here.  (Stored
+    // unretained, cocoa_destroy_engine released a freed object when an adopted
+    // tab closed -- objc_msgSend on a garbage isa on the AppKit main thread.)
+    // `manager` stays borrowed: the child WKWebView's own configuration owns
+    // that controller, and no teardown path releases it.
+    child_e->config = msg(configuration, sel("retain"));
     child_e->manager = msg(configuration, sel("userContentController"));
     child_e->popup_window = win;              // nil for ADOPT
     child_e->popup_id = (jlong)child_e;
@@ -6953,6 +6961,10 @@ static void impl_web_view_did_close(id self, SEL, id webView) {
     // here is a prime candidate for on-device zombie/Instruments validation.)
     if (e->webview) { msg(e->webview, sel("release")); }
     e->webview = nullptr;
+    // Balance the retain taken on the passed configuration in
+    // impl_create_web_view (Canvas 18 safeguard "An engine owns every object
+    // it releases").
+    if (e->config) { msg(e->config, sel("release")); e->config = nullptr; }
     delete e;
 }
 
@@ -9299,6 +9311,13 @@ static void cocoa_discard_popup(jlong popupId) {
         if (e->webview) {
             msg(e->webview, sel("release"));
             e->webview = nullptr;
+        }
+        // Balance the retain taken on the passed configuration in
+        // impl_create_web_view (Canvas 18 safeguard "An engine owns every
+        // object it releases").
+        if (e->config) {
+            msg(e->config, sel("release"));
+            e->config = nullptr;
         }
         delete e;
     });
