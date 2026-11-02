@@ -32,6 +32,17 @@ and launches the demo.
     custom UA you set.
   - **window.open → popup** and the **target=_blank** link also open as tabs.
   - No native popup window appears at any point.
+  - **Teardown of an adopted tab** (Canvas 18 Op 10.3). Select an adopted
+    tab and click **Close tab**: the tab is removed and its
+    `WebViewComponent` is disposed, which destroys the native engine. The
+    button does nothing on the opener tab. Repeat several times with each
+    popup kind above. The app must keep running.
+  - **window.open → self-closing popup** opens an adopted tab with a
+    **window.close()** button. Click it (the page asks to close itself),
+    then close the tab with **Close tab**. Repeat several times.
+  - Run with `NSZombieEnabled=YES ./run-mac-adopt-popup-demo.sh` so a
+    message sent to a freed Objective-C object stops the app at once
+    instead of crashing it later.
 - **Native window** — the Canvas 15 behaviour: the popup opens in a separate
   native window (POST preserved, opener-linked).
 - **Block** — `window.open` returns `null`; the POST form submit is blocked.

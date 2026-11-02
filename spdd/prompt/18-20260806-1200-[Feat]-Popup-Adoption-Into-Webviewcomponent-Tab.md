@@ -573,6 +573,12 @@ File: `src_c/webview_embed.cpp` (Cocoa)
    - `NATIVE_WINDOW` (1): exactly today's window path (create child,
      `NSWindow`, `makeKeyAndOrderFront:`, register child engine, fire
      `onPopupOpened`).
+   - **Both non-BLOCK branches**: the child `Engine` **retains** the
+     `configuration` WebKit passed before storing it as `child_e->config`
+     (see the "An engine owns every object it releases" safeguard). WebKit
+     only lends that object for the duration of the delegate call (+0); the
+     child `WKWebView` keeps its own copy, so the passed object is freed
+     soon after the call returns unless the engine holds a reference.
    - `ADOPT` (2): **isolate the child's script world first** — before
      `initWithFrame:configuration:`, replace the passed
      `configuration`'s `userContentController` with a **fresh, empty
@@ -603,8 +609,12 @@ File: `src_c/webview_embed.cpp` (Cocoa)
    remove from `g_retained_popups`; return the child engine handle.
 4. `cocoa_discard_popup(jlong popupId)`: look up + remove from
    `g_retained_popups`; `setUIDelegate:nil`; delete inherited global
-   refs; release the child view; delete the engine (mirror
+   refs; release the child view; **release the retained
+   `child_e->config`**; delete the engine (mirror
    `impl_web_view_did_close` teardown ordering, minus the window).
+   `impl_web_view_did_close`'s engine-owned path (not `java_owned`) likewise
+   releases the retained `config` before `delete e`; its `java_owned` path
+   leaves it for `cocoa_destroy_engine`, which releases it exactly once.
 5. JNI bridges
    `Java_ca_weblite_webview_WebViewNative_webview_1embed_1adopt_1popup`
    (resolve `parent`'s peer/`NSView` from the AWT `Component` via the
@@ -646,6 +656,21 @@ Files: `demos/WebViewAdoptPopupDemo/…` (or a mode on
    switches handler modes: Adopt (host in a `JFrame`-hosted tab/panel
    created on `popupAdoptable`), Native window (Canvas 15 allow),
    Block. Adopt mode logs POST-body round-trip to a console line.
+3. **Adopted-child teardown is testable by hand.** The controls carry a
+   **Close tab** button: when the selected tab is an adopted popup (never
+   the opener tab, which the button leaves alone), it removes that tab
+   from the `JTabbedPane` and calls `WebViewComponent.dispose()` on it —
+   removing a heavyweight component from its parent does not destroy its
+   native peer, so `dispose()` is the call that reaches
+   `cocoa_destroy_engine`. The opener page gains a fourth case,
+   **"window.open → page that closes itself"**: it opens a named popup on
+   `about:blank` and, through the returned window handle, writes into it a
+   button that calls `window.close()`, so the adopted child's
+   `webViewDidClose:` path runs before its tab is closed. The demo README's
+   checklist lists both steps (repeat each several times) and suggests
+   running with `NSZombieEnabled=YES` so a remaining over-release faults at
+   once. These steps verify the "An engine owns every object it releases"
+   and "An adopted child is freed exactly once" safeguards on macOS.
 
 ### 11. README + Tests
 Files: `README.md`, `test/ca/weblite/webview/PopupDispatcherTest.java`
@@ -749,6 +774,21 @@ Files: `README.md`, `test/ca/weblite/webview/PopupDispatcherTest.java`
   `"eng"` association before freeing, so a `window.close()` that
   drains after the engine is gone recovers `nil` and no-ops. The
   two paths are mutually exclusive on `delete`, never racing it.
+- **An engine owns every object it releases (no over-release on
+  destroy).** Every Objective-C object a teardown path releases
+  (`cocoa_destroy_engine`, `cocoa_discard_popup`, the engine-owned
+  `impl_web_view_did_close` path) MUST be held at +1 by that `Engine`.
+  A popup child's `config` is the `WKWebViewConfiguration` WebKit passes
+  to `webView:createWebViewWithConfiguration:forNavigationAction:
+  windowFeatures:` — a borrowed (+0) object WebKit frees soon after the
+  call — so the child engine retains it when storing it, and each
+  teardown path releases it exactly once. Storing it unretained let
+  `cocoa_destroy_engine` release a freed object when an adopted tab was
+  closed: `objc_msgSend` on a garbage isa on the AppKit main thread
+  (`EXC_BAD_ACCESS` at isa + 0x10), seen in the field after an Okta
+  dashboard tile opened Jira as an adopted tab. `child_e->manager` stays
+  a borrowed pointer: it is owned by the child `WKWebView`'s own
+  configuration and is never released by a teardown path.
 - **Opener linkage + POST are mandatory (AC1/AC2).** The adopted child
   MUST be the WebKit-created child from the passed configuration;
   creating a fresh view or re-navigating from Java is a defect.
