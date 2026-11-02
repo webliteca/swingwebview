@@ -656,6 +656,21 @@ Files: `demos/WebViewAdoptPopupDemo/…` (or a mode on
    switches handler modes: Adopt (host in a `JFrame`-hosted tab/panel
    created on `popupAdoptable`), Native window (Canvas 15 allow),
    Block. Adopt mode logs POST-body round-trip to a console line.
+3. **Adopted-child teardown is testable by hand.** The controls carry a
+   **Close tab** button: when the selected tab is an adopted popup (never
+   the opener tab, which the button leaves alone), it removes that tab
+   from the `JTabbedPane` and calls `WebViewComponent.dispose()` on it —
+   removing a heavyweight component from its parent does not destroy its
+   native peer, so `dispose()` is the call that reaches
+   `cocoa_destroy_engine`. The opener page gains a fourth case,
+   **"window.open → page that closes itself"**: it opens a named popup on
+   `about:blank` and, through the returned window handle, writes into it a
+   button that calls `window.close()`, so the adopted child's
+   `webViewDidClose:` path runs before its tab is closed. The demo README's
+   checklist lists both steps (repeat each several times) and suggests
+   running with `NSZombieEnabled=YES` so a remaining over-release faults at
+   once. These steps verify the "An engine owns every object it releases"
+   and "An adopted child is freed exactly once" safeguards on macOS.
 
 ### 11. README + Tests
 Files: `README.md`, `test/ca/weblite/webview/PopupDispatcherTest.java`

@@ -140,13 +140,14 @@ public final class WebViewAdoptPopupDemo {
         });
         opener.setUrl(openerPage());
 
-        frame.add(buildControls(opener), java.awt.BorderLayout.NORTH);
+        frame.add(buildControls(opener, tabs), java.awt.BorderLayout.NORTH);
         addTab(tabs, "opener", opener);
         frame.add(tabs, java.awt.BorderLayout.CENTER);
         frame.setVisible(true);
     }
 
-    private static JPanel buildControls(WebViewComponent opener) {
+    private static JPanel buildControls(WebViewComponent opener,
+                                        JTabbedPane tabs) {
         // Canvas 21 Op 14.4: three rows, not one long FlowLayout line. A row
         // wider than the frame silently wraps its trailing components out of
         // view, and in a fixed-height row they become unreachable -- the
@@ -205,6 +206,25 @@ public final class WebViewAdoptPopupDemo {
             opener.eval("location.reload()");
         });
         bar.add(clearCache);
+
+        // Canvas 18 Op 10.3: close the selected ADOPTED tab and dispose it.
+        // Removing a heavyweight component from its parent does not destroy
+        // its native peer; dispose() is what reaches cocoa_destroy_engine, so
+        // this is the step that exercises an adopted child's teardown.  The
+        // opener tab is never closed by this button.
+        JButton closeTab = new JButton("Close tab");
+        closeTab.addActionListener(e -> {
+            java.awt.Component sel = tabs.getSelectedComponent();
+            if (sel == null || sel == opener
+                    || !(sel instanceof WebViewComponent)) {
+                System.out.println("[demo] Close tab: select an adopted tab");
+                return;
+            }
+            tabs.remove(sel);
+            ((WebViewComponent) sel).dispose();
+            System.out.println("[demo] closed and disposed an adopted tab");
+        });
+        bar.add(closeTab);
 
         // Row 2: the User-Agent field takes the slack, its buttons pin right,
         // so the row's width never depends on the field's preferred size.
@@ -331,6 +351,15 @@ public final class WebViewAdoptPopupDemo {
           + "window.open &rarr; popup</button>"
           + "<h3>3. target=_blank link</h3>"
           + "<a href='https://example.com' target='_blank'>open example.com</a>"
+          // Canvas 18 Op 10.3: a popup that closes itself, so the adopted
+          // child's webViewDidClose: path runs before its tab is closed.
+          + "<h3>4. window.open &rarr; page that closes itself</h3>"
+          + "<button onclick=\"var w=window.open('about:blank','selfclose');"
+          + "if(w){w.document.write('<!doctype html><body>"
+          + "<p>Adopted popup. Click to call window.close():</p>"
+          + "<button onclick=window.close()>window.close()</button></body>');"
+          + "w.document.close();}\">"
+          + "window.open &rarr; self-closing popup</button>"
           + "<script>document.getElementById('ua').textContent="
           + "navigator.userAgent;</script>"
           + "</body></html>";
