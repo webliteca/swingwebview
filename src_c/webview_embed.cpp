@@ -6764,6 +6764,12 @@ static id impl_create_web_view(id self, SEL, id webView, id configuration,
         win = msg<id, CGRect, unsigned long, unsigned long, BOOL>(
             win, sel("initWithContentRect:styleMask:backing:defer:"),
             CGRectMake(0, 0, W, H), (unsigned long)15, (unsigned long)2, NO);
+        // Canvas 15 safeguard "The library owns the popup window": this alloc
+        // is balanced by the single release in impl_web_view_did_close.  Left
+        // at its default (YES), -close would release the window too, and that
+        // release would be one too many (NSZombie: -[NSWindow release]: message
+        // sent to deallocated instance, after a popup's window.close()).
+        msg<void, BOOL>(win, sel("setReleasedWhenClosed:"), NO);
         msg<void, id>(win, sel("setTitle:"), ns_str("Popup"));
         msg<void, id>(win, sel("setContentView:"), child);
         msg<void>(win, sel("center"));

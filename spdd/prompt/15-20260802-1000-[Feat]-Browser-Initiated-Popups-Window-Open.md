@@ -444,7 +444,9 @@ WebViewPopupCallback ..> PopupDispatcher : delegates to
      (W/H default to 500×650 — a typical auth-popup size — when
      unspecified). Create an `NSWindow`
      (`NSWindowStyleMaskTitled|Closable|Resizable`, contentRect W×H),
-     set its `contentView` to `child`, `center`, and
+     **set `releasedWhenClosed` to NO** (see the "The library owns the
+     popup window" safeguard), set its `contentView` to `child`,
+     `center`, and
      `makeKeyAndOrderFront:`. Build a child `Engine` (webview=child,
      jvm, config=configuration, manager=child's
      `configuration.userContentController`, `popup_callback` and
@@ -856,6 +858,17 @@ File: `test/ca/weblite/webview/PopupDispatcherTest.java`
   (consistent with Canvas 11 and the embedding canvases).
 
 ## S · Safeguards
+
+- **The library owns the popup window (macOS).** The engine-owned
+  popup `NSWindow` is created by `alloc` (+1, held in `popup_window`)
+  and freed by the single `release` in the `webViewDidClose:` teardown.
+  It MUST therefore be created with `releasedWhenClosed` set to NO:
+  left at its default (YES), `-close` releases the window as well, and
+  the teardown's `release` is one too many. Observed on-device with
+  `NSZombieEnabled`: a native-window popup that calls `window.close()`
+  stopped with `-[NSKVONotifying_NSWindow release]: message sent to
+  deallocated instance` in `objc_autoreleasePoolPop` on the AppKit main
+  thread.
 
 - **Constructor null-checks.** `WebViewPopupEvent` and
   `PopupDispatcher` reject null `source` with an NPE named
