@@ -461,7 +461,18 @@ WebViewPopupCallback ..> PopupDispatcher : delegates to
      `Engine`, `[popup_window close]`, fire
      `onPopupClosed(popupId, …)` async, then tear down the child
      engine (remove from `g_webview_map`, `setUIDelegate:nil`, delete
-     global refs, release window + delegate).
+     global refs, release window + delegate). Before `-close` it clears
+     the window's delegate, so its own close does not re-enter the
+     window-close path below.
+   - **The window's close button tears the popup down too.** The popup's
+     UI-delegate object also adopts `NSWindowDelegate` and is set as the
+     popup `NSWindow`'s delegate. Its `windowWillClose:` recovers the
+     engine through the `"eng"` association; for an engine-owned
+     native-window popup (not `java_owned`, `popup_window` set) it
+     schedules the `webViewDidClose:` teardown on the AppKit main queue,
+     retaining the delegate and the web view across the hop (a window
+     must not be released inside its own `windowWillClose:`). Java
+     receives `onPopupClosed` exactly as for `window.close()`.
 
 5. **Linux (WebKitGTK) signal strategy.** Connect three signals on
    every `WebKitWebView` created by `gtk_create_engine`
@@ -858,6 +869,15 @@ File: `test/ca/weblite/webview/PopupDispatcherTest.java`
   (consistent with Canvas 11 and the embedding canvases).
 
 ## S · Safeguards
+
+- **A native popup is torn down once, however it closes (macOS).** A
+  page's `window.close()` and the window's own close button both reach
+  the single `webViewDidClose:` teardown, which clears the delegate's
+  `"eng"` association before anything else; whichever path runs second
+  recovers nil and does nothing. Without the close-button path, a
+  user-closed window (created with `releasedWhenClosed` = NO) left the
+  window, its web view, delegate, configuration, Java global refs and
+  `Engine` alive, and Java never heard `onPopupClosed`.
 
 - **The library owns the popup window (macOS).** The engine-owned
   popup `NSWindow` is created by `alloc` (+1, held in `popup_window`)

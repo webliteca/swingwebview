@@ -6816,6 +6816,12 @@ static id impl_create_web_view(id self, SEL, id webView, id configuration,
     // the child engine's inherited download_callback (Canvas 23).
     msg<void, id>(child, sel("setNavigationDelegate:"), ui);
     child_e->ui_delegate = ui;
+    // Canvas 15: the same delegate object hears the NATIVE_WINDOW popup's
+    // window close (its close button), so a user-closed window is torn down
+    // like window.close() -- see impl_popup_window_will_close.
+    if (win) {
+        msg<void, id>(win, sel("setDelegate:"), ui);
+    }
     {
         std::lock_guard<std::mutex> lk(g_webview_map_mutex);
         g_webview_map[child] = child_e;
@@ -6932,6 +6938,9 @@ static void impl_web_view_did_close(id self, SEL, id webView) {
         g_retained_popups.erase(pid);
     }
     if (e->popup_window) {
+        // Clear the window's delegate first so this -close does not re-enter
+        // impl_popup_window_will_close (Canvas 15).
+        msg<void, id>(e->popup_window, sel("setDelegate:"), (id)nullptr);
         msg<void>(e->popup_window, sel("close"));
     }
 
@@ -6972,6 +6981,32 @@ static void impl_web_view_did_close(id self, SEL, id webView) {
     // it releases").
     if (e->config) { msg(e->config, sel("release")); e->config = nullptr; }
     delete e;
+}
+
+// NSWindowDelegate windowWillClose: -- the user closed an engine-owned
+// NATIVE_WINDOW popup with its own close button (Canvas 15 safeguard "A native
+// popup is torn down once, however it closes").  Runs on AppKit main.  The
+// teardown is the webViewDidClose: one, scheduled for after this close
+// finishes: a window must not be released inside its own windowWillClose:.
+// cocoa_run_on_main_async would run it inline here (we are on main), so the
+// hop goes through dispatch_async_f.  The delegate and the web view are
+// retained across the hop.  The teardown clears the "eng" association first,
+// so if window.close() already tore the popup down, the hop finds nil and
+// does nothing.
+static void impl_popup_window_will_close(id self, SEL, id /*notification*/) {
+    Engine *e = (Engine *)objc_getAssociatedObject(self, "eng");
+    if (!e || e->java_owned || !e->popup_window || !e->webview) return;
+    struct Hop { id ui; id webview; };
+    Hop *h = new Hop{self, e->webview};
+    msg(h->ui, sel("retain"));
+    msg(h->webview, sel("retain"));
+    dispatch_async_f(dispatch_get_main_queue(), h, +[](void *p) {
+        Hop *g = static_cast<Hop *>(p);
+        impl_web_view_did_close(g->ui, sel("webViewDidClose:"), g->webview);
+        msg(g->webview, sel("release"));
+        msg(g->ui, sel("release"));
+        delete g;
+    });
 }
 
 // Register (or clear, when cb is null) the Java WebViewPopupCallback for this
@@ -7920,6 +7955,15 @@ static Class get_webview_embed_ui_delegate_cls() {
             c,
             sel("webViewDidClose:"),
             (IMP)impl_web_view_did_close, "v@:@");
+        // Canvas 15: a NATIVE_WINDOW popup's window close button.
+        {
+            Protocol *wd = objc_getProtocol("NSWindowDelegate");
+            if (wd) class_addProtocol(c, wd);
+        }
+        class_addMethod(
+            c,
+            sel("windowWillClose:"),
+            (IMP)impl_popup_window_will_close, "v@:@");
         // Download support -- Canvas 23.  The same object serves as the
         // WKNavigationDelegate and the WKDownloadDelegate: it already
         // carries the per-engine "eng" associated object every selector
