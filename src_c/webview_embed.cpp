@@ -505,6 +505,44 @@ static int perm_upcall(JavaVM *jvm, jobject cb, long long id,
     return answer;
 }
 
+// ---------------------------------------------------------------------------
+// Canvas 37 D4: content rule list store completions.  The engine's async
+// completion (GTK main loop / AppKit main) hands the result to a detached
+// thread that attaches to the JVM, calls
+// WebViewContentRuleListCallback.onComplete(ok, found, error) exactly once,
+// deletes the callback's global ref and detaches -- never inside the JNI call
+// that started the operation, and never blocking the UI thread on Java.
+// ---------------------------------------------------------------------------
+static void content_rules_upcall(JavaVM *jvm, jobject cb, bool ok, bool found,
+                                 std::string error) {
+    if (!jvm || !cb) return;
+    std::thread([jvm, cb, ok, found, error] {
+        JNIEnv *env = nullptr;
+        if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK || !env) return;
+        jclass cls = env->GetObjectClass(cb);
+        jmethodID mid = cls ? env->GetMethodID(cls, "onComplete",
+                                               "(ZZLjava/lang/String;)V")
+                            : nullptr;
+        if (mid) {
+            jstring je = error.empty() ? nullptr : env->NewStringUTF(error.c_str());
+            env->CallVoidMethod(cb, mid, ok ? JNI_TRUE : JNI_FALSE,
+                                found ? JNI_TRUE : JNI_FALSE, je);
+            if (je) env->DeleteLocalRef(je);
+        }
+        if (env->ExceptionCheck()) {
+            env->ExceptionDescribe();
+            env->ExceptionClear();
+        }
+        if (cls) env->DeleteLocalRef(cls);
+        env->DeleteGlobalRef(cb);
+        jvm->DetachCurrentThread();
+    }).detach();
+}
+
+static std::string content_rules_key(const std::string &dir, const std::string &id) {
+    return dir + "\n" + id;
+}
+
 #ifdef WEBVIEW_GTK
 // =========================================================================
 // Linux / GTK / X11
@@ -5235,6 +5273,228 @@ static void gtk_off_snapshot_into(OffEngine *e, JNIEnv *env,
                            reinterpret_cast<const jint *>(tmp.data()));
 }
 
+// ---------------------------------------------------------------------------
+// Canvas 37 D8: content rule lists on WebKitGTK (2.24+).  The stores and the
+// registry of compiled filters are touched only on the GTK thread.
+// ---------------------------------------------------------------------------
+#if WEBKIT_CHECK_VERSION(2, 24, 0)
+static std::map<std::string, WebKitUserContentFilterStore *> g_cr_stores;
+static std::map<std::string, WebKitUserContentFilter *> g_cr_filters;
+
+static bool gtk_filters_ok() {
+    return WK_HAS(webkit_user_content_filter_store_new) &&
+           WK_HAS(webkit_user_content_filter_store_save) &&
+           WK_HAS(webkit_user_content_filter_store_save_finish) &&
+           WK_HAS(webkit_user_content_filter_store_load) &&
+           WK_HAS(webkit_user_content_filter_store_load_finish) &&
+           WK_HAS(webkit_user_content_filter_store_remove) &&
+           WK_HAS(webkit_user_content_filter_store_remove_finish) &&
+           WK_HAS(webkit_user_content_filter_ref) &&
+           WK_HAS(webkit_user_content_filter_unref) &&
+           WK_HAS(webkit_user_content_manager_add_filter) &&
+           WK_HAS(webkit_user_content_manager_remove_filter_by_id) &&
+           WK_HAS(webkit_user_content_manager_remove_all_filters);
+}
+
+static WebKitUserContentFilterStore *gtk_cr_store(const std::string &dir) {
+    auto it = g_cr_stores.find(dir);
+    if (it != g_cr_stores.end()) return it->second;
+    WebKitUserContentFilterStore *st = webkit_user_content_filter_store_new(dir.c_str());
+    g_cr_stores[dir] = st;
+    return st;
+}
+
+static void gtk_cr_put(const std::string &key, WebKitUserContentFilter *f) {
+    auto it = g_cr_filters.find(key);
+    if (it != g_cr_filters.end() && it->second) {
+        webkit_user_content_filter_unref(it->second);
+    }
+    g_cr_filters[key] = f;
+}
+
+static void gtk_cr_drop(const std::string &key) {
+    auto it = g_cr_filters.find(key);
+    if (it == g_cr_filters.end()) return;
+    if (it->second) webkit_user_content_filter_unref(it->second);
+    g_cr_filters.erase(it);
+}
+
+struct GtkCrOp {
+    JavaVM *jvm;
+    jobject cb;
+    std::string key;
+};
+
+static std::string gtk_cr_error(GError *err, const char *fallback) {
+    std::string m = err && err->message ? err->message : fallback;
+    return m;
+}
+#else
+static bool gtk_filters_ok() { return false; }
+#endif
+
+static bool gtk_content_rules_available() {
+    // Resolve the runtime first: the optional symbols are only known once
+    // the loader has run (it runs at JNI_OnLoad on Linux).
+    return webkit_loader_ensure(nullptr, 0) && gtk_filters_ok();
+}
+
+static void gtk_content_rules_compile(JavaVM *jvm, jobject cb, std::string dir,
+                                      std::string id, std::string json) {
+#if WEBKIT_CHECK_VERSION(2, 24, 0)
+    if (!gtk_content_rules_available()) {
+        content_rules_upcall(jvm, cb, false, false, "content rule lists need WebKitGTK 2.24+");
+        return;
+    }
+    GtkPump::instance().run_async([=] {
+        auto *op = new GtkCrOp{jvm, cb, content_rules_key(dir, id)};
+        GBytes *bytes = g_bytes_new(json.data(), json.size());
+        webkit_user_content_filter_store_save(
+            gtk_cr_store(dir), id.c_str(), bytes, nullptr,
+            +[](GObject *src, GAsyncResult *res, gpointer data) {
+                auto *op = static_cast<GtkCrOp *>(data);
+                GError *err = nullptr;
+                WebKitUserContentFilter *f = webkit_user_content_filter_store_save_finish(
+                    (WebKitUserContentFilterStore *)src, res, &err);
+                if (f) {
+                    gtk_cr_put(op->key, f);
+                    content_rules_upcall(op->jvm, op->cb, true, true, "");
+                } else {
+                    content_rules_upcall(op->jvm, op->cb, false, false,
+                                         gtk_cr_error(err, "could not compile the rule list"));
+                }
+                if (err) g_error_free(err);
+                delete op;
+            },
+            op);
+        g_bytes_unref(bytes);
+    });
+#else
+    (void)dir; (void)id; (void)json;
+    content_rules_upcall(jvm, cb, false, false, "content rule lists need WebKitGTK 2.24+");
+#endif
+}
+
+static void gtk_content_rules_lookup(JavaVM *jvm, jobject cb, std::string dir,
+                                     std::string id) {
+#if WEBKIT_CHECK_VERSION(2, 24, 0)
+    if (!gtk_content_rules_available()) {
+        content_rules_upcall(jvm, cb, false, false, "content rule lists need WebKitGTK 2.24+");
+        return;
+    }
+    GtkPump::instance().run_async([=] {
+        auto *op = new GtkCrOp{jvm, cb, content_rules_key(dir, id)};
+        webkit_user_content_filter_store_load(
+            gtk_cr_store(dir), id.c_str(), nullptr,
+            +[](GObject *src, GAsyncResult *res, gpointer data) {
+                auto *op = static_cast<GtkCrOp *>(data);
+                GError *err = nullptr;
+                WebKitUserContentFilter *f = webkit_user_content_filter_store_load_finish(
+                    (WebKitUserContentFilterStore *)src, res, &err);
+                if (f) {
+                    gtk_cr_put(op->key, f);
+                    content_rules_upcall(op->jvm, op->cb, true, true, "");
+                } else if (err && err->code == 1 /* NOT_FOUND */) {
+                    content_rules_upcall(op->jvm, op->cb, true, false, "");
+                } else {
+                    content_rules_upcall(op->jvm, op->cb, false, false,
+                                         gtk_cr_error(err, "could not look up the rule list"));
+                }
+                if (err) g_error_free(err);
+                delete op;
+            },
+            op);
+    });
+#else
+    (void)dir; (void)id;
+    content_rules_upcall(jvm, cb, false, false, "content rule lists need WebKitGTK 2.24+");
+#endif
+}
+
+static void gtk_content_rules_remove(JavaVM *jvm, jobject cb, std::string dir,
+                                     std::string id) {
+#if WEBKIT_CHECK_VERSION(2, 24, 0)
+    if (!gtk_content_rules_available()) {
+        content_rules_upcall(jvm, cb, true, false, "");
+        return;
+    }
+    GtkPump::instance().run_async([=] {
+        auto *op = new GtkCrOp{jvm, cb, content_rules_key(dir, id)};
+        gtk_cr_drop(op->key);
+        webkit_user_content_filter_store_remove(
+            gtk_cr_store(dir), id.c_str(), nullptr,
+            +[](GObject *src, GAsyncResult *res, gpointer data) {
+                auto *op = static_cast<GtkCrOp *>(data);
+                GError *err = nullptr;
+                gboolean ok = webkit_user_content_filter_store_remove_finish(
+                    (WebKitUserContentFilterStore *)src, res, &err);
+                if (ok) {
+                    content_rules_upcall(op->jvm, op->cb, true, true, "");
+                } else if (err && err->code == 1 /* NOT_FOUND */) {
+                    content_rules_upcall(op->jvm, op->cb, true, false, "");
+                } else {
+                    content_rules_upcall(op->jvm, op->cb, false, false,
+                                         gtk_cr_error(err, "could not remove the rule list"));
+                }
+                if (err) g_error_free(err);
+                delete op;
+            },
+            op);
+    });
+#else
+    (void)dir; (void)id;
+    content_rules_upcall(jvm, cb, true, false, "");
+#endif
+}
+
+// D5: apply to a view's content manager, on the GTK thread in FIFO order.
+// `manager_of` reads the engine's manager inside the queued job, so an add
+// queued right after engine creation sees the manager creation set.
+template <typename E>
+static void gtk_cr_apply_add(E *e, std::string dir, std::string id) {
+#if WEBKIT_CHECK_VERSION(2, 24, 0)
+    if (!e || !gtk_filters_ok()) return;
+    GtkPump::instance().run_async([=] {
+        if (!e->manager) return;
+        auto it = g_cr_filters.find(content_rules_key(dir, id));
+        if (it == g_cr_filters.end() || !it->second) {
+            fprintf(stderr, "[webview] content rule list %s was not compiled or looked up in "
+                            "this process; not applied\n", id.c_str());
+            return;
+        }
+        webkit_user_content_manager_add_filter(e->manager, it->second);
+    });
+#else
+    (void)e; (void)dir; (void)id;
+#endif
+}
+
+template <typename E>
+static void gtk_cr_apply_remove(E *e, std::string id) {
+#if WEBKIT_CHECK_VERSION(2, 24, 0)
+    if (!e || !gtk_filters_ok()) return;
+    GtkPump::instance().run_async([=] {
+        if (!e->manager) return;
+        webkit_user_content_manager_remove_filter_by_id(e->manager, id.c_str());
+    });
+#else
+    (void)e; (void)id;
+#endif
+}
+
+template <typename E>
+static void gtk_cr_apply_clear(E *e) {
+#if WEBKIT_CHECK_VERSION(2, 24, 0)
+    if (!e || !gtk_filters_ok()) return;
+    GtkPump::instance().run_async([=] {
+        if (!e->manager) return;
+        webkit_user_content_manager_remove_all_filters(e->manager);
+    });
+#else
+    (void)e;
+#endif
+}
+
 #endif // WEBVIEW_GTK
 
 #ifdef WEBVIEW_COCOA
@@ -5584,6 +5844,11 @@ struct Engine {
     // nullptr.  Read by decidePolicyForNavigationAction on AppKit main;
     // set by cocoa_set_navigation_callback; freed in cocoa_destroy_engine.
     jobject navigation_callback = nullptr;
+    // Canvas 37 D12: the content rule lists applied to this view, in order,
+    // as (registry key, retained WKContentRuleList).  AppKit main only;
+    // copied onto a popup child at creation; released in
+    // cocoa_destroy_engine.
+    std::vector<std::pair<std::string, id>> content_rules;
     // Canvas 36 D10: JNI global ref to the WebViewContextMenuCallback, or
     // nullptr.  Read by the willOpenMenu:withEvent: hook on AppKit main; set
     // by cocoa_set_context_menu_callback; freed in cocoa_destroy_engine.
@@ -6792,6 +7057,17 @@ static id impl_create_web_view(id self, SEL, id webView, id configuration,
     // that controller, and no teardown path releases it.
     child_e->config = msg(configuration, sel("retain"));
     child_e->manager = msg(configuration, sel("userContentController"));
+    // Canvas 37 D12: the child is governed by its opener's content rule lists
+    // before its first request.  An ADOPT child has its own empty controller;
+    // a window child's controller may be the opener's, where re-adding a
+    // list is a no-op (WebKit keys them by identifier).
+    for (const auto &kv : e->content_rules) {
+        if (child_e->manager && kv.second) {
+            msg<void, id>(child_e->manager, sel("addContentRuleList:"), kv.second);
+            child_e->content_rules.push_back(
+                std::make_pair(kv.first, msg(kv.second, sel("retain"))));
+        }
+    }
     child_e->popup_window = win;              // nil for ADOPT
     child_e->popup_id = (jlong)child_e;
     if (env) {
@@ -9694,6 +9970,16 @@ static void cocoa_print_to_pdf(Engine *e, PdfJob *job, std::string path,
 //   6. delete e.
 static void cocoa_destroy_engine(Engine *e) {
     if (!e) return;
+    // Canvas 37 D12: release the applied content rule lists on AppKit main.
+    if (!e->content_rules.empty()) {
+        std::vector<std::pair<std::string, id>> rules;
+        rules.swap(e->content_rules);
+        cocoa_run_on_main_async([rules] {
+            for (const auto &kv : rules) {
+                if (kv.second) msg<void>(kv.second, sel("release"));
+            }
+        });
+    }
     // Canvas 21 (1.5.0): drop the User-Agent resolver's global ref.  Only the
     // popup-child creation path reads it, but a late popup during teardown
     // would follow a freed ref, so it goes with the other callbacks.
@@ -10171,6 +10457,171 @@ static void cocoa_execute_editing_command(Engine *e, int cmdId) {
                 "directly to WKWebView %p\n", name, (void *)e->webview);
         }
         msg<void, id>(e->webview, action, (id)nullptr);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Canvas 37 D12: content rule lists on WKWebView.  WKContentRuleListStore per
+// directory and the registry of compiled lists live on AppKit main only.
+// ---------------------------------------------------------------------------
+static std::map<std::string, id> g_cr_stores;    // dir -> retained store
+static std::map<std::string, id> g_cr_lists;     // key -> retained WKContentRuleList
+
+static id cocoa_cr_store(const std::string &dir) {
+    auto it = g_cr_stores.find(dir);
+    if (it != g_cr_stores.end()) return it->second;
+    id url = msg<id, id, BOOL>(objc_cls("NSURL"), sel("fileURLWithPath:isDirectory:"),
+                               ns_str(dir.c_str()), YES);
+    id store = msg<id, id>(objc_cls("WKContentRuleListStore"), sel("storeWithURL:"), url);
+    if (store) msg(store, sel("retain"));
+    g_cr_stores[dir] = store;
+    return store;
+}
+
+static void cocoa_cr_put(const std::string &key, id list) {
+    auto it = g_cr_lists.find(key);
+    if (it != g_cr_lists.end() && it->second) msg<void>(it->second, sel("release"));
+    g_cr_lists[key] = msg(list, sel("retain"));
+}
+
+static void cocoa_cr_drop(const std::string &key) {
+    auto it = g_cr_lists.find(key);
+    if (it == g_cr_lists.end()) return;
+    if (it->second) msg<void>(it->second, sel("release"));
+    g_cr_lists.erase(it);
+}
+
+static std::string cocoa_cr_error(id error, const char *fallback) {
+    if (!error) return fallback;
+    std::string m = ns_string_to_utf8(msg<id>(error, sel("localizedDescription")));
+    return m.empty() ? std::string(fallback) : m;
+}
+
+static void cocoa_content_rules_compile(JavaVM *jvm, jobject cb, std::string dir,
+                                        std::string ident, std::string json) {
+    cocoa_run_on_main_async([=] {
+        id store = cocoa_cr_store(dir);
+        if (!store) {
+            content_rules_upcall(jvm, cb, false, false, "WKContentRuleListStore is unavailable");
+            return;
+        }
+        std::string key = content_rules_key(dir, ident);
+        msg<void, id, id, void (^)(id, id)>(
+            store, sel("compileContentRuleListForIdentifier:encodedContentRuleList:"
+                       "completionHandler:"),
+            ns_str(ident.c_str()), ns_str(json.c_str()),
+            ^(id list, id error) {
+                if (list) {
+                    cocoa_cr_put(key, list);
+                    content_rules_upcall(jvm, cb, true, true, "");
+                } else {
+                    content_rules_upcall(jvm, cb, false, false,
+                                         cocoa_cr_error(error, "could not compile the rule list"));
+                }
+            });
+    });
+}
+
+static void cocoa_content_rules_lookup(JavaVM *jvm, jobject cb, std::string dir,
+                                       std::string ident) {
+    cocoa_run_on_main_async([=] {
+        id store = cocoa_cr_store(dir);
+        if (!store) {
+            content_rules_upcall(jvm, cb, false, false, "WKContentRuleListStore is unavailable");
+            return;
+        }
+        std::string key = content_rules_key(dir, ident);
+        msg<void, id, void (^)(id, id)>(
+            store, sel("lookUpContentRuleListForIdentifier:completionHandler:"),
+            ns_str(ident.c_str()),
+            ^(id list, id error) {
+                if (list) {
+                    cocoa_cr_put(key, list);
+                    content_rules_upcall(jvm, cb, true, true, "");
+                } else if (error && msg<long>(error, sel("code")) == 6
+                           /* WKErrorContentRuleListStoreLookUpFailed */) {
+                    content_rules_upcall(jvm, cb, true, false, "");
+                } else {
+                    content_rules_upcall(jvm, cb, false, false,
+                                         cocoa_cr_error(error, "could not look up the rule list"));
+                }
+            });
+    });
+}
+
+static void cocoa_content_rules_remove(JavaVM *jvm, jobject cb, std::string dir,
+                                       std::string ident) {
+    cocoa_run_on_main_async([=] {
+        id store = cocoa_cr_store(dir);
+        if (!store) {
+            content_rules_upcall(jvm, cb, true, false, "");
+            return;
+        }
+        cocoa_cr_drop(content_rules_key(dir, ident));
+        msg<void, id, void (^)(id)>(
+            store, sel("removeContentRuleListForIdentifier:completionHandler:"),
+            ns_str(ident.c_str()),
+            ^(id error) {
+                if (!error) {
+                    content_rules_upcall(jvm, cb, true, true, "");
+                } else if (msg<long>(error, sel("code")) == 7
+                           /* WKErrorContentRuleListStoreRemoveFailed */) {
+                    content_rules_upcall(jvm, cb, true, false, "");
+                } else {
+                    content_rules_upcall(jvm, cb, false, false,
+                                         cocoa_cr_error(error, "could not remove the rule list"));
+                }
+            });
+    });
+}
+
+// D5: apply on AppKit main, FIFO with cocoa_navigate.
+static void cocoa_cr_apply_add(Engine *e, std::string dir, std::string ident) {
+    cocoa_run_on_main_async([=] {
+        if (!e || e->destroyed.load() || !e->manager) return;
+        std::string key = content_rules_key(dir, ident);
+        auto it = g_cr_lists.find(key);
+        if (it == g_cr_lists.end() || !it->second) {
+            fprintf(stderr, "[webview] content rule list %s was not compiled or looked up in "
+                            "this process; not applied\n", ident.c_str());
+            return;
+        }
+        for (auto r = e->content_rules.begin(); r != e->content_rules.end(); ++r) {
+            if (r->first == key) {
+                msg<void, id>(e->manager, sel("removeContentRuleList:"), r->second);
+                msg<void>(r->second, sel("release"));
+                e->content_rules.erase(r);
+                break;
+            }
+        }
+        msg<void, id>(e->manager, sel("addContentRuleList:"), it->second);
+        e->content_rules.push_back(std::make_pair(key, msg(it->second, sel("retain"))));
+    });
+}
+
+static void cocoa_cr_apply_remove(Engine *e, std::string dir, std::string ident) {
+    cocoa_run_on_main_async([=] {
+        if (!e || e->destroyed.load() || !e->manager) return;
+        std::string key = content_rules_key(dir, ident);
+        for (auto r = e->content_rules.begin(); r != e->content_rules.end(); ++r) {
+            if (r->first == key) {
+                msg<void, id>(e->manager, sel("removeContentRuleList:"), r->second);
+                msg<void>(r->second, sel("release"));
+                e->content_rules.erase(r);
+                break;
+            }
+        }
+    });
+}
+
+static void cocoa_cr_apply_clear(Engine *e) {
+    cocoa_run_on_main_async([=] {
+        if (!e || e->destroyed.load() || !e->manager) return;
+        msg<void>(e->manager, sel("removeAllContentRuleLists"));
+        for (const auto &kv : e->content_rules) {
+            if (kv.second) msg<void>(kv.second, sel("release"));
+        }
+        e->content_rules.clear();
     });
 }
 
@@ -11742,6 +12193,147 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
 #else
     (void)popupId;
 #endif
+}
+
+// Content rule lists — Canvas 37 D3–D5.  webview_content_rules_available is
+// the support probe (an older native lacks the symbol); the store natives call
+// the WebViewContentRuleListCallback exactly once, later, from a native thread;
+// the apply natives run on the engine's UI thread in FIFO order.  Windows
+// implements the probe and the D9/D11 bridges in windows/webview_embed.cc.
+static std::string cr_jstr(JNIEnv *env, jstring s) {
+    if (!s) return std::string();
+    const char *c = env->GetStringUTFChars(s, nullptr);
+    std::string out = c ? c : "";
+    if (c) env->ReleaseStringUTFChars(s, c);
+    return out;
+}
+
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1content_1rules_1available
+  (JNIEnv *, jclass) {
+#ifdef WEBVIEW_GTK
+    return embed::gtk_content_rules_available() ? JNI_TRUE : JNI_FALSE;
+#elif defined(WEBVIEW_COCOA)
+    return JNI_TRUE;
+#else
+    return JNI_FALSE;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1content_1rules_1compile
+  (JNIEnv *env, jclass, jstring dir, jstring ident, jstring json, jobject cb) {
+    JavaVM *jvm = nullptr;
+    env->GetJavaVM(&jvm);
+    jobject g = cb ? env->NewGlobalRef(cb) : nullptr;
+    std::string d = cr_jstr(env, dir), i = cr_jstr(env, ident), j = cr_jstr(env, json);
+#ifdef WEBVIEW_GTK
+    embed::gtk_content_rules_compile(jvm, g, d, i, j);
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_content_rules_compile(jvm, g, d, i, j);
+#else
+    embed::content_rules_upcall(jvm, g, false, false, "unsupported");
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1content_1rules_1lookup
+  (JNIEnv *env, jclass, jstring dir, jstring ident, jobject cb) {
+    JavaVM *jvm = nullptr;
+    env->GetJavaVM(&jvm);
+    jobject g = cb ? env->NewGlobalRef(cb) : nullptr;
+    std::string d = cr_jstr(env, dir), i = cr_jstr(env, ident);
+#ifdef WEBVIEW_GTK
+    embed::gtk_content_rules_lookup(jvm, g, d, i);
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_content_rules_lookup(jvm, g, d, i);
+#else
+    embed::content_rules_upcall(jvm, g, false, false, "unsupported");
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1content_1rules_1remove
+  (JNIEnv *env, jclass, jstring dir, jstring ident, jobject cb) {
+    JavaVM *jvm = nullptr;
+    env->GetJavaVM(&jvm);
+    jobject g = cb ? env->NewGlobalRef(cb) : nullptr;
+    std::string d = cr_jstr(env, dir), i = cr_jstr(env, ident);
+#ifdef WEBVIEW_GTK
+    embed::gtk_content_rules_remove(jvm, g, d, i);
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_content_rules_remove(jvm, g, d, i);
+#else
+    embed::content_rules_upcall(jvm, g, true, false, "");
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1add_1content_1rule_1list
+  (JNIEnv *env, jclass, jlong wv, jstring dir, jstring ident) {
+    if (wv == 0) return;
+    std::string d = cr_jstr(env, dir), i = cr_jstr(env, ident);
+#ifdef WEBVIEW_GTK
+    embed::gtk_cr_apply_add((embed::Engine *)wv, d, i);
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_cr_apply_add((embed::Engine *)wv, d, i);
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1remove_1content_1rule_1list
+  (JNIEnv *env, jclass, jlong wv, jstring dir, jstring ident) {
+    if (wv == 0) return;
+    std::string d = cr_jstr(env, dir), i = cr_jstr(env, ident);
+#ifdef WEBVIEW_GTK
+    (void)d;
+    embed::gtk_cr_apply_remove((embed::Engine *)wv, i);
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_cr_apply_remove((embed::Engine *)wv, d, i);
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1remove_1all_1content_1rule_1lists
+  (JNIEnv *, jclass, jlong wv) {
+    if (wv == 0) return;
+#ifdef WEBVIEW_GTK
+    embed::gtk_cr_apply_clear((embed::Engine *)wv);
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_cr_apply_clear((embed::Engine *)wv);
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1add_1content_1rule_1list
+  (JNIEnv *env, jclass, jlong peer, jstring dir, jstring ident) {
+    if (peer == 0) return;
+#ifdef WEBVIEW_GTK
+    embed::gtk_cr_apply_add((embed::OffEngine *)peer, cr_jstr(env, dir), cr_jstr(env, ident));
+#else
+    // No offscreen engine on macOS or Windows.
+    (void)env; (void)dir; (void)ident;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1remove_1content_1rule_1list
+  (JNIEnv *env, jclass, jlong peer, jstring dir, jstring ident) {
+    if (peer == 0) return;
+    (void)dir;
+#ifdef WEBVIEW_GTK
+    embed::gtk_cr_apply_remove((embed::OffEngine *)peer, cr_jstr(env, ident));
+#else
+    (void)env; (void)ident;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1remove_1all_1content_1rule_1lists
+  (JNIEnv *, jclass, jlong peer) {
+    if (peer == 0) return;
+#ifdef WEBVIEW_GTK
+    embed::gtk_cr_apply_clear((embed::OffEngine *)peer);
+#endif
+}
+
+// D9, D11 are Windows-only: no-ops here, for link symmetry.
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1content_1rule_1callback
+  (JNIEnv *, jclass, jlong, jobject) {
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1content_1rule_1script
+  (JNIEnv *, jclass, jlong, jstring) {
 }
 
 } // extern "C"

@@ -1010,6 +1010,51 @@ wv.setNavigationHandler(e ->
   popups of a page you restrict. See
   [`demos/WebViewNavigationDemo/`](demos/WebViewNavigationDemo/README.md).
 
+## Blocking content with rule lists
+
+A content rule list makes the engine refuse matching requests **before they are sent** and hide
+matching elements — the network-level blocking an ad or tracker blocker needs. Rules use WebKit's
+[content-blocker JSON format](https://developer.apple.com/documentation/safariservices/creating-a-content-blocker)
+on every platform (Canvas 37).
+
+```java
+File store = new File(appDataDir, "content-rules");
+String json = "[{\"trigger\":{\"url-filter\":\"/ads/\"},\"action\":{\"type\":\"block\"}},"
+            + " {\"trigger\":{\"url-filter\":\".*\"},"
+            + "  \"action\":{\"type\":\"css-display-none\",\"selector\":\".ad-slot\"}}]";
+
+if (WebViewContentRules.isSupported()) {
+    // Compile once; the compiled list is kept in `store` for the next launch.
+    WebViewContentRules.lookup(store, "ads-v1")
+        .thenCompose(l -> l != null ? CompletableFuture.completedFuture(l)
+                                    : WebViewContentRules.compile(store, "ads-v1", json))
+        .thenAccept(l -> SwingUtilities.invokeLater(() -> wv.addContentRuleList(l)));
+}
+```
+
+* **Actions:** `block`, `block-cookies`, `css-display-none`, `ignore-previous-rules`
+  (`make-https` and `notify` compile, and work where the engine supports them natively).
+* **Triggers:** `url-filter`, `url-filter-is-case-sensitive`, `if-domain` / `unless-domain`,
+  `if-top-url` / `unless-top-url`, `resource-type`, `load-type`, `load-context`.
+* **When it applies.** Lists added before the component is displayed govern its first request.
+  Later changes govern the next request — reload to re-evaluate the current page. Each list decides
+  on its own (an `ignore-previous-rules` cancels only its own list's earlier rules).
+* **Popups** opened by the view are governed by the same lists; a popup adopted with
+  `adoptPopup` starts with them. On Linux an adopted popup shares its opener's WebKit content
+  manager, so removing a list from either removes it from both.
+* **Engines.** macOS compiles with `WKContentRuleListStore`, Linux with
+  `WebKitUserContentFilterStore` (**WebKitGTK 2.24+**; older reports unsupported). Windows has no
+  compiler: lists are parsed and matched in Java on every request, and hide rules are injected as
+  one document-created script. On Windows, third-party is decided on an approximation of the public
+  suffix list, a rule limited to `child-frame` never matches, and `make-https` / `notify` are
+  ignored.
+* **Identifiers** are 1–128 of `[A-Za-z0-9._-]`. Applying two lists with the same identifier from
+  different stores to one view is not supported.
+* **Not reported:** which requests were blocked. No engine reports it portably.
+
+Demo: `run-linux-content-rules-demo.sh`, `run-mac-content-rules-demo.sh`,
+`run-windows-content-rules-demo.bat` (`CRDEMO_AUTO=1` runs the checks and exits).
+
 ## Adding items to the native context menu
 
 The engine's own right-click menu — Copy, Look Up, spelling suggestions,

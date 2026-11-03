@@ -1061,6 +1061,85 @@ public class EmbeddedWebView {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Canvas 37: content rule lists
+    // ------------------------------------------------------------------
+
+    /**
+     * Apply a compiled content rule list (Canvas 37 D5) on macOS and Linux.
+     * Runs on the engine's UI thread in FIFO order, so a list added before
+     * {@link #navigate} governs the first request.  An older native library
+     * leaves the view unfiltered.
+     *
+     * @return {@code this} for chaining
+     */
+    public EmbeddedWebView addContentRuleList(WebViewContentRuleList list) {
+        checkAlive();
+        try {
+            WebViewNative.webview_embed_add_content_rule_list(peer,
+                list.storeDirectory().getAbsolutePath(), list.identifier());
+        } catch (UnsatisfiedLinkError ule) {
+            // Native library predates Canvas 37.
+        }
+        return this;
+    }
+
+    /** Remove an applied content rule list by identifier (Canvas 37 D5). */
+    public EmbeddedWebView removeContentRuleList(WebViewContentRuleList list) {
+        checkAlive();
+        try {
+            WebViewNative.webview_embed_remove_content_rule_list(peer,
+                list.storeDirectory().getAbsolutePath(), list.identifier());
+        } catch (UnsatisfiedLinkError ule) {
+            // Native library predates Canvas 37.
+        }
+        return this;
+    }
+
+    /** Remove every applied content rule list (Canvas 37 D5). */
+    public EmbeddedWebView removeAllContentRuleLists() {
+        checkAlive();
+        try {
+            WebViewNative.webview_embed_remove_all_content_rule_lists(peer);
+        } catch (UnsatisfiedLinkError ule) {
+            // Native library predates Canvas 37.
+        }
+        return this;
+    }
+
+    /**
+     * Windows: register the per-request content-rule callback (Canvas 37 D9).
+     * The engine calls it synchronously on the WebView2 thread for every
+     * http(s) and ws(s) request; {@code null} makes the hook inert.  Anchors
+     * {@code cb} in {@link #heap}.  A no-op on macOS and Linux natives.
+     */
+    public EmbeddedWebView setContentRuleCallback(WebViewContentRuleCallback cb) {
+        checkAlive();
+        if (cb != null) {
+            heap.add(cb);
+        }
+        try {
+            WebViewNative.webview_embed_set_content_rule_callback(peer, cb);
+        } catch (UnsatisfiedLinkError ule) {
+            // Native library predates Canvas 37.
+        }
+        return this;
+    }
+
+    /**
+     * Windows: replace the cosmetic document-created script (Canvas 37 D11);
+     * an empty string removes it.  A no-op on macOS and Linux natives.
+     */
+    public EmbeddedWebView setContentRuleScript(String js) {
+        checkAlive();
+        try {
+            WebViewNative.webview_embed_set_content_rule_script(peer, js == null ? "" : js);
+        } catch (UnsatisfiedLinkError ule) {
+            // Native library predates Canvas 37.
+        }
+        return this;
+    }
+
     private void checkAlive() {
         if (peer == 0L) {
             throw new IllegalStateException("EmbeddedWebView has been disposed.");

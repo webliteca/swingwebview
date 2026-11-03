@@ -766,6 +766,51 @@ public class OffscreenWebView {
         }
     }
 
+    // ------------------------------------------------------------------
+    // Canvas 37: content rule lists (Linux offscreen engine)
+    // ------------------------------------------------------------------
+
+    /**
+     * Apply a compiled content rule list (Canvas 37 D5).  Runs on the GTK
+     * thread in FIFO order, so a list added before {@link #navigate} governs
+     * the first request.  An older native library leaves the view unfiltered.
+     *
+     * @return {@code this} for chaining
+     */
+    public OffscreenWebView addContentRuleList(WebViewContentRuleList list) {
+        checkAlive();
+        try {
+            WebViewNative.webview_offscreen_add_content_rule_list(peer,
+                list.storeDirectory().getAbsolutePath(), list.identifier());
+        } catch (UnsatisfiedLinkError ule) {
+            // Native library predates Canvas 37.
+        }
+        return this;
+    }
+
+    /** Remove an applied content rule list by identifier (Canvas 37 D5). */
+    public OffscreenWebView removeContentRuleList(WebViewContentRuleList list) {
+        checkAlive();
+        try {
+            WebViewNative.webview_offscreen_remove_content_rule_list(peer,
+                list.storeDirectory().getAbsolutePath(), list.identifier());
+        } catch (UnsatisfiedLinkError ule) {
+            // Native library predates Canvas 37.
+        }
+        return this;
+    }
+
+    /** Remove every applied content rule list (Canvas 37 D5). */
+    public OffscreenWebView removeAllContentRuleLists() {
+        checkAlive();
+        try {
+            WebViewNative.webview_offscreen_remove_all_content_rule_lists(peer);
+        } catch (UnsatisfiedLinkError ule) {
+            // Native library predates Canvas 37.
+        }
+        return this;
+    }
+
     private void checkAlive() {
         if (peer == 0L) {
             throw new IllegalStateException(

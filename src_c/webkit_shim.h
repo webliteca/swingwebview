@@ -122,6 +122,20 @@
 #endif
 
 // Context-menu items (Canvas 36 D9): optional -- test WK_HAS.
+#if WEBKIT_CHECK_VERSION(2, 24, 0)
+#define webkit_user_content_filter_store_new (::g_wk.fn_webkit_user_content_filter_store_new)
+#define webkit_user_content_filter_store_save (::g_wk.fn_webkit_user_content_filter_store_save)
+#define webkit_user_content_filter_store_save_finish (::g_wk.fn_webkit_user_content_filter_store_save_finish)
+#define webkit_user_content_filter_store_load (::g_wk.fn_webkit_user_content_filter_store_load)
+#define webkit_user_content_filter_store_load_finish (::g_wk.fn_webkit_user_content_filter_store_load_finish)
+#define webkit_user_content_filter_store_remove (::g_wk.fn_webkit_user_content_filter_store_remove)
+#define webkit_user_content_filter_store_remove_finish (::g_wk.fn_webkit_user_content_filter_store_remove_finish)
+#define webkit_user_content_filter_ref (::g_wk.fn_webkit_user_content_filter_ref)
+#define webkit_user_content_filter_unref (::g_wk.fn_webkit_user_content_filter_unref)
+#define webkit_user_content_manager_add_filter (::g_wk.fn_webkit_user_content_manager_add_filter)
+#define webkit_user_content_manager_remove_filter_by_id (::g_wk.fn_webkit_user_content_manager_remove_filter_by_id)
+#define webkit_user_content_manager_remove_all_filters (::g_wk.fn_webkit_user_content_manager_remove_all_filters)
+#endif
 #if WEBKIT_CHECK_VERSION(2, 18, 0)
 #define webkit_context_menu_append (::g_wk.fn_webkit_context_menu_append)
 #define webkit_context_menu_item_new_from_gaction (::g_wk.fn_webkit_context_menu_item_new_from_gaction)
