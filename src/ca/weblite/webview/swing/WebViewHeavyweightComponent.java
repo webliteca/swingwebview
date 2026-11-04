@@ -17,6 +17,9 @@ import ca.weblite.webview.JavascriptFunction;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewClickCallback;
 import ca.weblite.webview.WebViewDialogCallback;
+import ca.weblite.webview.ContentRuleSet;
+import ca.weblite.webview.WebViewContentRuleCallback;
+import ca.weblite.webview.WebViewContentRuleList;
 import ca.weblite.webview.WebViewNavigationCallback;
 import ca.weblite.webview.WebViewContextMenuCallback;
 import ca.weblite.webview.WebViewPermissionCallback;
@@ -272,6 +275,7 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         if (embedded != null) {
             EmbeddedWebView e = embedded;
             embedded = null;
+            contentRuleCallbackInstalled = false;   // Canvas 37 D9: a new peer starts bare
             e.dispose();
         }
     }
@@ -558,6 +562,82 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         return true;
     }
 
+    // ------------------------------------------------------------------
+    // Canvas 37: content rule lists
+    // ------------------------------------------------------------------
+
+    /** Canvas 37 D9: whether the Windows request callback is installed. */
+    private boolean contentRuleCallbackInstalled;
+
+    private void replayContentRules(EmbeddedWebView e) {
+        if (ContentRuleSet.usesJavaMatcher()) {
+            if (!contentRules.isEmpty()) syncWindowsContentRules(e);
+            return;
+        }
+        for (WebViewContentRuleList l : contentRules.lists()) {
+            e.addContentRuleList(l);
+        }
+    }
+
+    /** Canvas 37 D9, D11: install or clear the request callback and replace
+     *  the cosmetic script to match the current set. */
+    private void syncWindowsContentRules(EmbeddedWebView e) {
+        if (contentRules.isEmpty()) {
+            if (contentRuleCallbackInstalled) {
+                e.setContentRuleCallback(null);
+                contentRuleCallbackInstalled = false;
+            }
+            e.setContentRuleScript("");
+            return;
+        }
+        if (!contentRuleCallbackInstalled) {
+            e.setContentRuleCallback(new WebViewContentRuleCallback() {
+                @Override
+                public int onResourceRequested(String url, String pageUrl, int type) {
+                    return contentRules.decide(url, pageUrl, type);
+                }
+            });
+            contentRuleCallbackInstalled = true;
+        }
+        e.setContentRuleScript(contentRules.cosmeticScript());
+    }
+
+    @Override
+    protected void contentRuleListAdded(WebViewContentRuleList list) {
+        EmbeddedWebView e = embedded;
+        if (e == null) return;
+        try {
+            if (ContentRuleSet.usesJavaMatcher()) syncWindowsContentRules(e);
+            else e.addContentRuleList(list);
+        } catch (IllegalStateException ignored) {
+            // disposed concurrently
+        }
+    }
+
+    @Override
+    protected void contentRuleListRemoved(WebViewContentRuleList list) {
+        EmbeddedWebView e = embedded;
+        if (e == null) return;
+        try {
+            if (ContentRuleSet.usesJavaMatcher()) syncWindowsContentRules(e);
+            else e.removeContentRuleList(list);
+        } catch (IllegalStateException ignored) {
+            // disposed concurrently
+        }
+    }
+
+    @Override
+    protected void contentRuleListsCleared() {
+        EmbeddedWebView e = embedded;
+        if (e == null) return;
+        try {
+            if (ContentRuleSet.usesJavaMatcher()) syncWindowsContentRules(e);
+            else e.removeAllContentRuleLists();
+        } catch (IllegalStateException ignored) {
+            // disposed concurrently
+        }
+    }
+
     private void createPeer() {
         if (embedded != null || !canvas.isDisplayable()) {
             return;
@@ -640,6 +720,9 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         if (pendingUserAgentResolver != null) {
             embedded.setUserAgentResolver(pendingUserAgentResolver);
         }
+        // Canvas 37 D6: the applied content rule lists, replayed before the
+        // first navigate so they govern its first request.
+        replayContentRules(embedded);
         // Canvas 34 D5: the navigation bridge, installed before the first
         // navigate so no navigation of this view escapes the decision.  It
         // answers synchronously on the native UI thread (no EDT hop).

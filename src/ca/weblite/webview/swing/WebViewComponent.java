@@ -6,6 +6,7 @@
 package ca.weblite.webview.swing;
 
 import ca.weblite.webview.ConsoleDispatcher;
+import ca.weblite.webview.ContentRuleSet;
 import ca.weblite.webview.ContextMenuDispatcher;
 import ca.weblite.webview.ConsoleListener;
 import ca.weblite.webview.DialogDispatcher;
@@ -20,6 +21,8 @@ import ca.weblite.webview.PdfPrinting;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewCredential;
 import ca.weblite.webview.WebViewCredentialStore;
+import ca.weblite.webview.WebViewContentRuleList;
+import ca.weblite.webview.WebViewContentRules;
 import ca.weblite.webview.WebViewDialogHandler;
 import ca.weblite.webview.WebViewDownloadHandler;
 import ca.weblite.webview.WebViewFillPasswordHandler;
@@ -115,6 +118,11 @@ public abstract class WebViewComponent extends JComponent {
      *  native navigate they make. */
     protected final NavigationDispatcher navigationDispatcher =
         new NavigationDispatcher(this);
+
+    /** The applied content rule lists (Canvas 37 D6).  Subclasses replay
+     *  them to the peer at attach, before the first navigation, and forward
+     *  later changes through the {@code contentRule*} hooks. */
+    protected final ContentRuleSet contentRules = new ContentRuleSet();
 
     /** Per-component hub for media-capture permission requests (Canvas 35).
      *  Subclasses install a {@link ca.weblite.webview.WebViewPermissionCallback}
@@ -226,6 +234,11 @@ public abstract class WebViewComponent extends JComponent {
     public static WebViewComponent adoptPopup(Mode mode, long popupId) {
         WebViewComponent c = create(mode);
         c.pendingAdoptPopupId = popupId;
+        // Canvas 37 D7: start with the opener's content rule lists.
+        List<WebViewContentRuleList> inherited = ContentRuleSet.takeForPopup(popupId);
+        if (inherited != null) {
+            for (WebViewContentRuleList l : inherited) c.contentRules.add(l);
+        }
         return c;
     }
 
@@ -1066,6 +1079,98 @@ public abstract class WebViewComponent extends JComponent {
      */
     public static boolean isNavigationHandlerSupported() {
         return NavigationDispatcher.isAvailable();
+    }
+
+    // ---------------------------------------------------------------------
+    // Content rule lists (Canvas 37).
+    // ---------------------------------------------------------------------
+
+    /**
+     * Apply a compiled content rule list to this component's view (Canvas 37
+     * D6): every request its pages make, in every frame, is refused before it
+     * is sent when the list blocks it, and the elements its
+     * {@code css-display-none} rules select are hidden.  Lists apply in the
+     * order added; adding an identifier already applied moves it to the end.
+     *
+     * <p>Before the component is displayed this only records the list; it is
+     * applied before the first navigation.  Afterwards it governs the next
+     * request (already-loaded resources are not re-evaluated; reload to see
+     * the effect on the current page).  Popups opened by this view are
+     * governed by the same lists, and a popup adopted with
+     * {@link #adoptPopup(long)} starts with them.
+     *
+     * <p>On Linux an adopted popup shares its opener's WebKit content
+     * manager, so removing a list from either removes it from both.  On an
+     * engine without support ({@link #isContentRuleListSupported()} false)
+     * the list is recorded and nothing else happens.  May be called from any
+     * thread.
+     *
+     * @param list a list from {@link WebViewContentRules#compile} or
+     *             {@link WebViewContentRules#lookup}
+     * @return {@code this} for chaining
+     */
+    public final WebViewComponent addContentRuleList(WebViewContentRuleList list) {
+        if (list == null) throw new NullPointerException("list");
+        contentRules.add(list);
+        contentRuleListAdded(list);
+        return this;
+    }
+
+    /**
+     * Remove the applied content rule list with this identifier (Canvas 37
+     * D6).  Governs the next request.  A no-op when none is applied.
+     *
+     * @return {@code this} for chaining
+     */
+    public final WebViewComponent removeContentRuleList(String identifier) {
+        if (identifier == null) throw new NullPointerException("identifier");
+        WebViewContentRuleList removed = null;
+        for (WebViewContentRuleList l : contentRules.lists()) {
+            if (l.identifier().equals(identifier)) removed = l;
+        }
+        if (removed != null && contentRules.remove(identifier)) {
+            contentRuleListRemoved(removed);
+        }
+        return this;
+    }
+
+    /**
+     * Remove every applied content rule list (Canvas 37 D6).
+     *
+     * @return {@code this} for chaining
+     */
+    public final WebViewComponent removeAllContentRuleLists() {
+        if (!contentRules.isEmpty()) {
+            contentRules.clear();
+            contentRuleListsCleared();
+        }
+        return this;
+    }
+
+    /** @return the applied content rule lists, in order (unmodifiable) */
+    public final List<WebViewContentRuleList> getContentRuleLists() {
+        return contentRules.lists();
+    }
+
+    /**
+     * Whether the loaded native library can apply content rule lists (Canvas
+     * 37 D3): false for an older native, and on Linux for WebKitGTK older
+     * than 2.24.
+     */
+    public static boolean isContentRuleListSupported() {
+        return WebViewContentRules.isSupported();
+    }
+
+    /** Subclass hook: forward an added list to the peer if attached. */
+    protected void contentRuleListAdded(WebViewContentRuleList list) {
+    }
+
+    /** Subclass hook: forward a removed list to the peer if attached. */
+    protected void contentRuleListRemoved(WebViewContentRuleList list) {
+    }
+
+    /** Subclass hook: forward the removal of every list to the peer if attached. */
+    protected void contentRuleListsCleared() {
     }
 
     // ---------------------------------------------------------------------

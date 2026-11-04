@@ -179,9 +179,28 @@
 #else
 #define WK_OPT_CTXMENU(X)
 #endif
+// Content rule lists (Canvas 37 D8): optional, so a runtime without the
+// filter store (WebKitGTK < 2.24) still loads and reports no support.
+#if WEBKIT_CHECK_VERSION(2, 24, 0)
+#define WK_OPT_FILTERS(X)                                                      \
+  X(webkit_user_content_filter_store_new)                                  \
+  X(webkit_user_content_filter_store_save)                                 \
+  X(webkit_user_content_filter_store_save_finish)                          \
+  X(webkit_user_content_filter_store_load)                                 \
+  X(webkit_user_content_filter_store_load_finish)                          \
+  X(webkit_user_content_filter_store_remove)                               \
+  X(webkit_user_content_filter_store_remove_finish)                        \
+  X(webkit_user_content_filter_ref)                                        \
+  X(webkit_user_content_filter_unref)                                      \
+  X(webkit_user_content_manager_add_filter)                                \
+  X(webkit_user_content_manager_remove_filter_by_id)                       \
+  X(webkit_user_content_manager_remove_all_filters)
+#else
+#define WK_OPT_FILTERS(X)
+#endif
 #define WK_WEBKIT_OPT_SYMS(X)                                                  \
   WK_OPT_2_12(X) WK_OPT_2_36(X) WK_OPT_2_40(X) WK_OPT_MEDIA(X) WK_OPT_2_42(X) \
-  WK_OPT_CTXMENU(X)
+  WK_OPT_CTXMENU(X) WK_OPT_FILTERS(X)
 
 // The pointer table. Member types are taken from the real declarations via
 // decltype — unevaluated, so this creates no link-time dependency on the

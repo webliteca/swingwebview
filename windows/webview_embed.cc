@@ -350,6 +350,13 @@ struct Engine {
     // view and its frames; and the two event tokens it is registered under,
     // removed in destroy_engine.
     jobject navigation_callback = nullptr;
+    // Canvas 37 D9: the content-rule request slot (callback global ref) the
+    // engine's ContentRuleRequestHandler reads, whether the "*" filter has
+    // been added, and the D11 cosmetic script's state.  Created with the
+    // engine; the callback is cleared in destroy.
+    std::shared_ptr<struct CrSlot> cr_slot;
+    bool cr_filter_added = false;
+    std::shared_ptr<struct CrScriptState> cr_script;
     EventRegistrationToken navigation_starting_token{};
     EventRegistrationToken frame_navigation_starting_token{};
     bool navigation_registered = false;
@@ -1980,6 +1987,12 @@ struct RetainedPopup {
     EventRegistrationToken new_window_token{};
     EventRegistrationToken script_dialog_token{};
     EventRegistrationToken close_token{};
+    // Canvas 37 D13: the content-rule hook and cosmetic script inherited from
+    // the opener for the retained phase; removed at adoption, when the
+    // adopted engine wires its own.
+    bool cr_inherited = false;
+    EventRegistrationToken cr_token{};
+    std::shared_ptr<struct CrScriptState> cr_script;
 };
 
 // ON-DEVICE-VALIDATION-REQUIRED: the retained-popup registry is the Windows
@@ -2690,6 +2703,255 @@ private:
     Engine *m_engine;
 };
 
+// ---------------------------------------------------------------------------
+// Canvas 37 D9, D11, D13: content rule lists on WebView2.  WebView2 has no
+// rule compiler, so every http(s)/ws(s) request is put, synchronously on the
+// WebView2 thread, to the component's WebViewContentRuleCallback, which
+// matches it in Java.  Hide rules travel as one replaceable document-created
+// script.
+// ---------------------------------------------------------------------------
+struct CrSlot {
+    std::mutex m;
+    JavaVM *jvm = nullptr;
+    jobject cb = nullptr;           // global ref, or nullptr (inert)
+
+    // Replace the callback; deletes the previous global ref.
+    void set(JNIEnv *env, jobject next) {
+        std::lock_guard<std::mutex> lk(m);
+        if (cb && env) env->DeleteGlobalRef(cb);
+        cb = next ? env->NewGlobalRef(next) : nullptr;
+    }
+
+    // Drop the callback from any thread (attaches if needed).
+    void clear() {
+        std::lock_guard<std::mutex> lk(m);
+        if (!cb || !jvm) { cb = nullptr; return; }
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK) env = nullptr;
+            else detach = true;
+        }
+        if (env) env->DeleteGlobalRef(cb);
+        cb = nullptr;
+        if (detach) jvm->DetachCurrentThread();
+    }
+
+    ~CrSlot() { clear(); }
+};
+
+struct CrScriptState {
+    std::wstring id;                // the current script's id, once known
+    unsigned long long gen = 0;     // bumped on every replace
+    std::wstring text;              // the current script (inherited by popups)
+};
+
+static int cr_resource_type(COREWEBVIEW2_WEB_RESOURCE_CONTEXT c) {
+    switch (c) {
+    case COREWEBVIEW2_WEB_RESOURCE_CONTEXT_DOCUMENT: return 0;
+    case COREWEBVIEW2_WEB_RESOURCE_CONTEXT_IMAGE: return 1;
+    case COREWEBVIEW2_WEB_RESOURCE_CONTEXT_STYLESHEET: return 2;
+    case COREWEBVIEW2_WEB_RESOURCE_CONTEXT_SCRIPT: return 3;
+    case COREWEBVIEW2_WEB_RESOURCE_CONTEXT_FONT: return 4;
+    case COREWEBVIEW2_WEB_RESOURCE_CONTEXT_MEDIA: return 5;
+    case COREWEBVIEW2_WEB_RESOURCE_CONTEXT_XML_HTTP_REQUEST:
+    case COREWEBVIEW2_WEB_RESOURCE_CONTEXT_FETCH:
+    case COREWEBVIEW2_WEB_RESOURCE_CONTEXT_EVENT_SOURCE: return 6;
+    case COREWEBVIEW2_WEB_RESOURCE_CONTEXT_WEBSOCKET: return 7;
+    case COREWEBVIEW2_WEB_RESOURCE_CONTEXT_PING:
+    case COREWEBVIEW2_WEB_RESOURCE_CONTEXT_CSP_VIOLATION_REPORT: return 8;
+    default: return 9;
+    }
+}
+
+class ContentRuleRequestHandler : public CallbackBase<
+    ICoreWebView2WebResourceRequestedEventHandler> {
+public:
+    ContentRuleRequestHandler(std::shared_ptr<CrSlot> slot, ICoreWebView2Environment *env)
+        : m_slot(std::move(slot)), m_env(env) {
+        if (m_env) m_env->AddRef();
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(
+        ICoreWebView2 *sender,
+        ICoreWebView2WebResourceRequestedEventArgs *args) override {
+        if (!args || !m_slot) return S_OK;
+        std::lock_guard<std::mutex> lk(m_slot->m);
+        jobject cb = m_slot->cb;
+        JavaVM *jvm = m_slot->jvm;
+        if (!cb || !jvm) return S_OK;
+
+        ICoreWebView2WebResourceRequest *req = nullptr;
+        if (FAILED(args->get_Request(&req)) || !req) return S_OK;
+        std::string url;
+        LPWSTR wuri = nullptr;
+        if (SUCCEEDED(req->get_Uri(&wuri)) && wuri) {
+            url = wide_to_utf8(wuri);
+            CoTaskMemFree(wuri);
+        }
+        size_t colon = url.find(':');
+        std::string scheme = colon == std::string::npos ? std::string() : url.substr(0, colon);
+        for (auto &c : scheme) c = (char)tolower((unsigned char)c);
+        if (scheme != "http" && scheme != "https" && scheme != "ws" && scheme != "wss") {
+            req->Release();
+            return S_OK;
+        }
+        COREWEBVIEW2_WEB_RESOURCE_CONTEXT ctx = COREWEBVIEW2_WEB_RESOURCE_CONTEXT_OTHER;
+        args->get_ResourceContext(&ctx);
+        int type = cr_resource_type(ctx);
+        std::string page = url;
+        if (type != 0 && sender) {
+            LPWSTR src = nullptr;
+            if (SUCCEEDED(sender->get_Source(&src)) && src) page = wide_to_utf8(src);
+            if (src) CoTaskMemFree(src);
+        }
+
+        int answer = 0;
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK) env = nullptr;
+            else detach = true;
+        }
+        if (env) {
+            jstring ju = env->NewStringUTF(url.c_str());
+            jstring jp = env->NewStringUTF(page.c_str());
+            jclass cls = env->GetObjectClass(cb);
+            if (cls) {
+                jmethodID mid = env->GetMethodID(cls, "onResourceRequested",
+                    "(Ljava/lang/String;Ljava/lang/String;I)I");
+                if (mid) answer = (int)env->CallIntMethod(cb, mid, ju, jp, (jint)type);
+                env->DeleteLocalRef(cls);
+            }
+            if (env->ExceptionCheck()) {          // fail open (D9)
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+                answer = 0;
+            }
+            if (ju) env->DeleteLocalRef(ju);
+            if (jp) env->DeleteLocalRef(jp);
+            if (detach) jvm->DetachCurrentThread();
+        }
+        if (answer == 1 && m_env) {
+            ICoreWebView2WebResourceResponse *resp = nullptr;
+            if (SUCCEEDED(m_env->CreateWebResourceResponse(
+                    nullptr, 403, L"Blocked by content rules", L"", &resp)) && resp) {
+                args->put_Response(resp);
+                resp->Release();
+            }
+        } else if (answer == 2) {
+            ICoreWebView2HttpRequestHeaders *headers = nullptr;
+            if (SUCCEEDED(req->get_Headers(&headers)) && headers) {
+                headers->RemoveHeader(L"Cookie");
+                headers->Release();
+            }
+        }
+        req->Release();
+        return S_OK;
+    }
+protected:
+    ~ContentRuleRequestHandler() override {
+        if (m_env) m_env->Release();
+    }
+private:
+    std::shared_ptr<CrSlot> m_slot;
+    ICoreWebView2Environment *m_env;
+};
+
+// Register the handler on `wv` for `slot`; adds the "*" filter when asked.
+static bool win_cr_register(ICoreWebView2 *wv, ICoreWebView2Environment *env,
+                            std::shared_ptr<CrSlot> slot, bool add_filter,
+                            EventRegistrationToken *token) {
+    if (!wv || !slot) return false;
+    if (add_filter) {
+        HRESULT hr = wv->AddWebResourceRequestedFilter(
+            L"*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+        if (FAILED(hr)) WV_LOG("content rules filter failed: 0x%08lx", (unsigned long)hr);
+    }
+    auto *h = new ContentRuleRequestHandler(slot, env);
+    EventRegistrationToken t{};
+    HRESULT hr = wv->add_WebResourceRequested(h, &t);
+    h->Release();
+    if (token) *token = t;
+    return SUCCEEDED(hr);
+}
+
+class CrScriptAddedHandler : public CallbackBase<
+    ICoreWebView2AddScriptToExecuteOnDocumentCreatedCompletedHandler> {
+public:
+    CrScriptAddedHandler(std::shared_ptr<CrScriptState> st, unsigned long long gen,
+                         ICoreWebView2 *wv)
+        : m_st(std::move(st)), m_gen(gen), m_wv(wv) {
+        if (m_wv) m_wv->AddRef();
+    }
+    HRESULT STDMETHODCALLTYPE Invoke(HRESULT hr, LPCWSTR id) override {
+        if (SUCCEEDED(hr) && id) {
+            if (m_st->gen == m_gen) m_st->id = id;
+            else if (m_wv) m_wv->RemoveScriptToExecuteOnDocumentCreated(id);  // superseded
+        }
+        return S_OK;
+    }
+protected:
+    ~CrScriptAddedHandler() override {
+        if (m_wv) m_wv->Release();
+    }
+private:
+    std::shared_ptr<CrScriptState> m_st;
+    unsigned long long m_gen;
+    ICoreWebView2 *m_wv;
+};
+
+// D11: replace the cosmetic script on `wv` (WebView2 thread).
+static void win_cr_set_script(ICoreWebView2 *wv, std::shared_ptr<CrScriptState> st,
+                              const std::wstring &js) {
+    if (!wv || !st) return;
+    st->gen++;
+    if (!st->id.empty()) {
+        wv->RemoveScriptToExecuteOnDocumentCreated(st->id.c_str());
+        st->id.clear();
+    }
+    st->text = js;
+    if (js.empty()) return;
+    auto *h = new CrScriptAddedHandler(st, st->gen, wv);
+    wv->AddScriptToExecuteOnDocumentCreated(js.c_str(), h);
+    h->Release();
+}
+
+// D13: a popup child inherits the opener's content rules before its first
+// request: its own slot holding a new global ref on the opener's callback
+// (so the child never reads a freed opener), the "*" filter, and the
+// opener's cosmetic script.  Called inside the NewWindowRequested deferral.
+static void win_cr_inherit(Engine *opener, ICoreWebView2 *child,
+                           EventRegistrationToken *token,
+                           std::shared_ptr<CrScriptState> *script_out,
+                           bool *inherited) {
+    if (inherited) *inherited = false;
+    if (!opener || !child || !opener->cr_slot) return;
+    jobject cb = nullptr;
+    JavaVM *jvm = opener->jvm;
+    {
+        std::lock_guard<std::mutex> lk(opener->cr_slot->m);
+        cb = opener->cr_slot->cb;
+        if (!cb || !jvm) return;
+        auto slot = std::make_shared<CrSlot>();
+        slot->jvm = jvm;
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            if (jvm->AttachCurrentThread((void **)&env, nullptr) != JNI_OK) return;
+            detach = true;
+        }
+        slot->cb = env->NewGlobalRef(cb);
+        if (detach) jvm->DetachCurrentThread();
+        win_cr_register(child, opener->environment, slot, true, token);
+    }
+    auto st = std::make_shared<CrScriptState>();
+    if (opener->cr_script && !opener->cr_script->text.empty()) {
+        win_cr_set_script(child, st, opener->cr_script->text);
+    }
+    if (script_out) *script_out = st;
+    if (inherited) *inherited = true;
+}
+
 // Canvas 34 D9: register the navigation handler on `wv` for `e`, for the view
 // and its frames.  Called beside add_NewWindowRequested, for a fresh engine
 // and for an adopted child.
@@ -3309,6 +3571,10 @@ public:
                             propagate_popup_user_agent(e, child, uri.c_str());
                             // Canvas 32 D3: the popup child answers the same custom schemes (AC11).
                             win_install_scheme_hook(child, e->environment);
+                            // Canvas 37 D13: the opener's content rules govern
+                            // the child's first request.
+                            win_cr_inherit(e, child, &rp->cr_token, &rp->cr_script,
+                                           &rp->cr_inherited);
 
                             // Return the LINKED child to WebView2 so it drives
                             // the original request (POST verb+body,
@@ -3432,6 +3698,9 @@ public:
                         propagate_popup_user_agent(e, child, uri.c_str());
                         // Canvas 32 D3: the popup child answers the same custom schemes (AC11).
                         win_install_scheme_hook(child, e->environment);
+                        // Canvas 37 D13: the opener's content rules govern the
+                        // child's first request.
+                        win_cr_inherit(e, child, nullptr, nullptr, nullptr);
 
                         args->put_NewWindow(child);   // LINKED to opener
                         args->put_Handled(TRUE);
@@ -3827,6 +4096,10 @@ static void engine_thread(Engine *e, HWND /*parent*/, int width, int height,
 
                     // Navigation decisions (Canvas 34 D9).
                     win_register_navigation(e, e->webview);
+                    // Canvas 37 D9: the content-rule hook, inert until a
+                    // callback is set (the "*" filter is added then).
+                    win_cr_register(e->webview, e->environment, e->cr_slot,
+                                    false, nullptr);
                     win_register_context_menu(e, e->webview);   // Canvas 36 D11
                     // Camera / microphone requests (Canvas 35 D9).
                     win_register_permission(e, e->webview);
@@ -3950,6 +4223,10 @@ static Engine *create_engine(JNIEnv *env, jobject component, int debug) {
     e->parent = parent;
     e->debug = debug != 0;
     env->GetJavaVM(&e->jvm);
+    // Canvas 37 D9, D11: the content-rule slot and cosmetic-script state.
+    e->cr_slot = std::make_shared<CrSlot>();
+    e->cr_slot->jvm = e->jvm;
+    e->cr_script = std::make_shared<CrScriptState>();
 
     std::atomic<bool> ready{false};
     std::atomic<bool> ok{false};
@@ -4097,6 +4374,8 @@ static void destroy_engine(Engine *e) {
         e->download_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
+    // Canvas 37 D9: make the content-rule hook inert and drop its callback.
+    if (e->cr_slot) e->cr_slot->clear();
     // Canvas 34 D9: stop asking, then drop the navigation callback's global
     // ref, before the worker thread tears down.
     if (e->navigation_registered && e->webview) {
@@ -4244,6 +4523,10 @@ static Engine *adopt_retained_popup(JNIEnv *env, HWND parent, RetainedPopup *rp,
     e->debug = debug != 0;
     e->jvm = rp->jvm;
     e->shared_thread = true;                 // reuse opener's worker thread
+    // Canvas 37 D9, D11: the adopted engine's own content-rule state.
+    e->cr_slot = std::make_shared<CrSlot>();
+    e->cr_slot->jvm = e->jvm;
+    e->cr_script = std::make_shared<CrScriptState>();
     e->thread_id = rp->worker_thread_id;
     e->thread = nullptr;
     e->controller = rp->controller;          // transferred (already AddRef'd)
@@ -4326,6 +4609,19 @@ static Engine *adopt_retained_popup(JNIEnv *env, HWND parent, RetainedPopup *rp,
 
             // Navigation decisions (Canvas 34 D9) on the adopted child.
             win_register_navigation(e, child);
+            // Canvas 37 D13: drop the opener's inherited content-rule hook and
+            // cosmetic script; the adopted engine's own (replayed from Java at
+            // attach) take over.
+            if (rp->cr_inherited) {
+                child->remove_WebResourceRequested(rp->cr_token);
+                rp->cr_inherited = false;
+            }
+            if (rp->cr_script && !rp->cr_script->id.empty()) {
+                child->RemoveScriptToExecuteOnDocumentCreated(rp->cr_script->id.c_str());
+            }
+            if (rp->cr_script) rp->cr_script->gen++;   // late completions remove themselves
+            rp->cr_script.reset();
+            win_cr_register(child, e->environment, e->cr_slot, false, nullptr);
             win_register_context_menu(e, child);   // Canvas 36 D11
             // Camera / microphone requests (Canvas 35 D9) on the adopted child.
             win_register_permission(e, child);
@@ -5005,6 +5301,96 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set
 JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1navigation_1callback
   (JNIEnv *, jclass, jlong, jobject) {
     // Windows has no offscreen engine; stub for link-symmetry.
+}
+
+// Content rule lists (Canvas 37 D3, D9, D11).  Windows compiles nothing
+// natively: WebViewContentRules parses lists in Java, so the store and apply
+// natives are stubs for link symmetry and only the request callback and the
+// cosmetic script are real.
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1content_1rules_1available
+  (JNIEnv *, jclass) {
+    return JNI_TRUE;
+}
+
+static void win_cr_store_stub(JNIEnv *env, jobject cb) {
+    if (!cb) return;
+    jclass cls = env->GetObjectClass(cb);
+    jmethodID mid = cls ? env->GetMethodID(cls, "onComplete", "(ZZLjava/lang/String;)V") : nullptr;
+    jstring msg = env->NewStringUTF("the Windows engine compiles content rules in Java");
+    if (mid) env->CallVoidMethod(cb, mid, JNI_FALSE, JNI_FALSE, msg);
+    if (env->ExceptionCheck()) { env->ExceptionDescribe(); env->ExceptionClear(); }
+    if (msg) env->DeleteLocalRef(msg);
+    if (cls) env->DeleteLocalRef(cls);
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1content_1rules_1compile
+  (JNIEnv *env, jclass, jstring, jstring, jstring, jobject cb) {
+    win_cr_store_stub(env, cb);
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1content_1rules_1lookup
+  (JNIEnv *env, jclass, jstring, jstring, jobject cb) {
+    win_cr_store_stub(env, cb);
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1content_1rules_1remove
+  (JNIEnv *env, jclass, jstring, jstring, jobject cb) {
+    win_cr_store_stub(env, cb);
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1add_1content_1rule_1list
+  (JNIEnv *, jclass, jlong, jstring, jstring) {
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1remove_1content_1rule_1list
+  (JNIEnv *, jclass, jlong, jstring, jstring) {
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1remove_1all_1content_1rule_1lists
+  (JNIEnv *, jclass, jlong) {
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1add_1content_1rule_1list
+  (JNIEnv *, jclass, jlong, jstring, jstring) {
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1remove_1content_1rule_1list
+  (JNIEnv *, jclass, jlong, jstring, jstring) {
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1remove_1all_1content_1rule_1lists
+  (JNIEnv *, jclass, jlong) {
+}
+
+// D9: install (or clear) the request callback; the "*" filter is added once,
+// on the WebView2 thread, in FIFO order with navigate.
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1content_1rule_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    auto *e = (Engine *)wv;
+    if (!e || !e->cr_slot) return;
+    e->cr_slot->set(env, cb);
+    if (cb) {
+        embed_win::dispatch_to_thread(e, [e] {
+            if (e->webview && !e->cr_filter_added) {
+                HRESULT hr = e->webview->AddWebResourceRequestedFilter(
+                    L"*", COREWEBVIEW2_WEB_RESOURCE_CONTEXT_ALL);
+                e->cr_filter_added = SUCCEEDED(hr);
+            }
+        });
+    }
+}
+
+// D11: replace the cosmetic document-created script ("" removes it).
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1content_1rule_1script
+  (JNIEnv *env, jclass, jlong wv, jstring js) {
+    auto *e = (Engine *)wv;
+    if (!e || !e->cr_script) return;
+    const char *s = js ? env->GetStringUTFChars(js, nullptr) : nullptr;
+    std::wstring w = s ? embed_win::utf8_to_wide(s) : std::wstring();
+    if (s) env->ReleaseStringUTFChars(js, s);
+    embed_win::dispatch_to_thread(e, [e, w] {
+        if (e->webview) embed_win::win_cr_set_script(e->webview, e->cr_script, w);
+    });
 }
 
 // Context-menu items (Canvas 36 D6, D11).

@@ -26,6 +26,21 @@ public class WebViewNative {
             // libjawt in transitively on macOS, so without this the first
             // JAWT call would dereference an unresolved symbol and SIGSEGV
             // at PC=0 (the dyld lazy-binding stub never resolved it).
+            //
+            // Canvas 8 Op 4: initialize AWT FIRST.  libjawt pulls in
+            // libawt_lwawt, whose JNI_OnLoad dereferences AWT state that
+            // only Toolkit.getDefaultToolkit() sets up; loaded before AWT it
+            // SIGSEGVs (macOS, Corretto 8 arm64).  This class can be reached
+            // before any Swing component exists (WebViewContentRules,
+            // Canvas 37), so AWT may not be running yet.  Headless JVMs skip
+            // it, and any failure is ignored so loading proceeds as before.
+            try {
+                if (!java.awt.GraphicsEnvironment.isHeadless()) {
+                    java.awt.Toolkit.getDefaultToolkit();
+                }
+            } catch (Throwable ignored) {
+                // AWT could not start; the preload below behaves as it did.
+            }
             try {
                 System.loadLibrary("jawt");
             } catch (UnsatisfiedLinkError ignored) {
@@ -701,5 +716,31 @@ native static boolean webview_cred_store_delete(String service, String origin,
 // Windows; meaningful on Linux where the Secret Service may be absent).
 native static boolean webview_cred_store_available();
 
+// Canvas 37: content rule lists.  webview_content_rules_available is present
+// only in natives built with the feature (WebViewContentRules.isSupported()
+// absorbs the UnsatisfiedLinkError an older native raises); on Linux it also
+// needs WebKitGTK 2.24+.  The store natives (macOS and Linux; D4) compile,
+// look up and remove a list under (dir, id) and call cb exactly once, later,
+// on a native thread.  The apply natives (D5) run on the engine's UI thread
+// in its FIFO dispatch, so an add issued before navigate governs the first
+// request.  Windows uses none of these but the probe: there the component
+// installs a per-request WebViewContentRuleCallback (D9) and a cosmetic
+// document-created script (D11) instead.  Offscreen bridges are no-ops on
+// macOS and Windows, which have no offscreen engine.
+native static boolean webview_content_rules_available();
+native static void webview_content_rules_compile(String dir, String id, String json,
+                                                 WebViewContentRuleListCallback cb);
+native static void webview_content_rules_lookup(String dir, String id,
+                                                WebViewContentRuleListCallback cb);
+native static void webview_content_rules_remove(String dir, String id,
+                                                WebViewContentRuleListCallback cb);
+native static void webview_embed_add_content_rule_list(long w, String dir, String id);
+native static void webview_embed_remove_content_rule_list(long w, String dir, String id);
+native static void webview_embed_remove_all_content_rule_lists(long w);
+native static void webview_offscreen_add_content_rule_list(long peer, String dir, String id);
+native static void webview_offscreen_remove_content_rule_list(long peer, String dir, String id);
+native static void webview_offscreen_remove_all_content_rule_lists(long peer);
+native static void webview_embed_set_content_rule_callback(long w, WebViewContentRuleCallback cb);
+native static void webview_embed_set_content_rule_script(long w, String js);
 
 }

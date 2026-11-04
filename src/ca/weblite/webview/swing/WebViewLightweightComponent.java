@@ -17,6 +17,7 @@ import ca.weblite.webview.WebViewDownloadCallback;
 import ca.weblite.webview.WebViewPasswordCallback;
 import ca.weblite.webview.WebView;
 import ca.weblite.webview.WebViewDialogCallback;
+import ca.weblite.webview.WebViewContentRuleList;
 import ca.weblite.webview.WebViewNavigationCallback;
 import ca.weblite.webview.WebViewContextMenuCallback;
 import ca.weblite.webview.WebViewPermissionCallback;
@@ -512,6 +513,11 @@ public class WebViewLightweightComponent extends WebViewComponent {
         // Canvas 34 D5: the navigation bridge, installed before the first
         // navigate so no navigation of this view escapes the decision.  It
         // answers synchronously on the native UI thread (no EDT hop).
+        // Canvas 37 D6: the applied content rule lists, replayed before the
+        // first navigate so they govern its first request.
+        for (WebViewContentRuleList l : contentRules.lists()) {
+            engine.addContentRuleList(l);
+        }
         engine.setNavigationCallback(new WebViewNavigationCallback() {
             @Override
             public boolean onNavigationRequested(String url, String currentUrl,
@@ -559,6 +565,28 @@ public class WebViewLightweightComponent extends WebViewComponent {
         repaintTimer.setRepeats(true);
         repaintTimer.start();
         installEditingShortcutDispatcher();
+    }
+
+    // Canvas 37 D6: forward content-rule changes once the engine exists.
+    @Override
+    protected void contentRuleListAdded(WebViewContentRuleList list) {
+        OffscreenWebView e = engine;
+        if (e == null) return;
+        try { e.addContentRuleList(list); } catch (IllegalStateException ignored) {}
+    }
+
+    @Override
+    protected void contentRuleListRemoved(WebViewContentRuleList list) {
+        OffscreenWebView e = engine;
+        if (e == null) return;
+        try { e.removeContentRuleList(list); } catch (IllegalStateException ignored) {}
+    }
+
+    @Override
+    protected void contentRuleListsCleared() {
+        OffscreenWebView e = engine;
+        if (e == null) return;
+        try { e.removeAllContentRuleLists(); } catch (IllegalStateException ignored) {}
     }
 
     @Override

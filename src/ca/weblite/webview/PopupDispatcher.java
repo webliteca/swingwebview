@@ -205,6 +205,11 @@ public final class PopupDispatcher {
         final WebViewPopupEvent event = new WebViewPopupEvent(
             source, targetUrl, targetName, userGesture, width, height, pageUrl);
         pendingAdopts.put(key, event);
+        // Canvas 37 D7: the adopting component starts with the opener's
+        // content rule lists.
+        if (source != null) {
+            ContentRuleSet.recordForPopup(popupId, source.getContentRuleLists());
+        }
         scheduleGrace(key);
         runOnEdtLater(new Runnable() {
             @Override public void run() {
