@@ -236,15 +236,19 @@ generated_at: 2026-11-03T12:00:00
   - `compileContentRuleListForIdentifier:encodedContentRuleList:completionHandler:`,
     `lookUpContentRuleListForIdentifier:completionHandler:`,
     `removeContentRuleListForIdentifier:completionHandler:` with clang blocks `^(id list, id error)` /
-    `^(id error)`. Success retains the list into the registry; lookup's error with code
-    `WKErrorContentRuleListStoreLookUpFailed` (6) answers `ok=true, found=false`; remove's
-    `WKErrorContentRuleListStoreRemoveFailed` (7) answers `ok=true, found=false`; other errors answer the
-    `localizedDescription`.
+    `^(id error)`. Success retains the list into the registry. `WKErrorDomain` codes (`WKError.h`):
+    `ContentRuleListStoreCompileFailed` 6, `ContentRuleListStoreLookUpFailed` 7,
+    `ContentRuleListStoreRemoveFailed` 8, `ContentRuleListStoreVersionMismatch` 9. Lookup's 7 (no list
+    under that name) and 9 (compiled by another WebKit version, so it must be recompiled) answer
+    `ok=true, found=false`; remove's 8 answers `ok=true, found=false`; other errors answer the
+    `localizedDescription`. (Verified on macOS: an earlier draft used 6/7 and a never-compiled lookup
+    failed with "WKErrorDomain error 7".)
   - The upcall runs on a detached `std::thread` (attach, call, delete the global ref, detach).
   - **Apply:** `addContentRuleList:` / `removeContentRuleList:` / `removeAllContentRuleLists` on
-    `e->manager`. The engine records applied keys in `e->content_rule_keys` (ordered vector).
-  - **Popups:** at child creation (both `ADOPT` and `NATIVE_WINDOW`), every key in the opener's
-    `content_rule_keys` still in the registry is added to `child_e->manager` and recorded on `child_e`,
+    `e->manager`. The engine records its applied lists in `e->content_rules` (ordered vector of registry
+    key and retained `WKContentRuleList`), released in `cocoa_destroy_engine`.
+  - **Popups:** at child creation (both `ADOPT` and `NATIVE_WINDOW`), every list in the opener's
+    `content_rules` is added to `child_e->manager` and recorded on `child_e`,
     before the child's first request.
 
 - **D13 · Windows popups and lifecycle.**

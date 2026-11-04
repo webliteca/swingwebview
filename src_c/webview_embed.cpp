@@ -10538,8 +10538,11 @@ static void cocoa_content_rules_lookup(JavaVM *jvm, jobject cb, std::string dir,
                 if (list) {
                     cocoa_cr_put(key, list);
                     content_rules_upcall(jvm, cb, true, true, "");
-                } else if (error && msg<long>(error, sel("code")) == 6
-                           /* WKErrorContentRuleListStoreLookUpFailed */) {
+                } else if (error && (msg<long>(error, sel("code")) == 7
+                                     /* WKErrorContentRuleListStoreLookUpFailed */ ||
+                                     msg<long>(error, sel("code")) == 9
+                                     /* WKErrorContentRuleListStoreVersionMismatch:
+                                        compiled by another WebKit; recompile */)) {
                     content_rules_upcall(jvm, cb, true, false, "");
                 } else {
                     content_rules_upcall(jvm, cb, false, false,
@@ -10564,7 +10567,7 @@ static void cocoa_content_rules_remove(JavaVM *jvm, jobject cb, std::string dir,
             ^(id error) {
                 if (!error) {
                     content_rules_upcall(jvm, cb, true, true, "");
-                } else if (msg<long>(error, sel("code")) == 7
+                } else if (msg<long>(error, sel("code")) == 8
                            /* WKErrorContentRuleListStoreRemoveFailed */) {
                     content_rules_upcall(jvm, cb, true, false, "");
                 } else {
@@ -10575,7 +10578,9 @@ static void cocoa_content_rules_remove(JavaVM *jvm, jobject cb, std::string dir,
     });
 }
 
-// D5: apply on AppKit main, FIFO with cocoa_navigate.
+// D5: apply on AppKit main, FIFO with cocoa_navigate.  (WKErrorDomain codes
+// used above, from WKError.h -- Canvas 37 D12: CompileFailed 6, LookUpFailed
+// 7, RemoveFailed 8, VersionMismatch 9.)
 static void cocoa_cr_apply_add(Engine *e, std::string dir, std::string ident) {
     cocoa_run_on_main_async([=] {
         if (!e || e->destroyed.load() || !e->manager) return;
