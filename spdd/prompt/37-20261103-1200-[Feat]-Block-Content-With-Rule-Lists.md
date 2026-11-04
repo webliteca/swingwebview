@@ -172,6 +172,11 @@ generated_at: 2026-11-03T12:00:00
       — **fail open**, because a matcher bug must not break browsing; the throwable is described);
     - `1` → `put_Response` with `CreateWebResourceResponse(nullptr, 403, L"Blocked by content rules", L"")`
       from the engine's `environment`; `2` → removes the `Cookie` request header.
+    - **What the page sees differs from WebKit.** WebView2 offers no way to fail a request with a network
+      error from `WebResourceRequested`, so a blocked request is *answered* with that 403. Nothing is sent,
+      but the page sees an HTTP error, not a network error: `fetch()` resolves with `ok == false` instead of
+      rejecting, and an `<img>` or `<script>` fires `error` as it does on WebKit. (Verified on Windows: the
+      demo's beacon never reached the server, while the page's `fetch` resolved.) Documented in the README.
   - **Java side**: the component installs a callback that answers `ContentRuleSet.decide(url, pageUrl,
     type)` — never throws (a throwable answers `0` and goes to the uncaught handler).
 
@@ -356,7 +361,8 @@ WebViewContentRules ..> WebViewContentRuleListCallback
    `HttpServer`) with `/ads/` and `/ok/` images, an `/ads/` script, a third-party script from
    `127.0.0.1:8124`, a fetch button and `.ad-slot` divs; it compiles a demo list into a temp store, applies
    it, and logs every request the server receives. `DEMO_AUTO=1` loads, waits, prints `HITS:` and the
-   computed visibility of `.ad-slot`, and exits.
+   computed visibility of `.ad-slot`, and exits. The in-page AC2 check counts the beacon as failed when its
+   `fetch` rejects (WebKit) **or** resolves with a non-ok response (the Windows 403, D9).
 10. **Verification recorded in the PR:** the Linux native built and the demo run under Xvfb **in the
     lightweight component**; CI compiling the macOS and Windows natives; JUnit green.
 

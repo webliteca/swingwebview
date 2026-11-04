@@ -64,7 +64,9 @@ public class WebViewContentRulesDemo {
         + "<script src='/ads/tag.js'></script>"
         + "<script src='/first/party.js'></script>"
         + "<script src='http://127.0.0.1:" + PORT + "/third/party.js'></script>"
-        + "<script>fetch('/ads/beacon').then(function(){window.beacon='sent';},"
+        // Canvas 37 D9: WebKit rejects a blocked fetch; WebView2 answers it with a
+        // 403, so the fetch resolves with ok=false.  Both mean "not sent".
+        + "<script>fetch('/ads/beacon').then(function(r){window.beacon=r.ok?'sent':'failed';},"
         + "function(){window.beacon='failed';});</script>"
         + "</body></html>";
 

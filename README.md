@@ -1047,7 +1047,9 @@ if (WebViewContentRules.isSupported()) {
   compiler: lists are parsed and matched in Java on every request, and hide rules are injected as
   one document-created script. On Windows, third-party is decided on an approximation of the public
   suffix list, a rule limited to `child-frame` never matches, and `make-https` / `notify` are
-  ignored.
+  ignored. A blocked request is never sent on any engine, but on Windows the page sees it answered
+  with **HTTP 403** rather than a network error (WebView2 cannot fail a request from its request
+  hook): `fetch()` resolves with `ok == false` instead of rejecting.
 * **Identifiers** are 1–128 of `[A-Za-z0-9._-]`. Applying two lists with the same identifier from
   different stores to one view is not supported.
 * **Not reported:** which requests were blocked. No engine reports it portably.
