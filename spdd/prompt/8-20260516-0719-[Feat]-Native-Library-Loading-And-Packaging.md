@@ -26,6 +26,15 @@ generated_at: 2026-05-16T07:19:13-07:00
   ignore `UnsatisfiedLinkError` here — some JDK distributions
   don't ship `libjawt` as a standalone loadable library and AWT
   may have already pulled it in (`WebViewNative.java:30`).
+- **Initialize AWT before that preload** (unless the JVM is
+  headless). Loading `libjawt` first brings in `libawt_lwawt`, and
+  its `JNI_OnLoad` dereferences AWT state that only
+  `Toolkit.getDefaultToolkit()` sets up: on macOS (Corretto 8,
+  arm64) the preload SIGSEGVs inside `libawt_lwawt` `JNI_OnLoad`
+  when it runs before AWT. It only ever ran after a Swing component
+  existed until Canvas 37's `WebViewContentRules.isSupported()` /
+  `compile()` became the first native entry point an application
+  reaches — before any UI exists.
 - On Windows the `WebView2Loader.lib` is statically linked into
   `webview.dll` so no separate `WebView2Loader.dll` extraction is
   needed (`WebViewNative.java:23`,
@@ -104,7 +113,10 @@ generated_at: 2026-05-16T07:19:13-07:00
 - **Two-phase JAWT preload on macOS.** Loading `libjawt`
   manually before the WebView dylib avoids a SIGSEGV at PC=0 on
   the first JAWT call. The comment at
-  `WebViewNative.java:25` records the diagnosis.
+  `WebViewNative.java:25` records the diagnosis. The preload is
+  itself preceded by AWT initialization (Requirements): the library
+  can now be reached before any component, so the loader cannot rely
+  on the application having started AWT first.
 - **The native libraries therefore do not LINK JAWT.** This is the
   direct consequence of the preload above, and it was never written
   down. JAWT symbols are left **undefined at link time** and resolve
@@ -328,7 +340,12 @@ File: `src/ca/weblite/webview/WebViewNative.java`
    point is referenced.
 2. Methods:
    - `static { … }` block (`WebViewNative.java:19`)
-     - Logic: try `System.loadLibrary("jawt")`, silently
+     - Logic: first, unless `GraphicsEnvironment.isHeadless()`,
+       call `java.awt.Toolkit.getDefaultToolkit()` so AWT is
+       initialized before `libjawt` (and with it `libawt_lwawt`)
+       is loaded; catch and ignore any `Throwable` from this step
+       so loading continues exactly as before when AWT cannot
+       start. Then try `System.loadLibrary("jawt")`, silently
        ignoring `UnsatisfiedLinkError`
        (`WebViewNative.java:30`). Call
        `NativeLoader.loadLibrary("webview")`
@@ -341,6 +358,10 @@ File: `src/ca/weblite/webview/WebViewNative.java`
      unresolved symbols. The log is the only diagnostic.
    - The static block runs once per classloader on first
      reference to any `WebViewNative.*` method.
+   - AWT is initialized before `libjawt` on every platform; a
+     headless JVM skips it (the headless toolkit has no `libjawt`
+     to prepare for, and forcing a display toolkit there would
+     throw).
 
 ### 5. Pack Native Binaries — pom.xml resources
 File: `pom.xml`
@@ -720,6 +741,12 @@ Files: `pom.xml`, `.github/workflows/maven-release.yml`
   only logs (`WebViewNative.java:39`). Operationally, any
   failed load means the next JNI call SIGSEGVs; treat the
   SEVERE log line as the early-warning signal.
+- **AWT before JAWT (never-relax).** The `libjawt` preload must
+  never run before `Toolkit.getDefaultToolkit()` in a non-headless
+  JVM: on macOS it SIGSEGVs in `libawt_lwawt` `JNI_OnLoad`, killing
+  the process with no Java exception. A failure to start AWT is
+  swallowed, never rethrown, so this step can only remove a crash,
+  never add a failure.
 - `loadLibrary("jawt")` is wrapped in its own try/catch and
   swallows `UnsatisfiedLinkError` — see explanation at
   `WebViewNative.java:31`. Do not change this to rethrow:

@@ -26,6 +26,21 @@ public class WebViewNative {
             // libjawt in transitively on macOS, so without this the first
             // JAWT call would dereference an unresolved symbol and SIGSEGV
             // at PC=0 (the dyld lazy-binding stub never resolved it).
+            //
+            // Canvas 8 Op 4: initialize AWT FIRST.  libjawt pulls in
+            // libawt_lwawt, whose JNI_OnLoad dereferences AWT state that
+            // only Toolkit.getDefaultToolkit() sets up; loaded before AWT it
+            // SIGSEGVs (macOS, Corretto 8 arm64).  This class can be reached
+            // before any Swing component exists (WebViewContentRules,
+            // Canvas 37), so AWT may not be running yet.  Headless JVMs skip
+            // it, and any failure is ignored so loading proceeds as before.
+            try {
+                if (!java.awt.GraphicsEnvironment.isHeadless()) {
+                    java.awt.Toolkit.getDefaultToolkit();
+                }
+            } catch (Throwable ignored) {
+                // AWT could not start; the preload below behaves as it did.
+            }
             try {
                 System.loadLibrary("jawt");
             } catch (UnsatisfiedLinkError ignored) {
