@@ -72,7 +72,11 @@ generated_at: 2026-09-25T02:00:00-07:00
 - **D9 · macOS: a modal run on the view's window.** `printOperationWithPrintInfo:` (macOS 11+) with an
   `NSPrintInfo` copy: job disposition "save", `NSPrintJobSavingURL` = the file URL, paper size in
   points, margins in points, automatic pagination, no print or progress panel. The operation's view
-  gets a frame of the paper size — without it WKWebView prints blank pages. Run with
+  gets a frame — without one WKWebView prints blank pages — and that frame is the **WKWebView's own
+  bounds**, not one paper page (amended for STORY-014-002: a paper-sized frame left the PDF holding a
+  single screenful); the pages come from the print info's paper and margins. The operation may spawn
+  its separate thread (`setCanSpawnSeparateThread:YES`), so WKPrintingView can wait for the web
+  process's page rectangles rather than settle for the visible ones. Run with
   `runOperationModalForWindow:delegate:didRunSelector:contextInfo:` on the WKWebView's window (the
   only way WKWebView renders asynchronously into the operation); a runtime-created delegate class
   (`WebviewEmbedPdfDelegate`, once per JVM) receives `printOperationDidRun:success:contextInfo:`
@@ -282,8 +286,9 @@ disposes its engine, call `failPendingPdf()` first.
   responds. `NSPrintInfo` = `[[NSPrintInfo sharedPrintInfo] copy]`; `setJobDisposition:` "NSPrintSaveJob";
   `dictionary[@"NSJobSavingURL"] = [NSURL fileURLWithPath:]`; `setPaperSize:` (points = inches × 72);
   four margins; `setHorizontalPagination:`/`setVerticalPagination:` automatic (0); centred off.
-  Operation from the view; `setShowsPrintPanel:NO`, `setShowsProgressPanel:NO`; its view's frame =
-  paper rect; `runOperationModalForWindow:delegate:didRunSelector:contextInfo:` with the shared
+  Operation from the view; `setShowsPrintPanel:NO`, `setShowsProgressPanel:NO`,
+  `setCanSpawnSeparateThread:YES`; its view's frame = the WKWebView's bounds (`msg_stret` of
+  `bounds`) (D9, STORY-014-002); `runOperationModalForWindow:delegate:didRunSelector:contextInfo:` with the shared
   delegate, `printOperationDidRun:success:contextInfo:` and the job as `contextInfo`.
 - The delegate class is created once (`std::call_once`) with that one method, which finishes the job
   (false → "The page could not be printed to PDF.").

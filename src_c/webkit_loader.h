@@ -50,6 +50,7 @@
   X(webkit_policy_decision_ignore)                               \
   X(webkit_print_operation_new)                                  \
   X(webkit_print_operation_print)                                \
+  X(webkit_print_operation_run_dialog)                           \
   X(webkit_print_operation_set_page_setup)                       \
   X(webkit_print_operation_set_print_settings)                   \
   X(webkit_script_dialog_confirm_set_confirmed)                  \

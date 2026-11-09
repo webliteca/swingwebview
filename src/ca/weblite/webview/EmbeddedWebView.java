@@ -867,6 +867,68 @@ public class EmbeddedWebView {
     }
 
     /**
+     * Show the engine's own print dialog for the page this WebView shows
+     * (Canvas 38 D2).  The future completes with how the dialog ended, or
+     * exceptionally with an {@link java.io.IOException} naming the reason
+     * (Canvas 38 D1).  It completes on the engine thread: chain further work
+     * with the {@code …Async} variants.
+     */
+    public CompletableFuture<PrintOutcome> showPrintDialog() {
+        checkAlive();
+        if (!PrintDialogs.isAvailable()) {
+            return PrintDialogs.failed(PrintDialogs.NOT_AVAILABLE);
+        }
+        long p = peer;
+        if (p == 0L) {
+            return PrintDialogs.failed(PrintDialogs.NOT_ATTACHED);
+        }
+        final PrintDialogs.Request request = PrintDialogs.request(
+                new java.util.concurrent.Executor() {
+                    @Override
+                    public void execute(Runnable r) {
+                        r.run();
+                    }
+                });
+        // Anchor the callback until it fires, as Canvas 29 D1 does.
+        final WebViewPrintCallback anchored = new WebViewPrintCallback() {
+            @Override
+            public void onPrintFinished(int outcome, String error) {
+                heap.remove(this);
+                request.callback.onPrintFinished(outcome, error);
+            }
+        };
+        heap.add(anchored);
+        try {
+            WebViewNative.webview_embed_print_dialog(p, anchored);
+        } catch (UnsatisfiedLinkError ule) {
+            anchored.onPrintFinished(-1, PrintDialogs.NOT_AVAILABLE);
+        }
+        return request.future;
+    }
+
+    /**
+     * Register the callback the engine calls when the page runs
+     * {@code window.print()} (Canvas 38 D6).  Anchors {@code cb} in
+     * {@link #heap} while the native side holds a global ref.  An older
+     * native library without the feature leaves {@code window.print()} to
+     * the engine.
+     *
+     * @return {@code this} for chaining
+     */
+    public EmbeddedWebView setPrintRequestCallback(WebViewPrintRequestCallback cb) {
+        checkAlive();
+        if (cb != null) {
+            heap.add(cb);
+        }
+        try {
+            WebViewNative.webview_embed_set_print_request_callback(peer, cb);
+        } catch (UnsatisfiedLinkError ule) {
+            // Native library predates Canvas 38.
+        }
+        return this;
+    }
+
+    /**
      * Windows-only: force Win32 keyboard focus back to the AWT-owned parent
      * HWND, so subsequent keystrokes route to AWT instead of the WebView2
      * child HWND.  Used by the Java-side global focus-owner listener when

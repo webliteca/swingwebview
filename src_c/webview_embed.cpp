@@ -370,6 +370,81 @@ static void pdf_finish(PdfJob *job, bool ok, const char *err) {
 static const char *const kPdfNotAttached = "The WebView is not attached yet.";
 
 // ---------------------------------------------------------------------------
+// Canvas 38: print-dialog request.  One per dialog; holds a global ref to the
+// Java WebViewPrintCallback.  print_finish upcalls onPrintFinished(outcome,
+// error) exactly once (D1) -- outcome is a PrintOutcome ordinal, or -1 with
+// `err` -- then deletes the ref and the job.  Callable from any thread.
+// ---------------------------------------------------------------------------
+enum { kPrintPrinted = 0, kPrintCancelled = 1, kPrintOpened = 2, kPrintFailed = -1 };
+
+struct PrintJob {
+    JavaVM *jvm = nullptr;
+    jobject cb = nullptr;
+    bool done = false;
+};
+
+static PrintJob *print_new_job(JNIEnv *env, jobject cb) {
+    PrintJob *job = new PrintJob();
+    env->GetJavaVM(&job->jvm);
+    job->cb = cb ? env->NewGlobalRef(cb) : nullptr;
+    return job;
+}
+
+static void print_finish(PrintJob *job, int outcome, const char *err) {
+    if (!job || job->done) return;
+    job->done = true;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (job->jvm && job->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        job->jvm->AttachCurrentThread((void **)&env, nullptr);
+        detach = true;
+    }
+    if (env && job->cb) {
+        jclass cls = env->GetObjectClass(job->cb);
+        jmethodID m = cls ? env->GetMethodID(cls, "onPrintFinished",
+                                             "(ILjava/lang/String;)V")
+                          : nullptr;
+        if (m) {
+            jstring jerr = (outcome >= 0 || !err) ? nullptr : env->NewStringUTF(err);
+            env->CallVoidMethod(job->cb, m, (jint)outcome, jerr);
+            if (jerr) env->DeleteLocalRef(jerr);
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (cls) env->DeleteLocalRef(cls);
+        env->DeleteGlobalRef(job->cb);
+        job->cb = nullptr;
+    }
+    if (detach) job->jvm->DetachCurrentThread();
+    delete job;
+}
+
+// Canvas 38 D6: tell Java the page called window.print().  Fire-and-forget;
+// any thread.  `cb` is a global ref to a WebViewPrintRequestCallback.
+static void print_request_upcall(JavaVM *jvm, jobject cb, const char *url) {
+    if (!jvm || !cb) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        jvm->AttachCurrentThread((void **)&env, nullptr);
+        detach = true;
+    }
+    if (env) {
+        jclass cls = env->GetObjectClass(cb);
+        jmethodID m = cls ? env->GetMethodID(cls, "onPrintRequested",
+                                             "(Ljava/lang/String;)V")
+                          : nullptr;
+        if (m) {
+            jstring ju = env->NewStringUTF(url ? url : "");
+            env->CallVoidMethod(cb, m, ju);
+            if (ju) env->DeleteLocalRef(ju);
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (cls) env->DeleteLocalRef(cls);
+    }
+    if (detach) jvm->DetachCurrentThread();
+}
+
+// ---------------------------------------------------------------------------
 // Canvas 30: custom URL schemes -- the state every engine shares (D14).
 // Installed once by webview_scheme_install, before the first engine exists:
 // the lower-case scheme names, the Java SchemeDispatcher (a global ref) and
@@ -3812,6 +3887,55 @@ static void gtk_print_to_pdf(std::function<GtkWidget *()> get_web,
     });
 }
 
+// Canvas 38 D2: the GTK print dialog for `web`, on the GTK thread.
+// webkit_print_operation_run_dialog runs its own nested main loop, so the
+// pump thread is busy until the person closes the dialog; the EDT is not.
+// The operation's `failed` signal, when it fires during the run, wins.
+static void gtk_print_failed_note(WebKitPrintOperation *, GError *error,
+                                  gpointer user_data) {
+    std::string *msg = static_cast<std::string *>(user_data);
+    if (!msg->empty()) return;
+    *msg = "The page could not be printed";
+    if (error && error->message && *error->message) {
+        *msg += ": ";
+        *msg += error->message;
+    }
+    *msg += ".";
+}
+
+static void gtk_print_dialog(std::function<GtkWidget *()> get_web,
+                             PrintJob *job) {
+    GtkPump::instance().run_async([=] {
+        GtkWidget *web = get_web();
+        if (!web) {
+            print_finish(job, kPrintFailed, kPdfNotAttached);
+            return;
+        }
+        WebKitPrintOperation *op =
+            webkit_print_operation_new(WEBKIT_WEB_VIEW(web));
+        if (!op) {
+            print_finish(job, kPrintFailed, "The page could not be printed.");
+            return;
+        }
+        std::string *failure = new std::string();
+        gulong sig = g_signal_connect(op, "failed",
+                                      G_CALLBACK(gtk_print_failed_note),
+                                      failure);
+        WebKitPrintOperationResponse resp =
+            webkit_print_operation_run_dialog(op, NULL);
+        g_signal_handler_disconnect(op, sig);
+        if (!failure->empty()) {
+            print_finish(job, kPrintFailed, failure->c_str());
+        } else if (resp == WEBKIT_PRINT_OPERATION_RESPONSE_PRINT) {
+            print_finish(job, kPrintPrinted, nullptr);
+        } else {
+            print_finish(job, kPrintCancelled, nullptr);
+        }
+        delete failure;
+        g_object_unref(op);
+    });
+}
+
 // Canvas 22: purge the WebKitGTK HTTP resource cache (memory + disk) for the
 // view's web context.  Clears the resource cache only -- the cookie manager
 // is untouched, so an active login survives.
@@ -4118,6 +4242,10 @@ struct OffEngine {
     // in gtk_off_destroy_engine.  Invoked by the "__webview_pw__"
     // script-message handler installed in gtk_off_create_engine.
     jobject password_callback = nullptr;
+
+    // Canvas 38 D6: JNI global ref to the WebViewPrintRequestCallback, or
+    // nullptr.  Read by the `print` signal handler; freed on destroy.
+    jobject print_request_callback = nullptr;
 };
 
 // Per-OffEngine wrapper for the `script-dialog` signal.  Reads page URL,
@@ -4172,6 +4300,18 @@ static gboolean on_permission_request_off_engine(WebKitWebView *web,
     if (!e) return FALSE;
     return gtk_handle_permission_request(e->jvm, e->permission_callback, e,
                                          web, request);
+}
+
+// Canvas 38 D6: the page's window.print().  With a callback, Java decides
+// and opens our own dialog; WebKit's default dialog is stopped (TRUE).
+// Without one, WebKit's default runs (FALSE), as before this feature.
+static gboolean on_print_off_engine(WebKitWebView *web, WebKitPrintOperation *,
+                                    gpointer user_data) {
+    OffEngine *e = static_cast<OffEngine *>(user_data);
+    if (!e || !e->print_request_callback) return FALSE;
+    print_request_upcall(e->jvm, e->print_request_callback,
+                         webkit_web_view_get_uri(web));
+    return TRUE;
 }
 
 // Canvas 36 D9: per-OffEngine wrapper for "context-menu".
@@ -4416,6 +4556,9 @@ static OffEngine *gtk_off_create_engine(JNIEnv *env,
         // Canvas 35 D7b: camera, microphone and screen-capture requests.
         g_signal_connect(WEBKIT_WEB_VIEW(e->web), "permission-request",
                          (GCallback)on_permission_request_off_engine, e);
+        // Canvas 38 D6: the page's window.print().
+        g_signal_connect(WEBKIT_WEB_VIEW(e->web), "print",
+                         (GCallback)on_print_off_engine, e);
         // Canvas 36 D9: application items in WebKit's own context menu, and
         // the menu opened at the pointer rather than at the parked window.
         g_signal_connect(WEBKIT_WEB_VIEW(e->web), "context-menu",
@@ -4578,6 +4721,9 @@ static void gtk_off_destroy_engine(OffEngine *e) {
         if (e->web) {
             g_signal_handlers_disconnect_by_func(G_OBJECT(e->web),
                 (gpointer)on_permission_request_off_engine, e);
+            // Canvas 38 D6: no print request after this point.
+            g_signal_handlers_disconnect_by_func(G_OBJECT(e->web),
+                (gpointer)on_print_off_engine, e);
         }
         gtk_perm_drain(e);
         if (e->window) {
@@ -4597,6 +4743,18 @@ static void gtk_off_destroy_engine(OffEngine *e) {
         }
         if (env) env->DeleteGlobalRef(e->permission_callback);
         e->permission_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
+    // Canvas 38 D6: the print-request callback, once the signal is gone.
+    if (e->print_request_callback) {
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(e->print_request_callback);
+        e->print_request_callback = nullptr;
         if (detach) e->jvm->DetachCurrentThread();
     }
     if (e->dialog_callback) {
@@ -4749,6 +4907,15 @@ static void gtk_off_set_permission_callback(OffEngine *e, JNIEnv *env,
     if (cb) {
         e->permission_callback = env->NewGlobalRef(cb);
     }
+}
+
+// Canvas 38 D6: offscreen print-request callback setter.
+static void gtk_off_set_print_request_callback(OffEngine *e, JNIEnv *env,
+                                               jobject cb) {
+    if (!e) return;
+    jobject old = e->print_request_callback;
+    e->print_request_callback = cb ? env->NewGlobalRef(cb) : nullptr;
+    if (old) env->DeleteGlobalRef(old);
 }
 
 // Canvas 35 D7e: apply a later answer on the pump thread.  GtkPump is
@@ -5858,6 +6025,10 @@ struct Engine {
     // thread; set by the permission-callback setter; freed on destroy after
     // the engine's pending requests are drained.
     jobject permission_callback = nullptr;
+    // Canvas 38 D6: JNI global ref to the WebViewPrintRequestCallback, or
+    // nullptr.  Read by the window.print() delegate selectors on AppKit main;
+    // set by cocoa_set_print_request_callback; freed in cocoa_destroy_engine.
+    jobject print_request_callback = nullptr;
     // Canvas 21 (1.5.0): per-destination User-Agent resolver
     // (java.util.function.Function<String,String>) as a JNI global ref.
     // Consulted at the popup-child creation site with the CHILD's target
@@ -7324,6 +7495,14 @@ static void cocoa_set_permission_callback(Engine *e, JNIEnv *env, jobject cb) {
     }
 }
 
+// Canvas 38 D6: register (or clear) the print-request callback.
+static void cocoa_set_print_request_callback(Engine *e, JNIEnv *env, jobject cb) {
+    if (!e) return;
+    jobject old = e->print_request_callback;
+    e->print_request_callback = cb ? env->NewGlobalRef(cb) : nullptr;
+    if (old) env->DeleteGlobalRef(old);
+}
+
 // ---------------------------------------------------------------------------
 // Browser-initiated file downloads (Canvas 23).
 //
@@ -8196,6 +8375,50 @@ static void cocoa_set_download_callback(Engine *e, JNIEnv *env, jobject cb) {
     }
 }
 
+// Canvas 38 D6: the page's window.print().  WKWebView only honours it when
+// the UI delegate implements one of these private selectors.  WebKit's web
+// process waits for the answer, and the print dialog needs that process to
+// lay out pages, so WebKit is answered first; Java hears about it on its own
+// thread, through a global ref of its own, and opens the dialog itself.
+static void cocoa_print_request_async(id self, id webView) {
+    Engine *e = (Engine *)objc_getAssociatedObject(self, "eng");
+    if (!e || e->destroyed.load() || !e->print_request_callback || !e->jvm) return;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        e->jvm->AttachCurrentThread((void **)&env, nullptr);
+        detach = true;
+    }
+    jobject cb = env ? env->NewGlobalRef(e->print_request_callback) : nullptr;
+    if (detach) e->jvm->DetachCurrentThread();
+    if (!cb) return;
+    JavaVM *jvm = e->jvm;
+    std::string url = page_url_utf8(webView);
+    std::thread([jvm, cb, url]() {
+        print_request_upcall(jvm, cb, url.c_str());
+        JNIEnv *tenv = nullptr;
+        bool tdetach = false;
+        if (jvm->GetEnv((void **)&tenv, JNI_VERSION_1_6) != JNI_OK) {
+            jvm->AttachCurrentThread((void **)&tenv, nullptr);
+            tdetach = true;
+        }
+        if (tenv) tenv->DeleteGlobalRef(cb);
+        if (tdetach) jvm->DetachCurrentThread();
+    }).detach();
+}
+
+// -[WebviewEmbedUIDelegate _webView:printFrame:]
+static void impl_print_frame(id self, SEL, id webView, id) {
+    cocoa_print_request_async(self, webView);
+}
+
+// -[WebviewEmbedUIDelegate _webView:printFrame:pdfFirstPageSize:completionHandler:]
+static void impl_print_frame_pdf(id self, SEL, id webView, id, CGSize,
+                                 id completionHandler) {
+    if (completionHandler) ((void (^)(void))completionHandler)();
+    cocoa_print_request_async(self, webView);
+}
+
 static Class get_webview_embed_ui_delegate_cls() {
     std::call_once(g_webview_embed_ui_delegate_once, [] {
         Class c = objc_allocateClassPair((Class)objc_cls("NSObject"),
@@ -8274,6 +8497,14 @@ static Class get_webview_embed_ui_delegate_cls() {
                     "initiatedByFrame:type:decisionHandler:"),
                 (IMP)impl_request_media_capture_permission, "v@:@@@q@");
         }
+        // Canvas 38 D6: window.print().  Private selectors; a WebKit that
+        // calls neither leaves window.print() inert, as without them.
+        class_addMethod(c, sel("_webView:printFrame:"),
+                        (IMP)impl_print_frame, "v@:@@");
+        class_addMethod(
+            c,
+            sel("_webView:printFrame:pdfFirstPageSize:completionHandler:"),
+            (IMP)impl_print_frame_pdf, "v@:@@{CGSize=dd}@");
         class_addMethod(
             c,
             sel("webView:navigationAction:didBecomeDownload:"),
@@ -9924,15 +10155,110 @@ static void cocoa_print_to_pdf(Engine *e, PdfJob *job, std::string path,
         }
         msg<void, BOOL>(op, sel("setShowsPrintPanel:"), NO);
         msg<void, BOOL>(op, sel("setShowsProgressPanel:"), NO);
-        // Without a frame the operation's view prints blank pages.
+        // D9 (amended, STORY-014-002): WKPrintingView asks the web process for
+        // the page rectangles and can wait for them only off the main thread.
+        msg<void, BOOL>(op, sel("setCanSpawnSeparateThread:"), YES);
+        // Without a frame the operation's view prints blank pages.  The frame
+        // is the web view's own bounds: a paper-sized one left the PDF holding
+        // a single screenful.  The pages come from the print info.
         id opView = msg<id>(op, sel("view"));
         if (opView) {
-            msg<void, CGRect>(opView, sel("setFrame:"),
-                              CGRectMake(0, 0, pw, ph));
+            CGRect b = msg_stret<CGRect>(wv, sel("bounds"));
+            msg<void, CGRect>(opView, sel("setFrame:"), b);
         }
         msg<void, id, id, SEL, void *>(
             op, sel("runOperationModalForWindow:delegate:didRunSelector:contextInfo:"),
             window, get_webview_embed_pdf_delegate(),
+            sel("printOperationDidRun:success:contextInfo:"), (void *)job);
+    });
+}
+
+// Canvas 38 D2: the macOS print panel for the page, run as a sheet on the
+// view's window, so AppKit main keeps running while the person decides.  The
+// answer goes to Java from its own thread (D7), as Canvas 29's does.
+static void cocoa_print_finish_async(PrintJob *job, int outcome, const char *err) {
+    std::string e = err ? err : "";
+    std::thread([job, outcome, e]() {
+        print_finish(job, outcome, outcome >= 0 ? nullptr : e.c_str());
+    }).detach();
+}
+
+static void impl_print_did_run(id, SEL, id, BOOL success, void *ctx) {
+    cocoa_print_finish_async(static_cast<PrintJob *>(ctx),
+                             success == YES ? kPrintPrinted : kPrintCancelled,
+                             nullptr);
+}
+
+static std::once_flag g_webview_embed_print_delegate_once;
+static id g_webview_embed_print_delegate = nullptr;
+
+static id get_webview_embed_print_delegate() {
+    std::call_once(g_webview_embed_print_delegate_once, [] {
+        Class c = objc_allocateClassPair((Class)objc_cls("NSObject"),
+                                         "WebviewEmbedPrintDelegate", 0);
+        class_addMethod(c, sel("printOperationDidRun:success:contextInfo:"),
+                        (IMP)impl_print_did_run, "v@:@c^v");
+        objc_registerClassPair(c);
+        g_webview_embed_print_delegate =
+            msg<id>(msg<id>((id)c, sel("alloc")), sel("init"));
+    });
+    return g_webview_embed_print_delegate;
+}
+
+static void cocoa_print_dialog(Engine *e, PrintJob *job) {
+    cocoa_run_on_main_async([=] {
+        if (!e || e->destroyed.load() || !e->webview) {
+            cocoa_print_finish_async(job, kPrintFailed, kPdfNotAttached);
+            return;
+        }
+        id wv = e->webview;
+        if (!msg<BOOL, SEL>(wv, sel("respondsToSelector:"),
+                            sel("printOperationWithPrintInfo:"))) {
+            cocoa_print_finish_async(job, kPrintFailed,
+                                     "Printing needs macOS 11 or later.");
+            return;
+        }
+        id window = msg<id>(wv, sel("window"));
+        if (!window) {
+            cocoa_print_finish_async(job, kPrintFailed,
+                                     "The WebView has no window to print from.");
+            return;
+        }
+        id info = msg<id>(msg<id>(objc_cls("NSPrintInfo"),
+                                  sel("sharedPrintInfo")), sel("copy"));
+        // NSPrintingPaginationModeAutomatic == 0; not centred, as a browser.
+        msg<void, long>(info, sel("setHorizontalPagination:"), 0L);
+        msg<void, long>(info, sel("setVerticalPagination:"), 0L);
+        msg<void, BOOL>(info, sel("setHorizontallyCentered:"), NO);
+        msg<void, BOOL>(info, sel("setVerticallyCentered:"), NO);
+        id op = msg<id, id>(wv, sel("printOperationWithPrintInfo:"), info);
+        msg<void>(info, sel("release"));
+        if (!op) {
+            cocoa_print_finish_async(job, kPrintFailed,
+                                     "The page could not be printed.");
+            return;
+        }
+        msg<void, BOOL>(op, sel("setShowsPrintPanel:"), YES);
+        msg<void, BOOL>(op, sel("setShowsProgressPanel:"), YES);
+        // WKPrintingView asks the web process for the page rectangles; it can
+        // wait for them only off the main thread.
+        msg<void, BOOL>(op, sel("setCanSpawnSeparateThread:"), YES);
+        id panel = msg<id>(op, sel("printPanel"));
+        if (panel) {
+            // Copies | page range | paper size | orientation | scaling | preview.
+            const long opts = 0x1 | 0x2 | 0x4 | 0x8 | 0x10 | 0x20000;
+            msg<void, long>(panel, sel("setOptions:"), opts);
+        }
+        // Without a frame the operation's view prints blank pages; the
+        // web view's own bounds keep pagination to the print info.
+        id opView = msg<id>(op, sel("view"));
+        if (opView) {
+            CGRect b = msg_stret<CGRect>(wv, sel("bounds"));
+            msg<void, CGRect>(opView, sel("setFrame:"), b);
+        }
+        msg<void, id, id, SEL, void *>(
+            op, sel("runOperationModalForWindow:delegate:didRunSelector:contextInfo:"),
+            window, get_webview_embed_print_delegate(),
             sel("printOperationDidRun:success:contextInfo:"), (void *)job);
     });
 }
@@ -10014,6 +10340,20 @@ static void cocoa_destroy_engine(Engine *e) {
         }
         if (env) env->DeleteGlobalRef(e->focus_callback);
         e->focus_callback = nullptr;
+        if (detach) e->jvm->DetachCurrentThread();
+    }
+    // Canvas 38 D6: the print-request callback.  Cleared before the delete so
+    // the delegate selectors see null rather than a freed ref.
+    if (e->print_request_callback) {
+        jobject old = e->print_request_callback;
+        e->print_request_callback = nullptr;
+        JNIEnv *env = nullptr;
+        bool detach = false;
+        if (e->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+            e->jvm->AttachCurrentThread((void **)&env, nullptr);
+            detach = true;
+        }
+        if (env) env->DeleteGlobalRef(old);
         if (detach) e->jvm->DetachCurrentThread();
     }
     // Same treatment for the download-callback global ref.  A download
@@ -12167,6 +12507,73 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
     (void)peer; (void)path; (void)w; (void)h; (void)mt; (void)mr; (void)mb;
     (void)ml; (void)bg;
     embed::pdf_finish(job, false, embed::kPdfNotAttached);
+#endif
+}
+
+// The engine's own print dialog — Canvas 38.  Inside this `extern "C"` block
+// (Canvas 29 D11).  Every path answers the callback exactly once; nothing
+// throws into Java.
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1print_1dialog_1available
+  (JNIEnv *, jclass) {
+#if defined(WEBVIEW_GTK) || defined(WEBVIEW_COCOA)
+    return JNI_TRUE;
+#else
+    return JNI_FALSE;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1print_1dialog
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    embed::PrintJob *job = embed::print_new_job(env, cb);
+    if (wv == 0) {
+        embed::print_finish(job, embed::kPrintFailed, embed::kPdfNotAttached);
+        return;
+    }
+#ifdef WEBVIEW_GTK
+    // Linux supports the lightweight component only (Canvas 38 D2).
+    embed::print_finish(job, embed::kPrintFailed,
+        "Printing on Linux needs the lightweight WebView component.");
+#elif defined(WEBVIEW_COCOA)
+    embed::cocoa_print_dialog((embed::Engine *)wv, job);
+#else
+    embed::print_finish(job, embed::kPrintFailed,
+        "Printing is not available in this version of the native library.");
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1print_1dialog
+  (JNIEnv *env, jclass, jlong peer, jobject cb) {
+    embed::PrintJob *job = embed::print_new_job(env, cb);
+#ifdef WEBVIEW_GTK
+    if (peer == 0) {
+        embed::print_finish(job, embed::kPrintFailed, embed::kPdfNotAttached);
+        return;
+    }
+    embed::OffEngine *e = (embed::OffEngine *)peer;
+    embed::gtk_print_dialog([e] { return e->web; }, job);
+#else
+    // No offscreen engine off Linux.
+    (void)peer;
+    embed::print_finish(job, embed::kPrintFailed, embed::kPdfNotAttached);
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1print_1request_1callback
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+#ifdef WEBVIEW_COCOA
+    embed::cocoa_set_print_request_callback((embed::Engine *)wv, env, cb);
+#else
+    // GTK heavyweight is unsupported (Canvas 38 op 7): WebKit's default stays.
+    (void)env; (void)wv; (void)cb;
+#endif
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1print_1request_1callback
+  (JNIEnv *env, jclass, jlong peer, jobject cb) {
+#ifdef WEBVIEW_GTK
+    embed::gtk_off_set_print_request_callback((embed::OffEngine *)peer, env, cb);
+#else
+    (void)env; (void)peer; (void)cb;
 #endif
 }
 

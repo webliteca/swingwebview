@@ -272,6 +272,7 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         downloadDispatcher.disposeAll();
         passwordDispatcher.disposeAll();
         failPendingPdf();
+        failPendingPrint();   // Canvas 38 D5
         if (embedded != null) {
             EmbeddedWebView e = embedded;
             embedded = null;
@@ -545,6 +546,52 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
         }
     }
 
+    /** Canvas 38 op 6: the engine's print dialog, relayed to {@code cb}. */
+    @Override
+    protected boolean printOnPeer(final ca.weblite.webview.WebViewPrintCallback cb) {
+        EmbeddedWebView e = embedded;
+        if (e == null) {
+            return false;
+        }
+        e.showPrintDialog().whenComplete((o, t) -> cb.onPrintFinished(
+                t == null ? o.ordinal() : -1,
+                t == null ? null
+                        : (t instanceof java.util.concurrent.CompletionException
+                                && t.getCause() != null ? t.getCause() : t).getMessage()));
+        return true;
+    }
+
+    /** Whether the Windows {@code window.print} script is installed (Canvas 38 D6). */
+    private boolean windowsPrintScriptInstalled;
+
+    /**
+     * Canvas 38 D6: WebView2 reports no event for {@code window.print()}, so
+     * while a print handler is installed each new document's
+     * {@code window.print} calls back into the component.  Once per component.
+     */
+    @Override
+    protected void onPrintHandlerInstalled() {
+        if (windowsPrintScriptInstalled
+                || !System.getProperty("os.name", "").toLowerCase().startsWith("windows")) {
+            return;
+        }
+        windowsPrintScriptInstalled = true;
+        Runnable install = () -> {
+            pendingBindings.put(ca.weblite.webview.PrintDialogs.CALLBACK_NAME,
+                    arg -> dispatchPrintRequest(ca.weblite.webview.PrintDialogs.firstStringArg(arg)));
+            if (embedded != null) {
+                embedded.addJavascriptCallback(ca.weblite.webview.PrintDialogs.CALLBACK_NAME,
+                        pendingBindings.get(ca.weblite.webview.PrintDialogs.CALLBACK_NAME));
+            }
+            addOnBeforeLoad(ca.weblite.webview.PrintDialogs.WINDOWS_SCRIPT);
+        };
+        if (javax.swing.SwingUtilities.isEventDispatchThread()) {
+            install.run();
+        } else {
+            javax.swing.SwingUtilities.invokeLater(install);
+        }
+    }
+
     @Override
     protected boolean printToPdfOnPeer(java.io.File out,
                                        ca.weblite.webview.PdfOptions o,
@@ -760,6 +807,8 @@ public class WebViewHeavyweightComponent extends WebViewComponent {
                 return permissionDispatcher.dispatch(id, origin, url, kinds);
             }
         });
+        // Canvas 38 D6: the page's window.print(), decided on the EDT.
+        embedded.setPrintRequestCallback(url -> dispatchPrintRequest(url));
         // An adopted popup already carries the engine's own in-flight
         // navigation (the original request WebKit drove into the child, POST
         // body intact); navigating pendingUrl here would clobber it.  Only
