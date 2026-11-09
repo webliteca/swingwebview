@@ -277,7 +277,9 @@ Commented with Canvas 38.
   with a throwing handler does not, and passes the URL.
 - `WebViewPrintDemo`: four pages of numbered paragraphs, a Swing "Print…" button printing the outcome,
   a page button calling `window.print()`, a "Deny page prints" checkbox installing a denying handler.
-  Scripts `run-{linux,mac}-print-demo.sh`, `run-windows-print-demo.bat`, modelled on the PDF demo's.
+  Scripts `run-{linux,mac}-print-demo.sh`, `run-windows-print-demo.bat`, modelled on the PDF demo's; the Windows
+  script passes `-encoding UTF-8` to both `javac` calls, because the sources hold non-ASCII literals (Canvas 37's
+  `ContentRuleSet` U+2028/U+2029, the demo's "Print…") that Windows' default code page garbles or rejects.
 - README: a section after "Print to PDF".
 
 ## N · Norms
