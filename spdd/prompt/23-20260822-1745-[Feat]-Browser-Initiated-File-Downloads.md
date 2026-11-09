@@ -869,6 +869,10 @@ File: `test/ca/weblite/webview/DownloadDispatcherTest.java`
     diagnostic for a trivial cause. Use a qualified name
     (`download_id`, `popup_id`, …), as the rest of that section
     already does.
+12. **Java literals are ASCII.** A non-ASCII character in a string or
+    character literal is written as a `\u` escape — `toString()`'s
+    truncation mark is `"\u2026"` — so the sources compile in any
+    source encoding (`javac` on Windows reads the console's code page).
 
 ## S · Safeguards
 

@@ -372,6 +372,9 @@ WebViewContentRules ..> WebViewContentRuleListCallback
 3. Java 8 source level, no new dependency.
 4. Every new native function has the same three-platform symmetry as Canvas 34 (stubs where an engine has
    no offscreen variant).
+5. Java literals are ASCII: a non-ASCII character in a string or character literal is written as a `\u` escape
+   (`ContentRuleSet`'s JSON escaping matches U+2028 and U+2029 as `'\u2028'` and `'\u2029'`), so the sources
+   compile in any source encoding — `javac` on Windows reads the console's code page.
 
 ## S · Safeguards
 1. **Before the request**: on every engine the block happens before bytes are sent.

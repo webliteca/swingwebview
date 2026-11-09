@@ -83,7 +83,7 @@ public final class WebViewDownloadEvent {
 
     @Override
     public String toString() {
-        String u = url.length() > 80 ? url.substring(0, 80) + "…" : url;
+        String u = url.length() > 80 ? url.substring(0, 80) + "\u2026" : url;
         return "WebViewDownloadEvent[id=" + id
             + ", file=" + suggestedFileName
             + ", mimeType=" + mimeType
