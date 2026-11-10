@@ -22,16 +22,19 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Both macOS builds run on macos-14 (arm64).  Intel runners
+          # Both macOS builds run on macos-15 (arm64); GitHub no longer serves
+          # the macos-14 image (Canvas 8 op 6).  -mmacosx-version-min=14.0 keeps
+          # the dylib loading on macOS 14+, the floor 1.13.0 shipped with, whatever
+          # SDK the runner carries.  Intel runners
           # (macos-13) are being phased out, and Xcode's SDK is universal
           # so cross-compiling x86_64 from arm64 with `clang -arch x86_64`
           # just works -- JNI headers, AWT, and the macOS frameworks all
           # have x86_64 slices regardless of host arch.
-          - os: macos-14
+          - os: macos-15
             mac_arch: x86_64
             native_dir: osx_64
             lib_name: libwebview.dylib
-          - os: macos-14
+          - os: macos-15
             mac_arch: arm64
             native_dir: osx_arm64
             lib_name: libwebview.dylib
@@ -77,6 +80,7 @@ jobs:
           mkdir -p "natives/${{ matrix.native_dir }}"
           c++ \
               -arch ${{ matrix.mac_arch }} \
+              -mmacosx-version-min=14.0 \
               -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/darwin" \
               -dynamiclib \
               src_c/webview_embed.cpp \
