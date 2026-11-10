@@ -45,11 +45,11 @@ jobs:
       fail-fast: true
       matrix:
         include:
-          - os: macos-14
+          - os: macos-15
             mac_arch: x86_64
             native_dir: osx_64
             lib_name: libwebview.dylib
-          - os: macos-14
+          - os: macos-15
             mac_arch: arm64
             native_dir: osx_arm64
             lib_name: libwebview.dylib
@@ -87,6 +87,7 @@ jobs:
           mkdir -p "natives/${{ matrix.native_dir }}"
           c++ \
               -arch ${{ matrix.mac_arch }} \
+              -mmacosx-version-min=14.0 \
               -I"$JAVA_HOME/include" -I"$JAVA_HOME/include/darwin" \
               -dynamiclib \
               src_c/webview_embed.cpp \

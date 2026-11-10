@@ -594,6 +594,157 @@ public abstract class WebViewComponent extends JComponent {
         return PdfPrinting.isAvailable();
     }
 
+    // ---------------------------------------------------------------------
+    // The engine's own print dialog (Canvas 38).
+    // ---------------------------------------------------------------------
+
+    /** The print dialog not yet answered, or null (Canvas 38 D4).  EDT-confined. */
+    private ca.weblite.webview.PrintDialogs.Request pendingPrint;
+
+    /** Decides the page's own print requests; null = allow (Canvas 38 D6). */
+    private volatile ca.weblite.webview.WebViewPrintHandler printHandler;
+
+    /**
+     * Show the platform's own print dialog for the page this component shows
+     * (Canvas 38): a preview of every page, the printer, page range, copies,
+     * paper, orientation and scale, and Save as PDF — whatever the platform's
+     * dialog offers.  The whole document prints, whatever the scroll position.
+     *
+     * <p>The future completes on the Swing event thread with
+     * {@link ca.weblite.webview.PrintOutcome#PRINTED PRINTED},
+     * {@link ca.weblite.webview.PrintOutcome#CANCELLED CANCELLED}, or — on
+     * Windows, whose dialog reports nothing more —
+     * {@link ca.weblite.webview.PrintOutcome#OPENED OPENED}; or exceptionally
+     * with an {@link java.io.IOException} whose message says why not: the
+     * native library cannot show the dialog, the component is not attached,
+     * a print is already in progress, or it was closed first.  Never waits on
+     * the calling thread.  Any thread.
+     */
+    public CompletableFuture<ca.weblite.webview.PrintOutcome> print() {
+        final ca.weblite.webview.PrintDialogs.Request request =
+                ca.weblite.webview.PrintDialogs.request(EDT);
+        if (!printDialogAvailable()) {
+            request.fail(ca.weblite.webview.PrintDialogs.NOT_AVAILABLE);
+            return request.future;
+        }
+        onEdt(new Runnable() {
+            @Override
+            public void run() {
+                if (pendingPrint != null) {
+                    request.fail(ca.weblite.webview.PrintDialogs.BUSY);
+                    return;
+                }
+                pendingPrint = request;
+                request.future.whenComplete((o, t) -> {
+                    if (pendingPrint == request) {
+                        pendingPrint = null;
+                    }
+                });
+                if (!printOnPeer(request.callback)) {
+                    request.fail(ca.weblite.webview.PrintDialogs.NOT_ATTACHED);
+                }
+            }
+        });
+        return request.future;
+    }
+
+    /**
+     * Show the live peer's print dialog, answering {@code cb} exactly once.
+     * Returns {@code false} when no peer is attached.  Called on the EDT.  The
+     * base class has no peer.
+     */
+    protected boolean printOnPeer(ca.weblite.webview.WebViewPrintCallback cb) {
+        return false;
+    }
+
+    /** Whether this component's native library can show the print dialog.
+     *  A test double without natives overrides it. */
+    protected boolean printDialogAvailable() {
+        return ca.weblite.webview.PrintDialogs.isAvailable();
+    }
+
+    /** Fail the unanswered print with {@code CLOSED} (Canvas 38 D5).
+     *  Subclasses call this before disposing their engine.  EDT-only. */
+    protected void failPendingPrint() {
+        ca.weblite.webview.PrintDialogs.Request r = pendingPrint;
+        if (r != null) {
+            r.fail(ca.weblite.webview.PrintDialogs.CLOSED);
+        }
+    }
+
+    /**
+     * Whether the loaded native library can show the print dialog (Canvas 38
+     * D3).  {@code false} against a native built before the feature, or
+     * without natives at all.
+     */
+    public static boolean isPrintDialogSupported() {
+        return ca.weblite.webview.PrintDialogs.isAvailable();
+    }
+
+    /**
+     * Install the handler that decides the page's own print requests — its
+     * {@code window.print()} (Canvas 38 D6).  Without one, every request opens
+     * the print dialog.  See {@link ca.weblite.webview.WebViewPrintHandler}
+     * for the Windows caveat.
+     *
+     * @return {@code this} for chaining
+     */
+    public final WebViewComponent setPrintHandler(
+            ca.weblite.webview.WebViewPrintHandler handler) {
+        printHandler = handler;
+        if (handler != null) {
+            onPrintHandlerInstalled();
+        }
+        return this;
+    }
+
+    /** @return the installed print handler, or {@code null} (allow every request). */
+    public final ca.weblite.webview.WebViewPrintHandler getPrintHandler() {
+        return printHandler;
+    }
+
+    /** Called when a non-null print handler is installed (Canvas 38 D6).
+     *  No-op here; the heavyweight component installs its Windows script. */
+    protected void onPrintHandlerInstalled() {
+    }
+
+    /**
+     * The page asked to print (Canvas 38 D6).  On the EDT: dropped while a
+     * print is in progress; else asks the handler (none = allow, a throw =
+     * deny) and opens the dialog when allowed.  Any thread.
+     */
+    protected final void dispatchPrintRequest(final String url) {
+        onEdt(new Runnable() {
+            @Override
+            public void run() {
+                if (pendingPrint != null) {
+                    return;
+                }
+                ca.weblite.webview.WebViewPrintHandler h = printHandler;
+                boolean allow = true;
+                if (h != null) {
+                    try {
+                        allow = h.allowPrint(WebViewComponent.this,
+                                url == null ? "" : url);
+                    } catch (Throwable t) {
+                        System.err.println("[webview] print: the print handler failed: " + t);
+                        allow = false;
+                    }
+                }
+                if (!allow) {
+                    return;
+                }
+                print().whenComplete((o, t) -> {
+                    if (t != null) {
+                        Throwable cause = t instanceof java.util.concurrent.CompletionException
+                                && t.getCause() != null ? t.getCause() : t;
+                        System.err.println("[webview] print: " + cause.getMessage());
+                    }
+                });
+            }
+        });
+    }
+
     private static final java.util.concurrent.Executor EDT =
             SwingUtilities::invokeLater;
 

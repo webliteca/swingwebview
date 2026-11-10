@@ -835,6 +835,53 @@ static void pdf_finish(PdfJob *job, bool ok, const char *err) {
 
 static const char *const kPdfNotAttached = "The WebView is not attached yet.";
 
+// ---------------------------------------------------------------------------
+// Canvas 38: print-dialog request (see src_c/webview_embed.cpp for the shared
+// contract).  print_finish upcalls onPrintFinished(outcome, error) exactly once.
+// ---------------------------------------------------------------------------
+enum { kPrintPrinted = 0, kPrintCancelled = 1, kPrintOpened = 2, kPrintFailed = -1 };
+
+struct PrintJob {
+    JavaVM *jvm = nullptr;
+    jobject cb = nullptr;
+    bool done = false;
+};
+
+static PrintJob *print_new_job(JNIEnv *env, jobject cb) {
+    PrintJob *job = new PrintJob();
+    env->GetJavaVM(&job->jvm);
+    job->cb = cb ? env->NewGlobalRef(cb) : nullptr;
+    return job;
+}
+
+static void print_finish(PrintJob *job, int outcome, const char *err) {
+    if (!job || job->done) return;
+    job->done = true;
+    JNIEnv *env = nullptr;
+    bool detach = false;
+    if (job->jvm && job->jvm->GetEnv((void **)&env, JNI_VERSION_1_6) != JNI_OK) {
+        job->jvm->AttachCurrentThread((void **)&env, nullptr);
+        detach = true;
+    }
+    if (env && job->cb) {
+        jclass cls = env->GetObjectClass(job->cb);
+        jmethodID m = cls ? env->GetMethodID(cls, "onPrintFinished",
+                                             "(ILjava/lang/String;)V")
+                          : nullptr;
+        if (m) {
+            jstring jerr = (outcome >= 0 || !err) ? nullptr : env->NewStringUTF(err);
+            env->CallVoidMethod(job->cb, m, (jint)outcome, jerr);
+            if (jerr) env->DeleteLocalRef(jerr);
+        }
+        if (env->ExceptionCheck()) env->ExceptionClear();
+        if (cls) env->DeleteLocalRef(cls);
+        env->DeleteGlobalRef(job->cb);
+        job->cb = nullptr;
+    }
+    if (detach) job->jvm->DetachCurrentThread();
+    delete job;
+}
+
 static void pdf_finish_hr(PdfJob *job, HRESULT hr) {
     char buf[96];
     snprintf(buf, sizeof(buf),
@@ -5805,6 +5852,68 @@ JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_
    jdouble, jdouble, jboolean, jobject cb) {
     embed_win::pdf_finish(embed_win::pdf_new_job(env, cb), false,
                           embed_win::kPdfNotAttached);
+}
+
+// The engine's own print dialog — Canvas 38 D2.  ShowPrintUI opens Edge's
+// print dialog and reports only that it opened.  Every path answers exactly
+// once; nothing throws into Java.
+JNIEXPORT jboolean JNICALL Java_ca_weblite_webview_WebViewNative_webview_1print_1dialog_1available
+  (JNIEnv *, jclass) {
+    return JNI_TRUE;
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1print_1dialog
+  (JNIEnv *env, jclass, jlong wv, jobject cb) {
+    embed_win::PrintJob *job = embed_win::print_new_job(env, cb);
+    auto *e = (Engine *)wv;
+    if (!e) {
+        embed_win::print_finish(job, embed_win::kPrintFailed,
+                                embed_win::kPdfNotAttached);
+        return;
+    }
+    embed_win::dispatch_to_thread(e, [=] {
+        if (!e->webview) {
+            embed_win::print_finish(job, embed_win::kPrintFailed,
+                                    embed_win::kPdfNotAttached);
+            return;
+        }
+        ICoreWebView2_16 *wv16 = nullptr;
+        if (FAILED(e->webview->QueryInterface(
+                __uuidof(ICoreWebView2_16), reinterpret_cast<void **>(&wv16))) ||
+            !wv16) {
+            embed_win::print_finish(job, embed_win::kPrintFailed,
+                                    "Printing needs a newer WebView2 runtime.");
+            return;
+        }
+        HRESULT hr = wv16->ShowPrintUI(COREWEBVIEW2_PRINT_DIALOG_KIND_BROWSER);
+        wv16->Release();
+        if (SUCCEEDED(hr)) {
+            embed_win::print_finish(job, embed_win::kPrintOpened, nullptr);
+        } else {
+            char buf[96];
+            snprintf(buf, sizeof(buf),
+                     "The print dialog could not be shown (0x%08lX).",
+                     (unsigned long)hr);
+            embed_win::print_finish(job, embed_win::kPrintFailed, buf);
+        }
+    });
+}
+
+// No offscreen engine on Windows.
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1print_1dialog
+  (JNIEnv *env, jclass, jlong, jobject cb) {
+    embed_win::print_finish(embed_win::print_new_job(env, cb),
+                            embed_win::kPrintFailed, embed_win::kPdfNotAttached);
+}
+
+// Canvas 38 D6: WebView2 has no window.print() event; the heavyweight
+// component handles it with a document-start script instead.
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1embed_1set_1print_1request_1callback
+  (JNIEnv *, jclass, jlong, jobject) {
+}
+
+JNIEXPORT void JNICALL Java_ca_weblite_webview_WebViewNative_webview_1offscreen_1set_1print_1request_1callback
+  (JNIEnv *, jclass, jlong, jobject) {
 }
 
 // Adopt a retained popup child (Canvas 20) into `parent`'s realized AWT HWND.

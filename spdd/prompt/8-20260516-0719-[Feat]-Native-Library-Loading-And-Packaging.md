@@ -427,6 +427,18 @@ Files: `.github/workflows/build.yml`,
      `clang -arch x86_64` because GitHub is phasing out Intel
      macOS runners (`maven-release.yml:37-43`). This relies on
      the macOS SDK being universal — it is, today.
+   - Both macOS natives build on `macos-15` (arm64) runners in
+     both workflows. GitHub no longer serves the `macos-14`
+     image: a job asking for it is cancelled before it starts
+     ("The configuration 'macos-14-arm64-us-default' is not
+     supported"), which also skips the assembly job.
+   - Every macOS compile passes `-mmacosx-version-min=14.0`. The
+     floor is the one the 1.13.0 release shipped with (its
+     dylibs' `LC_BUILD_VERSION`: minos 14.0, SDK 14.5). Without
+     the flag clang takes the runner SDK's version as the floor,
+     so a runner image upgrade would silently stop the library
+     loading on older macOS. The floor moves only by a deliberate
+     change to this line.
    - Windows builds statically link `WebView2LoaderStatic.lib`
      so the published jar carries only `webview.dll`, no
      `WebView2Loader.dll` (`build.yml:171`).

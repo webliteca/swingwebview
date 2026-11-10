@@ -230,8 +230,8 @@ public final class ContentRuleSet {
                 case '\r': sb.append("\\r"); break;
                 case '\t': sb.append("\\t"); break;
                 case '<': sb.append("\\u003c"); break;
-                case ' ': sb.append("\\u2028"); break;
-                case ' ': sb.append("\\u2029"); break;
+                case '\u2028': sb.append("\\u2028"); break;
+                case '\u2029': sb.append("\\u2029"); break;
                 default:
                     if (c < 0x20) sb.append(String.format("\\u%04x", (int) c));
                     else sb.append(c);

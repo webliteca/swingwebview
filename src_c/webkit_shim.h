@@ -46,6 +46,7 @@
 #define webkit_navigation_action_is_user_gesture (::g_wk.fn_webkit_navigation_action_is_user_gesture)
 #define webkit_print_operation_new (::g_wk.fn_webkit_print_operation_new)
 #define webkit_print_operation_print (::g_wk.fn_webkit_print_operation_print)
+#define webkit_print_operation_run_dialog (::g_wk.fn_webkit_print_operation_run_dialog)
 #define webkit_print_operation_set_page_setup (::g_wk.fn_webkit_print_operation_set_page_setup)
 #define webkit_print_operation_set_print_settings (::g_wk.fn_webkit_print_operation_set_print_settings)
 #define webkit_script_dialog_confirm_set_confirmed (::g_wk.fn_webkit_script_dialog_confirm_set_confirmed)

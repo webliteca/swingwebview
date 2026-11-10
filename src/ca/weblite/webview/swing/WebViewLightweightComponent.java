@@ -265,6 +265,21 @@ public class WebViewLightweightComponent extends WebViewComponent {
         }
     }
 
+    /** Canvas 38 op 6: the engine's print dialog, relayed to {@code cb}. */
+    @Override
+    protected boolean printOnPeer(final ca.weblite.webview.WebViewPrintCallback cb) {
+        OffscreenWebView e = engine;
+        if (e == null) {
+            return false;
+        }
+        e.showPrintDialog().whenComplete((o, t) -> cb.onPrintFinished(
+                t == null ? o.ordinal() : -1,
+                t == null ? null
+                        : (t instanceof java.util.concurrent.CompletionException
+                                && t.getCause() != null ? t.getCause() : t).getMessage()));
+        return true;
+    }
+
     @Override
     protected boolean printToPdfOnPeer(java.io.File out,
                                        ca.weblite.webview.PdfOptions o,
@@ -552,6 +567,8 @@ public class WebViewLightweightComponent extends WebViewComponent {
                 return permissionDispatcher.dispatch(id, origin, url, kinds);
             }
         });
+        // Canvas 38 D6: the page's window.print(), decided on the EDT.
+        engine.setPrintRequestCallback(url -> dispatchPrintRequest(url));
         // An adopted popup already carries the engine's own in-flight
         // navigation (the original request WebKit drove into the child, POST
         // body intact); navigating pendingUrl here would clobber it.  Only
@@ -613,6 +630,7 @@ public class WebViewLightweightComponent extends WebViewComponent {
         downloadDispatcher.disposeAll();
         passwordDispatcher.disposeAll();
         failPendingPdf();
+        failPendingPrint();   // Canvas 38 D5
         if (engine != null) {
             OffscreenWebView ow = engine;
             engine = null;
@@ -853,6 +871,7 @@ public class WebViewLightweightComponent extends WebViewComponent {
             repaintTimer = null;
         }
         failPendingPdf();
+        failPendingPrint();   // Canvas 38 D5
         if (engine != null) {
             OffscreenWebView ow = engine;
             engine = null;

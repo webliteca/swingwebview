@@ -656,6 +656,22 @@ native static void webview_offscreen_print_to_pdf(long peer, String path,
         double marginRight, double marginBottom, double marginLeft,
         boolean backgrounds, WebViewPdfCallback cb);
 
+// Canvas 38: the engine's own print dialog.  webview_print_dialog_available is
+// present only in natives built with the feature (PrintDialogs.isAvailable()
+// absorbs the UnsatisfiedLinkError an older native raises).  The print_dialog
+// calls show the dialog for the page and answer cb.onPrintFinished(outcome,
+// error) exactly once: macOS -[WKWebView printOperationWithPrintInfo:] with its
+// panels on, run as a sheet; Windows ICoreWebView2_16::ShowPrintUI; Linux
+// (offscreen) webkit_print_operation_run_dialog.  The set_print_request_callback
+// bridges hand the engine the callback it calls when the page runs
+// window.print() (macOS private UI-delegate selectors, the GTK `print` signal;
+// a no-op on Windows).  Never throw via JNI.
+native static boolean webview_print_dialog_available();
+native static void webview_embed_print_dialog(long w, WebViewPrintCallback cb);
+native static void webview_offscreen_print_dialog(long peer, WebViewPrintCallback cb);
+native static void webview_embed_set_print_request_callback(long w, WebViewPrintRequestCallback cb);
+native static void webview_offscreen_set_print_request_callback(long peer, WebViewPrintRequestCallback cb);
+
 // Offscreen counterpart to webview_embed_adopt_popup (Canvas 19).  Adopt a
 // browser-initiated popup child that was retained (not shown) after an ADOPT
 // disposition, reusing it inside a fresh GtkOffscreenWindow (OffEngine) and

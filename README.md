@@ -890,6 +890,35 @@ wv.printToPdf(new File("report-a4.pdf"), PdfOptions.a4().withMargins(0.5));
   heavyweight component refuses with "PDF printing on Linux needs the
   lightweight WebView component."
 
+## Print with the native dialog
+
+Show the platform's own print dialog for the page — preview of every page,
+printer, page range, copies, paper, orientation, scale and Save as PDF:
+
+```java
+wv.print().thenAccept(outcome -> System.out.println(outcome)); // PRINTED, CANCELLED or OPENED
+
+// The page's own window.print() opens the same dialog unless you refuse it:
+wv.setPrintHandler((component, url) -> url.startsWith("https://example.com/"));
+```
+
+* **The dialog is the platform's.** macOS (heavyweight, macOS 11+) runs the
+  print panel as a sheet on the window; Windows (heavyweight) opens WebView2's
+  print dialog (`ICoreWebView2_16::ShowPrintUI`, with headers, footers and
+  margins); Linux (lightweight) opens the GTK print dialog. The whole document
+  prints from the top, whatever the scroll position.
+* **The outcome.** The future completes on the EDT with `PRINTED` (printed or
+  saved), `CANCELLED`, or on Windows `OPENED` (WebView2 reports nothing more),
+  or fails with an `IOException` saying why: not supported, not attached, a
+  print already in progress, or closed first. One dialog per component.
+* **`window.print()`.** Without a `WebViewPrintHandler` the page's own print
+  requests open the dialog; a handler decides on the EDT. On Windows a handler
+  takes effect from the next page loaded after it is installed, and the page's
+  `window.print()` returns before the dialog closes.
+* **Capability check.** `WebViewComponent.isPrintDialogSupported()` is `false`
+  against a native library built before this feature. See
+  [`demos/WebViewPrintDemo/`](demos/WebViewPrintDemo/README.md).
+
 ## Custom URL schemes
 
 Serve an application's own pages from a URL scheme of its own, such as
@@ -1265,6 +1294,9 @@ Additional demos:
 * `demos/WebViewPdfDemo/` — exercises `printToPdf`: a two-page report
   with a full-bleed cover printed as Letter and as A4 with margins, and a
   print into a missing folder (`run-*-pdf-demo`).
+* `demos/WebViewPrintDemo/` — exercises `print()` and `window.print()`: a
+  four-page document, the outcome of the dialog, and a handler that denies the
+  page's own print requests (`run-*-print-demo`).
 * `demos/WebViewSchemeDemo/` — serves a two-file page from the `demo://`
   scheme in Java: a script, a POST echoed as JSON, a slow answer, a failing
   handler and a popup (`run-*-scheme-demo`).
